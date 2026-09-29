@@ -361,7 +361,7 @@ async fn run_session(
     });
 
     let writer = tokio::spawn(write_loop(send, write_rx));
-    let mut reader = tokio::spawn(read_loop(
+    let reader = tokio::spawn(read_loop(
         recv,
         write_tx.clone(),
         conn.clone(),
@@ -377,7 +377,7 @@ async fn run_session(
             conn.close(close_code(CLOSE_SHUTDOWN), b"shutdown");
             Ok(())
         }
-        r = &mut reader => match r {
+        r = reader => match r {
             Ok(()) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
@@ -386,10 +386,6 @@ async fn run_session(
     writer.abort();
     incoming.abort();
     ping.abort();
-    let _ = writer.await;
-    let _ = reader.await;
-    let _ = incoming.await;
-    let _ = ping.await;
     outcome
 }
 
