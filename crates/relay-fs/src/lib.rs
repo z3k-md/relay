@@ -11,8 +11,11 @@ use std::path::Path;
 
 pub use error::FsError;
 pub use marker::MountMarker;
-pub use materialize::materialize_file;
-pub use paths::{resolve_os_path, to_logical_path, to_os_path};
+pub use materialize::{MaterializeOptions, materialize_file};
+pub use paths::{
+    check_real_dir_chain, component_is_normal, ensure_real_dir_chain, resolve_os_path,
+    to_logical_path, to_os_path,
+};
 pub use scan::{
     PartialScan, ScanResult, ScanScope, ScanWarning, ScannedEntry, ScopeKind, effective_rules,
     scan_mount, scan_paths,

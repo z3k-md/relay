@@ -86,6 +86,14 @@ impl LogicalPath {
     pub fn portability_issues(&self) -> Vec<PortabilityIssue> {
         self.components().flat_map(component_issues).collect()
     }
+
+    /// Portability issues that apply on the current operating system.
+    pub fn current_os_issues(&self) -> Vec<PortabilityIssue> {
+        self.portability_issues()
+            .into_iter()
+            .filter(PortabilityIssue::applies_to_current_os)
+            .collect()
+    }
 }
 
 fn validate(path: &str) -> Result<(), CoreError> {

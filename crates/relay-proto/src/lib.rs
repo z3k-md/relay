@@ -189,6 +189,11 @@ pub struct WireEntry {
     /// The sender's local sequence for this version.
     #[prost(uint64, tag = "11")]
     pub sequence: u64,
+    /// Sender's observed file mtime (Unix nanoseconds). Used so Git's stat
+    /// checks on the other device keep matching. Absent for directories and
+    /// tombstones, and for older peers that do not send it.
+    #[prost(int64, optional, tag = "12")]
+    pub mtime_unix_ns: Option<i64>,
 }
 
 pub mod wire_entry {
@@ -336,6 +341,7 @@ pub struct RemoteEntry {
     pub modified_by: DeviceId,
     pub modified_at_unix_ms: i64,
     pub sequence: Sequence,
+    pub mtime_ns: Option<i64>,
 }
 
 impl RemoteEntry {
@@ -354,7 +360,7 @@ impl RemoteEntry {
             sequence,
             modified_by: self.modified_by,
             modified_at_unix_ms: self.modified_at_unix_ms,
-            stat,
+            stat, // mtime_ns is applied at materialize time; stored stat is observed after write
         }
     }
 }
@@ -392,6 +398,7 @@ pub fn entry_to_wire(record: &EntryRecord) -> WireEntry {
         modified_by: record.modified_by.as_bytes().to_vec(),
         modified_at_unix_ms: record.modified_at_unix_ms,
         sequence: record.sequence.0,
+        mtime_unix_ns: record.stat.map(|s| s.mtime_ns),
     }
 }
 
@@ -435,6 +442,7 @@ pub fn entry_from_wire(space: SpaceId, wire: WireEntry) -> Result<RemoteEntry, P
         modified_by: device_id_from_bytes(&wire.modified_by)?,
         modified_at_unix_ms: wire.modified_at_unix_ms,
         sequence: Sequence(wire.sequence),
+        mtime_ns: wire.mtime_unix_ns,
     })
 }
 
@@ -485,6 +493,7 @@ mod tests {
         assert_eq!(remote.vector, record.vector);
         assert_eq!(remote.modified_by, record.modified_by);
         assert_eq!(remote.sequence, record.sequence);
+        assert_eq!(remote.mtime_ns, record.stat.map(|s| s.mtime_ns));
     }
 
     #[test]

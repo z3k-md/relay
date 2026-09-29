@@ -19,6 +19,7 @@ pub use ids::{DeviceId, MountId, ObjectId, Sequence, SpaceId};
 pub use local::{LocalChange, Observation, derive_local_change, needs_rehash};
 pub use model::{Device, Mount, Space, validate_name};
 pub use path::LogicalPath;
+pub use reserved::PortabilityIssue;
 pub use version::{VectorOrdering, VersionRelation, VersionVector, compare_versions};
 
 /// File at the root of every materialized mount holding its Space and Mount

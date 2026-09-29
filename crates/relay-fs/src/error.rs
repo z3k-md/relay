@@ -41,6 +41,12 @@ pub enum FsError {
     #[error("invalid name at {os_path}: {reason}")]
     InvalidName { os_path: PathBuf, reason: String },
 
+    #[error("path {path} cannot be represented on this OS: {reason}")]
+    Unrepresentable { path: String, reason: String },
+
+    #[error("refusing to write through {path}: {reason}")]
+    UnsafeAncestor { path: PathBuf, reason: String },
+
     #[error("invalid ignore pattern {pattern:?}: {message}")]
     InvalidPattern { pattern: String, message: String },
 

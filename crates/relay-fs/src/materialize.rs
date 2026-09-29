@@ -1,11 +1,24 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use relay_core::{ObjectId, StatHint, TEMP_PREFIX};
 use uuid::Uuid;
 
 use crate::error::FsError;
+use crate::paths::ensure_real_dir_chain;
+
+/// Options for a safe materialize under a mount root.
+#[derive(Clone, Copy, Debug)]
+pub struct MaterializeOptions<'a> {
+    /// Mount root. Every existing ancestor from here to `dest`'s parent must
+    /// be a real directory (not a symlink or reparse point).
+    pub mount_root: &'a Path,
+    /// Set the destination mtime to this Unix-nanosecond timestamp before the
+    /// final rename, so a peer's Git stat checks keep matching.
+    pub mtime_ns: Option<i64>,
+}
 
 /// Write `reader`'s bytes to `dest` atomically.
 ///
@@ -18,29 +31,34 @@ use crate::error::FsError;
 /// current [`StatHint::from_metadata`] of `symlink_metadata` must equal it.
 /// Otherwise the temp is deleted and [`FsError::DestinationChanged`] is
 /// returned so the caller can treat the edit as a local change.
+///
+/// Parents are created one component at a time; an existing ancestor that is
+/// not a real directory is refused so a symlink cannot redirect the write
+/// outside the mount.
 pub fn materialize_file(
     reader: &mut dyn Read,
     dest: &Path,
     expected: ObjectId,
     executable: bool,
     expected_existing: Option<&StatHint>,
+    options: MaterializeOptions<'_>,
 ) -> Result<StatHint, FsError> {
-    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
-    if let Some(parent) = parent {
-        fs::create_dir_all(parent).map_err(|e| FsError::io(parent, e))?;
-    }
-    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_real_dir_chain(options.mount_root, parent)?;
 
     let tmp = parent.join(format!("{}{}", TEMP_PREFIX, Uuid::new_v4()));
     let mut guard = TempGuard(Some(tmp.clone()));
 
-    write_hashed(&tmp, dest, reader, expected, executable)?;
+    write_hashed(&tmp, dest, reader, expected, executable, options.mtime_ns)?;
 
     if !destination_still_matches(dest, expected_existing)? {
         return Err(FsError::DestinationChanged(dest.to_path_buf()));
     }
 
-    fs::rename(&tmp, dest).map_err(|e| FsError::io(dest, e))?;
+    rename_with_retry(&tmp, dest)?;
     guard.defuse();
     crate::sync_parent_dir(parent)?;
 
@@ -54,6 +72,7 @@ fn write_hashed(
     reader: &mut dyn Read,
     expected: ObjectId,
     executable: bool,
+    mtime_ns: Option<i64>,
 ) -> Result<(), FsError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -82,8 +101,60 @@ fn write_hashed(
     }
 
     set_executable(&file, tmp, executable)?;
+    if let Some(mtime_ns) = mtime_ns {
+        set_mtime(&file, tmp, mtime_ns)?;
+    }
     file.sync_all().map_err(|e| FsError::io(tmp, e))?;
     Ok(())
+}
+
+fn set_mtime(file: &File, path: &Path, mtime_ns: i64) -> Result<(), FsError> {
+    let time = unix_ns_to_system_time(mtime_ns);
+    let times = fs::FileTimes::new().set_modified(time);
+    file.set_times(times).map_err(|e| FsError::io(path, e))
+}
+
+fn unix_ns_to_system_time(ns: i64) -> SystemTime {
+    if ns >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_nanos(ns as u64)
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_nanos(ns.unsigned_abs())
+    }
+}
+
+const RENAME_ATTEMPTS: u32 = 5;
+
+fn rename_with_retry(tmp: &Path, dest: &Path) -> Result<(), FsError> {
+    let mut last = None;
+    for attempt in 0..RENAME_ATTEMPTS {
+        match fs::rename(tmp, dest) {
+            Ok(()) => return Ok(()),
+            Err(err) if retryable_rename(&err) && attempt + 1 < RENAME_ATTEMPTS => {
+                last = Some(err);
+                std::thread::sleep(Duration::from_millis(10 * u64::from(attempt + 1)));
+            }
+            Err(err) => return Err(FsError::io(dest, err)),
+        }
+    }
+    Err(FsError::io(dest, last.expect("retry loop stored an error")))
+}
+
+fn retryable_rename(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION
+        err.raw_os_error() == Some(32)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn destination_still_matches(
@@ -146,6 +217,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_via(
+        root: &Path,
         dest: &Path,
         bytes: &[u8],
         executable: bool,
@@ -157,6 +229,10 @@ mod tests {
             ObjectId::of(bytes),
             executable,
             expected_existing,
+            MaterializeOptions {
+                mount_root: root,
+                mtime_ns: None,
+            },
         )
     }
 
@@ -177,7 +253,7 @@ mod tests {
     fn materializes_new_file_and_parents() {
         let dir = tempdir().unwrap();
         let dest = dir.path().join("a/b/hello.txt");
-        let stat = write_via(&dest, b"hello", false, None).unwrap();
+        let stat = write_via(dir.path(), &dest, b"hello", false, None).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"hello");
         assert_eq!(stat.size, 5);
         assert!(list_temps(dest.parent().unwrap()).is_empty());
@@ -189,7 +265,7 @@ mod tests {
         let dest = dir.path().join("file.txt");
         fs::write(&dest, b"old").unwrap();
         let before = StatHint::from_metadata(&fs::symlink_metadata(&dest).unwrap());
-        write_via(&dest, b"newer!", false, Some(&before)).unwrap();
+        write_via(dir.path(), &dest, b"newer!", false, Some(&before)).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"newer!");
     }
 
@@ -200,7 +276,7 @@ mod tests {
         fs::write(&dest, b"old").unwrap();
         let before = StatHint::from_metadata(&fs::symlink_metadata(&dest).unwrap());
         fs::write(&dest, b"changed-size").unwrap();
-        let err = write_via(&dest, b"incoming", false, Some(&before)).unwrap_err();
+        let err = write_via(dir.path(), &dest, b"incoming", false, Some(&before)).unwrap_err();
         assert!(matches!(err, FsError::DestinationChanged(_)));
         assert_eq!(fs::read(&dest).unwrap(), b"changed-size");
         assert!(list_temps(dir.path()).is_empty());
@@ -211,7 +287,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let dest = dir.path().join("file.txt");
         fs::write(&dest, b"already").unwrap();
-        let err = write_via(&dest, b"incoming", false, None).unwrap_err();
+        let err = write_via(dir.path(), &dest, b"incoming", false, None).unwrap_err();
         assert!(matches!(err, FsError::DestinationChanged(_)));
         assert_eq!(fs::read(&dest).unwrap(), b"already");
     }
@@ -227,6 +303,10 @@ mod tests {
             ObjectId::of(b"expected-bytes"),
             false,
             None,
+            MaterializeOptions {
+                mount_root: dir.path(),
+                mtime_ns: None,
+            },
         )
         .unwrap_err();
         assert!(matches!(err, FsError::HashMismatch { .. }));
@@ -240,8 +320,49 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let dest = dir.path().join("tool");
-        write_via(&dest, b"#!/bin/sh\n", true, None).unwrap();
+        write_via(dir.path(), &dest, b"#!/bin/sh\n", true, None).unwrap();
         let mode = fs::metadata(&dest).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlink_escape() {
+        let mount = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), mount.path().join("evil")).unwrap();
+        let dest = mount.path().join("evil/x");
+        let err = write_via(mount.path(), &dest, b"pwned", false, None).unwrap_err();
+        assert!(
+            matches!(err, FsError::UnsafeAncestor { .. }),
+            "{err:?}"
+        );
+        assert!(!outside.path().join("x").exists());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn sets_mtime_when_provided() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("timed.txt");
+        let mtime_ns = 1_700_000_000_000_000_000i64;
+        materialize_file(
+            &mut Cursor::new(b"hi"),
+            &dest,
+            ObjectId::of(b"hi"),
+            false,
+            None,
+            MaterializeOptions {
+                mount_root: dir.path(),
+                mtime_ns: Some(mtime_ns),
+            },
+        )
+        .unwrap();
+        let observed = StatHint::from_metadata(&fs::symlink_metadata(&dest).unwrap());
+        let delta = (observed.mtime_ns - mtime_ns).abs();
+        assert!(
+            delta < 2_000_000_000,
+            "mtime {observed:?} not near {mtime_ns}"
+        );
     }
 }

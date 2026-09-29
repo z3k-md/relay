@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use relay_core::{DeviceId, EntryKey, MOUNT_MARKER, validate_name};
 use relay_db::Database;
-use relay_fs::{MountMarker, materialize_file, resolve_os_path, to_os_path};
+use relay_fs::{MaterializeOptions, MountMarker, materialize_file, resolve_os_path, to_os_path};
 use relay_policy::MountRules;
 use relay_store::StoreError;
 
@@ -445,7 +445,7 @@ impl Engine {
 
         let dest = match resolve_os_path(&local_path, path)? {
             Some(existing) => existing,
-            None => to_os_path(&local_path, path),
+            None => to_os_path(&local_path, path)?,
         };
         let current = self.db.repo().entry(&key)?;
         let expected_existing = restore_expected_stat(&self.store, &dest, current.as_ref())?;
@@ -457,6 +457,10 @@ impl Engine {
             object,
             executable,
             expected_existing.as_ref(),
+            MaterializeOptions {
+                mount_root: &local_path,
+                mtime_ns: None,
+            },
         ) {
             Ok(stat) => stat,
             Err(relay_fs::FsError::DestinationChanged(path)) => {

@@ -13,6 +13,18 @@ pub enum PortabilityIssue {
     ComponentTooLong(String),
 }
 
+impl PortabilityIssue {
+    /// Issues that actually prevent materializing this name on the running OS.
+    pub fn applies_to_current_os(&self) -> bool {
+        match self {
+            Self::WindowsReservedName(_)
+            | Self::WindowsForbiddenChar { .. }
+            | Self::WindowsTrailingDotOrSpace(_) => cfg!(windows),
+            Self::ComponentTooLong(_) => cfg!(windows),
+        }
+    }
+}
+
 impl fmt::Display for PortabilityIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

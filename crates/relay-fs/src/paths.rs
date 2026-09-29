@@ -10,16 +10,51 @@ use crate::error::FsError;
 /// Join `path` onto `root` one component at a time. Never string-concatenates
 /// with `/`.
 ///
+/// Each logical component must be exactly one [`Component::Normal`] on this
+/// OS. Names that encode a drive prefix, `..`, or an OS path separator
+/// (`C:\x`, `a\..\b`, `\\server\share`) are rejected so they cannot escape
+/// the mount root.
+///
 /// This writes the NFC spelling from [`LogicalPath`]. Use it only to construct
 /// destinations for **new** files. On-disk names may be a different
 /// normalization (NFD is common for files copied from macOS); look up existing
 /// entries with [`resolve_os_path`].
-pub fn to_os_path(root: &Path, path: &LogicalPath) -> PathBuf {
+pub fn to_os_path(root: &Path, path: &LogicalPath) -> Result<PathBuf, FsError> {
     let mut out = root.to_path_buf();
     for component in path.components() {
+        require_normal_component(path, component)?;
         out.push(component);
     }
-    out
+    Ok(out)
+}
+
+/// True when `component` is exactly one [`Component::Normal`] whose OsStr
+/// equals the logical name. Drive prefixes, `..`, and extra separators fail.
+pub fn component_is_normal(component: &str) -> bool {
+    inspect_normal_component(component).is_ok()
+}
+
+fn require_normal_component(path: &LogicalPath, component: &str) -> Result<(), FsError> {
+    inspect_normal_component(component).map_err(|reason| FsError::Unrepresentable {
+        path: path.as_str().to_owned(),
+        reason,
+    })
+}
+
+fn inspect_normal_component(component: &str) -> Result<(), String> {
+    let as_path = Path::new(component);
+    let mut parts = as_path.components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(name)), None) if name.to_str() == Some(component) => Ok(()),
+        (Some(Component::Normal(_)), None) => Err(format!(
+            "component {component:?} is not a single ordinary name on this OS"
+        )),
+        (Some(other), rest) => Err(format!(
+            "component {component:?} expands to {other:?}{} on this OS",
+            if rest.is_some() { " plus further parts" } else { "" }
+        )),
+        (None, _) => Err(format!("component {component:?} is empty on this OS")),
+    }
 }
 
 /// Walk `path` from `root`, returning the real on-disk path if it exists.
@@ -37,6 +72,7 @@ pub fn resolve_os_path(root: &Path, path: &LogicalPath) -> Result<Option<PathBuf
     let mut current = root.to_path_buf();
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
+        require_normal_component(path, component)?;
         let is_last = components.peek().is_none();
         let Some(next) = resolve_component(&current, component)? else {
             return Ok(None);
@@ -94,17 +130,92 @@ fn nfc_matching_entries(dir: &Path, component: &str) -> Result<Vec<PathBuf>, FsE
     Ok(matches)
 }
 
+/// Walk from `root` down to `dir`, creating missing directories one component
+/// at a time. Every *existing* ancestor must be a real directory (not a
+/// symlink, junction, or reparse point).
+pub fn ensure_real_dir_chain(root: &Path, dir: &Path) -> Result<(), FsError> {
+    walk_dir_chain(root, dir, true)
+}
+
+/// Same as [`ensure_real_dir_chain`] but never creates directories. Used
+/// before deletes so a symlink ancestor cannot redirect the removal.
+pub fn check_real_dir_chain(root: &Path, dir: &Path) -> Result<(), FsError> {
+    walk_dir_chain(root, dir, false)
+}
+
+fn walk_dir_chain(root: &Path, dir: &Path, create_missing: bool) -> Result<(), FsError> {
+    require_real_dir(root)?;
+    if dir == root {
+        return Ok(());
+    }
+    let rel = dir.strip_prefix(root).map_err(|_| FsError::Unrepresentable {
+        path: dir.display().to_string(),
+        reason: "path is not under the mount root".into(),
+    })?;
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                current.push(name);
+                match fs::symlink_metadata(&current) {
+                    Ok(meta) if is_real_directory(&meta) => {}
+                    Ok(_) => {
+                        return Err(FsError::UnsafeAncestor {
+                            path: current,
+                            reason: "ancestor is not a real directory".into(),
+                        });
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        if create_missing {
+                            fs::create_dir(&current).map_err(|e| FsError::io(&current, e))?;
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    Err(err) => return Err(FsError::io(&current, err)),
+                }
+            }
+            other => {
+                return Err(FsError::Unrepresentable {
+                    path: current.display().to_string(),
+                    reason: format!("path contains {other:?}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_real_dir(path: &Path) -> Result<(), FsError> {
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            FsError::MountRootMissing(path.to_path_buf())
+        } else {
+            FsError::io(path, err)
+        }
+    })?;
+    if is_real_directory(&meta) {
+        Ok(())
+    } else {
+        Err(FsError::UnsafeAncestor {
+            path: path.to_path_buf(),
+            reason: "mount root is not a real directory".into(),
+        })
+    }
+}
+
 fn name_bytes(path: &Path) -> &[u8] {
     path.file_name()
         .map(|name| name.as_encoded_bytes())
         .unwrap_or(b"")
 }
 
-fn is_real_directory(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_real_directory(meta: &fs::Metadata) -> bool {
     meta.is_dir() && !is_symlink_like(meta)
 }
 
-fn is_symlink_like(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_symlink_like(meta: &fs::Metadata) -> bool {
     if meta.file_type().is_symlink() {
         return true;
     }
@@ -173,7 +284,7 @@ mod tests {
     fn round_trip_nested_path() {
         let root = PathBuf::from("/mnt/space");
         let logical = LogicalPath::new("game/inventory/Core.lua").unwrap();
-        let os = to_os_path(&root, &logical);
+        let os = to_os_path(&root, &logical).unwrap();
         assert_eq!(os, PathBuf::from("/mnt/space/game/inventory/Core.lua"));
         assert_eq!(to_logical_path(&root, &os).unwrap(), logical);
     }
@@ -220,7 +331,10 @@ mod tests {
         let nfd = root.join("cafe\u{301}.txt");
         std::fs::write(&nfd, b"nfd").unwrap();
         let logical = LogicalPath::new("caf\u{e9}.txt").unwrap();
-        assert_eq!(to_os_path(root, &logical), root.join("caf\u{e9}.txt"));
+        assert_eq!(
+            to_os_path(root, &logical).unwrap(),
+            root.join("caf\u{e9}.txt")
+        );
         assert_eq!(
             resolve_os_path(root, &logical).unwrap().as_deref(),
             Some(nfd.as_path())
@@ -241,5 +355,39 @@ mod tests {
             resolve_os_path(root, &logical).unwrap().as_deref(),
             Some(nfc_file.as_path())
         );
+    }
+
+    #[test]
+    fn rejects_component_containing_os_separator() {
+        if std::path::MAIN_SEPARATOR == '/' {
+            // `/` cannot appear in a LogicalPath component; nothing to test.
+            return;
+        }
+        let name = format!("a{}b", std::path::MAIN_SEPARATOR);
+        let logical = LogicalPath::new(&name).unwrap();
+        let err = to_os_path(Path::new("/mnt"), &logical).unwrap_err();
+        assert!(
+            matches!(err, FsError::Unrepresentable { .. }),
+            "{err:?}"
+        );
+        let err = resolve_os_path(Path::new("/mnt"), &logical).unwrap_err();
+        assert!(
+            matches!(err, FsError::Unrepresentable { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_and_unc_components_are_unrepresentable() {
+        let root = PathBuf::from(r"C:\relay\mount");
+        for bad in [r"C:\x", r"a\..\b", r"\\server\share", "C:"] {
+            let logical = LogicalPath::new(bad).unwrap();
+            let err = to_os_path(&root, &logical).unwrap_err();
+            assert!(
+                matches!(err, FsError::Unrepresentable { .. }),
+                "{bad:?} => {err:?}"
+            );
+        }
     }
 }
