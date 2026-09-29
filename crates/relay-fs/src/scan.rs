@@ -35,6 +35,23 @@ pub enum ScanWarning {
 pub struct ScanResult {
     pub entries: Vec<ScannedEntry>,
     pub warnings: Vec<ScanWarning>,
+    /// Rules actually applied (user rules plus a root `.relayignore`, if any).
+    pub rules: Option<MountRules>,
+}
+
+/// User `rules` plus a root `.relayignore` when one is present and readable.
+///
+/// Unreadable `.relayignore` is recorded as a warning and the user rules are
+/// returned unchanged, matching [`scan_mount`].
+pub fn effective_rules(
+    root: &Path,
+    rules: &MountRules,
+    warnings: &mut Vec<ScanWarning>,
+) -> Result<MountRules, FsError> {
+    match load_root_relayignore(root, warnings) {
+        None => Ok(rules.clone()),
+        Some(extra) => rules.with_extra_excludes(&extra).map_err(map_policy),
+    }
 }
 
 /// Walk `root` applying `rules` (plus a root `.relayignore` if present).
@@ -45,20 +62,13 @@ pub struct ScanResult {
 pub fn scan_mount(root: &Path, rules: &MountRules) -> Result<ScanResult, FsError> {
     ensure_root(root)?;
     let mut result = ScanResult::default();
-    let rules_owned;
-    let rules = match load_root_relayignore(root, &mut result.warnings) {
-        None => rules,
-        Some(extra) => {
-            rules_owned = rules.with_extra_excludes(&extra).map_err(map_policy)?;
-            &rules_owned
-        }
-    };
+    let rules = effective_rules(root, rules, &mut result.warnings)?;
 
     let early = RefCell::new(WalkEarly::default());
     let walker = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| filter_entry(root, entry, rules, &early));
+        .filter_entry(|entry| filter_entry(root, entry, &rules, &early));
 
     for item in walker {
         match item {
@@ -76,7 +86,7 @@ pub fn scan_mount(root: &Path, rules: &MountRules) -> Result<ScanResult, FsError
                 if entry.depth() == 0 {
                     continue;
                 }
-                if let Some(scanned) = collect_entry(root, &entry, rules, &mut result.warnings)? {
+                if let Some(scanned) = collect_entry(root, &entry, &rules, &mut result.warnings)? {
                     result.entries.push(scanned);
                 }
             }
@@ -89,7 +99,7 @@ pub fn scan_mount(root: &Path, rules: &MountRules) -> Result<ScanResult, FsError
     } = early.into_inner();
     result.warnings.append(&mut warnings);
     for os_path in extra_symlinks {
-        if let Some(scanned) = collect_symlink_path(root, &os_path, rules, &mut result.warnings) {
+        if let Some(scanned) = collect_symlink_path(root, &os_path, &rules, &mut result.warnings) {
             result.entries.push(scanned);
         }
     }
@@ -97,6 +107,7 @@ pub fn scan_mount(root: &Path, rules: &MountRules) -> Result<ScanResult, FsError
     add_portability_warnings(&result.entries, &mut result.warnings);
     add_case_collision_warnings(&result.entries, &mut result.warnings);
     result.entries.sort_by(|a, b| a.path.cmp(&b.path));
+    result.rules = Some(rules);
     Ok(result)
 }
 
@@ -562,6 +573,12 @@ mod tests {
                 .any(|w| matches!(w, ScanWarning::NestedMount(p) if p == &nested))
         );
         assert!(result.entries.windows(2).all(|w| w[0].path <= w[1].path));
+        let effective = result.rules.expect("scan should report effective rules");
+        assert!(!effective.is_selected(&LogicalPath::new("ignored.txt").unwrap(), EntryKind::File));
+        assert!(!effective.is_selected(
+            &LogicalPath::new("node_modules/deep/secret/x").unwrap(),
+            EntryKind::File
+        ));
     }
 
     #[cfg(unix)]

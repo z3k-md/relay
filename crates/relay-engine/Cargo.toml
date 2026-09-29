@@ -7,7 +7,19 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+directories.workspace = true
+dunce = "1"
 relay-core.workspace = true
+relay-db.workspace = true
+relay-fs.workspace = true
+relay-policy.workspace = true
+relay-store.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

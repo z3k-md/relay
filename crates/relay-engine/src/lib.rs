@@ -1,1 +1,517 @@
+//! Integration layer: local index, object store, and filesystem scans.
 
+mod clock;
+mod error;
+mod reports;
+mod scan;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use relay_core::{DeviceId, EntryKey, MOUNT_MARKER, validate_name};
+use relay_db::Database;
+use relay_fs::{MountMarker, materialize_file, to_os_path};
+use relay_policy::MountRules;
+use relay_store::StoreError;
+
+pub use clock::{Clock, ManualClock, SystemClock};
+pub use error::EngineError;
+pub use relay_core::{
+    Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount, ObjectId, Sequence, Space,
+    VectorOrdering,
+};
+pub use relay_db::{HistoryRecord, MountConfig};
+pub use relay_fs::{FsError, ScanWarning};
+pub use relay_store::ObjectStore;
+pub use reports::{
+    GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR, MountStatus,
+    ScanOptions, ScanReport, Status, VerifyReport, Warning,
+};
+
+const DB_FILE: &str = "relay.db";
+const STORE_DIR: &str = "store";
+const LOGS_DIR: &str = "logs";
+const TMP_CLEAN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// `$RELAY_HOME` if set; else the platform project data dir; else `~/.relay`.
+pub fn default_home() -> PathBuf {
+    if let Ok(home) = std::env::var("RELAY_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
+    if let Some(dirs) = directories::ProjectDirs::from("dev", "Relay", "Relay") {
+        return dirs.data_dir().to_path_buf();
+    }
+    fallback_dot_relay()
+}
+
+fn fallback_dot_relay() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home).join(".relay");
+    }
+    PathBuf::from(".relay")
+}
+
+pub struct Engine {
+    home: PathBuf,
+    db: Database,
+    store: ObjectStore,
+    device: Device,
+    clock: Arc<dyn Clock>,
+}
+
+impl Engine {
+    pub fn init(home: &Path, device_name: &str) -> Result<Engine, EngineError> {
+        validate_name(device_name)?;
+        ensure_layout(home)?;
+        let mut db = Database::open(&home.join(DB_FILE))?;
+        if db.repo().local_device()?.is_some() {
+            return Err(EngineError::AlreadyInitialized);
+        }
+        let device = Device {
+            id: DeviceId::random(),
+            name: device_name.to_owned(),
+        };
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let now = clock.now_ms();
+        db.transaction(|repo| repo.init_local_device(&device, now))
+            .map_err(EngineError::from_db)?;
+        let store = ObjectStore::open(home.join(STORE_DIR))?;
+        Ok(Engine {
+            home: home.to_path_buf(),
+            db,
+            store,
+            device,
+            clock,
+        })
+    }
+
+    pub fn open(home: &Path) -> Result<Engine, EngineError> {
+        let db_path = home.join(DB_FILE);
+        if !db_path.is_file() {
+            return Err(EngineError::NotInitialized);
+        }
+        ensure_layout(home)?;
+        let db = Database::open(&db_path)?;
+        let local = db
+            .repo()
+            .local_device()
+            .map_err(EngineError::from_db)?
+            .ok_or(EngineError::NotInitialized)?;
+        let store = ObjectStore::open(home.join(STORE_DIR))?;
+        Ok(Engine {
+            home: home.to_path_buf(),
+            db,
+            store,
+            device: local.device,
+            clock: Arc::new(SystemClock),
+        })
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Engine {
+        self.clock = clock;
+        self
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn create_space(&mut self, name: &str) -> Result<Space, EngineError> {
+        validate_name(name)?;
+        let space = Space {
+            id: relay_core::SpaceId::new(),
+            name: name.to_owned(),
+        };
+        let now = self.clock.now_ms();
+        self.db
+            .transaction(|repo| repo.create_space(&space, now))
+            .map_err(EngineError::from_db)?;
+        Ok(space)
+    }
+
+    pub fn spaces(&self) -> Result<Vec<Space>, EngineError> {
+        Ok(self.db.repo().list_spaces()?)
+    }
+
+    pub fn add_mount(
+        &mut self,
+        space: &str,
+        mount: &str,
+        local_path: &Path,
+        includes: &[String],
+        excludes: &[String],
+    ) -> Result<MountConfig, EngineError> {
+        validate_name(space)?;
+        validate_name(mount)?;
+        let meta = fs::metadata(local_path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                EngineError::PathNotADirectory(local_path.to_path_buf())
+            } else {
+                EngineError::Io(err)
+            }
+        })?;
+        if !meta.is_dir() {
+            return Err(EngineError::PathNotADirectory(local_path.to_path_buf()));
+        }
+
+        let canonical = dunce::canonicalize(local_path)?;
+        let home = dunce::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
+        if paths_overlap(&canonical, &home) {
+            return Err(EngineError::OverlapsRelayHome);
+        }
+
+        let existing = self.db.repo().list_mounts(None)?;
+        for cfg in &existing {
+            let Some(other) = cfg.local_path.as_ref() else {
+                continue;
+            };
+            let other = dunce::canonicalize(other).unwrap_or_else(|_| other.clone());
+            if paths_overlap(&canonical, &other) {
+                return Err(EngineError::OverlappingMount { existing: other });
+            }
+        }
+
+        if canonical.join(MOUNT_MARKER).exists() {
+            return Err(EngineError::MountAlreadyClaimed { path: canonical });
+        }
+
+        MountRules::new(includes, excludes)?;
+
+        let space_rec = self
+            .db
+            .repo()
+            .space_by_name(space)?
+            .ok_or_else(|| EngineError::UnknownSpace(space.to_owned()))?;
+        let mount_rec = Mount {
+            id: relay_core::MountId::new(),
+            space: space_rec.id,
+            name: mount.to_owned(),
+        };
+
+        let marker = MountMarker {
+            space: space_rec.id,
+            mount: mount_rec.id,
+            created_by: self.device.id,
+        };
+        marker.write(&canonical)?;
+
+        let now = self.clock.now_ms();
+        let db_result = self.db.transaction(|repo| {
+            repo.create_mount(&mount_rec, now)?;
+            repo.set_local_mount_path(mount_rec.id, &canonical)?;
+            repo.set_mount_rules(mount_rec.id, includes, excludes)?;
+            Ok::<(), EngineError>(())
+        });
+        if let Err(err) = db_result {
+            let _ = fs::remove_file(canonical.join(MOUNT_MARKER));
+            return Err(match err {
+                EngineError::Db(inner) => EngineError::from_db(inner),
+                other => other,
+            });
+        }
+
+        self.db
+            .repo()
+            .mount_config(mount_rec.id)?
+            .ok_or(EngineError::MountNotLocal)
+    }
+
+    pub fn mounts(&self, space: Option<&str>) -> Result<Vec<(Space, MountConfig)>, EngineError> {
+        let space_id = match space {
+            Some(name) => Some(
+                self.db
+                    .repo()
+                    .space_by_name(name)?
+                    .ok_or_else(|| EngineError::UnknownSpace(name.to_owned()))?
+                    .id,
+            ),
+            None => None,
+        };
+        let configs = self.db.repo().list_mounts(space_id)?;
+        let mut out = Vec::with_capacity(configs.len());
+        for config in configs {
+            let space = self
+                .db
+                .repo()
+                .space(config.mount.space)?
+                .ok_or_else(|| EngineError::UnknownSpace(config.mount.name.clone()))?;
+            out.push((space, config));
+        }
+        Ok(out)
+    }
+
+    pub fn scan(
+        &mut self,
+        space: &str,
+        mount: &str,
+        opts: ScanOptions,
+    ) -> Result<ScanReport, EngineError> {
+        self.scan_mount(space, mount, opts)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn scan_all(
+        &mut self,
+        opts: ScanOptions,
+    ) -> Result<Vec<(Space, Mount, Result<ScanReport, EngineError>)>, EngineError> {
+        let listed = self.mounts(None)?;
+        let mut out = Vec::with_capacity(listed.len());
+        for (space, config) in listed {
+            let mount = config.mount.clone();
+            let report = self.scan(&space.name, &mount.name, opts);
+            out.push((space, mount, report));
+        }
+        Ok(out)
+    }
+
+    pub fn entries(
+        &self,
+        space: &str,
+        mount: &str,
+        include_deleted: bool,
+    ) -> Result<Vec<EntryRecord>, EngineError> {
+        let (_, config) = self.lookup_mount(space, mount)?;
+        let mut entries = self.db.repo().entries_for_mount(config.mount.id)?;
+        if !include_deleted {
+            entries.retain(|e| !e.is_deleted());
+        }
+        Ok(entries)
+    }
+
+    pub fn history(
+        &self,
+        space: &str,
+        mount: &str,
+        path: &LogicalPath,
+    ) -> Result<Vec<HistoryRecord>, EngineError> {
+        let (space_rec, config) = self.lookup_mount(space, mount)?;
+        let key = EntryKey {
+            space: space_rec.id,
+            mount: config.mount.id,
+            path: path.clone(),
+        };
+        Ok(self.db.repo().history(&key)?)
+    }
+
+    pub fn restore(
+        &mut self,
+        space: &str,
+        mount: &str,
+        path: &LogicalPath,
+        sequence: Sequence,
+    ) -> Result<EntryRecord, EngineError> {
+        let (space_rec, config) = self.lookup_mount(space, mount)?;
+        let local_path = config
+            .local_path
+            .clone()
+            .ok_or(EngineError::MountNotLocal)?;
+        relay_fs::MountMarker::verify(&local_path, config.mount.id)?;
+
+        let key = EntryKey {
+            space: space_rec.id,
+            mount: config.mount.id,
+            path: path.clone(),
+        };
+        let history = self.db.repo().history(&key)?;
+        let version = history
+            .iter()
+            .find(|h| h.sequence == sequence)
+            .ok_or(EngineError::UnknownVersion)?;
+        let (object, size, executable) = match &version.content {
+            EntryContent::File {
+                object,
+                size,
+                executable,
+            } => (*object, *size, *executable),
+            other => {
+                return Err(EngineError::RestoreUnsupported(format!(
+                    "only files can be restored (found {})",
+                    content_kind_name(other)
+                )));
+            }
+        };
+
+        let current = self.db.repo().entry(&key)?;
+        let expected_existing = current.as_ref().and_then(|record| {
+            if matches!(record.content, EntryContent::File { .. }) && !record.is_deleted() {
+                record.stat.as_ref()
+            } else {
+                None
+            }
+        });
+
+        let dest = to_os_path(&local_path, path);
+        let mut reader = self.store.open_object(&object)?;
+        let stat = match materialize_file(&mut reader, &dest, object, executable, expected_existing)
+        {
+            Ok(stat) => stat,
+            Err(relay_fs::FsError::DestinationChanged(path)) => {
+                return Err(EngineError::DestinationChanged(path));
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let now = self.clock.now_ms();
+        let device = self.device.id;
+        let content = EntryContent::File {
+            object,
+            size,
+            executable,
+        };
+        self.db
+            .transaction(|repo| {
+                repo.record_object(object, size, now)?;
+                let sequence = repo.next_sequence()?;
+                let record = EntryRecord::local_write(
+                    current.as_ref(),
+                    key.clone(),
+                    content.clone(),
+                    Some(stat),
+                    device,
+                    now,
+                    sequence,
+                );
+                repo.put_entry(&record)?;
+                Ok(record)
+            })
+            .map_err(|err| match err {
+                EngineError::Db(inner) => EngineError::from_db(inner),
+                other => other,
+            })
+    }
+
+    pub fn verify_objects(&self) -> Result<VerifyReport, EngineError> {
+        let live = self.db.repo().live_objects()?;
+        let mut missing = Vec::new();
+        let mut corrupt = Vec::new();
+        for id in &live {
+            match self.store.verify(id) {
+                Ok(()) => {}
+                Err(StoreError::NotFound(_)) => missing.push(*id),
+                Err(StoreError::Corrupt { .. }) => corrupt.push(*id),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        missing.sort();
+        corrupt.sort();
+        Ok(VerifyReport {
+            checked: live.len(),
+            missing,
+            corrupt,
+        })
+    }
+
+    pub fn gc(&mut self, grace: Duration) -> Result<GcReport, EngineError> {
+        let live = self.db.repo().live_objects()?;
+        let sweep = self.store.sweep(&live, grace)?;
+        let tmp_cleaned = self.store.clean_tmp(TMP_CLEAN_AGE)?;
+        Ok(GcReport {
+            removed: sweep.removed,
+            bytes_freed: sweep.bytes_freed,
+            kept: sweep.kept,
+            tmp_cleaned,
+        })
+    }
+
+    pub fn status(&self) -> Result<Status, EngineError> {
+        let local = self
+            .db
+            .repo()
+            .local_device()
+            .map_err(EngineError::from_db)?
+            .ok_or(EngineError::NotInitialized)?;
+        let last_sequence = Sequence(local.next_sequence.0.saturating_sub(1));
+        let listed = self.mounts(None)?;
+        let mut mounts = Vec::with_capacity(listed.len());
+        for (space, config) in listed {
+            let entries = self.db.repo().entries_for_mount(config.mount.id)?;
+            let live_entries = entries.iter().filter(|e| !e.is_deleted()).count();
+            let tombstones = entries.len() - live_entries;
+            let (marker_ok, marker_state) = match &config.local_path {
+                None => (false, "NO_PATH".to_owned()),
+                Some(path) => match MountMarker::verify(path, config.mount.id) {
+                    Ok(_) => (true, "OK".to_owned()),
+                    Err(relay_fs::FsError::MarkerMissing(_)) => (false, "MISSING".to_owned()),
+                    Err(relay_fs::FsError::MarkerMismatch { .. }) => (false, "MISMATCH".to_owned()),
+                    Err(relay_fs::FsError::MarkerInvalid { .. }) => (false, "INVALID".to_owned()),
+                    Err(relay_fs::FsError::MountRootMissing(_)) => {
+                        (false, "ROOT_MISSING".to_owned())
+                    }
+                    Err(relay_fs::FsError::NotADirectory(_)) => {
+                        (false, "NOT_A_DIRECTORY".to_owned())
+                    }
+                    Err(_) => (false, "ERROR".to_owned()),
+                },
+            };
+            mounts.push(MountStatus {
+                space: space.name,
+                mount: config.mount.name,
+                path: config.local_path,
+                marker_ok,
+                marker_state,
+                live_entries,
+                tombstones,
+            });
+        }
+        let object_count = self.store.list()?.len() as u64;
+        Ok(Status {
+            device: self.device.clone(),
+            mounts,
+            object_count,
+            last_sequence,
+        })
+    }
+
+    pub(crate) fn lookup_mount(
+        &self,
+        space: &str,
+        mount: &str,
+    ) -> Result<(Space, MountConfig), EngineError> {
+        let space_rec = self
+            .db
+            .repo()
+            .space_by_name(space)?
+            .ok_or_else(|| EngineError::UnknownSpace(space.to_owned()))?;
+        let mount_rec = self
+            .db
+            .repo()
+            .mount_by_name(space_rec.id, mount)?
+            .ok_or_else(|| EngineError::UnknownMount {
+                space: space.to_owned(),
+                mount: mount.to_owned(),
+            })?;
+        let config = self
+            .db
+            .repo()
+            .mount_config(mount_rec.id)?
+            .ok_or(EngineError::MountNotLocal)?;
+        Ok((space_rec, config))
+    }
+}
+
+fn ensure_layout(home: &Path) -> Result<(), EngineError> {
+    fs::create_dir_all(home)?;
+    fs::create_dir_all(home.join(LOGS_DIR))?;
+    Ok(())
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+fn content_kind_name(content: &EntryContent) -> &'static str {
+    match content {
+        EntryContent::File { .. } => "file",
+        EntryContent::Directory => "directory",
+        EntryContent::Symlink { .. } => "symlink",
+        EntryContent::Deleted => "deleted",
+    }
+}

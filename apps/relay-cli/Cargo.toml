@@ -11,7 +11,20 @@ name = "relay"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
 relay-core.workspace = true
+relay-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

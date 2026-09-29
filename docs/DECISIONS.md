@@ -77,6 +77,13 @@ database commit has not landed yet is never collected.
 - A scan that would tombstone a large fraction of a mount is refused unless
   explicitly forced.
 - A subdirectory containing its own marker is another mount and is skipped.
+- Entries under a path the scan could not read (permission denied, non-UTF-8
+  or invalid names, nested mounts) are protected: they are not tombstoned by
+  that scan.
+- Entries that are no longer selected because a rule or `.relayignore`
+  changed are reported as deselected and never tombstoned (design §48.6).
+- A file that changes while it is being hashed is reported as unstable and left
+  untouched until the next scan.
 
 ## D8. Safe reads and writes of live files
 
