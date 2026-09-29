@@ -482,16 +482,17 @@ pub(crate) fn recorded_stat(
 fn protected_prefixes(root: &Path, warnings: &[ScanWarning]) -> Protection {
     let mut prefixes = Vec::new();
     for warning in warnings {
-        let os_path = match warning {
+        match warning {
             ScanWarning::Unreadable { os_path, .. }
             | ScanWarning::NonUtf8Name(os_path)
             | ScanWarning::InvalidName { os_path, .. }
-            | ScanWarning::NestedMount(os_path) => os_path.as_path(),
+            | ScanWarning::NestedMount(os_path)
+            | ScanWarning::SpecialFile(os_path) => match logical_or_ancestor(root, os_path) {
+                None => return Protection::EntireMount,
+                Some(path) => prefixes.push(path),
+            },
+            ScanWarning::NormalizationCollision { path, .. } => prefixes.push(path.clone()),
             _ => continue,
-        };
-        match logical_or_ancestor(root, os_path) {
-            None => return Protection::EntireMount,
-            Some(path) => prefixes.push(path),
         }
     }
     prefixes.sort();

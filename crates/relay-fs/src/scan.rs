@@ -920,6 +920,20 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
+    fn unreadable_dirs_still_readable() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let secret = dir.path().join("s");
+        fs::create_dir(&secret).unwrap();
+        let mut perms = fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&secret, perms).unwrap();
+        let readable = fs::read_dir(&secret).is_ok();
+        let _ = fs::set_permissions(&secret, fs::Permissions::from_mode(0o755));
+        readable
+    }
+
     #[test]
     fn scan_errors_when_root_missing_or_not_dir() {
         let dir = tempdir().unwrap();
@@ -1467,6 +1481,13 @@ mod tests {
     #[test]
     fn scan_paths_unreadable_path_and_subdir() {
         use std::os::unix::fs::PermissionsExt;
+
+        if unreadable_dirs_still_readable() {
+            eprintln!(
+                "skipping scan_paths_unreadable_path_and_subdir: running with permissions that bypass chmod"
+            );
+            return;
+        }
 
         let dir = tempdir().unwrap();
         let root = dir.path();

@@ -120,6 +120,7 @@ pub(crate) struct EncodedStat {
     pub size: Option<i64>,
     pub mtime_ns: Option<i64>,
     pub file_id: Option<i64>,
+    pub ctime_ns: Option<i64>,
 }
 
 pub(crate) fn encode_stat(stat: Option<StatHint>) -> Result<EncodedStat, DbError> {
@@ -128,11 +129,13 @@ pub(crate) fn encode_stat(stat: Option<StatHint>) -> Result<EncodedStat, DbError
             size: None,
             mtime_ns: None,
             file_id: None,
+            ctime_ns: None,
         }),
         Some(hint) => Ok(EncodedStat {
             size: Some(i64_from_u64(hint.size)?),
             mtime_ns: Some(hint.mtime_ns),
             file_id: hint.file_id.map(i64_from_u64).transpose()?,
+            ctime_ns: hint.ctime_ns,
         }),
     }
 }
@@ -141,13 +144,15 @@ pub(crate) fn decode_stat(
     size: Option<i64>,
     mtime_ns: Option<i64>,
     file_id: Option<i64>,
+    ctime_ns: Option<i64>,
 ) -> Result<Option<StatHint>, DbError> {
-    match (size, mtime_ns, file_id) {
-        (None, None, None) => Ok(None),
-        (Some(size), Some(mtime_ns), file_id) => Ok(Some(StatHint {
+    match (size, mtime_ns, file_id, ctime_ns) {
+        (None, None, None, None) => Ok(None),
+        (Some(size), Some(mtime_ns), file_id, ctime_ns) => Ok(Some(StatHint {
             size: u64_from_i64(size)?,
             mtime_ns,
             file_id: file_id.map(u64_from_i64).transpose()?,
+            ctime_ns,
         })),
         _ => Err(DbError::Corrupt(
             "stat hint columns are partially populated".into(),

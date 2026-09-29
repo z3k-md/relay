@@ -5,9 +5,10 @@ use crate::DbError;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_mount_state.sql"),
+    include_str!("../migrations/0003_stat_ctime_and_history_unique.sql"),
 ];
 
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 pub(crate) fn user_version(conn: &Connection) -> Result<u32, DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

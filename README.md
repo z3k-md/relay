@@ -73,6 +73,9 @@ relay status
 Global flags: `--home DIR` to use a different data directory, `--json` for
 machine-readable output. Set `RELAY_LOG=debug` for logs on stderr.
 
+Exit codes: `0` ok, `1` error, `2` mass delete refused, `3` `relay verify`
+found missing or corrupt objects.
+
 `--dev-excludes` adds `**/node_modules/**`, `**/target/**`, `**/dist/**`,
 `**/build/**`, `**/.venv/**` and `**/__pycache__/**`. A `.relayignore` file at
 the mount root adds more exclude globs, one per line.

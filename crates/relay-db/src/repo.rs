@@ -17,7 +17,7 @@ use crate::convert::{
 const ENTRY_SELECT: &str = "e.id, e.mount_id, e.path, e.kind, e.deleted, e.object_id, e.size,
      e.executable, e.symlink_target, e.parent_object, e.sequence,
      d.device_id, e.modified_at_ms, e.stat_size, e.stat_mtime_ns, e.stat_file_id,
-     m.space_id";
+     e.stat_ctime_ns, m.space_id";
 
 #[derive(Clone, Copy)]
 pub struct Repo<'c> {
@@ -73,6 +73,7 @@ struct RawEntry {
     stat_size: Option<i64>,
     stat_mtime_ns: Option<i64>,
     stat_file_id: Option<i64>,
+    stat_ctime_ns: Option<i64>,
     space_id: [u8; 16],
 }
 
@@ -413,12 +414,14 @@ impl Repo<'_> {
         let stat = encode_stat(stat)?;
         let mount = mount_bytes(key.mount);
         let changed = self.conn.execute(
-            "UPDATE entries SET stat_size = ?1, stat_mtime_ns = ?2, stat_file_id = ?3
-             WHERE mount_id = ?4 AND path = ?5",
+            "UPDATE entries SET stat_size = ?1, stat_mtime_ns = ?2, stat_file_id = ?3,
+                 stat_ctime_ns = ?4
+             WHERE mount_id = ?5 AND path = ?6",
             params![
                 stat.size,
                 stat.mtime_ns,
                 stat.file_id,
+                stat.ctime_ns,
                 mount.as_slice(),
                 key.path.as_str()
             ],
@@ -644,8 +647,9 @@ impl Repo<'_> {
                 "UPDATE entries SET
                     kind = ?1, deleted = ?2, object_id = ?3, size = ?4, executable = ?5,
                     symlink_target = ?6, parent_object = ?7, sequence = ?8, modified_by = ?9,
-                    modified_at_ms = ?10, stat_size = ?11, stat_mtime_ns = ?12, stat_file_id = ?13
-                 WHERE id = ?14",
+                    modified_at_ms = ?10, stat_size = ?11, stat_mtime_ns = ?12, stat_file_id = ?13,
+                    stat_ctime_ns = ?14
+                 WHERE id = ?15",
                 params![
                     encoded.kind,
                     encoded.deleted,
@@ -660,6 +664,7 @@ impl Repo<'_> {
                     stat.size,
                     stat.mtime_ns,
                     stat.file_id,
+                    stat.ctime_ns,
                     entry_id,
                 ],
             ) {
@@ -674,8 +679,8 @@ impl Repo<'_> {
                 "INSERT INTO entries (
                     mount_id, path, kind, deleted, object_id, size, executable, symlink_target,
                     parent_object, sequence, modified_by, modified_at_ms,
-                    stat_size, stat_mtime_ns, stat_file_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    stat_size, stat_mtime_ns, stat_file_id, stat_ctime_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     mount.as_slice(),
                     record.key.path.as_str(),
@@ -692,6 +697,7 @@ impl Repo<'_> {
                     stat.size,
                     stat.mtime_ns,
                     stat.file_id,
+                    stat.ctime_ns,
                 ],
             ) {
                 Ok(_) => self.conn.last_insert_rowid(),
@@ -715,7 +721,7 @@ impl Repo<'_> {
 
         let vector_json = serde_json::to_string(&record.vector)?;
         self.conn.execute(
-            "INSERT INTO history (
+            "INSERT OR IGNORE INTO history (
                 entry_id, sequence, kind, deleted, object_id, size, executable, symlink_target,
                 parent_object, vector_json, modified_by, modified_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -760,7 +766,12 @@ impl Repo<'_> {
             sequence: Sequence(u64_from_i64(raw.sequence)?),
             modified_by: DeviceId::from_bytes(raw.modified_by),
             modified_at_unix_ms: raw.modified_at_ms,
-            stat: decode_stat(raw.stat_size, raw.stat_mtime_ns, raw.stat_file_id)?,
+            stat: decode_stat(
+                raw.stat_size,
+                raw.stat_mtime_ns,
+                raw.stat_file_id,
+                raw.stat_ctime_ns,
+            )?,
         })
     }
 
@@ -818,7 +829,8 @@ impl Repo<'_> {
             stat_size: row.get(13)?,
             stat_mtime_ns: row.get(14)?,
             stat_file_id: row.get(15)?,
-            space_id: row.get(16)?,
+            stat_ctime_ns: row.get(16)?,
+            space_id: row.get(17)?,
         })
     }
 

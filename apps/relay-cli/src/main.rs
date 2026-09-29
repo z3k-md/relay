@@ -112,7 +112,7 @@ fn main() -> ExitCode {
     init_logging();
     let cli = Cli::parse();
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             if let Some(engine) = err.downcast_ref::<EngineError>() {
                 print_engine_error(engine);
@@ -132,14 +132,14 @@ fn init_logging() {
         .try_init();
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<ExitCode> {
     let home = cli.home.unwrap_or_else(default_home);
     let json = cli.json;
     match cli.command {
-        Command::Init { name } => cmd_init(&home, name, json),
+        Command::Init { name } => cmd_init(&home, name, json).map(|()| ExitCode::SUCCESS),
         Command::Status => {
             let engine = Engine::open_read_only(&home)?;
-            cmd_status(&engine, json)
+            cmd_status(&engine, json).map(|()| ExitCode::SUCCESS)
         }
         Command::Space { cmd } => match cmd {
             SpaceCmd::Create { name } => {
@@ -150,7 +150,7 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     println!("created space {}", space.name);
                 }
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             }
             SpaceCmd::List => {
                 let engine = Engine::open_read_only(&home)?;
@@ -162,7 +162,7 @@ fn run(cli: Cli) -> Result<()> {
                         println!("{}", space.name);
                     }
                 }
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             }
         },
         Command::Mount { cmd } => match cmd {
@@ -192,7 +192,7 @@ fn run(cli: Cli) -> Result<()> {
                         .unwrap_or_else(|| path.display().to_string());
                     println!("added mount {space}/{mount} at {shown}");
                 }
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             }
             MountCmd::List { space } => {
                 let engine = Engine::open_read_only(&home)?;
@@ -221,7 +221,7 @@ fn run(cli: Cli) -> Result<()> {
                         .collect();
                     print_table(&rows);
                 }
-                Ok(())
+                Ok(ExitCode::SUCCESS)
             }
         },
         Command::Scan {
@@ -237,6 +237,7 @@ fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 json,
             )
+            .map(|()| ExitCode::SUCCESS)
         }
         Command::Ls {
             target,
@@ -244,15 +245,15 @@ fn run(cli: Cli) -> Result<()> {
             prefix,
         } => {
             let engine = Engine::open_read_only(&home)?;
-            cmd_ls(&engine, &target, deleted, prefix.as_deref(), json)
+            cmd_ls(&engine, &target, deleted, prefix.as_deref(), json).map(|()| ExitCode::SUCCESS)
         }
         Command::History { target } => {
             let engine = Engine::open_read_only(&home)?;
-            cmd_history(&engine, &target, json)
+            cmd_history(&engine, &target, json).map(|()| ExitCode::SUCCESS)
         }
         Command::Restore { target, sequence } => {
             let mut engine = Engine::open(&home)?;
-            cmd_restore(&mut engine, &target, Sequence(sequence), json)
+            cmd_restore(&mut engine, &target, Sequence(sequence), json).map(|()| ExitCode::SUCCESS)
         }
         Command::Verify => {
             let engine = Engine::open_read_only(&home)?;
@@ -273,7 +274,11 @@ fn run(cli: Cli) -> Result<()> {
                     println!("corrupt  {}", id.short());
                 }
             }
-            Ok(())
+            if report.missing.is_empty() && report.corrupt.is_empty() {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::from(3))
+            }
         }
         Command::Gc { grace_secs } => {
             let mut engine = Engine::open(&home)?;
@@ -286,7 +291,7 @@ fn run(cli: Cli) -> Result<()> {
                     report.removed, report.bytes_freed, report.kept, report.tmp_cleaned
                 );
             }
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -650,6 +655,7 @@ struct Target {
 }
 
 fn parse_target(raw: &str) -> Result<Target> {
+    let raw = raw.strip_suffix('/').unwrap_or(raw);
     let mut parts = raw.split('/');
     let space = parts
         .next()
@@ -819,4 +825,28 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_target_trims_one_trailing_slash() {
+        let mount = parse_target("Personal/code/").unwrap();
+        assert_eq!(mount.space, "Personal");
+        assert_eq!(mount.mount.as_deref(), Some("code"));
+        assert!(mount.path.is_none());
+
+        let dir = parse_target("Personal/code/foo/").unwrap();
+        assert_eq!(dir.space, "Personal");
+        assert_eq!(dir.mount.as_deref(), Some("code"));
+        assert_eq!(dir.path.as_ref().map(LogicalPath::as_str), Some("foo"));
+
+        let file = parse_target("Personal/code/foo/bar.txt/").unwrap();
+        assert_eq!(
+            file.path.as_ref().map(LogicalPath::as_str),
+            Some("foo/bar.txt")
+        );
+    }
 }

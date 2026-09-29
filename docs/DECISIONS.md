@@ -96,6 +96,10 @@ database commit has not landed yet is never collected.
   local change.
 - `sync_all` is used for durability (on macOS Rust uses `F_FULLFSYNC`), and the
   parent directory is fsynced on Unix.
+- On Windows, change detection relies on size + 100ns mtime (no ctime or file
+  id from std), like other sync tools; periodic full scans don't rehash
+  either, so an mtime-preserving same-size overwrite on Windows is a
+  documented blind spot.
 
 ## D9. Logical path rules
 

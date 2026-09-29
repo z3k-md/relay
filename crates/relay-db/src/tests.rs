@@ -113,13 +113,13 @@ fn migrations_are_idempotent_on_reopen() {
     let path = dir.path().join("nested").join("relay.sqlite");
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
     }
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
         db.repo().init_local_device(&device(9, "again"), 1).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
     }
 }
 
@@ -137,7 +137,7 @@ fn schema_too_new_is_rejected() {
         err,
         DbError::SchemaTooNew {
             found: 99,
-            supported: 2
+            supported: 3
         }
     ));
 }
@@ -174,13 +174,13 @@ fn write_v1_db(path: &std::path::Path) {
 }
 
 #[test]
-fn v1_database_upgrades_to_v2_without_data_loss() {
+fn v1_database_upgrades_to_current_without_data_loss() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("relay.sqlite");
     write_v1_db(&path);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 2);
+    assert_eq!(db.schema_version().unwrap(), 3);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -189,6 +189,38 @@ fn v1_database_upgrades_to_v2_without_data_loss() {
     assert_eq!(local.device.name, "legacy");
     assert_eq!(local.next_sequence, Sequence(7));
     assert!(db.repo().mount_state(mount.id).unwrap().is_none());
+}
+
+#[test]
+fn upgrade_collapses_duplicate_history_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    write_v1_db(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO entries (id, mount_id, path, kind, deleted, sequence, modified_by, modified_at_ms)
+             VALUES (1, ?1, 'a.txt', 'directory', 0, 5, 1, 1)",
+            params![[2u8; 16].as_slice()],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO history (entry_id, sequence, kind, deleted, executable, vector_json, modified_by, modified_at_ms)
+                 VALUES (1, 5, 'directory', 0, 0, '{}', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+    }
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 3);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
 }
 
 #[test]
@@ -203,7 +235,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooOld {
                 found: 1,
-                supported: 2
+                supported: 3
             }
         ),
         "{err}"
@@ -226,7 +258,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooNew {
                 found: 99,
-                supported: 2
+                supported: 3
             }
         ),
         "{err}"
@@ -248,7 +280,7 @@ fn open_read_only_reads_without_writing() {
         db.repo().create_space(&space, 1).unwrap();
     }
     let db = Database::open_read_only(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 2);
+    assert_eq!(db.schema_version().unwrap(), 3);
     let names: Vec<_> = db
         .repo()
         .list_spaces()
@@ -421,6 +453,7 @@ fn put_entry_round_trips_all_content_kinds_and_history() {
         size: 42,
         mtime_ns: 1_000_000,
         file_id: Some(99),
+        ctime_ns: Some(2_000_000),
     };
 
     let file_rec = h.record(
@@ -477,6 +510,7 @@ fn put_entry_round_trips_all_content_kinds_and_history() {
             size: 6,
             mtime_ns: 2,
             file_id: Some(7),
+            ctime_ns: Some(8),
         }),
         file_rec.content.object(),
     );
@@ -519,6 +553,28 @@ fn put_entry_round_trips_all_content_kinds_and_history() {
 }
 
 #[test]
+fn put_entry_identical_record_leaves_one_history_row() {
+    let h = Harness::new();
+    let rec = h.record(
+        "same.txt",
+        file(b"once", false),
+        1,
+        vector(&[(1, 1)]),
+        Some(StatHint {
+            size: 4,
+            mtime_ns: 10,
+            file_id: Some(1),
+            ctime_ns: Some(11),
+        }),
+        None,
+    );
+    h.db.repo().put_entry(&rec).unwrap();
+    h.db.repo().put_entry(&rec).unwrap();
+    assert_eq!(h.db.repo().entry(&rec.key).unwrap().as_ref(), Some(&rec));
+    assert_eq!(h.db.repo().history(&rec.key).unwrap().len(), 1);
+}
+
+#[test]
 fn put_entry_rejects_space_mismatch() {
     let h = Harness::new();
     let mut rec = h.record("x.txt", file(b"x", false), 1, vector(&[(1, 1)]), None, None);
@@ -541,6 +597,7 @@ fn update_stat_changes_only_stat() {
             size: 3,
             mtime_ns: 10,
             file_id: Some(1),
+            ctime_ns: Some(11),
         }),
         None,
     );
@@ -549,6 +606,7 @@ fn update_stat_changes_only_stat() {
         size: 3,
         mtime_ns: 99,
         file_id: Some(2),
+        ctime_ns: Some(100),
     };
     h.db.repo().update_stat(&rec.key, Some(new_stat)).unwrap();
     let got = h.db.repo().entry(&rec.key).unwrap().unwrap();

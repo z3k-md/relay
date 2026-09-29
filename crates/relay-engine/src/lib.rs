@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use relay_core::{DeviceId, EntryKey, MOUNT_MARKER, validate_name};
 use relay_db::Database;
-use relay_fs::{MountMarker, materialize_file, to_os_path};
+use relay_fs::{MountMarker, materialize_file, resolve_os_path, to_os_path};
 use relay_policy::MountRules;
 use relay_store::StoreError;
 
@@ -238,7 +238,13 @@ impl Engine {
         }
 
         if canonical.join(MOUNT_MARKER).exists() {
-            return Err(EngineError::MountAlreadyClaimed { path: canonical });
+            if !self.can_adopt_leftover_marker(&canonical)? {
+                return Err(EngineError::MountAlreadyClaimed { path: canonical });
+            }
+            tracing::info!(
+                path = %canonical.display(),
+                "adopting leftover mount marker written by this device"
+            );
         }
 
         MountRules::new(includes, excludes)?;
@@ -398,7 +404,10 @@ impl Engine {
             }
         };
 
-        let dest = to_os_path(&local_path, path);
+        let dest = match resolve_os_path(&local_path, path)? {
+            Some(existing) => existing,
+            None => to_os_path(&local_path, path),
+        };
         let current = self.db.repo().entry(&key)?;
         let expected_existing = restore_expected_stat(&self.store, &dest, current.as_ref())?;
 
@@ -565,6 +574,17 @@ impl Engine {
         } else {
             Ok(())
         }
+    }
+
+    fn can_adopt_leftover_marker(&self, root: &Path) -> Result<bool, EngineError> {
+        let marker = match MountMarker::read(root) {
+            Ok(marker) => marker,
+            Err(_) => return Ok(false),
+        };
+        if marker.created_by != self.device.id {
+            return Ok(false);
+        }
+        Ok(self.db.repo().mount_config(marker.mount)?.is_none())
     }
 }
 

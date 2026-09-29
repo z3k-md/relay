@@ -618,6 +618,7 @@ mod tests {
             size: 1,
             mtime_ns: 0,
             file_id: None,
+            ctime_ns: None,
         };
         let err = store.hash_file(&src, Some(&wrong)).unwrap_err();
         assert!(
@@ -664,6 +665,7 @@ mod tests {
             size: 1,
             mtime_ns: 0,
             file_id: None,
+            ctime_ns: None,
         };
         let err = store.put_file(&src, Some(&wrong)).unwrap_err();
         assert!(

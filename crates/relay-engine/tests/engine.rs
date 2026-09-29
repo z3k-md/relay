@@ -116,6 +116,39 @@ fn phase0_success_path() {
     assert!(tomb.is_deleted());
 }
 
+#[cfg(unix)]
+#[test]
+fn in_place_overwrite_preserving_mtime_is_detected_via_ctime() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    let path = mount.path().join("same.txt");
+    fs::write(&path, b"AAAAA").unwrap();
+    let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    scan(&mut engine);
+
+    fs::write(&path, b"BBBBB").unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+
+    let report = scan(&mut engine);
+    assert_eq!(report.modified, 1, "{report:?}");
+    let entry = engine
+        .entries("Personal", "code", false)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.key.path.as_str() == "same.txt")
+        .unwrap();
+    assert_eq!(
+        entry.content.object(),
+        Some(relay_engine::ObjectId::of(b"BBBBB"))
+    );
+}
+
 #[test]
 fn editor_atomic_save_is_one_modify() {
     let home = new_home();
@@ -367,6 +400,9 @@ fn unreadable_directory_is_protected() {
     use std::os::unix::fs::PermissionsExt;
 
     if unreadable_dirs_still_readable() {
+        eprintln!(
+            "skipping unreadable_directory_is_protected: running with permissions that bypass chmod"
+        );
         return;
     }
 
@@ -408,6 +444,9 @@ fn unreadable_file_is_a_warning_not_a_failed_scan() {
     use std::os::unix::fs::PermissionsExt;
 
     if unreadable_dirs_still_readable() {
+        eprintln!(
+            "skipping unreadable_file_is_a_warning_not_a_failed_scan: running with permissions that bypass chmod"
+        );
         return;
     }
 
@@ -452,6 +491,58 @@ fn unreadable_dirs_still_readable() -> bool {
     let readable = fs::read_dir(&secret).is_ok();
     let _ = fs::set_permissions(&secret, fs::Permissions::from_mode(0o755));
     readable
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_replacing_regular_file_is_protected() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    let path = mount.path().join("pipe");
+    fs::write(&path, b"regular").unwrap();
+    scan(&mut engine);
+
+    fs::remove_file(&path).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let report = scan(&mut engine);
+    assert_eq!(report.deleted, 0, "{report:?}");
+    assert!(report.protected >= 1, "{report:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_writes_to_existing_nfd_on_disk_name() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    let nfd = mount.path().join("cafe\u{301}.txt");
+    let nfc = mount.path().join("caf\u{e9}.txt");
+    fs::write(&nfd, b"version-one").unwrap();
+    scan(&mut engine);
+    fs::write(&nfd, b"version-two").unwrap();
+    scan(&mut engine);
+
+    let history = engine
+        .history("Personal", "code", &lp("caf\u{e9}.txt"))
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    engine
+        .restore(
+            "Personal",
+            "code",
+            &lp("caf\u{e9}.txt"),
+            history[0].sequence,
+        )
+        .unwrap();
+
+    assert_eq!(fs::read(&nfd).unwrap(), b"version-one");
+    assert!(!nfc.exists());
 }
 
 #[test]
@@ -508,6 +599,58 @@ fn existing_marker_rejected() {
     engine.create_space("S").unwrap();
     let err = engine
         .add_mount("S", "code", mount.path(), &[], &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::MountAlreadyClaimed { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn leftover_marker_from_this_device_is_adopted() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = init_engine(home.path());
+    engine.create_space("S").unwrap();
+    relay_fs::MountMarker {
+        space: relay_core::SpaceId::new(),
+        mount: relay_core::MountId::new(),
+        created_by: engine.device().id,
+    }
+    .write(mount.path())
+    .unwrap();
+
+    engine
+        .add_mount("S", "code", mount.path(), &[], &[])
+        .unwrap();
+    let mounts = engine.mounts(None).unwrap();
+    assert_eq!(mounts.len(), 1);
+    let marker = relay_fs::MountMarker::read(mount.path()).unwrap();
+    assert_eq!(marker.created_by, engine.device().id);
+    assert_eq!(marker.mount, mounts[0].1.mount.id);
+}
+
+#[test]
+fn leftover_marker_for_known_mount_is_rejected() {
+    let home = new_home();
+    let first = new_home();
+    let leftover = new_home();
+    let mut engine = init_engine(home.path());
+    engine.create_space("S").unwrap();
+    engine
+        .add_mount("S", "code", first.path(), &[], &[])
+        .unwrap();
+    let existing = engine.mounts(None).unwrap()[0].1.mount.clone();
+    relay_fs::MountMarker {
+        space: existing.space,
+        mount: existing.id,
+        created_by: engine.device().id,
+    }
+    .write(leftover.path())
+    .unwrap();
+
+    let err = engine
+        .add_mount("S", "other", leftover.path(), &[], &[])
         .unwrap_err();
     assert!(
         matches!(err, EngineError::MountAlreadyClaimed { .. }),

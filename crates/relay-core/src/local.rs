@@ -49,7 +49,7 @@ pub fn derive_local_change(
 }
 
 /// Whether a file's bytes must be hashed again, or the previous object can be
-/// trusted because size, mtime and file identity are all unchanged.
+/// trusted because size, mtime, ctime and file identity are all unchanged.
 pub fn needs_rehash(previous: Option<&EntryRecord>, stat: &StatHint) -> bool {
     match previous {
         Some(prev) => {
@@ -88,6 +88,7 @@ mod tests {
             size: 1,
             mtime_ns: mtime,
             file_id: Some(7),
+            ctime_ns: None,
         }
     }
 
@@ -164,5 +165,8 @@ mod tests {
         assert!(!needs_rehash(Some(&v1), &stat(1)));
         assert!(needs_rehash(Some(&v1), &stat(2)));
         assert!(needs_rehash(None, &stat(1)));
+        let mut other = stat(1);
+        other.ctime_ns = Some(99);
+        assert!(needs_rehash(Some(&v1), &other));
     }
 }

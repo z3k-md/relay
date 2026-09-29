@@ -65,7 +65,7 @@ fn cli_end_to_end() {
     );
 
     relay()
-        .args(["--home", &home_s, "ls", "Personal/code"])
+        .args(["--home", &home_s, "ls", "Personal/code/"])
         .assert()
         .success()
         .stdout(predicate::str::contains("a.txt"));
@@ -122,6 +122,42 @@ fn cli_end_to_end() {
         .success()
         .stdout(predicate::str::contains("include:"))
         .stdout(predicate::str::contains("exclude:"));
+}
+
+#[test]
+fn verify_corrupt_object_exits_three() {
+    let home = TempDir::new().unwrap();
+    let mount = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let mount_s = mount.path().to_str().unwrap().to_owned();
+
+    fs::write(mount.path().join("a.txt"), b"hello").unwrap();
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args([
+            "--home", &home_s, "mount", "add", "Personal", "code", &mount_s,
+        ])
+        .assert()
+        .success();
+    relay().args(["--home", &home_s, "scan"]).assert().success();
+
+    let store = relay_engine::ObjectStore::open(home.path().join("store")).unwrap();
+    let id = relay_engine::ObjectId::of(b"hello");
+    fs::write(store.path_for(&id), b"corrupted").unwrap();
+
+    relay()
+        .args(["--home", &home_s, "verify"])
+        .assert()
+        .failure()
+        .code(3)
+        .stdout(predicate::str::contains("corrupt"));
 }
 
 #[test]

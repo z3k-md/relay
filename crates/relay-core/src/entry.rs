@@ -83,6 +83,9 @@ pub struct StatHint {
     pub mtime_ns: i64,
     /// Inode on Unix, file index on Windows, when available.
     pub file_id: Option<u64>,
+    /// Change time in nanoseconds since the Unix epoch. Present on Unix, where
+    /// ctime cannot be set by user space and updates on every write.
+    pub ctime_ns: Option<i64>,
 }
 
 impl StatHint {
@@ -99,6 +102,7 @@ impl StatHint {
             size: meta.len(),
             mtime_ns,
             file_id: file_id(meta),
+            ctime_ns: ctime_ns(meta),
         }
     }
 }
@@ -112,6 +116,20 @@ fn file_id(meta: &std::fs::Metadata) -> Option<u64> {
 // `MetadataExt::file_index` is still unstable on Windows; size + mtime only.
 #[cfg(not(unix))]
 fn file_id(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn ctime_ns(meta: &std::fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    meta.ctime()
+        .checked_mul(NS_PER_SEC)?
+        .checked_add(meta.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn ctime_ns(_meta: &std::fs::Metadata) -> Option<i64> {
     None
 }
 
