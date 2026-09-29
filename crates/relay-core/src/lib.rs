@@ -8,6 +8,7 @@ pub mod entry;
 pub mod error;
 pub mod ids;
 pub mod local;
+pub mod model;
 pub mod path;
 pub mod reserved;
 pub mod version;
@@ -15,7 +16,8 @@ pub mod version;
 pub use entry::{EntryContent, EntryKey, EntryKind, EntryRecord, StatHint};
 pub use error::CoreError;
 pub use ids::{DeviceId, MountId, ObjectId, Sequence, SpaceId};
-pub use local::{LocalChange, Observation, derive_local_change};
+pub use local::{LocalChange, Observation, derive_local_change, needs_rehash};
+pub use model::{Device, Mount, Space, validate_name};
 pub use path::LogicalPath;
 pub use version::{VectorOrdering, VersionRelation, VersionVector, compare_versions};
 
