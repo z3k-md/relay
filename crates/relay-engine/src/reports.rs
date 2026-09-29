@@ -82,6 +82,16 @@ pub struct ScanReport {
     pub bytes_hashed: u64,
 }
 
+impl ScanReport {
+    pub fn has_changes(&self) -> bool {
+        self.created != 0
+            || self.modified != 0
+            || self.deleted != 0
+            || self.stat_only != 0
+            || !self.warnings.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifyReport {
     pub checked: usize,
@@ -118,12 +128,16 @@ pub struct MountStatus {
     pub last_error: Option<String>,
 }
 
+pub(crate) fn is_large_fraction_delete(deletions: usize, live: usize) -> bool {
+    live > 0
+        && deletions >= MASS_DELETE_MIN_COUNT
+        && deletions * MASS_DELETE_NUMERATOR > live * MASS_DELETE_DENOMINATOR
+}
+
 pub(crate) fn is_mass_delete(deletions: usize, live: usize, scanned: usize) -> bool {
     if live == 0 {
         return false;
     }
     let empty_scan = scanned == 0 && deletions > 0;
-    let large_fraction = deletions >= MASS_DELETE_MIN_COUNT
-        && deletions * MASS_DELETE_NUMERATOR > live * MASS_DELETE_DENOMINATOR;
-    empty_scan || large_fraction
+    empty_scan || is_large_fraction_delete(deletions, live)
 }

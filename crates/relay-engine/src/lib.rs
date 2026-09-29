@@ -4,6 +4,7 @@ mod clock;
 mod error;
 mod reports;
 mod scan;
+mod watch;
 
 use std::fs::{self, File};
 use std::io;
@@ -30,6 +31,7 @@ pub use reports::{
     GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR, MountStatus,
     ScanOptions, ScanReport, Status, VerifyReport, Warning,
 };
+pub use watch::{WatchEvent, WatchOptions};
 
 const DB_FILE: &str = "relay.db";
 const STORE_DIR: &str = "store";
@@ -319,6 +321,17 @@ impl Engine {
         opts: ScanOptions,
     ) -> Result<ScanReport, EngineError> {
         self.scan_mount(space, mount, opts)
+    }
+
+    /// Incremental scan of `paths` (and the scopes `scan_paths` derives).
+    pub fn scan_paths(
+        &mut self,
+        space: &str,
+        mount: &str,
+        paths: &[LogicalPath],
+        opts: ScanOptions,
+    ) -> Result<ScanReport, EngineError> {
+        self.scan_paths_inner(space, mount, paths, opts)
     }
 
     #[allow(clippy::type_complexity)]

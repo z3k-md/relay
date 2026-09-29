@@ -6,13 +6,13 @@ use relay_core::{
     EntryContent, EntryKey, EntryKind, EntryRecord, LocalChange, LogicalPath, MountId, Observation,
     Sequence, derive_local_change, needs_rehash,
 };
-use relay_fs::{ScanWarning, effective_rules, scan_mount, to_logical_path};
+use relay_fs::{ScanScope, ScanWarning, ScopeKind, effective_rules, scan_mount, to_logical_path};
 use relay_policy::MountRules;
 use relay_store::StoreError;
 
 use crate::Engine;
 use crate::error::EngineError;
-use crate::reports::{ScanOptions, ScanReport, Warning, is_mass_delete};
+use crate::reports::{ScanOptions, ScanReport, Warning, is_large_fraction_delete, is_mass_delete};
 
 const SCAN_APPLY_ATTEMPTS: u32 = 3;
 
@@ -55,25 +55,52 @@ impl Engine {
         mount_name: &str,
         opts: ScanOptions,
     ) -> Result<ScanReport, EngineError> {
+        self.run_scan(space_name, mount_name, opts, true, None)
+    }
+
+    pub(crate) fn scan_paths_inner(
+        &mut self,
+        space: &str,
+        mount: &str,
+        paths: &[LogicalPath],
+        opts: ScanOptions,
+    ) -> Result<ScanReport, EngineError> {
+        self.run_scan(space, mount, opts, false, Some(paths))
+    }
+
+    fn run_scan(
+        &mut self,
+        space_name: &str,
+        mount_name: &str,
+        opts: ScanOptions,
+        full: bool,
+        paths: Option<&[LogicalPath]>,
+    ) -> Result<ScanReport, EngineError> {
         self.ensure_writable()?;
         let (space, config) = self.lookup_mount(space_name, mount_name)?;
         let mount_id = config.mount.id;
-        let result = self.scan_mount_attempts(&space, &config, opts);
+        let result = self.scan_attempts(&space, &config, opts, full, paths);
         if !opts.dry_run {
-            self.record_scan_bookkeeping(mount_id, &result)?;
+            self.record_scan_bookkeeping(mount_id, full, &result)?;
         }
         result
     }
 
-    fn scan_mount_attempts(
+    fn scan_attempts(
         &mut self,
         space: &relay_core::Space,
         config: &relay_db::MountConfig,
         opts: ScanOptions,
+        full: bool,
+        paths: Option<&[LogicalPath]>,
     ) -> Result<ScanReport, EngineError> {
         let mut last_conflict = None;
         for attempt in 0..SCAN_APPLY_ATTEMPTS {
-            let plan = self.plan_scan_for(space, config, opts)?;
+            let plan = if full {
+                self.plan_scan_for(space, config, opts)?
+            } else {
+                self.plan_scan_paths_for(space, config, paths.unwrap_or(&[]), opts)?
+            };
             if opts.dry_run {
                 return Ok(plan.report);
             }
@@ -107,29 +134,86 @@ impl Engine {
         config: &relay_db::MountConfig,
         opts: ScanOptions,
     ) -> Result<ScanPlan, EngineError> {
-        let local_path = config
-            .local_path
-            .clone()
-            .ok_or(EngineError::MountNotLocal)?;
-        relay_fs::MountMarker::verify(&local_path, config.mount.id)?;
-
-        let wall_now_ns = wall_clock_now_ns();
+        let local_path = verified_root(config)?;
         let user_rules = MountRules::new(&config.includes, &config.excludes)?;
         let scanned = scan_mount(&local_path, &user_rules)?;
         let rules = match scanned.rules.clone() {
             Some(rules) => rules,
             None => effective_rules(&local_path, &user_rules, &mut Vec::new())?,
         };
-
         let previous = self.db.repo().entries_for_mount(config.mount.id)?;
+        let live_count = previous.iter().filter(|r| !r.is_deleted()).count();
+        let deletion_scope: HashSet<LogicalPath> = previous
+            .iter()
+            .filter(|r| !r.is_deleted())
+            .map(|r| r.key.path.clone())
+            .collect();
+        self.build_plan(BuildPlan {
+            space,
+            config,
+            opts,
+            local_path: &local_path,
+            entries: &scanned.entries,
+            warnings: &scanned.warnings,
+            rules: &rules,
+            previous,
+            deletion_scope,
+            live_for_guard: live_count,
+            empty_scan_rule: true,
+        })
+    }
+
+    fn plan_scan_paths_for(
+        &self,
+        space: &relay_core::Space,
+        config: &relay_db::MountConfig,
+        paths: &[LogicalPath],
+        opts: ScanOptions,
+    ) -> Result<ScanPlan, EngineError> {
+        let local_path = verified_root(config)?;
+        let user_rules = MountRules::new(&config.includes, &config.excludes)?;
+        let scanned = relay_fs::scan_paths(&local_path, &user_rules, paths)?;
+        let previous = self.db.repo().entries_for_mount(config.mount.id)?;
+        let deletion_scope = scoped_previous_paths(self, config.mount.id, &scanned.scopes)?;
+        let live_for_guard = self.db.repo().count_live(config.mount.id)?;
+        self.build_plan(BuildPlan {
+            space,
+            config,
+            opts,
+            local_path: &local_path,
+            entries: &scanned.entries,
+            warnings: &scanned.warnings,
+            rules: &scanned.rules,
+            previous,
+            deletion_scope,
+            live_for_guard,
+            empty_scan_rule: false,
+        })
+    }
+
+    fn build_plan(&self, input: BuildPlan<'_>) -> Result<ScanPlan, EngineError> {
+        let BuildPlan {
+            space,
+            config,
+            opts,
+            local_path,
+            entries,
+            warnings,
+            rules,
+            previous,
+            deletion_scope,
+            live_for_guard,
+            empty_scan_rule,
+        } = input;
+
         let prev_by_path: HashMap<LogicalPath, EntryRecord> = previous
             .into_iter()
             .map(|record| (record.key.path.clone(), record))
             .collect();
 
-        let protection = protected_prefixes(&local_path, &scanned.warnings);
+        let protection = protected_prefixes(local_path, warnings);
         let mut report = ScanReport {
-            warnings: scanned.warnings.iter().map(Warning::from).collect(),
+            warnings: warnings.iter().map(Warning::from).collect(),
             ..ScanReport::default()
         };
 
@@ -138,8 +222,9 @@ impl Engine {
         let mut writes = Vec::new();
         let mut stat_updates = Vec::new();
         let mut new_objects = Vec::new();
+        let wall_now_ns = wall_clock_now_ns();
 
-        for entry in &scanned.entries {
+        for entry in entries {
             scanned_paths.insert(entry.path.clone());
             let prev = prev_by_path.get(&entry.path);
             let mut observe = ObserveCtx {
@@ -161,33 +246,13 @@ impl Engine {
                 LocalChange::Created => {
                     writes.push((
                         ChangeKind::Created,
-                        VersionWrite {
-                            path: entry.path.clone(),
-                            previous: prev.cloned(),
-                            key: EntryKey {
-                                space: space.id,
-                                mount: config.mount.id,
-                                path: entry.path.clone(),
-                            },
-                            content: observation.content,
-                            stat: observation.stat,
-                        },
+                        version_write(space, config, entry, prev, observation),
                     ));
                 }
                 LocalChange::Modified => {
                     writes.push((
                         ChangeKind::Modified,
-                        VersionWrite {
-                            path: entry.path.clone(),
-                            previous: prev.cloned(),
-                            key: EntryKey {
-                                space: space.id,
-                                mount: config.mount.id,
-                                path: entry.path.clone(),
-                            },
-                            content: observation.content,
-                            stat: observation.stat,
-                        },
+                        version_write(space, config, entry, prev, observation),
                     ));
                 }
                 LocalChange::StatOnly => {
@@ -206,7 +271,10 @@ impl Engine {
         }
 
         let mut deletion_candidates = Vec::new();
-        for (path, record) in &prev_by_path {
+        for path in &deletion_scope {
+            let Some(record) = prev_by_path.get(path) else {
+                continue;
+            };
             if record.is_deleted() {
                 continue;
             }
@@ -218,7 +286,7 @@ impl Engine {
                 continue;
             }
             if let Some(kind) = record.content.kind()
-                && is_deselected(&rules, path, kind)
+                && is_deselected(rules, path, kind)
             {
                 report.deselected.push(path.clone());
                 continue;
@@ -229,13 +297,15 @@ impl Engine {
             deletion_candidates.push(record.clone());
         }
 
-        let live_count = prev_by_path.values().filter(|r| !r.is_deleted()).count();
-        if !opts.allow_mass_delete
-            && is_mass_delete(deletion_candidates.len(), live_count, scanned.entries.len())
-        {
+        let refuse = if empty_scan_rule {
+            is_mass_delete(deletion_candidates.len(), live_for_guard, entries.len())
+        } else {
+            is_large_fraction_delete(deletion_candidates.len(), live_for_guard)
+        };
+        if !opts.allow_mass_delete && refuse {
             return Err(EngineError::MassDeleteRefused {
                 deletions: deletion_candidates.len(),
-                live: live_count,
+                live: live_for_guard,
             });
         }
 
@@ -324,13 +394,14 @@ impl Engine {
     fn record_scan_bookkeeping(
         &mut self,
         mount: MountId,
+        full: bool,
         result: &Result<ScanReport, EngineError>,
     ) -> Result<(), EngineError> {
         let now = self.clock.now_ms();
         match result {
             Ok(_) => self
                 .db
-                .transaction(|repo| repo.record_scan_success(mount, true, now))
+                .transaction(|repo| repo.record_scan_success(mount, full, now))
                 .map_err(EngineError::from_db),
             Err(err) if is_mount_scan_error(err) => {
                 let message = err.to_string();
@@ -350,6 +421,70 @@ impl EngineError {
             EngineError::Db(inner) => EngineError::from_db(inner),
             other => other,
         }
+    }
+}
+
+struct BuildPlan<'a> {
+    space: &'a relay_core::Space,
+    config: &'a relay_db::MountConfig,
+    opts: ScanOptions,
+    local_path: &'a Path,
+    entries: &'a [relay_fs::ScannedEntry],
+    warnings: &'a [ScanWarning],
+    rules: &'a MountRules,
+    previous: Vec<EntryRecord>,
+    deletion_scope: HashSet<LogicalPath>,
+    live_for_guard: usize,
+    empty_scan_rule: bool,
+}
+
+fn verified_root(config: &relay_db::MountConfig) -> Result<std::path::PathBuf, EngineError> {
+    let local_path = config
+        .local_path
+        .clone()
+        .ok_or(EngineError::MountNotLocal)?;
+    relay_fs::MountMarker::verify(&local_path, config.mount.id)?;
+    Ok(local_path)
+}
+
+fn scoped_previous_paths(
+    engine: &Engine,
+    mount: MountId,
+    scopes: &[ScanScope],
+) -> Result<HashSet<LogicalPath>, EngineError> {
+    let mut out = HashSet::new();
+    for scope in scopes {
+        match scope.kind {
+            ScopeKind::Exact => {
+                out.insert(scope.path.clone());
+            }
+            ScopeKind::Subtree => {
+                for record in engine.db.repo().entries_under(mount, &scope.path)? {
+                    out.insert(record.key.path);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn version_write(
+    space: &relay_core::Space,
+    config: &relay_db::MountConfig,
+    entry: &relay_fs::ScannedEntry,
+    prev: Option<&EntryRecord>,
+    observation: Observation,
+) -> VersionWrite {
+    VersionWrite {
+        path: entry.path.clone(),
+        previous: prev.cloned(),
+        key: EntryKey {
+            space: space.id,
+            mount: config.mount.id,
+            path: entry.path.clone(),
+        },
+        content: observation.content,
+        stat: observation.stat,
     }
 }
 
