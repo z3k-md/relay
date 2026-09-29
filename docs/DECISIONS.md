@@ -132,3 +132,125 @@ keys (Phase 9) will use a separate X25519 key signed by the identity key.
 
 The `relay` binary embeds `relay-engine` in Phase 0. From Phase 4 it becomes a
 thin IPC client of `relayd`, and commands keep their names.
+
+## D13. Watching
+
+Filesystem events are hints only; they never update the index directly. A
+debounce of 200ms, or a 2s max batch delay from the first event in a burst,
+coalesces editor save storms into one incremental `scan_paths`. The scope of
+a partial scan is the `PartialScan` from `relay_fs`: `Exact` is that path
+only; `Subtree` is the path and everything under it. A periodic full scan
+(default 10 minutes) heals missed events. `--poll` disables the native
+watcher and relies on those periodic scans. Changing the root `.relayignore`
+or the mount marker forces a full scan (rules or mount identity changed).
+Nested `.relayignore` files are not yet supported.
+
+## D14. Device identity and transport security (Phase 2)
+
+Supersedes D11. Each device owns an Ed25519 key at `<home>/identity/device.key`
+(PKCS#8 PEM, mode 0600 on Unix). `DeviceId` is the raw 32-byte public key.
+A self-signed certificate is regenerated from the key at every start.
+
+Peers talk QUIC (quinn) with TLS 1.3 (rustls, `ring` provider) and ALPN
+`relay/1`. Both sides present certificates. Each side accepts a certificate
+only if its Ed25519 key equals the id of a peer the user added with
+`relay peer add`; anything else fails the handshake. There is no CA, no TOFU
+and no discovery in Phase 2. A home created before this change has a random
+id and no key; it must be re-initialized.
+
+## D15. Pairing, addressing and sharing
+
+Pairing is manual and mutual: each device runs `relay peer add <name> <id>
+[--addr host:port]` for the other. At least one side needs an address; both
+dial every peer with an address and accept from any trusted peer. When two
+connections to the same peer exist, the one dialed by the lower device id
+survives. The default listen address is `0.0.0.0:47321/udp`.
+
+A Space is synced with a peer only if both devices have it (same `SpaceId`)
+and both have shared it with each other (`relay share <space> <peer>`).
+On connect each device sends `SpaceOffers` for spaces it shares with that
+peer. `relay space join <name> --from <peer>` creates the offered space and
+its mounts locally with the offered ids and shares it back with that peer.
+`relay mount add` on an existing (offered) mount attaches a local path to it.
+Attaching resets the receive watermark of that space for all peers to zero,
+so entries skipped while the mount had no local path are re-sent.
+
+## D16. Index exchange
+
+Per (peer, space) each side keeps two watermarks, both in the peer's or our
+sequence space as noted:
+
+- `received`: highest *peer* sequence durably applied. Sent in
+  `IndexRequest.after_sequence` on every connect.
+- `acked`: highest *local* sequence the peer has acknowledged. Used only for
+  status ("in sync" when `acked` equals our latest sequence touching the
+  space).
+
+The responder streams `changes_since` restricted to the space in batches of at
+most 1000 entries in sequence order, then pushes new batches whenever local
+sequences are committed. A batch is applied as a unit: every object it needs
+is fetched into the store first, then entries are applied, then `received`
+advances to `through_sequence` and an `Ack` is sent. A dropped connection
+re-requests from `received`; reapplying is idempotent (`Same`).
+
+Entries for mounts with no local path, entries excluded by local mount rules,
+and entries that cannot exist on this OS (Windows-invalid names, symlinks on
+Windows, case-insensitive collisions with a different live entry) are skipped
+with a warning and **not stored**, so a local scan can never turn them into
+tombstones.
+
+## D17. Applying a remote version
+
+`compare_versions(local, remote)`:
+
+- `Same`, `LocalNewer`: nothing.
+- `ConcurrentIdentical`: store the merged vector (content unchanged).
+- `RemoteNewer`: materialize, then store the remote record unchanged (vector,
+  `modified_by`, `parent_object`, `modified_at`) with a fresh local sequence
+  and the stat observed after writing. Files are written with
+  `materialize_file` and `expected_existing` = the local record's stat, so a
+  local edit that has not been scanned yet aborts the write
+  (`DestinationChanged`); the path is then re-scanned and reconciled again,
+  which turns it into a conflict. A missing stat (racy) is verified by
+  re-hashing the on-disk file first. Deletions remove a file only if it still
+  matches the local record; directories are removed only when empty.
+- `Conflict`, `Diverged`: see D18.
+
+File mtimes are set to the sender's observed mtime when known, so Git's stat
+checks on the other device match.
+
+Order inside a batch, both when a sender assigns sequences in a scan and when
+a receiver applies: tombstones of files, tombstones of directories (deepest
+first), directory creations, file and symlink writes outside `.git`, `.git`
+content other than refs, and finally `.git` refs (`HEAD`, `ORIG_HEAD`,
+`FETCH_HEAD`, `packed-refs`, `refs/**`, `index`). Deleting before creating
+makes case-only renames safe on case-insensitive filesystems; refs last keeps
+objects-before-refs (D1) even when a large change spans batches.
+
+## D18. Conflicts
+
+For concurrent versions L (local) and R (remote), every device computes the
+same result from replicated data only:
+
+1. If exactly one side is a tombstone, the live side wins; no copy.
+2. If kinds differ and one is a directory, the directory wins; the other goes
+   to a conflict copy.
+3. Otherwise `choose_winner` picks the version that keeps the path.
+
+The path gets the winner's content with vector `merged(L, R)` and no bump
+(bumping would make each device's result different and never converge). The
+loser is stored at `conflict_path(path, loser.modified_by,
+loser.vector[loser.modified_by])` with the loser's own vector, content,
+`modified_by` and `parent_object`. Before overwriting a local loser the local
+bytes are already in the object store, so the copy is materialized from the
+store. `relay conflicts` lists live conflict copies. Git-aware grouping of
+`.git` conflicts is deferred to Phase 3.
+
+## D19. Daemon threading
+
+`relay run` owns the Engine on one thread. The network runs a tokio runtime on
+its own thread (`relay-net`). They talk over channels: the engine sends
+`NetCommand`s; the network delivers `NetEvent`s through a callback into the
+engine's single input queue, which also carries watcher signals. The network
+writes fetched objects into the object store directly (verified by hash
+before rename) and serves objects from it; it never touches the database.
