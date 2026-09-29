@@ -65,3 +65,6 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
+
+[profile.release]
+strip = "symbols"
