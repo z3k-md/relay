@@ -28,25 +28,34 @@ impl Events {
         }
     }
 
-    fn wait_match<T>(&mut self, timeout: Duration, mut f: impl FnMut(&NetEvent) -> Option<T>) -> T {
+    fn wait_match<T>(&mut self, timeout: Duration, f: impl FnMut(&NetEvent) -> Option<T>) -> T {
+        match self.poll_match(timeout, f) {
+            Some(t) => t,
+            None => panic!("timeout waiting for event; have {:#?}", self.got),
+        }
+    }
+
+    fn poll_match<T>(
+        &mut self,
+        timeout: Duration,
+        mut f: impl FnMut(&NetEvent) -> Option<T>,
+    ) -> Option<T> {
         let deadline = Instant::now() + timeout;
         loop {
             while self.next < self.got.len() {
                 let ev = &self.got[self.next];
                 self.next += 1;
                 if let Some(t) = f(ev) {
-                    return t;
+                    return Some(t);
                 }
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                panic!("timeout waiting for event; have {:#?}", self.got);
+                return None;
             }
             match self.rx.recv_timeout(left) {
                 Ok(ev) => self.got.push(ev),
-                Err(RecvTimeoutError::Timeout) => {
-                    panic!("timeout waiting for event; have {:#?}", self.got)
-                }
+                Err(RecvTimeoutError::Timeout) => return None,
                 Err(RecvTimeoutError::Disconnected) => {
                     panic!("event channel closed; have {:#?}", self.got)
                 }
@@ -162,6 +171,27 @@ fn wait_ack(events: &mut Events, from: DeviceId, seq: u64) {
     });
 }
 
+/// Frames are delivered at most once: one sent while a duplicate connection
+/// is being replaced is dropped. The engine re-requests on every reconnect;
+/// this resends until the frame arrives.
+fn deliver_ack(from: &NetHandle, from_id: DeviceId, to: &mut Events, to_id: DeviceId, seq: u64) {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        send_ack(from, to_id, seq);
+        let got = to.poll_match(Duration::from_millis(500), |ev| match ev {
+            NetEvent::Frame {
+                peer,
+                body: frame::Body::Ack(ack),
+            } if *peer == from_id && ack.through_sequence == seq => Some(()),
+            _ => None,
+        });
+        if got.is_some() {
+            return;
+        }
+    }
+    panic!("ack {seq} never delivered; have {:#?}", to.got);
+}
+
 fn send_ack(handle: &NetHandle, peer: DeviceId, seq: u64) {
     handle.send(NetCommand::Send {
         peer,
@@ -226,10 +256,8 @@ fn simultaneous_dial_keeps_one_connection() {
     wait_connected(&mut alice.events, bob_id, "bob");
     wait_connected(&mut bob.events, alice_id, "alice");
 
-    send_ack(&alice.handle, bob_id, 1);
-    send_ack(&bob.handle, alice_id, 2);
-    wait_ack(&mut bob.events, alice_id, 1);
-    wait_ack(&mut alice.events, bob_id, 2);
+    deliver_ack(&alice.handle, alice_id, &mut bob.events, bob_id, 1);
+    deliver_ack(&bob.handle, bob_id, &mut alice.events, alice_id, 2);
 
     alice.events.collect_for(Duration::from_secs(3));
     bob.events.collect_for(Duration::from_secs(3));
@@ -244,10 +272,8 @@ fn simultaneous_dial_keeps_one_connection() {
         bob.events.got
     );
 
-    send_ack(&alice.handle, bob_id, 3);
-    send_ack(&bob.handle, alice_id, 4);
-    wait_ack(&mut bob.events, alice_id, 3);
-    wait_ack(&mut alice.events, bob_id, 4);
+    deliver_ack(&alice.handle, alice_id, &mut bob.events, bob_id, 3);
+    deliver_ack(&bob.handle, bob_id, &mut alice.events, alice_id, 4);
 }
 
 #[test]

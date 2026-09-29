@@ -170,14 +170,16 @@ impl Inner {
         stable_id: usize,
         write_tx: UnboundedSender<Vec<u8>>,
         name: String,
-    ) {
+    ) -> bool {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(s) = sessions.get_mut(&peer)
-            && s.stable_id == stable_id
-        {
-            s.write_tx = Some(write_tx);
-            s.established = true;
-            s.name = name;
+        match sessions.get_mut(&peer) {
+            Some(s) if s.stable_id == stable_id => {
+                s.write_tx = Some(write_tx);
+                s.established = true;
+                s.name = name;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -370,12 +372,16 @@ async fn run_session(
     let peer_name = h.device_name.clone();
     let remote = conn.remote_address();
     let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
-    inner.attach(
+    // A connection superseded during the handshake was never announced, so it
+    // must not announce itself now; claim() already closed it.
+    if !inner.attach(
         peer_id,
         conn.stable_id(),
         write_tx.clone(),
         peer_name.clone(),
-    );
+    ) {
+        return Err("superseded during handshake".into());
+    }
 
     tracing::info!(peer = %peer_id, name = %peer_name, addr = %remote, "peer connected");
     inner.emit(NetEvent::PeerConnected {
