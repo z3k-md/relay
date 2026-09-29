@@ -14,11 +14,12 @@ no commit/push/pull step in between.
 
 ## Status
 
-**Phase 0: single-machine domain model.** Relay can index directories into a
-content-addressed object store and a durable SQLite index, detect changes
-between scans with version vectors, record deletes as tombstones, keep a
-per-file history, and restore old versions. There is no networking, watcher
-or background daemon yet; those arrive in Phases 1-4.
+**Phase 1: reliable local filesystem index.** Relay indexes directories into
+a content-addressed object store and a durable SQLite index, detects changes
+with version vectors, records deletes as tombstones, keeps per-file history,
+and restores old versions. `relay watch` keeps the index live from filesystem
+events, with periodic full scans to heal anything the watcher missed. There
+is no networking or background daemon yet; those arrive in Phases 2-4.
 
 ## Requirements
 
@@ -41,7 +42,7 @@ cargo fmt --all
 relay init --name MacBook
 relay space create Personal
 relay mount add Personal code ~/Code --dev-excludes
-relay scan
+relay watch                         # keep the index live (Ctrl-C to stop)
 relay ls Personal/code
 ```
 
@@ -64,6 +65,7 @@ relay status
 | `relay mount add SPACE MOUNT PATH [--include P]... [--exclude P]... [--dev-excludes]` | Map a directory into a Space |
 | `relay mount list [SPACE]` | List mounts and their rules |
 | `relay scan [SPACE[/MOUNT]] [--allow-mass-delete] [--dry-run]` | Index changes; all mounts if no argument. `--dry-run` reports without writing |
+| `relay watch [--debounce-ms 200] [--full-scan-secs 600] [--poll] [--verbose]` | Keep the index live. Event times are UTC `HH:MM:SS` |
 | `relay ls SPACE/MOUNT [--deleted] [--prefix PATH]` | Show the logical index |
 | `relay history SPACE/MOUNT/PATH` | Every recorded version of one entry |
 | `relay restore SPACE/MOUNT/PATH --sequence N` | Write an old version back to disk as a new version |
@@ -84,6 +86,20 @@ the mount root adds more exclude globs, one per line.
 [D1](docs/DECISIONS.md#d1-git-is-synchronized-like-any-other-directory));
 Git's transient lock files are always excluded.
 
+## Keeping the index live
+
+`relay watch` attaches a native filesystem watcher to every local mount,
+debounces events (default 200ms, or 2s after the first event in a burst),
+and runs an incremental `scan_paths` on the dirty set. A periodic full scan
+(default 10 minutes) heals missed events. `--poll` skips the watcher and
+relies on those periodic scans only.
+
+Only one writer can hold `relay.lock`. Stop `watch` before `scan` or `gc`,
+or they get the Busy error. Read-only commands (`ls`, `status`, `history`,
+`verify`) can run while `watch` is up.
+
+Times printed by `watch` are UTC `HH:MM:SS`.
+
 ## Where data lives
 
 | Platform | Default location |
@@ -103,7 +119,7 @@ Each mount root gets a small `.relay-mount` marker file identifying it.
 Relay's rule is to preserve data when unsure. In Phase 0 that means:
 
 - **Only one writer at a time**: `relay.lock` in the home directory is held
-  exclusively by `init`, `scan`, `restore`, `gc`, and other mutating
+  exclusively by `init`, `scan`, `restore`, `gc`, `watch`, and other mutating
   commands. A second writer fails immediately. Read-only commands (`status`,
   `ls`, `history`, `space list`, `mount list`, `verify`) do not take the lock.
 - **A scan refuses to run** if the mount root or its `.relay-mount` marker is
@@ -147,9 +163,7 @@ added in the phases that need them.
 
 The phase plan is in [`docs/DESIGN.md`](docs/DESIGN.md) section 51. Next:
 
-1. **Phase 1**: filesystem watcher with debouncing, periodic rescans, and
-   self-write suppression.
-2. **Phase 2**: two-node QUIC sync over LAN/Tailscale, with conflict
+1. **Phase 2**: two-node QUIC sync over LAN/Tailscale, with conflict
    preservation required from the start.
-3. **Phases 3-4**: deterministic conflict resolution, `relayd` background
+2. **Phases 3-4**: deterministic conflict resolution, `relayd` background
    daemon, CLI over local IPC.

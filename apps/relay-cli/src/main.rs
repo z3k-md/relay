@@ -1,11 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use relay_core::{EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
-use relay_engine::{Engine, EngineError, ScanOptions, ScanReport, default_home};
+use relay_engine::{
+    Engine, EngineError, ScanOptions, ScanReport, WatchEvent, WatchOptions, default_home,
+};
 
 const DEV_EXCLUDES: &[&str] = &[
     "**/node_modules/**",
@@ -81,6 +85,18 @@ enum Command {
     Gc {
         #[arg(long, default_value_t = 3600)]
         grace_secs: u64,
+    },
+    /// Watch mounts and keep the index live. Event times are UTC `HH:MM:SS`.
+    Watch {
+        #[arg(long, default_value_t = 200)]
+        debounce_ms: u64,
+        #[arg(long, default_value_t = 600)]
+        full_scan_secs: u64,
+        /// Periodic full scans only; do not attach a native filesystem watcher
+        #[arg(long)]
+        poll: bool,
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -293,7 +309,133 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Watch {
+            debounce_ms,
+            full_scan_secs,
+            poll,
+            verbose,
+        } => cmd_watch(&home, debounce_ms, full_scan_secs, poll, verbose, json),
     }
+}
+
+fn cmd_watch(
+    home: &Path,
+    debounce_ms: u64,
+    full_scan_secs: u64,
+    poll: bool,
+    verbose: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut engine = Engine::open(home)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+    })
+    .context("installing Ctrl-C handler")?;
+
+    let opts = WatchOptions {
+        debounce: Duration::from_millis(debounce_ms),
+        full_scan_interval: Duration::from_secs(full_scan_secs),
+        use_watcher: !poll,
+        ..WatchOptions::default()
+    };
+    engine.watch(opts, &stop, &mut |event| {
+        print_watch_event(event, json, verbose);
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_watch_event(event: &WatchEvent, json: bool, verbose: bool) {
+    if json {
+        match serde_json::to_string(event) {
+            Ok(line) => println!("{line}"),
+            Err(err) => eprintln!("error: failed to serialize event: {err}"),
+        }
+        return;
+    }
+    match event {
+        WatchEvent::Started { mounts } => {
+            if mounts.is_empty() {
+                println!("{} watching (no local mounts)", utc_hms());
+            } else {
+                println!("{} watching {}", utc_hms(), mounts.join(", "));
+            }
+        }
+        WatchEvent::Scanned {
+            space,
+            mount,
+            full,
+            paths,
+            report,
+        } => {
+            if *full && !report.has_changes() && !verbose {
+                return;
+            }
+            if *full && !report.has_changes() {
+                println!("{} {space}/{mount}: full scan, 0 changes", utc_hms());
+                return;
+            }
+            let summary = watch_change_summary(report);
+            if *full {
+                println!("{} {space}/{mount}: full scan, {summary}", utc_hms());
+            } else {
+                println!("{} {space}/{mount}: {summary} ({paths} paths)", utc_hms());
+            }
+            for warning in &report.warnings {
+                println!("  warning: {warning}");
+            }
+        }
+        WatchEvent::ScanFailed {
+            space,
+            mount,
+            error,
+        } => {
+            eprintln!("error: {space}/{mount}: {error}");
+            print_watch_error_hints(error);
+        }
+        WatchEvent::WatcherUnavailable {
+            space,
+            mount,
+            error,
+        } => {
+            eprintln!("error: {space}/{mount}: {error}");
+        }
+        WatchEvent::Stopped => println!("stopped"),
+    }
+}
+
+fn watch_change_summary(report: &ScanReport) -> String {
+    let mut parts = vec![
+        format!("{} created", report.created),
+        format!("{} modified", report.modified),
+    ];
+    if report.deleted > 0 {
+        parts.push(format!("{} deleted", report.deleted));
+    }
+    parts.join(", ")
+}
+
+fn print_watch_error_hints(error: &str) {
+    if error.contains("refusing to delete") {
+        eprintln!("hint: re-run with --allow-mass-delete if this was intentional");
+    } else if error.contains("marker")
+        || error.contains("mount root")
+        || error.contains("not a directory")
+    {
+        eprintln!("hint: is the drive mounted / was the folder moved?");
+    } else if error.contains("another relay process") {
+        eprintln!("hint: stop `relay watch` or wait for the other command to finish");
+    }
+}
+
+fn utc_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tod = (secs % 86_400) as u32;
+    format!("{:02}:{:02}:{:02}", tod / 3600, (tod % 3600) / 60, tod % 60)
 }
 
 fn cmd_init(home: &Path, name: Option<String>, json: bool) -> Result<()> {

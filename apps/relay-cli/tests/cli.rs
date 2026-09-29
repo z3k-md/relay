@@ -1,4 +1,7 @@
 use std::fs;
+use std::process::{Command as StdCommand, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -330,4 +333,87 @@ fn mount_list_prints_rules() {
         .success()
         .stdout(predicate::str::contains("include: src/**"))
         .stdout(predicate::str::contains("exclude: target/**"));
+}
+
+#[test]
+fn watch_indexes_new_file_then_stops_on_signal() {
+    let home = TempDir::new().unwrap();
+    let mount = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let mount_s = mount.path().to_str().unwrap().to_owned();
+
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args([
+            "--home", &home_s, "mount", "add", "Personal", "code", &mount_s,
+        ])
+        .assert()
+        .success();
+
+    let bin = assert_cmd::cargo::cargo_bin("relay");
+    let mut child = StdCommand::new(&bin)
+        .args(["--home", &home_s, "watch", "--debounce-ms", "50"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let started = wait_until(Duration::from_secs(10), || {
+        relay()
+            .args(["--home", &home_s, "status"])
+            .ok()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("Personal"))
+    });
+    assert!(started, "watch did not come up");
+
+    fs::write(mount.path().join("seen.txt"), b"hi").unwrap();
+    let appeared = wait_until(Duration::from_secs(10), || {
+        relay()
+            .args(["--home", &home_s, "--json", "ls", "Personal/code"])
+            .ok()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("seen.txt"))
+    });
+    assert!(appeared, "watch did not index seen.txt");
+
+    #[cfg(unix)]
+    {
+        let pid = child.id().to_string();
+        let status = StdCommand::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -INT failed");
+        let exit = child.wait().unwrap();
+        assert!(exit.success(), "watch exit {exit}");
+    }
+    #[cfg(not(unix))]
+    {
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+
+    relay()
+        .args(["--home", &home_s, "status"])
+        .assert()
+        .success();
+}
+
+fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pred() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
 }
