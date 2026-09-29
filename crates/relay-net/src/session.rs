@@ -52,6 +52,13 @@ pub(crate) struct Inner {
     pub identity: Arc<DeviceIdentity>,
 }
 
+type EstablishedSession = (
+    Connection,
+    UnboundedSender<Vec<u8>>,
+    Arc<Semaphore>,
+    Arc<Mutex<HashSet<ObjectId>>>,
+);
+
 pub(crate) struct LiveSession {
     pub conn: Connection,
     pub stable_id: usize,
@@ -101,15 +108,7 @@ impl Inner {
             .contains_key(&peer)
     }
 
-    pub(crate) fn established_session(
-        &self,
-        peer: DeviceId,
-    ) -> Option<(
-        Connection,
-        UnboundedSender<Vec<u8>>,
-        Arc<Semaphore>,
-        Arc<Mutex<HashSet<ObjectId>>>,
-    )> {
+    pub(crate) fn established_session(&self, peer: DeviceId) -> Option<EstablishedSession> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let s = sessions.get(&peer)?;
         if !s.established {
