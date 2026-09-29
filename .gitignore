@@ -3,3 +3,4 @@ uploads/
 *.db
 *.db-wal
 *.db-shm
+/dist
