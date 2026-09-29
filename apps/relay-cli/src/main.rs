@@ -195,7 +195,7 @@ fn main() -> ExitCode {
                 print_engine_error(engine);
                 return ExitCode::from(engine_exit_code(engine));
             }
-            eprintln!("error: {err}");
+            eprintln!("error: {err:#}");
             ExitCode::from(1)
         }
     }

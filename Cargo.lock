@@ -1260,6 +1260,7 @@ dependencies = [
  "predicates",
  "relay-core",
  "relay-engine",
+ "relay-net",
  "serde",
  "serde_json",
  "tempfile",
