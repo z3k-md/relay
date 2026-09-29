@@ -495,8 +495,10 @@ fn put_entry_round_trips_all_content_kinds_and_history() {
         .list_devices()
         .unwrap()
         .into_iter()
-        .filter(|d| d.name == DeviceId::from_bytes([2; 32]).short()
-            || d.name == DeviceId::from_bytes([3; 32]).short())
+        .filter(|d| {
+            d.name == DeviceId::from_bytes([2; 32]).short()
+                || d.name == DeviceId::from_bytes([3; 32]).short()
+        })
         .map(|d| d.id)
         .collect();
     assert!(placeholders.contains(&DeviceId::from_bytes([2; 32])));
@@ -752,11 +754,10 @@ fn count_live_skips_tombstones() {
 fn peers_shares_offers_and_progress() {
     let h = Harness::new();
     let peer_dev = device(9, "laptop");
-    let peer = h
-        .db
-        .repo()
-        .add_peer(&peer_dev, &["127.0.0.1:47321".into()], 5_000)
-        .unwrap();
+    let peer =
+        h.db.repo()
+            .add_peer(&peer_dev, &["127.0.0.1:47321".into()], 5_000)
+            .unwrap();
     assert_eq!(peer.device.name, "laptop");
     assert_eq!(h.db.repo().list_peers().unwrap().len(), 1);
     assert!(h.db.repo().peer_by_name("laptop").unwrap().is_some());
@@ -777,31 +778,29 @@ fn peers_shares_offers_and_progress() {
             name: "mods".into(),
         }],
     };
-    h.db
-        .repo()
-        .replace_peer_offers(peer_dev.id, &[offer.clone()], 6_000)
+    h.db.repo()
+        .replace_peer_offers(peer_dev.id, std::slice::from_ref(&offer), 6_000)
         .unwrap();
     let listed = h.db.repo().list_offers().unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "Work");
-    h.db
-        .repo()
+    h.db.repo()
         .replace_peer_offers(peer_dev.id, &[], 7_000)
         .unwrap();
     assert!(h.db.repo().list_offers().unwrap().is_empty());
 
-    h.db
-        .repo()
+    h.db.repo()
         .set_received_seq(peer_dev.id, h.space.id, Sequence(12), 8_000)
         .unwrap();
-    h.db
-        .repo()
+    h.db.repo()
         .set_acked_seq(peer_dev.id, h.space.id, Sequence(4), 8_100)
         .unwrap();
     let progress = h.db.repo().sync_progress(peer_dev.id, h.space.id).unwrap();
     assert_eq!(progress.received_seq, Sequence(12));
     assert_eq!(progress.acked_seq, Sequence(4));
-    h.db.repo().reset_received_seq_for_space(h.space.id).unwrap();
+    h.db.repo()
+        .reset_received_seq_for_space(h.space.id)
+        .unwrap();
     let progress = h.db.repo().sync_progress(peer_dev.id, h.space.id).unwrap();
     assert_eq!(progress.received_seq, Sequence(0));
     assert_eq!(progress.acked_seq, Sequence(4));
@@ -810,7 +809,10 @@ fn peers_shares_offers_and_progress() {
     assert!(h.db.repo().list_peers().unwrap().is_empty());
     assert!(!h.db.repo().is_shared(h.space.id, peer_dev.id).unwrap());
     assert_eq!(
-        h.db.repo().sync_progress(peer_dev.id, h.space.id).unwrap().received_seq,
+        h.db.repo()
+            .sync_progress(peer_dev.id, h.space.id)
+            .unwrap()
+            .received_seq,
         Sequence(0)
     );
 }
@@ -824,8 +826,7 @@ fn changes_since_in_space_filters_by_mount_space() {
     h.db.repo().create_mount(&other_mount, 1_000).unwrap();
 
     let vv = vector(&[(1, 1)]);
-    h.db
-        .repo()
+    h.db.repo()
         .put_entry(&h.record("a.txt", file(b"a", false), 1, vv.clone(), None, None))
         .unwrap();
     let other_rec = EntryRecord {
@@ -840,19 +841,17 @@ fn changes_since_in_space_filters_by_mount_space() {
     };
     h.db.repo().put_entry(&other_rec).unwrap();
 
-    let in_personal = h
-        .db
-        .repo()
-        .changes_since_in_space(h.space.id, Sequence(0), 100)
-        .unwrap();
+    let in_personal =
+        h.db.repo()
+            .changes_since_in_space(h.space.id, Sequence(0), 100)
+            .unwrap();
     assert_eq!(in_personal.len(), 1);
     assert_eq!(in_personal[0].key.path.as_str(), "a.txt");
 
-    let in_other = h
-        .db
-        .repo()
-        .changes_since_in_space(other.id, Sequence(0), 100)
-        .unwrap();
+    let in_other =
+        h.db.repo()
+            .changes_since_in_space(other.id, Sequence(0), 100)
+            .unwrap();
     assert_eq!(in_other.len(), 1);
     assert_eq!(in_other[0].key.path.as_str(), "b.txt");
 

@@ -1,0 +1,633 @@
+//! Engine-native peer sync I/O. The CLI/daemon maps these 1:1 onto relay-net.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use relay_core::{DeviceId, ObjectId, Sequence, SpaceId};
+use relay_db::PeerOfferRow;
+use relay_proto::{
+    Ack, INDEX_BATCH_ENTRIES, IndexBatch, IndexRequest, RemoteEntry, entry_from_wire,
+    entry_to_wire, frame, space_id_bytes, space_id_from_bytes,
+};
+use serde::Serialize;
+
+use crate::Engine;
+use crate::error::EngineError;
+use crate::peers::offered_mounts_from_wire;
+
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_ATTEMPTS: u32 = 3;
+
+#[derive(Clone, Debug)]
+pub enum SyncInput {
+    PeerConnected {
+        peer: DeviceId,
+        name: String,
+    },
+    PeerDisconnected {
+        peer: DeviceId,
+    },
+    Frame {
+        peer: DeviceId,
+        body: frame::Body,
+    },
+    ObjectFetched {
+        peer: DeviceId,
+        object: ObjectId,
+    },
+    ObjectFetchFailed {
+        peer: DeviceId,
+        object: ObjectId,
+        not_found: bool,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum SyncOutput {
+    Send { peer: DeviceId, body: frame::Body },
+    FetchObject { peer: DeviceId, object: ObjectId },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum SyncEvent {
+    PeerConnected {
+        peer: DeviceId,
+        name: String,
+    },
+    PeerDisconnected {
+        peer: DeviceId,
+    },
+    OffersReceived {
+        peer: DeviceId,
+        spaces: Vec<OfferedSpaceEvent>,
+    },
+    RemoteApplied {
+        peer: DeviceId,
+        space: String,
+        mount: String,
+        written: usize,
+        deleted: usize,
+        conflicts: usize,
+        skipped: usize,
+    },
+    SentChanges {
+        peer: DeviceId,
+        space: String,
+        entries: usize,
+    },
+    SyncWarning {
+        peer: DeviceId,
+        path: String,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OfferedSpaceEvent {
+    pub name: String,
+    pub id: SpaceId,
+    pub already_joined: bool,
+}
+
+struct Connected {
+    #[allow(dead_code)]
+    name: String,
+    send_cursor: HashMap<SpaceId, Sequence>,
+    incoming: HashMap<SpaceId, VecDeque<PendingBatch>>,
+}
+
+struct PendingBatch {
+    through_sequence: u64,
+    entries: Vec<RemoteEntry>,
+    pending_objects: HashSet<ObjectId>,
+    failed_objects: HashSet<ObjectId>,
+    attempts: u32,
+    retry_at: Option<Instant>,
+}
+
+#[derive(Default)]
+pub struct Syncer {
+    connected: HashMap<DeviceId, Connected>,
+}
+
+impl Syncer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn handle(
+        &mut self,
+        engine: &mut Engine,
+        input: SyncInput,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<Vec<SyncEvent>, EngineError> {
+        let mut events = Vec::new();
+        match input {
+            SyncInput::PeerConnected { peer, name } => {
+                self.on_connected(engine, peer, name, out, &mut events)?;
+            }
+            SyncInput::PeerDisconnected { peer } => {
+                self.connected.remove(&peer);
+                events.push(SyncEvent::PeerDisconnected { peer });
+            }
+            SyncInput::Frame { peer, body } => {
+                self.on_frame(engine, peer, body, out, &mut events)?;
+            }
+            SyncInput::ObjectFetched { peer, object } => {
+                self.on_object(engine, peer, object, true, out, &mut events)?;
+            }
+            SyncInput::ObjectFetchFailed {
+                peer,
+                object,
+                reason,
+                ..
+            } => {
+                events.push(SyncEvent::SyncWarning {
+                    peer,
+                    path: object.to_string(),
+                    reason,
+                });
+                self.on_object(engine, peer, object, false, out, &mut events)?;
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn push_local_changes(
+        &mut self,
+        engine: &mut Engine,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<Vec<SyncEvent>, EngineError> {
+        let mut events = Vec::new();
+        let peers: Vec<DeviceId> = self.connected.keys().copied().collect();
+        for peer in peers {
+            let spaces: Vec<SpaceId> = self
+                .connected
+                .get(&peer)
+                .map(|c| c.send_cursor.keys().copied().collect())
+                .unwrap_or_default();
+            for space in spaces {
+                self.send_batches(engine, peer, space, false, out, &mut events)?;
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn tick(
+        &mut self,
+        engine: &mut Engine,
+        now: Instant,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<Vec<SyncEvent>, EngineError> {
+        let mut events = Vec::new();
+        let peers: Vec<DeviceId> = self.connected.keys().copied().collect();
+        for peer in peers {
+            let spaces: Vec<SpaceId> = self
+                .connected
+                .get(&peer)
+                .map(|c| c.incoming.keys().copied().collect())
+                .unwrap_or_default();
+            for space in spaces {
+                let due = self
+                    .connected
+                    .get(&peer)
+                    .and_then(|c| c.incoming.get(&space))
+                    .and_then(|q| q.front())
+                    .is_some_and(|b| b.retry_at.is_some_and(|t| now >= t));
+                if due {
+                    self.process_head(engine, peer, space, out, &mut events)?;
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn on_connected(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        name: String,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        if engine.db.repo().peer_by_id(peer)?.is_none() {
+            events.push(SyncEvent::SyncWarning {
+                peer,
+                path: String::new(),
+                reason: format!("unknown peer {name}; ignoring connection"),
+            });
+            return Ok(());
+        }
+        engine.record_peer_name(peer, &name)?;
+        self.connected.insert(
+            peer,
+            Connected {
+                name: name.clone(),
+                send_cursor: HashMap::new(),
+                incoming: HashMap::new(),
+            },
+        );
+        events.push(SyncEvent::PeerConnected {
+            peer,
+            name: name.clone(),
+        });
+
+        let offers = engine.space_offers_for_peer(peer)?;
+        out(SyncOutput::Send {
+            peer,
+            body: frame::Body::SpaceOffers(offers),
+        });
+
+        for space_id in engine.db.repo().shared_space_ids(peer)? {
+            if engine.db.repo().space(space_id)?.is_none() {
+                continue;
+            }
+            let after = engine.db.repo().sync_progress(peer, space_id)?.received_seq;
+            out(SyncOutput::Send {
+                peer,
+                body: frame::Body::IndexRequest(IndexRequest {
+                    space_id: space_id_bytes(&space_id),
+                    after_sequence: after.0,
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    fn on_frame(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        body: frame::Body,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        if !self.connected.contains_key(&peer) {
+            return Ok(());
+        }
+        match body {
+            frame::Body::SpaceOffers(offers) => self.on_offers(engine, peer, offers, events)?,
+            frame::Body::IndexRequest(req) => {
+                self.on_index_request(engine, peer, req, out, events)?
+            }
+            frame::Body::IndexBatch(batch) => {
+                self.on_index_batch(engine, peer, batch, out, events)?
+            }
+            frame::Body::Ack(ack) => self.on_ack(engine, peer, ack)?,
+            frame::Body::Hello(_)
+            | frame::Body::Ping(_)
+            | frame::Body::Pong(_)
+            | frame::Body::Error(_) => {}
+        }
+        Ok(())
+    }
+
+    fn on_offers(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        offers: relay_proto::SpaceOffers,
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let mut rows = Vec::new();
+        let mut listed = Vec::new();
+        for offer in offers.spaces {
+            let Ok(space_id) = space_id_from_bytes(&offer.space_id) else {
+                events.push(SyncEvent::SyncWarning {
+                    peer,
+                    path: offer.name.clone(),
+                    reason: "invalid space id in offer".into(),
+                });
+                continue;
+            };
+            let mounts = match offered_mounts_from_wire(&offer.mounts) {
+                Ok(m) => m,
+                Err(err) => {
+                    events.push(SyncEvent::SyncWarning {
+                        peer,
+                        path: offer.name.clone(),
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let already = engine.db.repo().space(space_id)?.is_some();
+            listed.push(OfferedSpaceEvent {
+                name: offer.name.clone(),
+                id: space_id,
+                already_joined: already,
+            });
+            rows.push(PeerOfferRow {
+                space_id,
+                name: offer.name,
+                mounts,
+            });
+        }
+        engine.persist_offers(peer, &rows)?;
+        let hint: Vec<_> = listed
+            .iter()
+            .filter(|s| !s.already_joined)
+            .cloned()
+            .collect();
+        if !hint.is_empty() {
+            events.push(SyncEvent::OffersReceived { peer, spaces: hint });
+        }
+        Ok(())
+    }
+
+    fn on_index_request(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        req: IndexRequest,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let space = match space_id_from_bytes(&req.space_id) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        if engine.db.repo().space(space)?.is_none() || !engine.db.repo().is_shared(space, peer)? {
+            return Ok(());
+        }
+        if let Some(conn) = self.connected.get_mut(&peer) {
+            conn.send_cursor.insert(space, Sequence(req.after_sequence));
+        }
+        self.send_batches(engine, peer, space, true, out, events)
+    }
+
+    fn send_batches(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        space: SpaceId,
+        force_empty: bool,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let latest = engine.db.repo().latest_sequence()?;
+        let mut after = self
+            .connected
+            .get(&peer)
+            .and_then(|c| c.send_cursor.get(&space).copied())
+            .unwrap_or(Sequence::ZERO);
+        let space_name = engine
+            .db
+            .repo()
+            .space(space)?
+            .map(|s| s.name)
+            .unwrap_or_else(|| space.to_string());
+
+        loop {
+            let changes =
+                engine
+                    .db
+                    .repo()
+                    .changes_since_in_space(space, after, INDEX_BATCH_ENTRIES)?;
+            if changes.is_empty() && !force_empty && after.0 >= latest.0 {
+                break;
+            }
+            let through = if changes.len() < INDEX_BATCH_ENTRIES {
+                latest
+            } else {
+                changes.last().map(|e| e.sequence).unwrap_or(after)
+            };
+            let caught_up = through.0 >= latest.0;
+            let n = changes.len();
+            let batch = IndexBatch {
+                space_id: space_id_bytes(&space),
+                entries: changes.iter().map(entry_to_wire).collect(),
+                through_sequence: through.0,
+                caught_up,
+            };
+            out(SyncOutput::Send {
+                peer,
+                body: frame::Body::IndexBatch(batch),
+            });
+            if n > 0 {
+                events.push(SyncEvent::SentChanges {
+                    peer,
+                    space: space_name.clone(),
+                    entries: n,
+                });
+            }
+            if let Some(conn) = self.connected.get_mut(&peer) {
+                conn.send_cursor.insert(space, through);
+            }
+            after = through;
+            if caught_up {
+                break;
+            }
+            // Only force one empty batch on the initial IndexRequest.
+            if force_empty && n == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn on_index_batch(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        batch: IndexBatch,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let space = match space_id_from_bytes(&batch.space_id) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        if engine.db.repo().space(space)?.is_none() || !engine.db.repo().is_shared(space, peer)? {
+            return Ok(());
+        }
+
+        let mut entries = Vec::new();
+        for wire in batch.entries {
+            match entry_from_wire(space, wire) {
+                Ok(entry) => entries.push(entry),
+                Err(err) => events.push(SyncEvent::SyncWarning {
+                    peer,
+                    path: String::new(),
+                    reason: format!("skipping bad entry: {err}"),
+                }),
+            }
+        }
+
+        let mut pending = HashSet::new();
+        for entry in &entries {
+            if let Some(obj) = entry.content.object()
+                && !engine.store.contains(&obj)
+            {
+                pending.insert(obj);
+            }
+        }
+        for obj in &pending {
+            out(SyncOutput::FetchObject { peer, object: *obj });
+        }
+
+        let pending_batch = PendingBatch {
+            through_sequence: batch.through_sequence,
+            entries,
+            pending_objects: pending,
+            failed_objects: HashSet::new(),
+            attempts: 0,
+            retry_at: None,
+        };
+        if let Some(conn) = self.connected.get_mut(&peer) {
+            conn.incoming
+                .entry(space)
+                .or_default()
+                .push_back(pending_batch);
+        }
+        self.process_head(engine, peer, space, out, events)
+    }
+
+    fn on_object(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        object: ObjectId,
+        ok: bool,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let spaces: Vec<SpaceId> = self
+            .connected
+            .get(&peer)
+            .map(|c| c.incoming.keys().copied().collect())
+            .unwrap_or_default();
+        for space in spaces {
+            if let Some(conn) = self.connected.get_mut(&peer)
+                && let Some(queue) = conn.incoming.get_mut(&space)
+                && let Some(head) = queue.front_mut()
+                && head.pending_objects.remove(&object)
+            {
+                if !ok {
+                    head.failed_objects.insert(object);
+                }
+                self.process_head(engine, peer, space, out, events)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn on_ack(&mut self, engine: &mut Engine, peer: DeviceId, ack: Ack) -> Result<(), EngineError> {
+        let space = match space_id_from_bytes(&ack.space_id) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        let now = engine.clock.now_ms();
+        engine
+            .db
+            .transaction(|repo| {
+                repo.set_acked_seq(peer, space, Sequence(ack.through_sequence), now)
+            })
+            .map_err(EngineError::from_db)
+    }
+
+    fn process_head(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        space: SpaceId,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let Some(conn) = self.connected.get_mut(&peer) else {
+            return Ok(());
+        };
+        let Some(queue) = conn.incoming.get_mut(&space) else {
+            return Ok(());
+        };
+        let Some(head) = queue.front_mut() else {
+            return Ok(());
+        };
+        if !head.pending_objects.is_empty() {
+            return Ok(());
+        }
+        if head.retry_at.is_some() && head.retry_at.is_some_and(|t| Instant::now() < t) {
+            return Ok(());
+        }
+
+        let entries = head.entries.clone();
+        let failed = head.failed_objects.clone();
+        let through = head.through_sequence;
+
+        let outcome = engine.apply_remote_batch(peer, space, entries, &failed)?;
+        for w in &outcome.warnings {
+            events.push(SyncEvent::SyncWarning {
+                peer,
+                path: w.path.clone(),
+                reason: w.reason.clone(),
+            });
+        }
+
+        if outcome.transient {
+            if let Some(conn) = self.connected.get_mut(&peer)
+                && let Some(queue) = conn.incoming.get_mut(&space)
+                && let Some(head) = queue.front_mut()
+            {
+                head.attempts += 1;
+                if head.attempts >= MAX_ATTEMPTS {
+                    let skipped = head.entries.len();
+                    events.push(SyncEvent::SyncWarning {
+                        peer,
+                        path: String::new(),
+                        reason: format!("giving up on batch after {MAX_ATTEMPTS} attempts ({skipped} entries skipped)"),
+                    });
+                    queue.pop_front();
+                    return self.process_head(engine, peer, space, out, events);
+                }
+                head.retry_at = Some(Instant::now() + RETRY_DELAY);
+            }
+            return Ok(());
+        }
+
+        let now = engine.clock.now_ms();
+        engine
+            .db
+            .transaction(|repo| repo.set_received_seq(peer, space, Sequence(through), now))?;
+
+        out(SyncOutput::Send {
+            peer,
+            body: frame::Body::Ack(Ack {
+                space_id: space_id_bytes(&space),
+                through_sequence: through,
+            }),
+        });
+
+        let space_name = engine
+            .db
+            .repo()
+            .space(space)?
+            .map(|s| s.name)
+            .unwrap_or_else(|| space.to_string());
+        let mount = engine
+            .db
+            .repo()
+            .list_mounts(Some(space))?
+            .into_iter()
+            .next()
+            .map(|c| c.mount.name)
+            .unwrap_or_default();
+        events.push(SyncEvent::RemoteApplied {
+            peer,
+            space: space_name,
+            mount,
+            written: outcome.written,
+            deleted: outcome.deleted,
+            conflicts: outcome.conflicts,
+            skipped: outcome.skipped,
+        });
+
+        if let Some(conn) = self.connected.get_mut(&peer)
+            && let Some(queue) = conn.incoming.get_mut(&space)
+        {
+            queue.pop_front();
+        }
+        self.process_head(engine, peer, space, out, events)
+    }
+}

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use relay_core::{Device, LogicalPath, ObjectId, Sequence};
+use relay_core::{Device, DeviceId, LogicalPath, ObjectId, Sequence};
 use relay_fs::ScanWarning;
 use serde::Serialize;
 
@@ -113,6 +113,24 @@ pub struct Status {
     pub mounts: Vec<MountStatus>,
     pub object_count: u64,
     pub last_sequence: Sequence,
+    pub peers: Vec<PeerStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerStatus {
+    pub name: String,
+    pub id: DeviceId,
+    pub addresses: Vec<String>,
+    pub spaces: Vec<PeerSpaceStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerSpaceStatus {
+    pub space: String,
+    pub received_seq: Sequence,
+    pub acked_seq: Sequence,
+    pub our_latest_seq: Sequence,
+    pub last_sync_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

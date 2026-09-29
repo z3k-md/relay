@@ -1,9 +1,13 @@
 //! Integration layer: local index, object store, and filesystem scans.
 
+mod apply;
 mod clock;
 mod error;
+mod order;
+mod peers;
 mod reports;
 mod scan;
+mod sync;
 mod watch;
 
 use std::fs::{self, File};
@@ -20,18 +24,20 @@ use relay_store::StoreError;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::EngineError;
+pub use peers::{OfferInfo, PeerInfo};
 pub use relay_core::{
     Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount, ObjectId, Sequence, Space,
     VectorOrdering,
 };
+pub use relay_crypto::DeviceIdentity;
 pub use relay_db::{HistoryRecord, MountConfig};
 pub use relay_fs::{FsError, ScanWarning};
 pub use relay_store::ObjectStore;
-pub use relay_crypto::DeviceIdentity;
 pub use reports::{
     GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR, MountStatus,
-    ScanOptions, ScanReport, Status, VerifyReport, Warning,
+    PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport, Status, VerifyReport, Warning,
 };
+pub use sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
 pub use watch::{WatchEvent, WatchOptions};
 
 const DB_FILE: &str = "relay.db";
@@ -282,6 +288,22 @@ impl Engine {
             .repo()
             .space_by_name(space)?
             .ok_or_else(|| EngineError::UnknownSpace(space.to_owned()))?;
+
+        if let Some(existing) = self.db.repo().mount_by_name(space_rec.id, mount)? {
+            let config = self
+                .db
+                .repo()
+                .mount_config(existing.id)?
+                .ok_or(EngineError::MountNotLocal)?;
+            if config.local_path.is_some() {
+                return Err(EngineError::MountAlreadyAttached {
+                    space: space.to_owned(),
+                    mount: mount.to_owned(),
+                });
+            }
+            return self.attach_mount(&space_rec, existing, &canonical, includes, excludes);
+        }
+
         let mount_rec = Mount {
             id: relay_core::MountId::new(),
             space: space_rec.id,
@@ -313,6 +335,39 @@ impl Engine {
         self.db
             .repo()
             .mount_config(mount_rec.id)?
+            .ok_or(EngineError::MountNotLocal)
+    }
+
+    fn attach_mount(
+        &mut self,
+        space: &Space,
+        mount: Mount,
+        canonical: &Path,
+        includes: &[String],
+        excludes: &[String],
+    ) -> Result<MountConfig, EngineError> {
+        let marker = MountMarker {
+            space: space.id,
+            mount: mount.id,
+            created_by: self.device.id,
+        };
+        marker.write(canonical)?;
+        let db_result = self.db.transaction(|repo| {
+            repo.set_local_mount_path(mount.id, canonical)?;
+            repo.set_mount_rules(mount.id, includes, excludes)?;
+            repo.reset_received_seq_for_space(space.id)?;
+            Ok::<(), EngineError>(())
+        });
+        if let Err(err) = db_result {
+            let _ = fs::remove_file(canonical.join(MOUNT_MARKER));
+            return Err(match err {
+                EngineError::Db(inner) => EngineError::from_db(inner),
+                other => other,
+            });
+        }
+        self.db
+            .repo()
+            .mount_config(mount.id)?
             .ok_or(EngineError::MountNotLocal)
     }
 
@@ -577,11 +632,37 @@ impl Engine {
             });
         }
         let object_count = self.store.list()?.len() as u64;
+        let mut peers = Vec::new();
+        for peer in self.db.repo().list_peers()? {
+            let mut spaces = Vec::new();
+            for space_id in self.db.repo().shared_space_ids(peer.device.id)? {
+                let Some(space) = self.db.repo().space(space_id)? else {
+                    continue;
+                };
+                let progress = self.db.repo().sync_progress(peer.device.id, space_id)?;
+                let our_latest_seq = self.db.repo().max_sequence_in_space(space_id)?;
+                spaces.push(crate::reports::PeerSpaceStatus {
+                    space: space.name,
+                    received_seq: progress.received_seq,
+                    acked_seq: progress.acked_seq,
+                    our_latest_seq,
+                    last_sync_ms: progress.last_sync_ms,
+                });
+            }
+            spaces.sort_by(|a, b| a.space.cmp(&b.space));
+            peers.push(crate::reports::PeerStatus {
+                name: peer.device.name,
+                id: peer.device.id,
+                addresses: peer.addresses,
+                spaces,
+            });
+        }
         Ok(Status {
             device: self.device.clone(),
             mounts,
             object_count,
             last_sequence,
+            peers,
         })
     }
 
@@ -648,7 +729,10 @@ fn load_or_generate_identity(dir: &Path) -> Result<DeviceIdentity, EngineError> 
     }
 }
 
-fn require_matching_identity(home: &Path, expected: DeviceId) -> Result<DeviceIdentity, EngineError> {
+fn require_matching_identity(
+    home: &Path,
+    expected: DeviceId,
+) -> Result<DeviceIdentity, EngineError> {
     let dir = home.join(IDENTITY_DIR);
     let identity = match DeviceIdentity::load(&dir) {
         Ok(identity) => identity,

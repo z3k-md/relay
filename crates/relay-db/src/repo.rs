@@ -716,9 +716,7 @@ impl Repo<'_> {
             params![bytes.as_slice()],
             |row| row.get(0),
         )?;
-        Ok(Sequence(
-            max.map(u64_from_i64).transpose()?.unwrap_or(0),
-        ))
+        Ok(Sequence(max.map(u64_from_i64).transpose()?.unwrap_or(0)))
     }
 
     pub fn changes_since_in_space(
@@ -791,8 +789,10 @@ impl Repo<'_> {
             "DELETE FROM sync_progress WHERE device_ref = ?1",
             params![device_ref],
         )?;
-        self.conn
-            .execute("DELETE FROM peers WHERE device_ref = ?1", params![device_ref])?;
+        self.conn.execute(
+            "DELETE FROM peers WHERE device_ref = ?1",
+            params![device_ref],
+        )?;
         Ok(true)
     }
 
@@ -956,11 +956,7 @@ impl Repo<'_> {
         }))
     }
 
-    pub fn sync_progress(
-        &self,
-        peer: DeviceId,
-        space: SpaceId,
-    ) -> Result<SyncProgress, DbError> {
+    pub fn sync_progress(&self, peer: DeviceId, space: SpaceId) -> Result<SyncProgress, DbError> {
         let Some(device_ref) = self.device_ref(peer)? else {
             return Ok(SyncProgress {
                 received_seq: Sequence::ZERO,
@@ -1027,7 +1023,10 @@ impl Repo<'_> {
         Ok(())
     }
 
-    pub fn list_progress_for_peer(&self, peer: DeviceId) -> Result<Vec<(SpaceId, SyncProgress)>, DbError> {
+    pub fn list_progress_for_peer(
+        &self,
+        peer: DeviceId,
+    ) -> Result<Vec<(SpaceId, SyncProgress)>, DbError> {
         let Some(device_ref) = self.device_ref(peer)? else {
             return Ok(Vec::new());
         };

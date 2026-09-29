@@ -51,7 +51,11 @@ fn inspect_normal_component(component: &str) -> Result<(), String> {
         )),
         (Some(other), rest) => Err(format!(
             "component {component:?} expands to {other:?}{} on this OS",
-            if rest.is_some() { " plus further parts" } else { "" }
+            if rest.is_some() {
+                " plus further parts"
+            } else {
+                ""
+            }
         )),
         (None, _) => Err(format!("component {component:?} is empty on this OS")),
     }
@@ -148,10 +152,12 @@ fn walk_dir_chain(root: &Path, dir: &Path, create_missing: bool) -> Result<(), F
     if dir == root {
         return Ok(());
     }
-    let rel = dir.strip_prefix(root).map_err(|_| FsError::Unrepresentable {
-        path: dir.display().to_string(),
-        reason: "path is not under the mount root".into(),
-    })?;
+    let rel = dir
+        .strip_prefix(root)
+        .map_err(|_| FsError::Unrepresentable {
+            path: dir.display().to_string(),
+            reason: "path is not under the mount root".into(),
+        })?;
     let mut current = root.to_path_buf();
     for component in rel.components() {
         match component {
@@ -366,15 +372,9 @@ mod tests {
         let name = format!("a{}b", std::path::MAIN_SEPARATOR);
         let logical = LogicalPath::new(&name).unwrap();
         let err = to_os_path(Path::new("/mnt"), &logical).unwrap_err();
-        assert!(
-            matches!(err, FsError::Unrepresentable { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, FsError::Unrepresentable { .. }), "{err:?}");
         let err = resolve_os_path(Path::new("/mnt"), &logical).unwrap_err();
-        assert!(
-            matches!(err, FsError::Unrepresentable { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, FsError::Unrepresentable { .. }), "{err:?}");
     }
 
     #[cfg(windows)]

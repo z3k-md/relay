@@ -322,7 +322,18 @@ impl Engine {
             ));
         }
 
-        writes.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+        writes.sort_by(|a, b| {
+            let class_a = crate::order::classify_apply(
+                &a.1.content,
+                a.1.previous.as_ref().and_then(|p| p.content.kind()),
+            );
+            let class_b = crate::order::classify_apply(
+                &b.1.content,
+                b.1.previous.as_ref().and_then(|p| p.content.kind()),
+            );
+            crate::order::apply_sort_key(&a.1.path, class_a)
+                .cmp(&crate::order::apply_sort_key(&b.1.path, class_b))
+        });
         report.unstable = {
             let mut paths: Vec<_> = unstable.into_iter().collect();
             paths.sort();
@@ -544,7 +555,7 @@ fn observation_for(
                             content: EntryContent::File {
                                 object: outcome.id,
                                 size: outcome.size,
-                                executable: entry.executable,
+                                executable: observed_executable(entry.executable, prev),
                             },
                             stat: recorded_stat(outcome.stat, ctx.wall_now_ns, ctx.racy_window),
                         }))
@@ -570,7 +581,7 @@ fn observation_for(
                     content: EntryContent::File {
                         object: *object,
                         size: *size,
-                        executable: entry.executable,
+                        executable: observed_executable(entry.executable, prev),
                     },
                     stat: recorded_stat(entry.stat, ctx.wall_now_ns, ctx.racy_window),
                 }))
@@ -588,6 +599,19 @@ fn observation_for(
             },
             stat: recorded_stat(entry.stat, ctx.wall_now_ns, ctx.racy_window),
         })),
+    }
+}
+
+/// On Windows the scanner cannot observe the Unix executable bit. Carry the
+/// existing record's bit forward so a Mac `executable: true` file is not
+/// rewritten as a new version with `executable: false`.
+pub(crate) fn observed_executable(scanned: bool, prev: Option<&EntryRecord>) -> bool {
+    if cfg!(unix) {
+        return scanned;
+    }
+    match prev.map(|p| &p.content) {
+        Some(EntryContent::File { executable, .. }) => *executable,
+        _ => false,
     }
 }
 
@@ -774,5 +798,35 @@ mod tests {
                 executable: false,
             }
         );
+    }
+
+    #[test]
+    fn non_unix_scan_carries_the_record_executable_bit() {
+        let key_path = LogicalPath::new("tool").unwrap();
+        let prev = EntryRecord::local_write(
+            None,
+            relay_core::EntryKey {
+                space: relay_core::SpaceId::new(),
+                mount: relay_core::MountId::new(),
+                path: key_path,
+            },
+            EntryContent::File {
+                object: ObjectId::of(b"x"),
+                size: 1,
+                executable: true,
+            },
+            None,
+            relay_core::DeviceId::from_bytes([1; 32]),
+            1_000,
+            Sequence(1),
+        );
+        if cfg!(unix) {
+            assert!(!observed_executable(false, Some(&prev)));
+            assert!(observed_executable(true, Some(&prev)));
+        } else {
+            assert!(observed_executable(false, Some(&prev)));
+            assert!(observed_executable(true, Some(&prev)));
+            assert!(!observed_executable(false, None));
+        }
     }
 }

@@ -333,10 +333,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), mount.path().join("evil")).unwrap();
         let dest = mount.path().join("evil/x");
         let err = write_via(mount.path(), &dest, b"pwned", false, None).unwrap_err();
-        assert!(
-            matches!(err, FsError::UnsafeAncestor { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, FsError::UnsafeAncestor { .. }), "{err:?}");
         assert!(!outside.path().join("x").exists());
         assert!(!dest.exists());
     }

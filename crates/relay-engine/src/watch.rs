@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::Engine;
 use crate::error::EngineError;
 use crate::reports::{ScanOptions, ScanReport};
+use crate::sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
 
 const STOP_POLL: Duration = Duration::from_millis(100);
 
@@ -60,6 +61,36 @@ pub enum WatchEvent {
         mount: String,
         error: String,
     },
+    PeerConnected {
+        peer: String,
+        name: String,
+    },
+    PeerDisconnected {
+        peer: String,
+    },
+    OffersReceived {
+        peer: String,
+        spaces: Vec<String>,
+    },
+    RemoteApplied {
+        peer: String,
+        space: String,
+        mount: String,
+        written: usize,
+        deleted: usize,
+        conflicts: usize,
+        skipped: usize,
+    },
+    SentChanges {
+        peer: String,
+        space: String,
+        entries: usize,
+    },
+    SyncWarning {
+        peer: String,
+        path: String,
+        reason: String,
+    },
     Stopped,
 }
 
@@ -76,6 +107,11 @@ struct MountWatch {
     watcher_attached: bool,
 }
 
+enum LoopMsg {
+    Fs(WatchSignal),
+    Sync(SyncInput),
+}
+
 impl Engine {
     pub fn watch(
         &mut self,
@@ -83,7 +119,41 @@ impl Engine {
         stop: &AtomicBool,
         on_event: &mut dyn FnMut(&WatchEvent),
     ) -> Result<(), EngineError> {
+        let (_tx, rx) = mpsc::channel();
+        self.run(opts, rx, |_| {}, stop, on_event)
+    }
+
+    /// Combined filesystem + peer sync loop.
+    ///
+    /// Performs an initial full scan of every local mount, then multiplexes
+    /// watcher hints and [`SyncInput`]s on one channel. After every committing
+    /// scan (or applied remote batch) new local changes are pushed to
+    /// subscribed peers. `tick` is invoked on the poll interval so transient
+    /// apply failures can retry.
+    ///
+    /// The daemon maps `relay-net`'s `NetEvent`/`NetCommand` 1:1 onto
+    /// [`SyncInput`] / [`SyncOutput`].
+    pub fn run(
+        &mut self,
+        opts: WatchOptions,
+        sync_inputs: mpsc::Receiver<SyncInput>,
+        mut output: impl FnMut(SyncOutput),
+        stop: &AtomicBool,
+        on_event: &mut dyn FnMut(&WatchEvent),
+    ) -> Result<(), EngineError> {
         self.ensure_writable()?;
+        let mut syncer = Syncer::new();
+        let (tx, rx) = mpsc::channel::<LoopMsg>();
+        {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(input) = sync_inputs.recv() {
+                    if tx.send(LoopMsg::Sync(input)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
 
         let listed = self.mounts(None)?;
         let mut states: Vec<MountWatch> = listed
@@ -105,9 +175,19 @@ impl Engine {
             })
             .collect();
 
-        let (tx, rx) = mpsc::channel();
+        let (fs_tx, fs_rx) = mpsc::channel();
+        {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(signal) = fs_rx.recv() {
+                    if tx.send(LoopMsg::Fs(signal)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let mut watcher = if opts.use_watcher {
-            match MountWatcher::new(tx.clone()) {
+            match MountWatcher::new(fs_tx.clone()) {
                 Ok(w) => Some(w),
                 Err(err) => {
                     let error = err.to_string();
@@ -147,17 +227,25 @@ impl Engine {
                 break;
             }
             let result = self.scan(&space, &mount, ScanOptions::default());
+            let committed = result.as_ref().is_ok_and(scan_committed);
             if let Some(state) = states
                 .iter_mut()
                 .find(|s| s.space == space && s.mount == mount)
             {
                 finish_watch_scan(state, true, 0, result, on_event);
             }
+            if committed {
+                emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+            }
         }
 
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(STOP_POLL) {
-                Ok(signal) => apply_signal(&mut states, signal, Instant::now()),
+                Ok(LoopMsg::Fs(signal)) => apply_signal(&mut states, signal, Instant::now()),
+                Ok(LoopMsg::Sync(input)) => {
+                    emit_sync(syncer.handle(self, input, &mut output), on_event);
+                    emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {}
             }
@@ -166,6 +254,7 @@ impl Engine {
             }
 
             let now = Instant::now();
+            emit_sync(syncer.tick(self, now, &mut output), on_event);
             retry_watchers(
                 watcher.as_mut(),
                 &mut states,
@@ -180,10 +269,13 @@ impl Engine {
                     break;
                 }
                 let state = &mut states[job.index];
-                if job.full {
-                    self.run_watch_scan(state, true, on_event);
+                let committed = if job.full {
+                    self.run_watch_scan(state, true, on_event)
                 } else {
-                    self.run_watch_scan_paths(state, &job.paths, on_event);
+                    self.run_watch_scan_paths(state, &job.paths, on_event)
+                };
+                if committed {
+                    emit_sync(syncer.push_local_changes(self, &mut output), on_event);
                 }
             }
         }
@@ -198,10 +290,12 @@ impl Engine {
         state: &mut MountWatch,
         full: bool,
         on_event: &mut dyn FnMut(&WatchEvent),
-    ) {
+    ) -> bool {
         let paths = state.dirty.len();
         let result = self.scan(&state.space, &state.mount, ScanOptions::default());
+        let committed = result.as_ref().is_ok_and(scan_committed);
         finish_watch_scan(state, full, paths, result, on_event);
+        committed
     }
 
     fn run_watch_scan_paths(
@@ -209,10 +303,78 @@ impl Engine {
         state: &mut MountWatch,
         paths: &[LogicalPath],
         on_event: &mut dyn FnMut(&WatchEvent),
-    ) {
+    ) -> bool {
         let n = paths.len();
         let result = self.scan_paths(&state.space, &state.mount, paths, ScanOptions::default());
+        let committed = result.as_ref().is_ok_and(scan_committed);
         finish_watch_scan(state, false, n, result, on_event);
+        committed
+    }
+}
+
+fn scan_committed(report: &ScanReport) -> bool {
+    report.created > 0 || report.modified > 0 || report.deleted > 0
+}
+
+fn emit_sync(result: Result<Vec<SyncEvent>, EngineError>, on_event: &mut dyn FnMut(&WatchEvent)) {
+    match result {
+        Ok(events) => {
+            for event in events {
+                on_event(&watch_from_sync(&event));
+            }
+        }
+        Err(err) => on_event(&WatchEvent::SyncWarning {
+            peer: String::new(),
+            path: String::new(),
+            reason: err.to_string(),
+        }),
+    }
+}
+
+fn watch_from_sync(event: &SyncEvent) -> WatchEvent {
+    match event {
+        SyncEvent::PeerConnected { peer, name } => WatchEvent::PeerConnected {
+            peer: peer.to_string(),
+            name: name.clone(),
+        },
+        SyncEvent::PeerDisconnected { peer } => WatchEvent::PeerDisconnected {
+            peer: peer.to_string(),
+        },
+        SyncEvent::OffersReceived { peer, spaces } => WatchEvent::OffersReceived {
+            peer: peer.to_string(),
+            spaces: spaces.iter().map(|s| s.name.clone()).collect(),
+        },
+        SyncEvent::RemoteApplied {
+            peer,
+            space,
+            mount,
+            written,
+            deleted,
+            conflicts,
+            skipped,
+        } => WatchEvent::RemoteApplied {
+            peer: peer.to_string(),
+            space: space.clone(),
+            mount: mount.clone(),
+            written: *written,
+            deleted: *deleted,
+            conflicts: *conflicts,
+            skipped: *skipped,
+        },
+        SyncEvent::SentChanges {
+            peer,
+            space,
+            entries,
+        } => WatchEvent::SentChanges {
+            peer: peer.to_string(),
+            space: space.clone(),
+            entries: *entries,
+        },
+        SyncEvent::SyncWarning { peer, path, reason } => WatchEvent::SyncWarning {
+            peer: peer.to_string(),
+            path: path.clone(),
+            reason: reason.clone(),
+        },
     }
 }
 
