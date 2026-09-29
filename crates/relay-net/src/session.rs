@@ -122,7 +122,11 @@ impl Inner {
         ))
     }
 
-    /// Keep the connection dialed by the lower device id. Returns whether `conn` is kept.
+    /// Keep the connection dialed by the lower device id. A new connection from
+    /// the same dialer as the existing one replaces it: a device only dials
+    /// when it has no connection, so the old one is stale (the peer restarted
+    /// or its network changed) and would otherwise block reconnection until
+    /// the idle timeout. Returns whether `conn` is kept.
     pub(crate) fn claim(&self, peer_id: DeviceId, conn: &Connection, we_dialed: bool) -> bool {
         let dialed_by = if we_dialed { self.our_id } else { peer_id };
         let preferred = std::cmp::min(self.our_id, peer_id);
@@ -133,7 +137,9 @@ impl Inner {
                 true
             }
             Some(existing) => {
-                if dialed_by == preferred && existing.dialed_by != preferred {
+                let replaces = existing.dialed_by == dialed_by
+                    || (dialed_by == preferred && existing.dialed_by != preferred);
+                if replaces {
                     let old = sessions.remove(&peer_id).expect("just looked up");
                     old.conn
                         .close(close_code(CLOSE_DUPLICATE), b"duplicate connection");
@@ -143,11 +149,11 @@ impl Inner {
                     if was_established {
                         tracing::info!(
                             peer = %peer_id,
-                            "superseding connection with the one dialed by the lower device id"
+                            "superseding existing connection"
                         );
                         self.emit(NetEvent::PeerDisconnected {
                             peer: peer_id,
-                            reason: "superseded by preferred connection".into(),
+                            reason: "superseded by a newer or preferred connection".into(),
                         });
                     }
                     true
