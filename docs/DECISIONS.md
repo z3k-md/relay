@@ -254,3 +254,18 @@ its own thread (`relay-net`). They talk over channels: the engine sends
 engine's single input queue, which also carries watcher signals. The network
 writes fetched objects into the object store directly (verified by hash
 before rename) and serves objects from it; it never touches the database.
+
+## Phase 2 implementation notes
+
+- `to_os_path` returns `Result` and rejects any logical component that is not
+  exactly one `Component::Normal` on the current OS (`FsError::Unrepresentable`).
+  `materialize_file` takes `MaterializeOptions { mount_root, mtime_ns }` and
+  creates parents one real directory at a time (`FsError::UnsafeAncestor`).
+- Unknown devices referenced by a version vector are stored with a placeholder
+  name equal to the short id (not `"unknown"`).
+- On Windows the scanner cannot observe the executable bit. The engine carries
+  the existing record's bit forward so a Mac `executable: true` file is not
+  rewritten as a new version.
+- The engine does not depend on `relay-net` or Tokio. `Engine::run` multiplexes
+  filesystem events and `SyncInput`s; the daemon maps `NetEvent`/`NetCommand`
+  1:1 onto `SyncInput`/`SyncOutput`. `Engine::watch` calls `run` with no sync.
