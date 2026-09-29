@@ -266,11 +266,30 @@ pub(crate) async fn drive_connection(inner: Arc<Inner>, conn: Connection, we_dia
         return;
     }
 
-    let reason = match run_session(inner.clone(), conn.clone(), peer_id, we_dialed).await {
-        Ok(()) => "closed".to_owned(),
-        Err(e) => e,
+    // Release on every exit, including task abort (SetPeers drops the dialer).
+    let mut guard = SessionGuard {
+        inner: inner.clone(),
+        peer: peer_id,
+        stable_id: conn.stable_id(),
+        reason: "closed".to_owned(),
     };
-    inner.release(peer_id, conn.stable_id(), reason);
+    if let Err(e) = run_session(inner, conn, peer_id, we_dialed).await {
+        guard.reason = e;
+    }
+}
+
+struct SessionGuard {
+    inner: Arc<Inner>,
+    peer: DeviceId,
+    stable_id: usize,
+    reason: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.inner
+            .release(self.peer, self.stable_id, std::mem::take(&mut self.reason));
+    }
 }
 
 async fn run_session(
