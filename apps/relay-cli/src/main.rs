@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use relay_core::{EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
+use relay_core::{DeviceId, EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
 use relay_engine::{
     Engine, EngineError, ScanOptions, ScanReport, WatchEvent, WatchOptions, default_home,
 };
@@ -42,8 +42,24 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Show device and mount status
+    /// Print this device's id and name
+    Id,
+    /// Show device, mount and peer status
     Status,
+    /// Peer pairing
+    Peer {
+        #[command(subcommand)]
+        cmd: PeerCmd,
+    },
+    /// Share a space with a peer
+    Share { space: String, peer: String },
+    /// Stop sharing a space with a peer
+    Unshare { space: String, peer: String },
+    /// List live conflict copies
+    Conflicts {
+        #[arg(long)]
+        space: Option<String>,
+    },
     /// Space commands
     Space {
         #[command(subcommand)]
@@ -102,8 +118,32 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum SpaceCmd {
-    Create { name: String },
+    Create {
+        name: String,
+    },
     List,
+    /// Spaces a peer has offered (not yet joined)
+    Offers,
+    /// Join an offered space and share it back
+    Join {
+        name_or_id: String,
+        #[arg(long = "from")]
+        from: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PeerCmd {
+    Add {
+        name: String,
+        device_id: String,
+        #[arg(long = "addr")]
+        addresses: Vec<String>,
+    },
+    List,
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -153,9 +193,48 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let json = cli.json;
     match cli.command {
         Command::Init { name } => cmd_init(&home, name, json).map(|()| ExitCode::SUCCESS),
+        Command::Id => {
+            let engine = Engine::open_read_only(&home)?;
+            cmd_id(&engine, json).map(|()| ExitCode::SUCCESS)
+        }
         Command::Status => {
             let engine = Engine::open_read_only(&home)?;
             cmd_status(&engine, json).map(|()| ExitCode::SUCCESS)
+        }
+        Command::Peer { cmd } => cmd_peer(&home, cmd, json),
+        Command::Share { space, peer } => {
+            let mut engine = Engine::open(&home)?;
+            engine.share(&space, &peer)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"shared": true, "space": space, "peer": peer})
+                    )?
+                );
+            } else {
+                println!("shared {space} with {peer}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Unshare { space, peer } => {
+            let mut engine = Engine::open(&home)?;
+            engine.unshare(&space, &peer)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"unshared": true, "space": space, "peer": peer})
+                    )?
+                );
+            } else {
+                println!("unshared {space} from {peer}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Conflicts { space } => {
+            let engine = Engine::open_read_only(&home)?;
+            cmd_conflicts(&engine, space.as_deref(), json).map(|()| ExitCode::SUCCESS)
         }
         Command::Space { cmd } => match cmd {
             SpaceCmd::Create { name } => {
@@ -177,6 +256,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     for space in spaces {
                         println!("{}", space.name);
                     }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            SpaceCmd::Offers => {
+                let engine = Engine::open_read_only(&home)?;
+                let offers = engine.offers()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&offers)?);
+                } else if offers.is_empty() {
+                    println!("no offers");
+                } else {
+                    for offer in offers {
+                        let mounts: Vec<_> = offer.mounts.iter().map(|m| m.name.as_str()).collect();
+                        println!(
+                            "{} from {} ({}): {}",
+                            offer.name,
+                            offer.peer,
+                            offer.space_id,
+                            mounts.join(", ")
+                        );
+                        println!(
+                            "  hint: relay space join {} --from {}",
+                            offer.name, offer.peer
+                        );
+                    }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            SpaceCmd::Join { name_or_id, from } => {
+                let mut engine = Engine::open(&home)?;
+                let space = engine.join_space(&name_or_id, &from)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&space)?);
+                } else {
+                    println!(
+                        "joined space {} ({}); attach mounts with `relay mount add`",
+                        space.name, space.id
+                    );
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -402,6 +519,42 @@ fn print_watch_event(event: &WatchEvent, json: bool, verbose: bool) {
             eprintln!("error: {space}/{mount}: {error}");
         }
         WatchEvent::Stopped => println!("stopped"),
+        WatchEvent::PeerConnected { peer, name } => {
+            println!("{} peer connected {name} ({peer})", utc_hms());
+        }
+        WatchEvent::PeerDisconnected { peer } => {
+            println!("{} peer disconnected {peer}", utc_hms());
+        }
+        WatchEvent::OffersReceived { peer, spaces } => {
+            println!("{} offers from {peer}: {}", utc_hms(), spaces.join(", "));
+            for name in spaces {
+                println!("  hint: relay space join {name} --from <peer>");
+            }
+        }
+        WatchEvent::RemoteApplied {
+            peer,
+            space,
+            mount,
+            written,
+            deleted,
+            conflicts,
+            skipped,
+        } => {
+            println!(
+                "{} {space}/{mount} from {peer}: {written} written, {deleted} deleted, {conflicts} conflicts, {skipped} skipped",
+                utc_hms()
+            );
+        }
+        WatchEvent::SentChanges {
+            peer,
+            space,
+            entries,
+        } => {
+            println!("{} sent {entries} changes of {space} to {peer}", utc_hms());
+        }
+        WatchEvent::SyncWarning { peer, path, reason } => {
+            eprintln!("warning: {peer} {path}: {reason}");
+        }
     }
 }
 
@@ -445,7 +598,83 @@ fn cmd_init(home: &Path, name: Option<String>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(device)?);
     } else {
-        println!("initialized device {} ({})", device.name, device.id.short());
+        println!("initialized device {} ({})", device.name, device.id);
+    }
+    Ok(())
+}
+
+fn cmd_id(engine: &Engine, json: bool) -> Result<()> {
+    let device = engine.device();
+    if json {
+        println!("{}", serde_json::to_string_pretty(device)?);
+    } else {
+        println!("{} {}", device.id, device.name);
+    }
+    Ok(())
+}
+
+fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
+    match cmd {
+        PeerCmd::Add {
+            name,
+            device_id,
+            addresses,
+        } => {
+            let id: DeviceId = device_id.parse()?;
+            let mut engine = Engine::open(home)?;
+            let peer = engine.add_peer(&name, id, &addresses)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&peer)?);
+            } else {
+                println!("added peer {} ({})", peer.name, peer.id);
+            }
+        }
+        PeerCmd::List => {
+            let engine = Engine::open_read_only(home)?;
+            let peers = engine.peers()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&peers)?);
+            } else if peers.is_empty() {
+                println!("no peers");
+            } else {
+                for peer in peers {
+                    let addrs = if peer.addresses.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        peer.addresses.join(", ")
+                    };
+                    println!("{}  {}  {addrs}", peer.name, peer.id);
+                }
+            }
+        }
+        PeerCmd::Remove { name } => {
+            let mut engine = Engine::open(home)?;
+            engine.remove_peer(&name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"removed": name}))?
+                );
+            } else {
+                println!("removed peer {name}");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_conflicts(engine: &Engine, space: Option<&str>, json: bool) -> Result<()> {
+    let entries = engine.conflicts(space)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("no conflicts");
+        return Ok(());
+    }
+    for entry in entries {
+        println!("{}", entry.key.path);
     }
     Ok(())
 }
@@ -491,6 +720,32 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
         "objects {}  last sequence {}",
         status.object_count, status.last_sequence
     );
+    if status.peers.is_empty() {
+        println!("no peers");
+    } else {
+        println!("peers");
+        for peer in &status.peers {
+            let addrs = if peer.addresses.is_empty() {
+                "-".to_owned()
+            } else {
+                peer.addresses.join(", ")
+            };
+            println!("  {}  {}  {addrs}", peer.name, peer.id);
+            for sp in &peer.spaces {
+                println!(
+                    "    {}: received {} acked {} local {} last {}",
+                    sp.space,
+                    sp.received_seq,
+                    sp.acked_seq,
+                    sp.our_latest_seq,
+                    match sp.last_sync_ms {
+                        Some(ms) => format_utc_ms(ms),
+                        None => "never".to_owned(),
+                    }
+                );
+            }
+        }
+    }
     Ok(())
 }
 

@@ -405,6 +405,113 @@ fn watch_indexes_new_file_then_stops_on_signal() {
         .success();
 }
 
+#[test]
+fn cli_identity_peers_share_and_conflicts() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let a = home_arg(&home_a);
+    let b = home_arg(&home_b);
+
+    relay()
+        .args(["--home", &a, "init", "--name", "alpha"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &b, "init", "--name", "bravo"])
+        .assert()
+        .success();
+
+    let id_out = relay()
+        .args(["--home", &a, "--json", "id"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let id_json: serde_json::Value = serde_json::from_slice(&id_out).unwrap();
+    let a_id = id_json["id"].as_str().unwrap().to_owned();
+    let b_id = {
+        let out = relay()
+            .args(["--home", &b, "--json", "id"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    relay()
+        .args([
+            "--home",
+            &a,
+            "peer",
+            "add",
+            "bravo",
+            &b_id,
+            "--addr",
+            "127.0.0.1:47321",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added peer bravo"));
+    relay()
+        .args(["--home", &b, "peer", "add", "alpha", &a_id])
+        .assert()
+        .success();
+
+    relay()
+        .args(["--home", &a, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &a, "share", "Personal", "bravo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("shared Personal with bravo"));
+
+    let peers = relay()
+        .args(["--home", &a, "--json", "peer", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let peers: serde_json::Value = serde_json::from_slice(&peers).unwrap();
+    assert_eq!(peers[0]["name"], "bravo");
+
+    relay()
+        .args(["--home", &a, "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bravo"));
+
+    relay()
+        .args(["--home", &a, "conflicts"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no conflicts"));
+
+    relay()
+        .args(["--home", &a, "space", "offers"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no offers"));
+
+    relay()
+        .args(["--home", &a, "unshare", "Personal", "bravo"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &a, "peer", "remove", "bravo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed peer bravo"));
+}
+
 fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
