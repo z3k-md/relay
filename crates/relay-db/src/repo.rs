@@ -390,6 +390,48 @@ impl Repo<'_> {
             .collect()
     }
 
+    /// Entries at `prefix` and every path under it (`prefix/...`).
+    ///
+    /// Uses a range query rather than `LIKE`, so `%` and `_` in names are
+    /// literals. The upper bound is `prefix` plus the byte after `'/'`.
+    pub fn entries_under(
+        &self,
+        mount: MountId,
+        prefix: &relay_core::LogicalPath,
+    ) -> Result<Vec<EntryRecord>, DbError> {
+        let mount_blob = mount_bytes(mount);
+        let exact = prefix.as_str();
+        let lower = format!("{exact}/");
+        let upper = format!("{exact}0");
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {ENTRY_SELECT}
+             FROM entries e
+             JOIN devices d ON d.ref = e.modified_by
+             JOIN mounts m ON m.id = e.mount_id
+             WHERE e.mount_id = ?1
+               AND (e.path = ?2 OR (e.path >= ?3 AND e.path < ?4))
+             ORDER BY e.path"
+        ))?;
+        let rows = stmt.query_map(
+            params![mount_blob.as_slice(), exact, lower, upper],
+            Self::map_raw_entry,
+        )?;
+        let raws = collect_raw_entries(rows)?;
+        raws.into_iter()
+            .map(|raw| self.assemble_record(raw))
+            .collect()
+    }
+
+    pub fn count_live(&self, mount: MountId) -> Result<usize, DbError> {
+        let mount_blob = mount_bytes(mount);
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE mount_id = ?1 AND deleted = 0",
+            params![mount_blob.as_slice()],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).map_err(|_| DbError::IntegerOverflow)
+    }
+
     /// Upsert current state (row + full replace of entry_versions) and append a history row.
     /// Unknown DeviceIds in the vector/modified_by are inserted into `devices` with name "unknown".
     /// The record's sequence must be unique.

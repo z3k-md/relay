@@ -706,6 +706,47 @@ fn transaction_rolls_back_on_error() {
     assert_eq!(h.db.repo().space(extra.id).unwrap().as_ref(), Some(&extra));
 }
 
+#[test]
+fn entries_under_is_a_range_not_like() {
+    let h = Harness::new();
+    let vv = vector(&[(1, 1)]);
+    let paths = [
+        "a/b", "a-b", "ab", "a/%weird", "a/_under", "a/plain", "other",
+    ];
+    for (i, p) in paths.iter().enumerate() {
+        let rec = h.record(p, file(b"x", false), (i + 1) as u64, vv.clone(), None, None);
+        h.db.repo().put_entry(&rec).unwrap();
+    }
+    let dir = h.record("a", EntryContent::Directory, 8, vv, None, None);
+    h.db.repo().put_entry(&dir).unwrap();
+
+    let under_a = h.db.repo().entries_under(h.mount.id, &path("a")).unwrap();
+    let got: Vec<_> = under_a.iter().map(|e| e.key.path.as_str()).collect();
+    assert_eq!(got, vec!["a", "a/%weird", "a/_under", "a/b", "a/plain"]);
+
+    let under_ab = h.db.repo().entries_under(h.mount.id, &path("a/b")).unwrap();
+    assert_eq!(under_ab.len(), 1);
+    assert_eq!(under_ab[0].key.path.as_str(), "a/b");
+
+    let sibling = h.db.repo().entries_under(h.mount.id, &path("a-b")).unwrap();
+    assert_eq!(sibling.len(), 1);
+    assert_eq!(sibling[0].key.path.as_str(), "a-b");
+}
+
+#[test]
+fn count_live_skips_tombstones() {
+    let h = Harness::new();
+    let vv = vector(&[(1, 1)]);
+    h.db.repo()
+        .put_entry(&h.record("live.txt", file(b"x", false), 1, vv.clone(), None, None))
+        .unwrap();
+    h.db.repo()
+        .put_entry(&h.record("gone.txt", EntryContent::Deleted, 2, vv, None, None))
+        .unwrap();
+    assert_eq!(h.db.repo().count_live(h.mount.id).unwrap(), 1);
+    assert_eq!(h.db.repo().count_live(MountId::new()).unwrap(), 0);
+}
+
 fn arb_vector() -> impl Strategy<Value = VersionVector> {
     proptest::collection::btree_map(0u8..8, 1u64..10_000, 0..8).prop_map(|map| {
         map.into_iter()
