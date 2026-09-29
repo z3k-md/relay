@@ -269,3 +269,17 @@ before rename) and serves objects from it; it never touches the database.
 - The engine does not depend on `relay-net` or Tokio. `Engine::run` multiplexes
   filesystem events and `SyncInput`s; the daemon maps `NetEvent`/`NetCommand`
   1:1 onto `SyncInput`/`SyncOutput`. `Engine::watch` calls `run` with no sync.
+- Object fetches that fail for a reason other than "not found" are retried up
+  to `MAX_FETCH_ATTEMPTS` times. If an entry's object still cannot be fetched,
+  the receiver records a hole: `received_seq` (persisted and acked) is held
+  below that entry's sender sequence, and after `RESYNC_DELAY` the receiver
+  sends `IndexRequest { after_sequence: hole }`. `IndexBatch.after_sequence`
+  tells the receiver which request a batch answers; a batch starting at or
+  below the hole that applies cleanly clears it. Entries are never dropped
+  silently.
+- Duplicate connections: normally the one dialed by the lower DeviceId is kept.
+  A new connection dialed by the same device as the existing one replaces it,
+  because the old one is stale (the peer restarted or its network changed).
+  Otherwise a restarted peer waited for the idle timeout before reconnecting.
+- Object import calls `sync_all` on a handle opened for writing. On Windows,
+  `FlushFileBuffers` on a read-only handle fails with "Access denied".
