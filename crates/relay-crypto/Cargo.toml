@@ -1,0 +1,20 @@
+[package]
+name = "relay-crypto"
+description = "Relay device identity: Ed25519 keys, self-signed certificates, device id derivation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rcgen.workspace = true
+relay-core.workspace = true
+thiserror.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
