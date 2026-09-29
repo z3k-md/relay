@@ -144,6 +144,11 @@ pub struct IndexBatch {
     /// True when the sender had nothing newer at the time it built the batch.
     #[prost(bool, tag = "4")]
     pub caught_up: bool,
+    /// The batch covers the sender's changes in `(after_sequence,
+    /// through_sequence]`. Lets a receiver tell a re-sent range from newer
+    /// changes.
+    #[prost(uint64, tag = "5")]
+    pub after_sequence: u64,
 }
 
 /// "I have durably applied your changes to this space through
@@ -478,6 +483,7 @@ mod tests {
             entries: vec![entry_to_wire(&record)],
             through_sequence: 42,
             caught_up: true,
+            after_sequence: 0,
         }));
         let bytes = encode_frame(&frame).unwrap();
         let len = frame_len(bytes[..4].try_into().unwrap()).unwrap();

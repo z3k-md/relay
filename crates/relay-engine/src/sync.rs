@@ -17,6 +17,11 @@ use crate::peers::offered_mounts_from_wire;
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_ATTEMPTS: u32 = 3;
+/// Fetches of one object that failed for a reason other than "not found"
+/// before the entries needing it are left for a later re-request.
+const MAX_FETCH_ATTEMPTS: u32 = 3;
+/// Delay before re-requesting a range whose objects could not be fetched.
+const RESYNC_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub enum SyncInput {
@@ -96,15 +101,28 @@ struct Connected {
     name: String,
     send_cursor: HashMap<SpaceId, Sequence>,
     incoming: HashMap<SpaceId, VecDeque<PendingBatch>>,
+    /// Highest peer sequence below which some entry could not be applied
+    /// because its object never arrived. `received_seq` is not advanced past
+    /// it, so a restart or re-request picks those entries up again.
+    holes: HashMap<SpaceId, u64>,
+    resync_at: HashMap<SpaceId, Instant>,
 }
 
 struct PendingBatch {
+    after_sequence: u64,
     through_sequence: u64,
     entries: Vec<RemoteEntry>,
     pending_objects: HashSet<ObjectId>,
     failed_objects: HashSet<ObjectId>,
+    fetch_attempts: HashMap<ObjectId, u32>,
     attempts: u32,
     retry_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fetch {
+    Ok,
+    Failed { not_found: bool },
 }
 
 #[derive(Default)]
@@ -136,20 +154,23 @@ impl Syncer {
                 self.on_frame(engine, peer, body, out, &mut events)?;
             }
             SyncInput::ObjectFetched { peer, object } => {
-                self.on_object(engine, peer, object, true, out, &mut events)?;
+                self.on_object(engine, peer, object, Fetch::Ok, out, &mut events)?;
             }
             SyncInput::ObjectFetchFailed {
                 peer,
                 object,
+                not_found,
                 reason,
-                ..
             } => {
-                events.push(SyncEvent::SyncWarning {
+                tracing::debug!(%peer, %object, not_found, %reason, "object fetch failed");
+                self.on_object(
+                    engine,
                     peer,
-                    path: object.to_string(),
-                    reason,
-                });
-                self.on_object(engine, peer, object, false, out, &mut events)?;
+                    object,
+                    Fetch::Failed { not_found },
+                    out,
+                    &mut events,
+                )?;
             }
         }
         Ok(events)
@@ -189,6 +210,29 @@ impl Syncer {
                 .get(&peer)
                 .map(|c| c.incoming.keys().copied().collect())
                 .unwrap_or_default();
+            let resync_due: Vec<(SpaceId, u64)> = self
+                .connected
+                .get(&peer)
+                .map(|c| {
+                    c.resync_at
+                        .iter()
+                        .filter(|(_, at)| now >= **at)
+                        .filter_map(|(space, _)| c.holes.get(space).map(|h| (*space, *h)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (space, hole) in resync_due {
+                if let Some(conn) = self.connected.get_mut(&peer) {
+                    conn.resync_at.remove(&space);
+                }
+                out(SyncOutput::Send {
+                    peer,
+                    body: frame::Body::IndexRequest(IndexRequest {
+                        space_id: space_id_bytes(&space),
+                        after_sequence: hole,
+                    }),
+                });
+            }
             for space in spaces {
                 let due = self
                     .connected
@@ -227,6 +271,8 @@ impl Syncer {
                 name: name.clone(),
                 send_cursor: HashMap::new(),
                 incoming: HashMap::new(),
+                holes: HashMap::new(),
+                resync_at: HashMap::new(),
             },
         );
         events.push(SyncEvent::PeerConnected {
@@ -401,6 +447,7 @@ impl Syncer {
                 entries: changes.iter().map(entry_to_wire).collect(),
                 through_sequence: through.0,
                 caught_up,
+                after_sequence: after.0,
             };
             out(SyncOutput::Send {
                 peer,
@@ -469,10 +516,12 @@ impl Syncer {
         }
 
         let pending_batch = PendingBatch {
+            after_sequence: batch.after_sequence,
             through_sequence: batch.through_sequence,
             entries,
             pending_objects: pending,
             failed_objects: HashSet::new(),
+            fetch_attempts: HashMap::new(),
             attempts: 0,
             retry_at: None,
         };
@@ -490,7 +539,7 @@ impl Syncer {
         engine: &mut Engine,
         peer: DeviceId,
         object: ObjectId,
-        ok: bool,
+        fetch: Fetch,
         out: &mut dyn FnMut(SyncOutput),
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
@@ -503,11 +552,18 @@ impl Syncer {
             if let Some(conn) = self.connected.get_mut(&peer)
                 && let Some(queue) = conn.incoming.get_mut(&space)
                 && let Some(head) = queue.front_mut()
-                && head.pending_objects.remove(&object)
+                && head.pending_objects.contains(&object)
             {
-                if !ok {
+                if let Fetch::Failed { not_found } = fetch {
+                    let attempts = head.fetch_attempts.entry(object).or_insert(0);
+                    *attempts += 1;
+                    if !not_found && *attempts < MAX_FETCH_ATTEMPTS {
+                        out(SyncOutput::FetchObject { peer, object });
+                        continue;
+                    }
                     head.failed_objects.insert(object);
                 }
+                head.pending_objects.remove(&object);
                 self.process_head(engine, peer, space, out, events)?;
             }
         }
@@ -554,7 +610,13 @@ impl Syncer {
 
         let entries = head.entries.clone();
         let failed = head.failed_objects.clone();
-        let through = head.through_sequence;
+        let batch_after = head.after_sequence;
+        let batch_through = head.through_sequence;
+        let failed_min = entries
+            .iter()
+            .filter(|e| e.content.object().is_some_and(|o| failed.contains(&o)))
+            .map(|e| e.sequence.0)
+            .min();
 
         let outcome = engine.apply_remote_batch(peer, space, entries, &failed)?;
         for w in &outcome.warnings {
@@ -586,6 +648,33 @@ impl Syncer {
             return Ok(());
         }
 
+        let through = match self.connected.get_mut(&peer) {
+            Some(conn) => {
+                if let Some(min) = failed_min {
+                    let hole = min.saturating_sub(1);
+                    let hole = conn.holes.get(&space).map_or(hole, |h| (*h).min(hole));
+                    conn.holes.insert(space, hole);
+                    conn.resync_at
+                        .entry(space)
+                        .or_insert_with(|| Instant::now() + RESYNC_DELAY);
+                    events.push(SyncEvent::SyncWarning {
+                        peer,
+                        path: String::new(),
+                        reason: format!(
+                            "{} objects could not be fetched; will re-request them",
+                            failed.len()
+                        ),
+                    });
+                } else if conn.holes.get(&space).is_some_and(|h| batch_after <= *h) {
+                    conn.holes.remove(&space);
+                    conn.resync_at.remove(&space);
+                }
+                conn.holes
+                    .get(&space)
+                    .map_or(batch_through, |h| (*h).min(batch_through))
+            }
+            None => batch_through,
+        };
         let now = engine.clock.now_ms();
         engine
             .db

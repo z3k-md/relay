@@ -1,6 +1,6 @@
 //! Deterministic in-process two-engine sync harness.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -77,6 +77,8 @@ struct Harness {
     sb: Syncer,
     /// Fail on any sync warning (skipped entry, bounded re-evaluation, ...).
     strict: bool,
+    /// Objects whose fetches fail (as a transient error) while present here.
+    broken_objects: HashSet<ObjectId>,
 }
 
 impl Harness {
@@ -103,6 +105,7 @@ impl Harness {
             sa: Syncer::new(),
             sb: Syncer::new(),
             strict: true,
+            broken_objects: HashSet::new(),
         }
     }
 
@@ -162,6 +165,30 @@ impl Harness {
         self.pump(q, None);
     }
 
+    fn tick_b(&mut self, now: std::time::Instant) {
+        let mut outs = Vec::new();
+        self.sb
+            .tick(&mut self.b, now, &mut |o| outs.push(o))
+            .unwrap();
+        let q = VecDeque::new();
+        let mut outputs: VecDeque<(bool, SyncOutput)> =
+            outs.into_iter().map(|o| (false, o)).collect();
+        // Deliver B's outputs, then pump everything to quiescence.
+        let mut q2 = q;
+        while let Some((from_a, output)) = outputs.pop_front() {
+            if let SyncOutput::Send { body, .. } = output {
+                q2.push_back((
+                    !from_a,
+                    SyncInput::Frame {
+                        peer: self.id_b(),
+                        body,
+                    },
+                ));
+            }
+        }
+        self.pump(q2, None);
+    }
+
     fn push_both(&mut self) {
         self.pump(VecDeque::new(), Some(true));
     }
@@ -209,7 +236,16 @@ impl Harness {
                     } else {
                         (&self.a, &self.b, self.id_a())
                     };
-                    let input = copy_object(src, dst, from_peer, object);
+                    let input = if self.broken_objects.contains(&object) {
+                        SyncInput::ObjectFetchFailed {
+                            peer: from_peer,
+                            object,
+                            not_found: false,
+                            reason: "simulated I/O error".into(),
+                        }
+                    } else {
+                        copy_object(src, dst, from_peer, object)
+                    };
                     q.push_back((from_a, input));
                 }
             }
@@ -422,6 +458,42 @@ fn concurrent_edits_of_just_modified_files_resolve_on_both_sides() {
 }
 
 #[test]
+fn failed_fetches_are_re_requested_instead_of_dropped() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("keep.txt", b"k")]);
+    h.strict = false;
+    let broken: &[u8] = b"cannot be fetched yet";
+    fs::write(h.mount_a.path().join("big.bin"), broken).unwrap();
+    fs::write(h.mount_a.path().join("ok.txt"), b"fine").unwrap();
+    h.broken_objects.insert(ObjectId::of(broken));
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert_eq!(fs::read(h.mount_b.path().join("ok.txt")).unwrap(), b"fine");
+    assert!(!h.mount_b.path().join("big.bin").exists());
+
+    // Still failing when the re-request fires: nothing is lost, still pending.
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(31);
+    h.tick_b(later);
+    assert!(!h.mount_b.path().join("big.bin").exists());
+
+    // Fault clears; the next re-request delivers the file.
+    h.broken_objects.clear();
+    h.tick_b(later + std::time::Duration::from_secs(31));
+    assert_eq!(fs::read(h.mount_b.path().join("big.bin")).unwrap(), broken);
+
+    // And a restart would not have lost it either: the watermark held.
+    h.strict = true;
+    h.disconnect();
+    h.connect();
+    h.push_both();
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+}
+
+#[test]
 fn delete_vs_modify_modify_wins() {
     let mut h = Harness::pair();
     h.setup_shared_space(&[("x.txt", b"old"), ("keep.txt", b"k")]);
@@ -590,6 +662,7 @@ fn hostile_symlink_escape_is_skipped() {
         entries: vec![wire],
         through_sequence: local.sequence.0 + 10,
         caught_up: true,
+        after_sequence: 0,
     };
     h.drive(
         SyncInput::Frame {
