@@ -5,14 +5,14 @@ use std::fs;
 use std::path::Path;
 
 use relay_core::{DeviceId, ObjectId};
-use relay_engine::{Engine, EngineConfig, ScanOptions, SyncInput, SyncOutput, Syncer};
+use relay_engine::{Engine, EngineConfig, ScanOptions, SyncEvent, SyncInput, SyncOutput, Syncer};
 use relay_proto::{IndexBatch, entry_to_wire, frame, space_id_bytes};
 use tempfile::TempDir;
 
-fn init(home: &Path, name: &str) -> Engine {
-    Engine::init(home, name).unwrap().with_config(EngineConfig {
-        racy_window: std::time::Duration::ZERO,
-    })
+fn init(home: &Path, name: &str, racy_window: std::time::Duration) -> Engine {
+    Engine::init(home, name)
+        .unwrap()
+        .with_config(EngineConfig { racy_window })
 }
 
 fn write_tree(root: &Path, files: &[(&str, &[u8])]) {
@@ -75,16 +75,24 @@ struct Harness {
     b: Engine,
     sa: Syncer,
     sb: Syncer,
+    /// Fail on any sync warning (skipped entry, bounded re-evaluation, ...).
+    strict: bool,
 }
 
 impl Harness {
     fn pair() -> Self {
+        Self::pair_with_racy_window(std::time::Duration::ZERO)
+    }
+
+    /// A huge racy window makes every recorded stat `None`, as for files
+    /// edited moments before a remote update arrives.
+    fn pair_with_racy_window(racy_window: std::time::Duration) -> Self {
         let home_a = TempDir::new().unwrap();
         let home_b = TempDir::new().unwrap();
         let mount_a = TempDir::new().unwrap();
         let mount_b = TempDir::new().unwrap();
-        let a = init(home_a.path(), "alpha");
-        let b = init(home_b.path(), "bravo");
+        let a = init(home_a.path(), "alpha", racy_window);
+        let b = init(home_b.path(), "bravo", racy_window);
         Self {
             _home_a: home_a,
             _home_b: home_b,
@@ -94,6 +102,7 @@ impl Harness {
             b,
             sa: Syncer::new(),
             sb: Syncer::new(),
+            strict: true,
         }
     }
 
@@ -161,17 +170,17 @@ impl Harness {
         let mut outputs: VecDeque<(bool, SyncOutput)> = VecDeque::new();
         let mut steps = 0;
         if push == Some(true) {
-            collect_push(&mut self.sa, &mut self.a, true, &mut outputs);
-            collect_push(&mut self.sb, &mut self.b, false, &mut outputs);
+            collect_push(&mut self.sa, &mut self.a, true, &mut outputs, self.strict);
+            collect_push(&mut self.sb, &mut self.b, false, &mut outputs, self.strict);
         }
         loop {
             steps += 1;
             assert!(steps < 50_000, "sync pump did not go quiet");
             if let Some((to_a, input)) = q.pop_front() {
                 let outs = if to_a {
-                    take_handle(&mut self.sa, &mut self.a, input)
+                    take_handle(&mut self.sa, &mut self.a, input, self.strict)
                 } else {
-                    take_handle(&mut self.sb, &mut self.b, input)
+                    take_handle(&mut self.sb, &mut self.b, input, self.strict)
                 };
                 for o in outs {
                     outputs.push_back((to_a, o));
@@ -232,9 +241,29 @@ impl Harness {
     }
 }
 
-fn take_handle(syncer: &mut Syncer, engine: &mut Engine, input: SyncInput) -> Vec<SyncOutput> {
+fn assert_no_warnings(events: &[SyncEvent], strict: bool) {
+    if !strict {
+        return;
+    }
+    for event in events {
+        if let SyncEvent::SyncWarning { path, reason, .. } = event {
+            panic!("unexpected sync warning for {path}: {reason}");
+        }
+        if let SyncEvent::RemoteApplied { skipped, .. } = event {
+            assert_eq!(*skipped, 0, "unexpected skipped entries: {events:?}");
+        }
+    }
+}
+
+fn take_handle(
+    syncer: &mut Syncer,
+    engine: &mut Engine,
+    input: SyncInput,
+    strict: bool,
+) -> Vec<SyncOutput> {
     let mut outs = Vec::new();
-    syncer.handle(engine, input, &mut |o| outs.push(o)).unwrap();
+    let events = syncer.handle(engine, input, &mut |o| outs.push(o)).unwrap();
+    assert_no_warnings(&events, strict);
     outs
 }
 
@@ -243,11 +272,13 @@ fn collect_push(
     engine: &mut Engine,
     _from_a: bool,
     outputs: &mut VecDeque<(bool, SyncOutput)>,
+    strict: bool,
 ) {
     let mut outs = Vec::new();
-    syncer
+    let events = syncer
         .push_local_changes(engine, &mut |o| outs.push(o))
         .unwrap();
+    assert_no_warnings(&events, strict);
     for o in outs {
         outputs.push_back((_from_a, o));
     }
@@ -354,6 +385,40 @@ fn concurrent_edits_same_winner_and_conflict_copy() {
     h.push_both();
     assert_eq!(before, index_triples(&h.a, "Personal", "code"));
     assert_eq!(before, index_triples(&h.b, "Personal", "code"));
+}
+
+#[test]
+fn concurrent_edits_of_just_modified_files_resolve_on_both_sides() {
+    for racy_window in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(3600),
+    ] {
+        let mut h = Harness::pair_with_racy_window(racy_window);
+        h.setup_shared_space(&[("foo.go", b"base"), ("dir/x", b"x")]);
+        fs::write(h.mount_a.path().join("foo.go"), b"alpha").unwrap();
+        fs::write(h.mount_b.path().join("foo.go"), b"bravo").unwrap();
+        h.a.scan("Personal", "code", ScanOptions::default())
+            .unwrap();
+        h.b.scan("Personal", "code", ScanOptions::default())
+            .unwrap();
+        h.push_both();
+        h.push_both();
+        assert_eq!(live_files(h.mount_a.path()), live_files(h.mount_b.path()));
+        let files = live_files(h.mount_a.path());
+        let contents: BTreeSet<&[u8]> = files.iter().map(|(_, b)| b.as_slice()).collect();
+        assert!(
+            contents.contains(&b"alpha"[..]),
+            "{racy_window:?}: {files:?}"
+        );
+        assert!(
+            contents.contains(&b"bravo"[..]),
+            "{racy_window:?}: {files:?}"
+        );
+        assert_eq!(
+            index_triples(&h.a, "Personal", "code"),
+            index_triples(&h.b, "Personal", "code")
+        );
+    }
 }
 
 #[test]
@@ -497,6 +562,7 @@ fn reconnect_after_drop_and_restart_sends_only_new_changes() {
 #[test]
 fn hostile_symlink_escape_is_skipped() {
     let mut h = Harness::pair();
+    h.strict = false;
     h.setup_shared_space(&[("safe.txt", b"ok")]);
     let outside = TempDir::new().unwrap();
     std::os::unix::fs::symlink(outside.path(), h.mount_b.path().join("evil")).unwrap();
@@ -562,6 +628,7 @@ fn large_batch_converges() {
 #[test]
 fn nonempty_dir_tombstone_is_kept() {
     let mut h = Harness::pair();
+    h.strict = false;
     h.pair_peers();
     h.a.create_space("Personal").unwrap();
     h.a.add_mount("Personal", "code", h.mount_a.path(), &[], &[])

@@ -396,7 +396,7 @@ impl Engine {
             let counter = loser.vector.get(&loser.modified_by);
             let path = conflict_path(&remote.key.path, &loser.modified_by, counter)
                 .map_err(EngineError::InvalidName)?;
-            if let Err(step) = self.materialize_content(&root, &path, &loser.content, loser.stat)? {
+            if let Err(step) = self.materialize_conflict_copy(&root, &path, &loser.content)? {
                 return Ok(step);
             }
             let copy_key = EntryKey {
@@ -417,12 +417,44 @@ impl Engine {
             copy_path = Some((path, copy));
         }
 
+        let mut path_stat = None;
         if winner_remote {
-            match self.materialize_content(&root, &remote.key.path, &winner.content, local.stat)? {
-                Ok(()) => {}
-                Err(TryApply::Rescan) => return Ok(TryApply::Rescan),
-                Err(other) => return Ok(other),
+            match &winner.content {
+                EntryContent::File {
+                    object, executable, ..
+                } => match self.materialize_remote_file(
+                    remote,
+                    Some(local),
+                    &root,
+                    *object,
+                    *executable,
+                )? {
+                    MaterializeStep::Done(stat) => path_stat = stat,
+                    MaterializeStep::Rescan => return Ok(TryApply::Rescan),
+                },
+                EntryContent::Directory => {
+                    let dest = dest_path(&root, &remote.key.path)?;
+                    let occupied_by_file = fs::symlink_metadata(&dest)
+                        .map(|m| !m.is_dir() || m.file_type().is_symlink())
+                        .unwrap_or(false);
+                    if occupied_by_file {
+                        if !file_still_matches(Some(local), &dest, &self.store)? {
+                            return Ok(TryApply::Rescan);
+                        }
+                        fs::remove_file(&dest).map_err(EngineError::Io)?;
+                    }
+                    ensure_real_dir_chain(&root, &dest)?;
+                }
+                other => {
+                    if let Err(step) =
+                        self.materialize_content(&root, &remote.key.path, other, None)?
+                    {
+                        return Ok(step);
+                    }
+                }
             }
+        } else {
+            path_stat = local.stat;
         }
 
         let now = self.clock.now_ms();
@@ -461,7 +493,7 @@ impl Engine {
                 sequence,
                 modified_by: winner_modified_by,
                 modified_at_unix_ms: winner_modified_at,
-                stat: None,
+                stat: path_stat,
             };
             repo.put_entry(&record)?;
             Ok::<(), EngineError>(())
@@ -506,6 +538,31 @@ impl Engine {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Write the losing version to its (new) conflict-copy path. An existing
+    /// file there with the same bytes is a previous attempt; anything else
+    /// means the path is taken and the whole entry is skipped so the local
+    /// version is never overwritten without its copy.
+    fn materialize_conflict_copy(
+        &mut self,
+        root: &Path,
+        path: &LogicalPath,
+        content: &EntryContent,
+    ) -> Result<Result<(), TryApply>, EngineError> {
+        if let EntryContent::File { object, .. } = content {
+            let dest = dest_path(root, path)?;
+            if fs::symlink_metadata(&dest).is_ok() {
+                return match self.store.hash_file(&dest, None) {
+                    Ok(outcome) if outcome.id == *object => Ok(Ok(())),
+                    _ => Ok(Err(TryApply::Done(ApplyResult::Skipped(
+                        path.to_string(),
+                        "conflict copy path is already taken".into(),
+                    )))),
+                };
+            }
+        }
+        self.materialize_content(root, path, content, None)
     }
 
     fn materialize_content(
