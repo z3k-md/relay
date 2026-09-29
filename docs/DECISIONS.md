@@ -223,7 +223,7 @@ Order inside a batch, both when a sender assigns sequences in a scan and when
 a receiver applies: tombstones of files, tombstones of directories (deepest
 first), directory creations, file and symlink writes outside `.git`, `.git`
 content other than refs, and finally `.git` refs (`HEAD`, `ORIG_HEAD`,
-`FETCH_HEAD`, `packed-refs`, `refs/**`, `index`). Deleting before creating
+`FETCH_HEAD`, `MERGE_HEAD`, `packed-refs`, `refs/**`, `index`). Deleting before creating
 makes case-only renames safe on case-insensitive filesystems; refs last keeps
 objects-before-refs (D1) even when a large change spans batches.
 
