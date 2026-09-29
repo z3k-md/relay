@@ -85,6 +85,36 @@ pub struct StatHint {
     pub file_id: Option<u64>,
 }
 
+impl StatHint {
+    /// Pure conversion from metadata the caller already fetched.
+    pub fn from_metadata(meta: &std::fs::Metadata) -> StatHint {
+        let mtime_ns = match meta.modified() {
+            Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
+                Err(before) => -i64::try_from(before.duration().as_nanos()).unwrap_or(i64::MAX),
+            },
+            Err(_) => 0,
+        };
+        StatHint {
+            size: meta.len(),
+            mtime_ns,
+            file_id: file_id(meta),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.ino())
+}
+
+// `MetadataExt::file_index` is still unstable on Windows; size + mtime only.
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
 /// The current state of one entry in a device's index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryRecord {

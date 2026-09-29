@@ -7,4 +7,7 @@ pub enum CoreError {
 
     #[error("invalid identifier {value:?}: {reason}")]
     InvalidId { value: String, reason: &'static str },
+
+    #[error("invalid name {name:?}: {reason}")]
+    InvalidName { name: String, reason: &'static str },
 }
