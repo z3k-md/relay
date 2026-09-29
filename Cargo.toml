@@ -28,9 +28,11 @@ relay-engine = { path = "crates/relay-engine" }
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 directories = "5"
 globset = "0.4"
 hex = "0.4"
+notify = "8"
 proptest = "1"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
