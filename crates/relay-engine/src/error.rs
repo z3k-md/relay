@@ -16,6 +16,32 @@ pub enum EngineError {
     #[error("relay is already initialized")]
     AlreadyInitialized,
 
+    #[error(
+        "this Relay home predates device keys or the key does not match the database; re-init with a fresh home (RELAY_HOME)"
+    )]
+    StaleIdentity { home: PathBuf },
+
+    #[error("unknown peer {0:?}")]
+    UnknownPeer(String),
+
+    #[error("peer {0:?} already exists")]
+    DuplicatePeer(String),
+
+    #[error("space {name:?} already exists with a different id")]
+    SpaceIdConflict { name: String },
+
+    #[error("no offer for {0:?} from that peer")]
+    UnknownOffer(String),
+
+    #[error("mount {mount:?} in space {space:?} is already attached")]
+    MountAlreadyAttached { space: String, mount: String },
+
+    #[error(transparent)]
+    Crypto(#[from] relay_crypto::CryptoError),
+
+    #[error(transparent)]
+    Proto(#[from] relay_proto::ProtoError),
+
     #[error("unknown space {0:?}")]
     UnknownSpace(String),
 

@@ -766,6 +766,26 @@ fn init_and_open_guards() {
 }
 
 #[test]
+fn init_writes_identity_and_open_requires_matching_key() {
+    let home = new_home();
+    let engine = Engine::init(home.path(), "one").unwrap();
+    let id = engine.device().id;
+    let loaded = engine.load_identity().unwrap();
+    assert_eq!(loaded.device_id(), id);
+    drop(engine);
+
+    let reopened = Engine::open(home.path()).unwrap();
+    assert_eq!(reopened.device().id, id);
+    drop(reopened);
+
+    std::fs::remove_dir_all(home.path().join("identity")).unwrap();
+    assert!(matches!(
+        Engine::open(home.path()),
+        Err(EngineError::StaleIdentity { .. })
+    ));
+}
+
+#[test]
 fn second_writer_is_busy_reader_works_and_lock_releases_on_drop() {
     let home = new_home();
     let engine = Engine::init(home.path(), "one").unwrap();

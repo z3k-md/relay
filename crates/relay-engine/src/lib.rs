@@ -27,6 +27,7 @@ pub use relay_core::{
 pub use relay_db::{HistoryRecord, MountConfig};
 pub use relay_fs::{FsError, ScanWarning};
 pub use relay_store::ObjectStore;
+pub use relay_crypto::DeviceIdentity;
 pub use reports::{
     GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR, MountStatus,
     ScanOptions, ScanReport, Status, VerifyReport, Warning,
@@ -36,6 +37,7 @@ pub use watch::{WatchEvent, WatchOptions};
 const DB_FILE: &str = "relay.db";
 const STORE_DIR: &str = "store";
 const LOGS_DIR: &str = "logs";
+const IDENTITY_DIR: &str = "identity";
 const LOCK_FILE: &str = "relay.lock";
 const TMP_CLEAN_AGE: Duration = Duration::from_secs(60 * 60);
 
@@ -91,12 +93,15 @@ impl Engine {
         validate_name(device_name)?;
         ensure_layout(home)?;
         let lock = acquire_lock(home)?;
+        // Key first, then the DB row: a crash cannot leave a database with no
+        // identity. If the key exists from a previous interrupted init, reuse it.
+        let identity = load_or_generate_identity(&home.join(IDENTITY_DIR))?;
         let mut db = Database::open(&home.join(DB_FILE))?;
         if db.repo().local_device()?.is_some() {
             return Err(EngineError::AlreadyInitialized);
         }
         let device = Device {
-            id: DeviceId::random(),
+            id: identity.device_id(),
             name: device_name.to_owned(),
         };
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -128,6 +133,8 @@ impl Engine {
             .local_device()
             .map_err(EngineError::from_db)?
             .ok_or(EngineError::NotInitialized)?;
+        let identity = require_matching_identity(home, local.device.id)?;
+        let _ = identity;
         let store = ObjectStore::open(home.join(STORE_DIR))?;
         Ok(Engine {
             home: home.to_path_buf(),
@@ -152,6 +159,8 @@ impl Engine {
             .local_device()
             .map_err(EngineError::from_db)?
             .ok_or(EngineError::NotInitialized)?;
+        let identity = require_matching_identity(home, local.device.id)?;
+        let _ = identity;
         let store = ObjectStore::open(home.join(STORE_DIR))?;
         Ok(Engine {
             home: home.to_path_buf(),
@@ -180,6 +189,23 @@ impl Engine {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn identity_dir(&self) -> PathBuf {
+        self.home.join(IDENTITY_DIR)
+    }
+
+    pub fn load_identity(&self) -> Result<DeviceIdentity, EngineError> {
+        DeviceIdentity::load(&self.identity_dir()).map_err(|err| match err {
+            relay_crypto::CryptoError::Io { .. } => EngineError::StaleIdentity {
+                home: self.home.clone(),
+            },
+            other => EngineError::Crypto(other),
+        })
+    }
+
+    pub fn store(&self) -> &ObjectStore {
+        &self.store
     }
 
     pub fn create_space(&mut self, name: &str) -> Result<Space, EngineError> {
@@ -605,6 +631,36 @@ fn ensure_layout(home: &Path) -> Result<(), EngineError> {
     fs::create_dir_all(home)?;
     fs::create_dir_all(home.join(LOGS_DIR))?;
     Ok(())
+}
+
+fn load_or_generate_identity(dir: &Path) -> Result<DeviceIdentity, EngineError> {
+    if DeviceIdentity::exists(dir) {
+        return Ok(DeviceIdentity::load(dir)?);
+    }
+    match DeviceIdentity::generate(dir) {
+        Ok(identity) => Ok(identity),
+        Err(relay_crypto::CryptoError::KeyExists(_)) => Ok(DeviceIdentity::load(dir)?),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn require_matching_identity(home: &Path, expected: DeviceId) -> Result<DeviceIdentity, EngineError> {
+    let dir = home.join(IDENTITY_DIR);
+    let identity = match DeviceIdentity::load(&dir) {
+        Ok(identity) => identity,
+        Err(relay_crypto::CryptoError::Io { .. }) => {
+            return Err(EngineError::StaleIdentity {
+                home: home.to_path_buf(),
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if identity.device_id() != expected {
+        return Err(EngineError::StaleIdentity {
+            home: home.to_path_buf(),
+        });
+    }
+    Ok(identity)
 }
 
 fn acquire_lock(home: &Path) -> Result<File, EngineError> {
