@@ -11,7 +11,10 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 pub use error::DbError;
-pub use repo::{HistoryRecord, LocalDevice, MountConfig, MountState, Repo};
+pub use repo::{
+    HistoryRecord, LocalDevice, MountConfig, MountState, OfferedMount, PeerOfferRow, PeerRecord,
+    Repo, StoredOffer, SyncProgress,
+};
 
 #[derive(Debug)]
 pub struct Database {

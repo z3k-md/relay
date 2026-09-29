@@ -113,13 +113,13 @@ fn migrations_are_idempotent_on_reopen() {
     let path = dir.path().join("nested").join("relay.sqlite");
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
     }
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
         db.repo().init_local_device(&device(9, "again"), 1).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
     }
 }
 
@@ -137,7 +137,7 @@ fn schema_too_new_is_rejected() {
         err,
         DbError::SchemaTooNew {
             found: 99,
-            supported: 3
+            supported: 4
         }
     ));
 }
@@ -180,7 +180,7 @@ fn v1_database_upgrades_to_current_without_data_loss() {
     write_v1_db(&path);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 3);
+    assert_eq!(db.schema_version().unwrap(), 4);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -215,7 +215,7 @@ fn upgrade_collapses_duplicate_history_rows() {
     }
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 3);
+    assert_eq!(db.schema_version().unwrap(), 4);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
@@ -235,7 +235,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooOld {
                 found: 1,
-                supported: 3
+                supported: 4
             }
         ),
         "{err}"
@@ -258,7 +258,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooNew {
                 found: 99,
-                supported: 3
+                supported: 4
             }
         ),
         "{err}"
@@ -280,7 +280,7 @@ fn open_read_only_reads_without_writing() {
         db.repo().create_space(&space, 1).unwrap();
     }
     let db = Database::open_read_only(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 3);
+    assert_eq!(db.schema_version().unwrap(), 4);
     let names: Vec<_> = db
         .repo()
         .list_spaces()
@@ -491,15 +491,16 @@ fn put_entry_round_trips_all_content_kinds_and_history() {
         Some(&deleted_rec)
     );
 
-    let unknown: Vec<_> = repo
+    let placeholders: Vec<_> = repo
         .list_devices()
         .unwrap()
         .into_iter()
-        .filter(|d| d.name == "unknown")
+        .filter(|d| d.name == DeviceId::from_bytes([2; 32]).short()
+            || d.name == DeviceId::from_bytes([3; 32]).short())
         .map(|d| d.id)
         .collect();
-    assert!(unknown.contains(&DeviceId::from_bytes([2; 32])));
-    assert!(unknown.contains(&DeviceId::from_bytes([3; 32])));
+    assert!(placeholders.contains(&DeviceId::from_bytes([2; 32])));
+    assert!(placeholders.contains(&DeviceId::from_bytes([3; 32])));
 
     let updated = h.record(
         "src/a.rs",
@@ -745,6 +746,120 @@ fn count_live_skips_tombstones() {
         .unwrap();
     assert_eq!(h.db.repo().count_live(h.mount.id).unwrap(), 1);
     assert_eq!(h.db.repo().count_live(MountId::new()).unwrap(), 0);
+}
+
+#[test]
+fn peers_shares_offers_and_progress() {
+    let h = Harness::new();
+    let peer_dev = device(9, "laptop");
+    let peer = h
+        .db
+        .repo()
+        .add_peer(&peer_dev, &["127.0.0.1:47321".into()], 5_000)
+        .unwrap();
+    assert_eq!(peer.device.name, "laptop");
+    assert_eq!(h.db.repo().list_peers().unwrap().len(), 1);
+    assert!(h.db.repo().peer_by_name("laptop").unwrap().is_some());
+    assert!(h.db.repo().peer_by_id(peer_dev.id).unwrap().is_some());
+
+    h.db.repo().share_space(h.space.id, peer_dev.id).unwrap();
+    assert!(h.db.repo().is_shared(h.space.id, peer_dev.id).unwrap());
+    assert_eq!(
+        h.db.repo().shared_space_ids(peer_dev.id).unwrap(),
+        vec![h.space.id]
+    );
+
+    let offer = crate::PeerOfferRow {
+        space_id: SpaceId::new(),
+        name: "Work".into(),
+        mounts: vec![crate::OfferedMount {
+            id: MountId::new(),
+            name: "mods".into(),
+        }],
+    };
+    h.db
+        .repo()
+        .replace_peer_offers(peer_dev.id, &[offer.clone()], 6_000)
+        .unwrap();
+    let listed = h.db.repo().list_offers().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "Work");
+    h.db
+        .repo()
+        .replace_peer_offers(peer_dev.id, &[], 7_000)
+        .unwrap();
+    assert!(h.db.repo().list_offers().unwrap().is_empty());
+
+    h.db
+        .repo()
+        .set_received_seq(peer_dev.id, h.space.id, Sequence(12), 8_000)
+        .unwrap();
+    h.db
+        .repo()
+        .set_acked_seq(peer_dev.id, h.space.id, Sequence(4), 8_100)
+        .unwrap();
+    let progress = h.db.repo().sync_progress(peer_dev.id, h.space.id).unwrap();
+    assert_eq!(progress.received_seq, Sequence(12));
+    assert_eq!(progress.acked_seq, Sequence(4));
+    h.db.repo().reset_received_seq_for_space(h.space.id).unwrap();
+    let progress = h.db.repo().sync_progress(peer_dev.id, h.space.id).unwrap();
+    assert_eq!(progress.received_seq, Sequence(0));
+    assert_eq!(progress.acked_seq, Sequence(4));
+
+    assert!(h.db.repo().remove_peer_by_name("laptop").unwrap());
+    assert!(h.db.repo().list_peers().unwrap().is_empty());
+    assert!(!h.db.repo().is_shared(h.space.id, peer_dev.id).unwrap());
+    assert_eq!(
+        h.db.repo().sync_progress(peer_dev.id, h.space.id).unwrap().received_seq,
+        Sequence(0)
+    );
+}
+
+#[test]
+fn changes_since_in_space_filters_by_mount_space() {
+    let h = Harness::new();
+    let other = space("Other");
+    let other_mount = mount(other.id, "docs");
+    h.db.repo().create_space(&other, 1_000).unwrap();
+    h.db.repo().create_mount(&other_mount, 1_000).unwrap();
+
+    let vv = vector(&[(1, 1)]);
+    h.db
+        .repo()
+        .put_entry(&h.record("a.txt", file(b"a", false), 1, vv.clone(), None, None))
+        .unwrap();
+    let other_rec = EntryRecord {
+        key: key(other.id, other_mount.id, "b.txt"),
+        content: file(b"b", false),
+        vector: vv,
+        parent_object: None,
+        sequence: Sequence(2),
+        modified_by: h.local.id,
+        modified_at_unix_ms: 2_000,
+        stat: None,
+    };
+    h.db.repo().put_entry(&other_rec).unwrap();
+
+    let in_personal = h
+        .db
+        .repo()
+        .changes_since_in_space(h.space.id, Sequence(0), 100)
+        .unwrap();
+    assert_eq!(in_personal.len(), 1);
+    assert_eq!(in_personal[0].key.path.as_str(), "a.txt");
+
+    let in_other = h
+        .db
+        .repo()
+        .changes_since_in_space(other.id, Sequence(0), 100)
+        .unwrap();
+    assert_eq!(in_other.len(), 1);
+    assert_eq!(in_other[0].key.path.as_str(), "b.txt");
+
+    assert_eq!(
+        h.db.repo().max_sequence_in_space(h.space.id).unwrap(),
+        Sequence(1)
+    );
 }
 
 fn arb_vector() -> impl Strategy<Value = VersionVector> {

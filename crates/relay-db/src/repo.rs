@@ -39,6 +39,42 @@ pub struct MountConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerRecord {
+    pub device: Device,
+    pub addresses: Vec<String>,
+    pub added_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OfferedMount {
+    pub id: MountId,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerOfferRow {
+    pub space_id: SpaceId,
+    pub name: String,
+    pub mounts: Vec<OfferedMount>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredOffer {
+    pub peer: Device,
+    pub space_id: SpaceId,
+    pub name: String,
+    pub mounts: Vec<OfferedMount>,
+    pub received_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncProgress {
+    pub received_seq: Sequence,
+    pub acked_seq: Sequence,
+    pub last_sync_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountState {
     pub last_scan_ms: Option<i64>,
     pub last_full_scan_ms: Option<i64>,
@@ -433,7 +469,8 @@ impl Repo<'_> {
     }
 
     /// Upsert current state (row + full replace of entry_versions) and append a history row.
-    /// Unknown DeviceIds in the vector/modified_by are inserted into `devices` with name "unknown".
+    /// Unknown DeviceIds in the vector/modified_by are inserted into `devices` with
+    /// a placeholder name equal to the short id.
     /// The record's sequence must be unique.
     pub fn put_entry(&self, record: &EntryRecord) -> Result<(), DbError> {
         let Some(space) = self.mount_space(record.key.mount)? else {
@@ -663,6 +700,417 @@ impl Repo<'_> {
             .conn
             .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))?;
         u64_from_i64(count)
+    }
+
+    pub fn latest_sequence(&self) -> Result<Sequence, DbError> {
+        let local = self.local_device()?.ok_or(DbError::NotInitialized)?;
+        Ok(Sequence(local.next_sequence.0.saturating_sub(1)))
+    }
+
+    pub fn max_sequence_in_space(&self, space: SpaceId) -> Result<Sequence, DbError> {
+        let bytes = space_bytes(space);
+        let max: Option<i64> = self.conn.query_row(
+            "SELECT MAX(e.sequence) FROM entries e
+             JOIN mounts m ON m.id = e.mount_id
+             WHERE m.space_id = ?1",
+            params![bytes.as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(Sequence(
+            max.map(u64_from_i64).transpose()?.unwrap_or(0),
+        ))
+    }
+
+    pub fn changes_since_in_space(
+        &self,
+        space: SpaceId,
+        after: Sequence,
+        limit: usize,
+    ) -> Result<Vec<EntryRecord>, DbError> {
+        let space = space_bytes(space);
+        let after = i64_from_u64(after.0)?;
+        let limit = i64::try_from(limit).map_err(|_| DbError::IntegerOverflow)?;
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {ENTRY_SELECT}
+             FROM entries e
+             JOIN devices d ON d.ref = e.modified_by
+             JOIN mounts m ON m.id = e.mount_id
+             WHERE m.space_id = ?1 AND e.sequence > ?2
+             ORDER BY e.sequence
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![space.as_slice(), after, limit], Self::map_raw_entry)?;
+        let raws = collect_raw_entries(rows)?;
+        raws.into_iter()
+            .map(|raw| self.assemble_record(raw))
+            .collect()
+    }
+
+    pub fn add_peer(
+        &self,
+        device: &Device,
+        addresses: &[String],
+        now_ms: i64,
+    ) -> Result<PeerRecord, DbError> {
+        self.upsert_device(device, now_ms)?;
+        let device_ref = self
+            .device_ref(device.id)?
+            .ok_or_else(|| DbError::Corrupt("upserted peer device is missing".into()))?;
+        let addresses_json = serde_json::to_string(addresses)?;
+        match self.conn.execute(
+            "INSERT INTO peers (device_ref, name, addresses, added_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![device_ref, device.name.as_str(), addresses_json, now_ms],
+        ) {
+            Ok(_) => {}
+            Err(err) => return Err(map_write_err(err, Some(&device.name))),
+        }
+        Ok(PeerRecord {
+            device: device.clone(),
+            addresses: addresses.to_vec(),
+            added_at_ms: now_ms,
+        })
+    }
+
+    pub fn remove_peer_by_name(&self, name: &str) -> Result<bool, DbError> {
+        let Some(peer) = self.peer_by_name(name)? else {
+            return Ok(false);
+        };
+        let device_ref = self
+            .device_ref(peer.device.id)?
+            .ok_or_else(|| DbError::Corrupt("peer device is missing".into()))?;
+        self.conn.execute(
+            "DELETE FROM space_shares WHERE device_ref = ?1",
+            params![device_ref],
+        )?;
+        self.conn.execute(
+            "DELETE FROM peer_offers WHERE device_ref = ?1",
+            params![device_ref],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sync_progress WHERE device_ref = ?1",
+            params![device_ref],
+        )?;
+        self.conn
+            .execute("DELETE FROM peers WHERE device_ref = ?1", params![device_ref])?;
+        Ok(true)
+    }
+
+    pub fn peer_by_name(&self, name: &str) -> Result<Option<PeerRecord>, DbError> {
+        self.load_peer("p.name = ?1", params![name])
+    }
+
+    pub fn peer_by_id(&self, id: DeviceId) -> Result<Option<PeerRecord>, DbError> {
+        let bytes = device_id_bytes(id);
+        self.load_peer("d.device_id = ?1", params![bytes.as_slice()])
+    }
+
+    pub fn list_peers(&self) -> Result<Vec<PeerRecord>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms
+             FROM peers p
+             JOIN devices d ON d.ref = p.device_ref
+             ORDER BY p.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, [u8; 32]>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut peers = Vec::new();
+        for row in rows {
+            let (id, name, addresses, added_at_ms) = row?;
+            peers.push(parse_peer(id, name, addresses, added_at_ms)?);
+        }
+        Ok(peers)
+    }
+
+    pub fn share_space(&self, space: SpaceId, peer: DeviceId) -> Result<(), DbError> {
+        let space = space_bytes(space);
+        let device_ref = self.device_ref(peer)?.ok_or(DbError::NotFound)?;
+        match self.conn.execute(
+            "INSERT OR IGNORE INTO space_shares (space_id, device_ref) VALUES (?1, ?2)",
+            params![space.as_slice(), device_ref],
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(map_write_err(err, None)),
+        }
+    }
+
+    pub fn unshare_space(&self, space: SpaceId, peer: DeviceId) -> Result<(), DbError> {
+        let space = space_bytes(space);
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "DELETE FROM space_shares WHERE space_id = ?1 AND device_ref = ?2",
+            params![space.as_slice(), device_ref],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_shared(&self, space: SpaceId, peer: DeviceId) -> Result<bool, DbError> {
+        let space = space_bytes(space);
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(false);
+        };
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM space_shares WHERE space_id = ?1 AND device_ref = ?2",
+            params![space.as_slice(), device_ref],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn shared_space_ids(&self, peer: DeviceId) -> Result<Vec<SpaceId>, DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT space_id FROM space_shares WHERE device_ref = ?1")?;
+        let rows = stmt.query_map(params![device_ref], |row| row.get::<_, [u8; 16]>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(space_from_bytes(row?));
+        }
+        Ok(ids)
+    }
+
+    pub fn replace_peer_offers(
+        &self,
+        peer: DeviceId,
+        offers: &[PeerOfferRow],
+        now_ms: i64,
+    ) -> Result<(), DbError> {
+        let device_ref = self.device_ref(peer)?.ok_or(DbError::NotFound)?;
+        self.conn.execute(
+            "DELETE FROM peer_offers WHERE device_ref = ?1",
+            params![device_ref],
+        )?;
+        for offer in offers {
+            let space = space_bytes(offer.space_id);
+            let mounts_json = serde_json::to_string(&offer.mounts)?;
+            self.conn.execute(
+                "INSERT INTO peer_offers (device_ref, space_id, name, mounts_json, received_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    device_ref,
+                    space.as_slice(),
+                    offer.name.as_str(),
+                    mounts_json,
+                    now_ms
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_offers(&self) -> Result<Vec<StoredOffer>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT d.device_id, p.name, o.space_id, o.name, o.mounts_json, o.received_at_ms
+             FROM peer_offers o
+             JOIN devices d ON d.ref = o.device_ref
+             JOIN peers p ON p.device_ref = o.device_ref
+             ORDER BY p.name, o.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, [u8; 32]>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, [u8; 16]>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut offers = Vec::new();
+        for row in rows {
+            let (id, peer_name, space_id, name, mounts_json, received_at_ms) = row?;
+            let mounts: Vec<OfferedMount> = serde_json::from_str(&mounts_json)?;
+            offers.push(StoredOffer {
+                peer: Device {
+                    id: DeviceId::from_bytes(id),
+                    name: peer_name,
+                },
+                space_id: space_from_bytes(space_id),
+                name,
+                mounts,
+                received_at_ms,
+            });
+        }
+        Ok(offers)
+    }
+
+    pub fn offer_from_peer(
+        &self,
+        peer: DeviceId,
+        name_or_id: &str,
+    ) -> Result<Option<StoredOffer>, DbError> {
+        let offers = self.list_offers()?;
+        Ok(offers.into_iter().find(|o| {
+            o.peer.id == peer && (o.name == name_or_id || o.space_id.to_string() == name_or_id)
+        }))
+    }
+
+    pub fn sync_progress(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+    ) -> Result<SyncProgress, DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(SyncProgress {
+                received_seq: Sequence::ZERO,
+                acked_seq: Sequence::ZERO,
+                last_sync_ms: None,
+            });
+        };
+        let space_b = space_bytes(space);
+        let row = self
+            .conn
+            .query_row(
+                "SELECT received_seq, acked_seq, last_sync_ms
+                 FROM sync_progress WHERE device_ref = ?1 AND space_id = ?2",
+                params![device_ref, space_b.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            None => Ok(SyncProgress {
+                received_seq: Sequence::ZERO,
+                acked_seq: Sequence::ZERO,
+                last_sync_ms: None,
+            }),
+            Some((received, acked, last_sync_ms)) => Ok(SyncProgress {
+                received_seq: Sequence(u64_from_i64(received)?),
+                acked_seq: Sequence(u64_from_i64(acked)?),
+                last_sync_ms,
+            }),
+        }
+    }
+
+    pub fn set_received_seq(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        seq: Sequence,
+        now_ms: i64,
+    ) -> Result<(), DbError> {
+        self.upsert_progress(peer, space, Some(seq), None, Some(now_ms))
+    }
+
+    pub fn set_acked_seq(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        seq: Sequence,
+        now_ms: i64,
+    ) -> Result<(), DbError> {
+        self.upsert_progress(peer, space, None, Some(seq), Some(now_ms))
+    }
+
+    pub fn reset_received_seq_for_space(&self, space: SpaceId) -> Result<(), DbError> {
+        let space = space_bytes(space);
+        self.conn.execute(
+            "UPDATE sync_progress SET received_seq = 0 WHERE space_id = ?1",
+            params![space.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_progress_for_peer(&self, peer: DeviceId) -> Result<Vec<(SpaceId, SyncProgress)>, DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT space_id, received_seq, acked_seq, last_sync_ms
+             FROM sync_progress WHERE device_ref = ?1",
+        )?;
+        let rows = stmt.query_map(params![device_ref], |row| {
+            Ok((
+                row.get::<_, [u8; 16]>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (space, received, acked, last_sync_ms) = row?;
+            out.push((
+                space_from_bytes(space),
+                SyncProgress {
+                    received_seq: Sequence(u64_from_i64(received)?),
+                    acked_seq: Sequence(u64_from_i64(acked)?),
+                    last_sync_ms,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    fn upsert_progress(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        received: Option<Sequence>,
+        acked: Option<Sequence>,
+        last_sync_ms: Option<i64>,
+    ) -> Result<(), DbError> {
+        let device_ref = self.device_ref(peer)?.ok_or(DbError::NotFound)?;
+        let space = space_bytes(space);
+        let received = received.map(|s| i64_from_u64(s.0)).transpose()?;
+        let acked = acked.map(|s| i64_from_u64(s.0)).transpose()?;
+        self.conn.execute(
+            "INSERT INTO sync_progress (device_ref, space_id, received_seq, acked_seq, last_sync_ms)
+             VALUES (?1, ?2, COALESCE(?3, 0), COALESCE(?4, 0), ?5)
+             ON CONFLICT(device_ref, space_id) DO UPDATE SET
+                received_seq = COALESCE(?3, sync_progress.received_seq),
+                acked_seq = COALESCE(?4, sync_progress.acked_seq),
+                last_sync_ms = COALESCE(?5, sync_progress.last_sync_ms)",
+            params![
+                device_ref,
+                space.as_slice(),
+                received,
+                acked,
+                last_sync_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_peer(
+        &self,
+        where_clause: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Option<PeerRecord>, DbError> {
+        let sql = format!(
+            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms
+             FROM peers p
+             JOIN devices d ON d.ref = p.device_ref
+             WHERE {where_clause}"
+        );
+        self.conn
+            .query_row(&sql, params, |row| {
+                Ok((
+                    row.get::<_, [u8; 32]>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .optional()?
+            .map(|(id, name, addresses, added_at_ms)| parse_peer(id, name, addresses, added_at_ms))
+            .transpose()
     }
 
     fn write_entry(&self, record: &EntryRecord) -> Result<(), DbError> {
@@ -981,13 +1429,30 @@ impl Repo<'_> {
             return Ok(existing);
         }
         let bytes = device_id_bytes(id);
+        let placeholder = id.short();
         self.conn.execute(
             "INSERT INTO devices (device_id, name, status, created_at_ms, last_seen_ms)
-             VALUES (?1, 'unknown', 'active', ?2, ?2)",
-            params![bytes.as_slice(), now_ms],
+             VALUES (?1, ?3, 'active', ?2, ?2)",
+            params![bytes.as_slice(), now_ms, placeholder],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+}
+
+fn parse_peer(
+    id: [u8; 32],
+    name: String,
+    addresses: String,
+    added_at_ms: i64,
+) -> Result<PeerRecord, DbError> {
+    Ok(PeerRecord {
+        device: Device {
+            id: DeviceId::from_bytes(id),
+            name,
+        },
+        addresses: serde_json::from_str(&addresses)?,
+        added_at_ms,
+    })
 }
 
 fn collect_mounts(
