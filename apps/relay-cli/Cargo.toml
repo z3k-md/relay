@@ -16,6 +16,7 @@ clap.workspace = true
 ctrlc.workspace = true
 relay-core.workspace = true
 relay-engine.workspace = true
+relay-net.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

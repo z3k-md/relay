@@ -1,15 +1,21 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use relay_core::{DeviceId, EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
 use relay_engine::{
-    Engine, EngineError, ScanOptions, ScanReport, WatchEvent, WatchOptions, default_home,
+    Engine, EngineError, ScanOptions, ScanReport, SyncInput, SyncOutput, WatchEvent, WatchOptions,
+    default_home,
 };
+use relay_net::{NetCommand, NetConfig, NetEvent, PeerConfig};
+
+const DEFAULT_LISTEN: &str = "0.0.0.0:47321";
 
 const DEV_EXCLUDES: &[&str] = &[
     "**/node_modules/**",
@@ -21,7 +27,7 @@ const DEV_EXCLUDES: &[&str] = &[
 ];
 
 #[derive(Parser, Debug)]
-#[command(name = "relay", about = "Local-first multi-device file sync")]
+#[command(name = "relay", version, about = "Local-first multi-device file sync")]
 struct Cli {
     /// Relay home directory (database, object store, logs)
     #[arg(long, global = true)]
@@ -102,7 +108,22 @@ enum Command {
         #[arg(long, default_value_t = 3600)]
         grace_secs: u64,
     },
-    /// Watch mounts and keep the index live. Event times are UTC `HH:MM:SS`.
+    /// Watch mounts and sync with peers until Ctrl-C. Event times are UTC `HH:MM:SS`.
+    Run {
+        /// UDP address to accept peer connections on
+        #[arg(long, default_value = DEFAULT_LISTEN)]
+        listen: SocketAddr,
+        #[arg(long, default_value_t = 200)]
+        debounce_ms: u64,
+        #[arg(long, default_value_t = 600)]
+        full_scan_secs: u64,
+        /// Periodic full scans only; do not attach a native filesystem watcher
+        #[arg(long)]
+        poll: bool,
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Watch mounts and keep the index live without syncing. Event times are UTC `HH:MM:SS`.
     Watch {
         #[arg(long, default_value_t = 200)]
         debounce_ms: u64,
@@ -432,6 +453,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             poll,
             verbose,
         } => cmd_watch(&home, debounce_ms, full_scan_secs, poll, verbose, json),
+        Command::Run {
+            listen,
+            debounce_ms,
+            full_scan_secs,
+            poll,
+            verbose,
+        } => {
+            let opts = WatchOptions {
+                debounce: Duration::from_millis(debounce_ms),
+                full_scan_interval: Duration::from_secs(full_scan_secs),
+                use_watcher: !poll,
+                ..WatchOptions::default()
+            };
+            cmd_run(&home, listen, opts, verbose, json)
+        }
     }
 }
 
@@ -457,13 +493,125 @@ fn cmd_watch(
         use_watcher: !poll,
         ..WatchOptions::default()
     };
+    let names = HashMap::new();
     engine.watch(opts, &stop, &mut |event| {
-        print_watch_event(event, json, verbose);
+        print_watch_event(event, json, verbose, &names);
     })?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_watch_event(event: &WatchEvent, json: bool, verbose: bool) {
+fn cmd_run(
+    home: &Path,
+    listen: SocketAddr,
+    opts: WatchOptions,
+    verbose: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut engine = Engine::open(home)?;
+    let identity = Arc::new(engine.load_identity()?);
+    let peers = engine.peers()?;
+    let names: HashMap<String, String> = peers
+        .iter()
+        .map(|p| (p.id.to_string(), p.name.clone()))
+        .collect();
+    if peers.is_empty() && !json {
+        println!("no peers yet; add one with `relay peer add <name> <device-id> --addr host:port`");
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+    })
+    .context("installing Ctrl-C handler")?;
+
+    let (tx, rx) = mpsc::channel::<SyncInput>();
+    let listen_failed = Arc::clone(&stop);
+    let sink = move |event: NetEvent| {
+        let input = match event {
+            NetEvent::PeerConnected { peer, name, .. } => SyncInput::PeerConnected { peer, name },
+            NetEvent::PeerDisconnected { peer, reason } => {
+                tracing::info!(%peer, %reason, "peer disconnected");
+                SyncInput::PeerDisconnected { peer }
+            }
+            NetEvent::Frame { peer, body } => SyncInput::Frame { peer, body },
+            NetEvent::ObjectFetched { peer, object } => SyncInput::ObjectFetched { peer, object },
+            NetEvent::ObjectFetchFailed {
+                peer,
+                object,
+                reason,
+                not_found,
+            } => SyncInput::ObjectFetchFailed {
+                peer,
+                object,
+                not_found,
+                reason,
+            },
+            NetEvent::ListenFailed { error } => {
+                eprintln!("error: network listener stopped: {error}");
+                listen_failed.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+        let _ = tx.send(input);
+    };
+    let net = relay_net::start(
+        NetConfig {
+            identity,
+            device_name: engine.device().name.clone(),
+            listen,
+            peers: peers
+                .iter()
+                .map(|p| PeerConfig {
+                    id: p.id,
+                    name: p.name.clone(),
+                    addresses: p.addresses.clone(),
+                })
+                .collect(),
+            store_root: engine.store().root().to_path_buf(),
+        },
+        Box::new(sink),
+    )
+    .with_context(|| format!("starting the network on {listen}"))?;
+    if !json {
+        println!(
+            "{} listening on {} as {} ({})",
+            utc_hms(),
+            net.local_addr(),
+            engine.device().name,
+            engine.device().id
+        );
+    }
+
+    let result = engine.run(
+        opts,
+        rx,
+        |output| {
+            net.send(match output {
+                SyncOutput::Send { peer, body } => NetCommand::Send { peer, body },
+                SyncOutput::FetchObject { peer, object } => {
+                    NetCommand::FetchObject { peer, object }
+                }
+            })
+        },
+        &stop,
+        &mut |event| print_watch_event(event, json, verbose, &names),
+    );
+    net.shutdown();
+    result?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn peer_label<'a>(names: &'a HashMap<String, String>, peer: &'a str) -> &'a str {
+    names.get(peer).map(String::as_str).unwrap_or(peer)
+}
+
+fn print_watch_event(
+    event: &WatchEvent,
+    json: bool,
+    verbose: bool,
+    names: &HashMap<String, String>,
+) {
     if json {
         match serde_json::to_string(event) {
             Ok(line) => println!("{line}"),
@@ -520,15 +668,21 @@ fn print_watch_event(event: &WatchEvent, json: bool, verbose: bool) {
         }
         WatchEvent::Stopped => println!("stopped"),
         WatchEvent::PeerConnected { peer, name } => {
-            println!("{} peer connected {name} ({peer})", utc_hms());
+            let label = names.get(peer).unwrap_or(name);
+            println!("{} connected to {label}", utc_hms());
         }
         WatchEvent::PeerDisconnected { peer } => {
-            println!("{} peer disconnected {peer}", utc_hms());
+            println!(
+                "{} disconnected from {}",
+                utc_hms(),
+                peer_label(names, peer)
+            );
         }
         WatchEvent::OffersReceived { peer, spaces } => {
-            println!("{} offers from {peer}: {}", utc_hms(), spaces.join(", "));
+            let label = peer_label(names, peer);
+            println!("{} {label} offers: {}", utc_hms(), spaces.join(", "));
             for name in spaces {
-                println!("  hint: relay space join {name} --from <peer>");
+                println!("  to accept: stop relay, then `relay space join {name} --from {label}`");
             }
         }
         WatchEvent::RemoteApplied {
@@ -540,6 +694,10 @@ fn print_watch_event(event: &WatchEvent, json: bool, verbose: bool) {
             conflicts,
             skipped,
         } => {
+            if *written + *deleted + *conflicts + *skipped == 0 && !verbose {
+                return;
+            }
+            let peer = peer_label(names, peer);
             println!(
                 "{} {space}/{mount} from {peer}: {written} written, {deleted} deleted, {conflicts} conflicts, {skipped} skipped",
                 utc_hms()
@@ -550,10 +708,11 @@ fn print_watch_event(event: &WatchEvent, json: bool, verbose: bool) {
             space,
             entries,
         } => {
+            let peer = peer_label(names, peer);
             println!("{} sent {entries} changes of {space} to {peer}", utc_hms());
         }
         WatchEvent::SyncWarning { peer, path, reason } => {
-            eprintln!("warning: {peer} {path}: {reason}");
+            eprintln!("warning: {} {path}: {reason}", peer_label(names, peer));
         }
     }
 }
