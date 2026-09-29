@@ -130,8 +130,8 @@ pub fn device_id_from_certificate(der: &[u8]) -> Result<DeviceId, CryptoError> {
     use x509_parser::oid_registry::OID_SIG_ED25519;
     use x509_parser::prelude::{FromDer, X509Certificate};
 
-    let (rest, cert) = X509Certificate::from_der(der)
-        .map_err(|e| CryptoError::PeerCertificate(e.to_string()))?;
+    let (rest, cert) =
+        X509Certificate::from_der(der).map_err(|e| CryptoError::PeerCertificate(e.to_string()))?;
     if !rest.is_empty() {
         return Err(CryptoError::PeerCertificate(
             "trailing bytes after certificate".into(),

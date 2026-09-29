@@ -251,10 +251,7 @@ pub enum ProtoError {
     #[error("malformed message: {0}")]
     Decode(#[from] prost::DecodeError),
     #[error("invalid field {field}: {reason}")]
-    Invalid {
-        field: &'static str,
-        reason: String,
-    },
+    Invalid { field: &'static str, reason: String },
 }
 
 fn invalid(field: &'static str, reason: impl Into<String>) -> ProtoError {
@@ -290,16 +287,22 @@ pub fn decode_message<M: prost::Message + Default>(body: &[u8]) -> Result<M, Pro
 }
 
 pub fn device_id_from_bytes(bytes: &[u8]) -> Result<DeviceId, ProtoError> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| invalid("device_id", format!("expected 32 bytes, got {}", bytes.len())))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        invalid(
+            "device_id",
+            format!("expected 32 bytes, got {}", bytes.len()),
+        )
+    })?;
     Ok(DeviceId::from_bytes(arr))
 }
 
 pub fn object_id_from_bytes(bytes: &[u8]) -> Result<ObjectId, ProtoError> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| invalid("object_id", format!("expected 32 bytes, got {}", bytes.len())))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        invalid(
+            "object_id",
+            format!("expected 32 bytes, got {}", bytes.len()),
+        )
+    })?;
     Ok(ObjectId::from_bytes(arr))
 }
 
