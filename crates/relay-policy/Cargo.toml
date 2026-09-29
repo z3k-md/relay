@@ -1,5 +1,6 @@
 [package]
 name = "relay-policy"
+description = "Include/exclude glob evaluation for Relay mounts."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +8,9 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+globset.workspace = true
 relay-core.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
