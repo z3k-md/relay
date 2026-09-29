@@ -172,13 +172,6 @@ pub fn start(
     ));
     let server = make_server_config(&tls, trusted.clone())?;
 
-    let endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(server),
-        socket,
-        Arc::new(quinn::TokioRuntime),
-    )?;
-
     let inner = Arc::new(Inner {
         our_id: config.identity.device_id(),
         device_name: config.device_name,
@@ -212,8 +205,25 @@ pub fn start(
                         return;
                     }
                 };
-                let _ = ready_tx.send(Ok(()));
-                rt.block_on(run(inner, endpoint, cmd_rx));
+                rt.block_on(async move {
+                    // Endpoint construction needs a Tokio reactor (Quinn's TokioRuntime).
+                    let endpoint = match quinn::Endpoint::new(
+                        quinn::EndpointConfig::default(),
+                        Some(server),
+                        socket,
+                        Arc::new(quinn::TokioRuntime),
+                    ) {
+                        Ok(ep) => {
+                            let _ = ready_tx.send(Ok(()));
+                            ep
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(NetError::from(e)));
+                            return;
+                        }
+                    };
+                    run(inner, endpoint, cmd_rx).await;
+                });
             }
         })
         .map_err(|e| NetError::Runtime(e.to_string()))?;
