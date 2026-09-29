@@ -5,14 +5,19 @@ mod marker;
 mod materialize;
 mod paths;
 mod scan;
+mod watch;
 
 use std::path::Path;
 
 pub use error::FsError;
 pub use marker::MountMarker;
 pub use materialize::materialize_file;
-pub use paths::{to_logical_path, to_os_path};
-pub use scan::{ScanResult, ScanWarning, ScannedEntry, effective_rules, scan_mount};
+pub use paths::{resolve_os_path, to_logical_path, to_os_path};
+pub use scan::{
+    PartialScan, ScanResult, ScanScope, ScanWarning, ScannedEntry, ScopeKind, effective_rules,
+    scan_mount, scan_paths,
+};
+pub use watch::{MountWatcher, WatchSignal};
 
 pub(crate) fn sync_parent_dir(dir: &Path) -> Result<(), FsError> {
     #[cfg(unix)]

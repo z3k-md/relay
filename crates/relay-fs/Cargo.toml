@@ -9,11 +9,13 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+notify.workspace = true
 relay-core.workspace = true
 relay-policy.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+unicode-normalization.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 

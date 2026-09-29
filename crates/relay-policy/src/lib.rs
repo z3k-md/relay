@@ -25,6 +25,10 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "**/desktop.ini",
     "**/.~lock.*#",
     "**/~$*",
+    "**/.*.sw?",
+    "**/.#*",
+    "**/*___jb_tmp___",
+    "**/*___jb_old___",
 ];
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -38,6 +42,10 @@ pub enum PolicyError {
 /// User-supplied includes and excludes are stored as given (after empty
 /// includes are replaced with `["**"]`). [`DEFAULT_EXCLUDES`] are compiled
 /// into the matcher but are not returned by [`MountRules::excludes`].
+///
+/// Globs are case-insensitive on macOS and Windows (those platforms' default
+/// filesystems) and case-sensitive elsewhere. Use
+/// [`MountRules::with_case_insensitive`] to override the platform default.
 #[derive(Clone, Debug)]
 pub struct MountRules {
     includes: Vec<String>,
@@ -48,14 +56,28 @@ pub struct MountRules {
     exclude_prefix_set: GlobSet,
     /// Globs `P` taken from include patterns of the form `P/**`.
     include_prefix_set: GlobSet,
+    case_insensitive: bool,
 }
 
 impl MountRules {
-    /// Compile `includes` and `excludes`.
+    /// Compile `includes` and `excludes` with the platform default case
+    /// sensitivity (insensitive on macOS and Windows).
     ///
     /// Empty `includes` becomes `["**"]`. [`DEFAULT_EXCLUDES`] are always
     /// appended to the compiled exclude set.
     pub fn new(includes: &[String], excludes: &[String]) -> Result<Self, PolicyError> {
+        Self::with_case_insensitive(includes, excludes, default_case_insensitive())
+    }
+
+    /// Compile `includes` and `excludes`, forcing glob case sensitivity.
+    ///
+    /// Empty `includes` becomes `["**"]`. [`DEFAULT_EXCLUDES`] are always
+    /// appended to the compiled exclude set.
+    pub fn with_case_insensitive(
+        includes: &[String],
+        excludes: &[String],
+        case_insensitive: bool,
+    ) -> Result<Self, PolicyError> {
         let includes = if includes.is_empty() {
             vec!["**".to_owned()]
         } else {
@@ -63,14 +85,14 @@ impl MountRules {
         };
         let excludes = excludes.to_vec();
 
-        let include_set = compile_set(&includes)?;
-        let include_prefix_set = compile_prefix_set(&includes)?;
+        let include_set = compile_set(&includes, case_insensitive)?;
+        let include_prefix_set = compile_prefix_set(&includes, case_insensitive)?;
 
         let mut all_excludes = Vec::with_capacity(DEFAULT_EXCLUDES.len() + excludes.len());
         all_excludes.extend(DEFAULT_EXCLUDES.iter().map(|s| (*s).to_owned()));
         all_excludes.extend(excludes.iter().cloned());
-        let exclude_set = compile_set(&all_excludes)?;
-        let exclude_prefix_set = compile_prefix_set(&all_excludes)?;
+        let exclude_set = compile_set(&all_excludes, case_insensitive)?;
+        let exclude_prefix_set = compile_prefix_set(&all_excludes, case_insensitive)?;
 
         Ok(Self {
             includes,
@@ -79,7 +101,13 @@ impl MountRules {
             exclude_set,
             exclude_prefix_set,
             include_prefix_set,
+            case_insensitive,
         })
+    }
+
+    /// Whether compiled globs match case-insensitively.
+    pub fn case_insensitive(&self) -> bool {
+        self.case_insensitive
     }
 
     /// User include patterns as stored (empty input is normalized to `["**"]`).
@@ -132,7 +160,7 @@ impl MountRules {
     pub fn with_extra_excludes(&self, extra: &[String]) -> Result<Self, PolicyError> {
         let mut excludes = self.excludes.clone();
         excludes.extend(extra.iter().cloned());
-        Self::new(&self.includes, &excludes)
+        Self::with_case_insensitive(&self.includes, &excludes, self.case_insensitive)
     }
 
     fn is_excluded(&self, path: &LogicalPath) -> bool {
@@ -161,10 +189,10 @@ impl MountRules {
             return true;
         }
         for inc in &self.includes {
-            if let Some(prefix) = inc.strip_suffix("/**") {
-                if prefix_matches(prefix, s) {
-                    return true;
-                }
+            if let Some(prefix) = inc.strip_suffix("/**")
+                && prefix_matches(prefix, s)
+            {
+                return true;
             }
         }
         false
@@ -181,9 +209,14 @@ pub fn parse_relayignore(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn compile_glob(pattern: &str) -> Result<Glob, PolicyError> {
+fn default_case_insensitive() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<Glob, PolicyError> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
+        .case_insensitive(case_insensitive)
         .build()
         .map_err(|err| PolicyError::InvalidPattern {
             pattern: pattern.to_owned(),
@@ -191,10 +224,10 @@ fn compile_glob(pattern: &str) -> Result<Glob, PolicyError> {
         })
 }
 
-fn compile_set(patterns: &[String]) -> Result<GlobSet, PolicyError> {
+fn compile_set(patterns: &[String], case_insensitive: bool) -> Result<GlobSet, PolicyError> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(compile_glob(pattern)?);
+        builder.add(compile_glob(pattern, case_insensitive)?);
     }
     builder.build().map_err(|err| PolicyError::InvalidPattern {
         pattern: patterns.join(","),
@@ -202,7 +235,7 @@ fn compile_set(patterns: &[String]) -> Result<GlobSet, PolicyError> {
     })
 }
 
-fn compile_prefix_set(patterns: &[String]) -> Result<GlobSet, PolicyError> {
+fn compile_prefix_set(patterns: &[String], case_insensitive: bool) -> Result<GlobSet, PolicyError> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let Some(prefix) = pattern.strip_suffix("/**") else {
@@ -211,7 +244,7 @@ fn compile_prefix_set(patterns: &[String]) -> Result<GlobSet, PolicyError> {
         if prefix.is_empty() {
             continue;
         }
-        builder.add(compile_glob(prefix)?);
+        builder.add(compile_glob(prefix, case_insensitive)?);
     }
     builder.build().map_err(|err| PolicyError::InvalidPattern {
         pattern: patterns.join(","),
@@ -235,9 +268,14 @@ mod tests {
     }
 
     fn rules(includes: &[&str], excludes: &[&str]) -> MountRules {
-        MountRules::new(
+        rules_case(includes, excludes, false)
+    }
+
+    fn rules_case(includes: &[&str], excludes: &[&str], case_insensitive: bool) -> MountRules {
+        MountRules::with_case_insensitive(
             &includes.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
             &excludes.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            case_insensitive,
         )
         .unwrap()
     }
@@ -365,6 +403,26 @@ mod tests {
     }
 
     #[test]
+    fn editor_temp_files_are_excluded() {
+        let r = default_rules();
+        for path in [".Core.lua.swp", ".#notes.md", "Core.lua___jb_tmp___"] {
+            assert!(
+                !r.is_selected(&lp(path), EntryKind::File),
+                "{path} should be excluded"
+            );
+        }
+        for path in ["Core.lua", "swap.md", "a.swift"] {
+            assert!(
+                r.is_selected(&lp(path), EntryKind::File),
+                "{path} should still be selected"
+            );
+        }
+        assert!(!r.is_selected(&lp("dir/.Core.lua.swo"), EntryKind::File));
+        assert!(!r.is_selected(&lp("dir/.#notes.md"), EntryKind::File));
+        assert!(!r.is_selected(&lp("dir/Core.lua___jb_old___"), EntryKind::File));
+    }
+
+    #[test]
     fn parse_relayignore_skips_comments_blanks_and_crlf() {
         let text = "# header\r\n*.tmp\r\n\r\n  # indented comment\r\nsecret/**\r\nfoo\r\n";
         assert_eq!(parse_relayignore(text), vec!["*.tmp", "secret/**", "foo"]);
@@ -389,6 +447,68 @@ mod tests {
         assert!(!combined.is_selected(&lp("secret/a"), EntryKind::File));
         assert!(combined.is_selected(&lp("notes.md"), EntryKind::File));
         assert_eq!(combined.includes(), base.includes());
+    }
+
+    #[test]
+    fn with_extra_excludes_preserves_case_insensitivity() {
+        let base = rules_case(&["**"], &["*.bak"], true);
+        assert!(base.case_insensitive());
+        let combined = base.with_extra_excludes(&["*.tmp".to_owned()]).unwrap();
+        assert!(combined.case_insensitive());
+        assert!(!combined.is_selected(&lp("Notes.BAK"), EntryKind::File));
+        assert!(!combined.is_selected(&lp("Notes.TMP"), EntryKind::File));
+    }
+
+    #[test]
+    fn git_lock_and_junk_defaults_are_case_insensitive_when_asked() {
+        let sensitive = default_rules();
+        let insensitive = rules_case(&[], &[], true);
+
+        for path in [".GIT/INDEX.LOCK", ".git/refs/heads/Main.LOCK"] {
+            assert!(
+                sensitive.is_selected(&lp(path), EntryKind::File),
+                "{path} should remain selected when case-sensitive"
+            );
+            assert!(
+                !insensitive.is_selected(&lp(path), EntryKind::File),
+                "{path} should be excluded when case-insensitive"
+            );
+        }
+
+        for path in ["thumbs.db", "docs/thumbs.db", ".ds_store", "foo/.ds_store"] {
+            assert!(
+                sensitive.is_selected(&lp(path), EntryKind::File),
+                "{path} should remain selected when case-sensitive"
+            );
+            assert!(
+                !insensitive.is_selected(&lp(path), EntryKind::File),
+                "{path} should be excluded when case-insensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn user_exclude_prefix_is_case_insensitive_when_asked() {
+        let sensitive = rules(&[], &["**/Build/**"]);
+        let insensitive = rules_case(&[], &["**/Build/**"], true);
+        assert!(sensitive.should_descend(&lp("build")));
+        assert!(sensitive.is_selected(&lp("build/a.rs"), EntryKind::File));
+        assert!(!insensitive.should_descend(&lp("build")));
+        assert!(!insensitive.is_selected(&lp("build/a.rs"), EntryKind::File));
+        assert!(!sensitive.should_descend(&lp("Build")));
+        assert!(!insensitive.should_descend(&lp("Build")));
+    }
+
+    #[test]
+    fn include_patterns_are_case_insensitive_when_asked() {
+        let sensitive = rules(&["Notes/**"], &[]);
+        let insensitive = rules_case(&["Notes/**"], &[], true);
+        assert!(sensitive.is_selected(&lp("Notes/a.md"), EntryKind::File));
+        assert!(!sensitive.is_selected(&lp("notes/a.md"), EntryKind::File));
+        assert!(insensitive.is_selected(&lp("Notes/a.md"), EntryKind::File));
+        assert!(insensitive.is_selected(&lp("notes/a.md"), EntryKind::File));
+        assert!(insensitive.is_selected(&lp("notes"), EntryKind::Directory));
+        assert!(!insensitive.is_selected(&lp("other/a.md"), EntryKind::File));
     }
 
     #[test]
