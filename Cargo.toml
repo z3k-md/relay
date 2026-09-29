@@ -9,6 +9,7 @@ members = [
     "crates/relay-engine",
     "crates/relay-proto",
     "crates/relay-crypto",
+    "crates/relay-net",
     "apps/relay-cli",
 ]
 
@@ -28,6 +29,7 @@ relay-db = { path = "crates/relay-db" }
 relay-engine = { path = "crates/relay-engine" }
 relay-proto = { path = "crates/relay-proto" }
 relay-crypto = { path = "crates/relay-crypto" }
+relay-net = { path = "crates/relay-net" }
 
 anyhow = "1"
 blake3 = "1"
@@ -38,14 +40,17 @@ globset = "0.4"
 hex = "0.4"
 notify = "8"
 prost = "0.14"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 proptest = "1"
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util", "net"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

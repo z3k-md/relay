@@ -234,6 +234,78 @@ impl ObjectStore {
         })
     }
 
+    /// Directory used for in-flight writes (`<root>/tmp`).
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root.join(TMP_DIR)
+    }
+
+    /// Reserve a unique empty file under [`Self::tmp_dir`] for an in-flight write.
+    ///
+    /// The file is created immediately so the name cannot collide. Leftovers are
+    /// reaped by [`Self::clean_tmp`].
+    pub fn tmp_path(&self) -> Result<PathBuf, StoreError> {
+        let dir = self.ensure_tmp()?;
+        let tmp = tempfile::Builder::new()
+            .prefix("recv-")
+            .tempfile_in(&dir)
+            .map_err(|e| io_err(&dir, e))?;
+        let tmp_path = tmp.into_temp_path();
+        match tmp_path.keep() {
+            Ok(path) => Ok(path),
+            Err(e) => Err(io_err(&dir, e.error)),
+        }
+    }
+
+    /// Rehash `tmp`, require it equals `expected`, fsync, and atomically publish
+    /// it to the object path. `tmp` is removed on success, hash mismatch, or
+    /// when the object is already present.
+    pub fn import_verified(&self, tmp: &Path, expected: &ObjectId) -> Result<(), StoreError> {
+        let actual = match hash_path(tmp) {
+            Ok(id) => id,
+            Err(e) => return Err(io_err(tmp, e)),
+        };
+        if actual != *expected {
+            let _ = fs::remove_file(tmp);
+            return Err(StoreError::Corrupt {
+                id: *expected,
+                actual,
+            });
+        }
+
+        if self.contains(expected) {
+            let _ = fs::remove_file(tmp);
+            return Ok(());
+        }
+
+        let file = File::open(tmp).map_err(|e| io_err(tmp, e))?;
+        file.sync_all().map_err(|e| io_err(tmp, e))?;
+        drop(file);
+
+        let dest = self.path_for(expected);
+        if dest.is_file() {
+            let _ = fs::remove_file(tmp);
+            return Ok(());
+        }
+        if let Some(parent) = dest.parent() {
+            create_dir(parent)?;
+        }
+        match fs::rename(tmp, &dest) {
+            Ok(()) => {
+                fsync_dir_best_effort(dest.parent());
+                Ok(())
+            }
+            Err(e) => {
+                let _ = fs::remove_file(tmp);
+                if dest.is_file() {
+                    self.verify(expected)?;
+                    Ok(())
+                } else {
+                    Err(io_err(&dest, e))
+                }
+            }
+        }
+    }
+
     /// Delete leftover tmp files whose mtime is older than `older_than`.
     pub fn clean_tmp(&self, older_than: Duration) -> Result<usize, StoreError> {
         let dir = self.tmp_dir();
@@ -269,10 +341,6 @@ impl ObjectStore {
 
     fn objects_dir(&self) -> PathBuf {
         self.root.join(OBJECTS_DIR)
-    }
-
-    fn tmp_dir(&self) -> PathBuf {
-        self.root.join(TMP_DIR)
     }
 
     fn ensure_tmp(&self) -> Result<PathBuf, StoreError> {
@@ -797,6 +865,78 @@ mod tests {
         let removed = store.clean_tmp(Duration::from_secs(60)).unwrap();
         assert_eq!(removed, 1);
         assert!(!young_path.exists());
+        assert_eq!(tmp_file_count(&store), 0);
+    }
+
+    #[test]
+    fn tmp_path_is_unique_under_tmp() {
+        let (_dir, store) = setup();
+        let a = store.tmp_path().unwrap();
+        let b = store.tmp_path().unwrap();
+        assert_ne!(a, b);
+        assert!(a.starts_with(store.tmp_dir()));
+        assert!(
+            a.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("recv-"))
+        );
+        assert!(a.is_file());
+        assert!(b.is_file());
+        assert_eq!(tmp_file_count(&store), 2);
+    }
+
+    #[test]
+    fn import_verified_publishes_matching_bytes() {
+        let (_dir, store) = setup();
+        let data = b"imported-object";
+        let id = ObjectId::of(data);
+        let tmp = store.tmp_path().unwrap();
+        fs::write(&tmp, data).unwrap();
+        store.import_verified(&tmp, &id).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(store.read(&id).unwrap(), data);
+        assert_eq!(tmp_file_count(&store), 0);
+    }
+
+    #[test]
+    fn import_verified_rejects_hash_mismatch() {
+        let (_dir, store) = setup();
+        let expected = ObjectId::of(b"wanted");
+        let tmp = store.tmp_path().unwrap();
+        fs::write(&tmp, b"other").unwrap();
+        let err = store.import_verified(&tmp, &expected).unwrap_err();
+        assert_corrupt(err, expected, b"other");
+        assert!(!store.contains(&expected));
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn import_verified_ok_when_already_present() {
+        let (_dir, store) = setup();
+        let id = store.put_bytes(b"dup").unwrap();
+        let tmp = store.tmp_path().unwrap();
+        fs::write(&tmp, b"dup").unwrap();
+        store.import_verified(&tmp, &id).unwrap();
+        assert_eq!(object_file_count(&store), 1);
+        assert!(!tmp.exists());
+        assert_eq!(store.read(&id).unwrap(), b"dup");
+    }
+
+    #[test]
+    fn abandoned_recv_tmp_is_reaped_by_clean_tmp() {
+        let (_dir, store) = setup();
+        let tmp = store.tmp_path().unwrap();
+        fs::write(&tmp, b"leftover").unwrap();
+
+        let file = OpenOptions::new().write(true).open(&tmp).unwrap();
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        file.set_times(fs::FileTimes::new().set_modified(past))
+            .unwrap();
+        drop(file);
+
+        let removed = store.clean_tmp(Duration::from_secs(60)).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!tmp.exists());
         assert_eq!(tmp_file_count(&store), 0);
     }
 }
