@@ -1,5 +1,6 @@
 [package]
 name = "relay-db"
+description = "Durable local SQLite index for a Relay device."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +9,15 @@ publish.workspace = true
 
 [dependencies]
 relay-core.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
