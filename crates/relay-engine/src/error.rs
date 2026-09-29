@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use relay_core::CoreError;
+use relay_core::{CoreError, LogicalPath};
 use relay_db::DbError;
 use relay_fs::FsError;
 use relay_policy::PolicyError;
@@ -39,6 +39,15 @@ pub enum EngineError {
 
     #[error("path already has a mount marker: {}", path.display())]
     MountAlreadyClaimed { path: PathBuf },
+
+    #[error("another relay process is using {}", .home.display())]
+    Busy { home: PathBuf },
+
+    #[error("relay home is open read-only")]
+    ReadOnly,
+
+    #[error("index changed concurrently at {path}")]
+    ConcurrentModification { path: LogicalPath },
 
     #[error("refusing to delete {deletions} of {live} live entries")]
     MassDeleteRefused { deletions: usize, live: usize },

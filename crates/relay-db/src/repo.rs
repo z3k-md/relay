@@ -39,6 +39,14 @@ pub struct MountConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountState {
+    pub last_scan_ms: Option<i64>,
+    pub last_full_scan_ms: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_error_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryRecord {
     pub sequence: Sequence,
     pub content: EntryContent,
@@ -445,10 +453,10 @@ impl Repo<'_> {
     }
 
     pub fn history(&self, key: &EntryKey) -> Result<Vec<HistoryRecord>, DbError> {
-        if let Some(space) = self.mount_space(key.mount)? {
-            if space != key.space {
-                return Ok(Vec::new());
-            }
+        if let Some(space) = self.mount_space(key.mount)?
+            && space != key.space
+        {
+            return Ok(Vec::new());
         }
         let Some(entry_id) = self.entry_id(key.mount, key.path.as_str())? else {
             return Ok(Vec::new());
@@ -538,6 +546,71 @@ impl Repo<'_> {
             objects.insert(object_id_from_blob(&row?)?);
         }
         Ok(objects)
+    }
+
+    pub fn record_scan_success(
+        &self,
+        mount: MountId,
+        full: bool,
+        now_ms: i64,
+    ) -> Result<(), DbError> {
+        if self.mount_space(mount)?.is_none() {
+            return Err(DbError::NotFound);
+        }
+        let mount = mount_bytes(mount);
+        let full_ms = full.then_some(now_ms);
+        self.conn.execute(
+            "INSERT INTO mount_state (mount_id, last_scan_ms, last_full_scan_ms, last_error, last_error_ms)
+             VALUES (?1, ?2, ?3, NULL, NULL)
+             ON CONFLICT(mount_id) DO UPDATE SET
+                last_scan_ms = excluded.last_scan_ms,
+                last_full_scan_ms = COALESCE(excluded.last_full_scan_ms, mount_state.last_full_scan_ms),
+                last_error = NULL,
+                last_error_ms = NULL",
+            params![mount.as_slice(), now_ms, full_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_scan_error(
+        &self,
+        mount: MountId,
+        message: &str,
+        now_ms: i64,
+    ) -> Result<(), DbError> {
+        if self.mount_space(mount)?.is_none() {
+            return Err(DbError::NotFound);
+        }
+        let mount = mount_bytes(mount);
+        self.conn.execute(
+            "INSERT INTO mount_state (mount_id, last_scan_ms, last_full_scan_ms, last_error, last_error_ms)
+             VALUES (?1, NULL, NULL, ?2, ?3)
+             ON CONFLICT(mount_id) DO UPDATE SET
+                last_error = excluded.last_error,
+                last_error_ms = excluded.last_error_ms",
+            params![mount.as_slice(), message, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn mount_state(&self, mount: MountId) -> Result<Option<MountState>, DbError> {
+        let mount = mount_bytes(mount);
+        self.conn
+            .query_row(
+                "SELECT last_scan_ms, last_full_scan_ms, last_error, last_error_ms
+                 FROM mount_state WHERE mount_id = ?1",
+                params![mount.as_slice()],
+                |row| {
+                    Ok(MountState {
+                        last_scan_ms: row.get(0)?,
+                        last_full_scan_ms: row.get(1)?,
+                        last_error: row.get(2)?,
+                        last_error_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
     }
 
     pub fn object_count(&self) -> Result<u64, DbError> {

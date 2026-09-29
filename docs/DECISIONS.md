@@ -101,6 +101,11 @@ database commit has not landed yet is never collected.
 
 - Paths are Unicode NFC, so macOS (NFD-preserving) and Windows spellings of the
   same name are one identity.
+- Looking up an existing path walks each component and, if the NFC spelling is
+  missing, accepts the unique (or byte-order-first) on-disk name whose NFC form
+  matches; `to_os_path` only constructs destinations for new files.
+- Include/exclude globs are case-insensitive on macOS and Windows (matching
+  those platforms' default filesystems) and case-sensitive elsewhere.
 - Names that are legal locally but cannot exist on another platform (Windows
   reserved names, `:` `?` `*` etc., trailing dots or spaces, over-long
   components) are valid identities and flagged as not portable, rather than

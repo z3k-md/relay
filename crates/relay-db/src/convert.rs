@@ -175,10 +175,10 @@ pub(crate) fn is_fk_violation(err: &rusqlite::Error) -> bool {
 }
 
 pub(crate) fn map_write_err(err: rusqlite::Error, duplicate_name: Option<&str>) -> DbError {
-    if is_unique_violation(&err) {
-        if let Some(name) = duplicate_name {
-            return DbError::DuplicateName(name.to_owned());
-        }
+    if is_unique_violation(&err)
+        && let Some(name) = duplicate_name
+    {
+        return DbError::DuplicateName(name.to_owned());
     }
     if is_fk_violation(&err) {
         return DbError::NotFound;

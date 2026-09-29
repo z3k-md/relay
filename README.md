@@ -63,7 +63,7 @@ relay status
 | `relay space create NAME` / `relay space list` | Manage Spaces (logical namespaces) |
 | `relay mount add SPACE MOUNT PATH [--include P]... [--exclude P]... [--dev-excludes]` | Map a directory into a Space |
 | `relay mount list [SPACE]` | List mounts and their rules |
-| `relay scan [SPACE[/MOUNT]] [--allow-mass-delete]` | Index changes; all mounts if no argument |
+| `relay scan [SPACE[/MOUNT]] [--allow-mass-delete] [--dry-run]` | Index changes; all mounts if no argument. `--dry-run` reports without writing |
 | `relay ls SPACE/MOUNT [--deleted] [--prefix PATH]` | Show the logical index |
 | `relay history SPACE/MOUNT/PATH` | Every recorded version of one entry |
 | `relay restore SPACE/MOUNT/PATH --sequence N` | Write an old version back to disk as a new version |
@@ -99,6 +99,10 @@ Each mount root gets a small `.relay-mount` marker file identifying it.
 
 Relay's rule is to preserve data when unsure. In Phase 0 that means:
 
+- **Only one writer at a time**: `relay.lock` in the home directory is held
+  exclusively by `init`, `scan`, `restore`, `gc`, and other mutating
+  commands. A second writer fails immediately. Read-only commands (`status`,
+  `ls`, `history`, `space list`, `mount list`, `verify`) do not take the lock.
 - **A scan refuses to run** if the mount root or its `.relay-mount` marker is
   missing, so an unplugged drive or moved folder is not recorded as "every file
   deleted".

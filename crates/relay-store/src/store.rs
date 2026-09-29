@@ -85,13 +85,7 @@ impl ObjectStore {
         source: &Path,
         expected: Option<&StatHint>,
     ) -> Result<PutOutcome, StoreError> {
-        let mut file = File::open(source).map_err(|e| io_err(source, e))?;
-        let before = StatHint::from_metadata(&file.metadata().map_err(|e| io_err(source, e))?);
-        if expected.is_some_and(|hint| before != *hint) {
-            return Err(StoreError::SourceChanged {
-                path: source.to_owned(),
-            });
-        }
+        let (mut file, before) = open_live_file(source, expected)?;
 
         let tmp_dir = self.ensure_tmp()?;
         let mut tmp = create_tmp(&tmp_dir)?;
@@ -111,6 +105,31 @@ impl ObjectStore {
             size,
             stat: before,
             already_present,
+        })
+    }
+
+    /// Same stable-read checks as [`put_file`], but nothing is written to the store.
+    ///
+    /// `already_present` reports whether the store already has the hashed object.
+    pub fn hash_file(
+        &self,
+        source: &Path,
+        expected: Option<&StatHint>,
+    ) -> Result<PutOutcome, StoreError> {
+        let (mut file, before) = open_live_file(source, expected)?;
+        let (id, size) = copy_hashed(&mut file, &mut io::sink(), source, source)?;
+
+        if !stat_unchanged(&before, &file, source)? {
+            return Err(StoreError::SourceChanged {
+                path: source.to_owned(),
+            });
+        }
+
+        Ok(PutOutcome {
+            id,
+            size,
+            stat: before,
+            already_present: self.contains(&id),
         })
     }
 
@@ -261,6 +280,20 @@ impl ObjectStore {
         create_dir(&dir)?;
         Ok(dir)
     }
+}
+
+fn open_live_file(
+    source: &Path,
+    expected: Option<&StatHint>,
+) -> Result<(File, StatHint), StoreError> {
+    let file = File::open(source).map_err(|e| io_err(source, e))?;
+    let before = StatHint::from_metadata(&file.metadata().map_err(|e| io_err(source, e))?);
+    if expected.is_some_and(|hint| before != *hint) {
+        return Err(StoreError::SourceChanged {
+            path: source.to_owned(),
+        });
+    }
+    Ok((file, before))
 }
 
 /// Both the open handle and the path must still match `before`.
@@ -572,6 +605,52 @@ mod tests {
         assert_eq!(object_file_count(&store), 1);
         assert_eq!(store.list().unwrap(), vec![id1]);
         assert_eq!(tmp_file_count(&store), 0);
+    }
+
+    #[test]
+    fn hash_file_wrong_expected_is_source_changed_and_does_not_store() {
+        let (_dir, store) = setup();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("live.txt");
+        fs::write(&src, b"payload").unwrap();
+
+        let wrong = StatHint {
+            size: 1,
+            mtime_ns: 0,
+            file_id: None,
+        };
+        let err = store.hash_file(&src, Some(&wrong)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::SourceChanged { ref path } if path == &src),
+            "{err:?}"
+        );
+        assert_eq!(tmp_file_count(&store), 0);
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hash_file_id_matches_put_file_and_does_not_store() {
+        let (_dir, store) = setup();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("note.txt");
+        fs::write(&src, b"from disk").unwrap();
+
+        let hashed = store.hash_file(&src, None).unwrap();
+        assert_eq!(hashed.id, ObjectId::of(b"from disk"));
+        assert_eq!(hashed.size, 9);
+        assert!(!hashed.already_present);
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(tmp_file_count(&store), 0);
+
+        let put = store.put_file(&src, Some(&hashed.stat)).unwrap();
+        assert_eq!(put.id, hashed.id);
+        assert_eq!(put.size, hashed.size);
+        assert_eq!(put.stat, hashed.stat);
+        assert!(!put.already_present);
+
+        let hashed_again = store.hash_file(&src, Some(&put.stat)).unwrap();
+        assert_eq!(hashed_again.id, put.id);
+        assert!(hashed_again.already_present);
     }
 
     #[test]

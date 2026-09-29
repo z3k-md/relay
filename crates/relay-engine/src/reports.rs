@@ -15,9 +15,10 @@ pub const MASS_DELETE_DENOMINATOR: usize = 1;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanOptions {
     pub allow_mass_delete: bool,
+    pub dry_run: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Warning {
     pub message: String,
 }
@@ -52,12 +53,22 @@ impl From<&ScanWarning> for Warning {
             ScanWarning::NestedMount(path) => {
                 format!("skipped nested mount at {}", path.display())
             }
+            ScanWarning::NormalizationCollision { path, os_paths } => {
+                let first = os_paths
+                    .first()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_owned());
+                let others = os_paths.len().saturating_sub(1);
+                format!(
+                    "{first} and {others} other on-disk names map to {path}; only the first is indexed"
+                )
+            }
         };
         Self { message }
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ScanReport {
     pub created: usize,
     pub modified: usize,
@@ -103,6 +114,8 @@ pub struct MountStatus {
     pub marker_state: String,
     pub live_entries: usize,
     pub tombstones: usize,
+    pub last_scan_ms: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 pub(crate) fn is_mass_delete(deletions: usize, live: usize, scanned: usize) -> bool {

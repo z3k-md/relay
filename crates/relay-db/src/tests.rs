@@ -6,6 +6,8 @@ use relay_core::{
     Sequence, Space, SpaceId, StatHint, VersionVector,
 };
 
+use rusqlite::params;
+
 use crate::{Database, DbError};
 
 fn device(n: u8, name: &str) -> Device {
@@ -111,13 +113,13 @@ fn migrations_are_idempotent_on_reopen() {
     let path = dir.path().join("nested").join("relay.sqlite");
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
     }
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
         db.repo().init_local_device(&device(9, "again"), 1).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
     }
 }
 
@@ -135,8 +137,160 @@ fn schema_too_new_is_rejected() {
         err,
         DbError::SchemaTooNew {
             found: 99,
-            supported: 1
+            supported: 2
         }
+    ));
+}
+
+fn write_v1_db(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+        .unwrap();
+    conn.pragma_update(None, "user_version", 1u32).unwrap();
+    let device = [9u8; 32];
+    let space = [1u8; 16];
+    let mount = [2u8; 16];
+    conn.execute(
+        "INSERT INTO devices (device_id, name, status, created_at_ms)
+         VALUES (?1, 'legacy', 'active', 1)",
+        params![device.as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO local_device (singleton, device_ref, next_sequence) VALUES (1, 1, 7)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO spaces (id, name, created_at_ms) VALUES (?1, 'Legacy', 1)",
+        params![space.as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO mounts (id, space_id, name, created_at_ms) VALUES (?1, ?2, 'docs', 1)",
+        params![mount.as_slice(), space.as_slice()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn v1_database_upgrades_to_v2_without_data_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    write_v1_db(&path);
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 2);
+    let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
+    assert_eq!(space.name, "Legacy");
+    let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
+    assert_eq!(mount.name, "docs");
+    let local = db.repo().local_device().unwrap().unwrap();
+    assert_eq!(local.device.name, "legacy");
+    assert_eq!(local.next_sequence, Sequence(7));
+    assert!(db.repo().mount_state(mount.id).unwrap().is_none());
+}
+
+#[test]
+fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    write_v1_db(&path);
+
+    let err = Database::open_read_only(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DbError::SchemaTooOld {
+                found: 1,
+                supported: 2
+            }
+        ),
+        "{err}"
+    );
+    let version: i64 = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(version, 1);
+
+    Database::open(&path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 99u32).unwrap();
+    }
+    let err = Database::open_read_only(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DbError::SchemaTooNew {
+                found: 99,
+                supported: 2
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn open_read_only_reads_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    let space_name;
+    {
+        let db = Database::open(&path).unwrap();
+        db.repo()
+            .init_local_device(&device(1, "reader"), 1)
+            .unwrap();
+        let space = space("Personal");
+        space_name = space.name.clone();
+        db.repo().create_space(&space, 1).unwrap();
+    }
+    let db = Database::open_read_only(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 2);
+    let names: Vec<_> = db
+        .repo()
+        .list_spaces()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names, vec![space_name]);
+}
+
+#[test]
+fn mount_state_success_and_error() {
+    let h = Harness::new();
+    let repo = h.db.repo();
+    assert!(repo.mount_state(h.mount.id).unwrap().is_none());
+
+    repo.record_scan_success(h.mount.id, true, 1_000).unwrap();
+    let state = repo.mount_state(h.mount.id).unwrap().unwrap();
+    assert_eq!(state.last_scan_ms, Some(1_000));
+    assert_eq!(state.last_full_scan_ms, Some(1_000));
+    assert!(state.last_error.is_none());
+    assert!(state.last_error_ms.is_none());
+
+    repo.record_scan_error(h.mount.id, "marker missing", 2_000)
+        .unwrap();
+    let state = repo.mount_state(h.mount.id).unwrap().unwrap();
+    assert_eq!(state.last_scan_ms, Some(1_000));
+    assert_eq!(state.last_full_scan_ms, Some(1_000));
+    assert_eq!(state.last_error.as_deref(), Some("marker missing"));
+    assert_eq!(state.last_error_ms, Some(2_000));
+
+    repo.record_scan_success(h.mount.id, false, 3_000).unwrap();
+    let state = repo.mount_state(h.mount.id).unwrap().unwrap();
+    assert_eq!(state.last_scan_ms, Some(3_000));
+    assert_eq!(state.last_full_scan_ms, Some(1_000));
+    assert!(state.last_error.is_none());
+    assert!(state.last_error_ms.is_none());
+
+    let other = MountId::new();
+    assert!(matches!(
+        repo.record_scan_success(other, true, 4_000),
+        Err(DbError::NotFound)
     ));
 }
 

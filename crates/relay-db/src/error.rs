@@ -7,6 +7,9 @@ pub enum DbError {
     #[error("database schema version {found} is newer than this binary supports ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
 
+    #[error("database schema version {found} is older than this binary requires ({supported})")]
+    SchemaTooOld { found: u32, supported: u32 },
+
     #[error("local device is already initialized")]
     AlreadyInitialized,
 

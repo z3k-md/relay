@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use relay_engine::{
-    Engine, EngineError, EntryContent, LogicalPath, ManualClock, ObjectStore, ScanOptions,
-    Sequence, VectorOrdering,
+    Engine, EngineConfig, EngineError, EntryContent, LogicalPath, ManualClock, ObjectStore,
+    ScanOptions, Sequence, VectorOrdering,
 };
 use tempfile::TempDir;
 
@@ -19,6 +19,9 @@ fn init_engine(home: &Path) -> Engine {
     Engine::init(home, "testdev")
         .unwrap()
         .with_clock(Arc::new(ManualClock::new(CLOCK_START)))
+        .with_config(EngineConfig {
+            racy_window: Duration::ZERO,
+        })
 }
 
 fn ready(home: &Path, mount: &Path) -> Engine {
@@ -285,6 +288,7 @@ fn mass_delete_guard() {
             "code",
             ScanOptions {
                 allow_mass_delete: true,
+                ..ScanOptions::default()
             },
         )
         .unwrap();
@@ -592,7 +596,10 @@ fn sequences_increase_across_restart() {
     drop(engine);
     let mut engine = Engine::open(home.path())
         .unwrap()
-        .with_clock(Arc::new(ManualClock::new(CLOCK_START + 60_000)));
+        .with_clock(Arc::new(ManualClock::new(CLOCK_START + 60_000)))
+        .with_config(EngineConfig {
+            racy_window: Duration::ZERO,
+        });
     fs::write(mount.path().join("a.txt"), b"v2").unwrap();
     scan(&mut engine);
     let later = last_seq(&engine);
@@ -613,4 +620,238 @@ fn init_and_open_guards() {
         Err(EngineError::AlreadyInitialized)
     ));
     Engine::open(home.path()).unwrap();
+}
+
+#[test]
+fn second_writer_is_busy_reader_works_and_lock_releases_on_drop() {
+    let home = new_home();
+    let engine = Engine::init(home.path(), "one").unwrap();
+
+    let err = match Engine::open(home.path()) {
+        Err(err) => err,
+        Ok(_) => panic!("expected second writer to be Busy"),
+    };
+    assert!(
+        matches!(err, EngineError::Busy { ref home } if home == engine.home()),
+        "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("another relay process is using {}", engine.home().display())
+    );
+
+    let reader = Engine::open_read_only(home.path()).unwrap();
+    assert_eq!(reader.device().name, "one");
+    assert!(reader.spaces().unwrap().is_empty());
+    assert!(matches!(
+        Engine::open_read_only(home.path())
+            .unwrap()
+            .create_space("nope")
+            .unwrap_err(),
+        EngineError::ReadOnly
+    ));
+
+    drop(engine);
+    Engine::open(home.path()).unwrap();
+}
+
+#[test]
+fn read_only_engine_rejects_create_space() {
+    let home = new_home();
+    Engine::init(home.path(), "one").unwrap();
+    let err = Engine::open_read_only(home.path())
+        .unwrap()
+        .create_space("Personal")
+        .unwrap_err();
+    assert!(matches!(err, EngineError::ReadOnly), "{err}");
+}
+
+#[test]
+fn racy_clean_just_written_file_has_no_stat_and_detects_same_mtime_rewrite() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = Engine::init(home.path(), "testdev")
+        .unwrap()
+        .with_clock(Arc::new(ManualClock::new(CLOCK_START)));
+    engine.create_space("Personal").unwrap();
+    engine
+        .add_mount("Personal", "code", mount.path(), &[], &[])
+        .unwrap();
+
+    let path = mount.path().join("racy.txt");
+    fs::write(&path, b"aaaa").unwrap();
+    let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    let report = scan(&mut engine);
+    assert_eq!(report.created, 1, "{report:?}");
+    let entry = engine
+        .entries("Personal", "code", false)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.key.path.as_str() == "racy.txt")
+        .unwrap();
+    assert_eq!(entry.stat, None);
+
+    fs::write(&path, b"bbbb").unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(original_mtime)
+        .unwrap();
+
+    let report = scan(&mut engine);
+    assert_eq!(report.modified, 1, "{report:?}");
+}
+
+#[test]
+fn old_mtime_stores_a_real_stat() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = Engine::init(home.path(), "testdev")
+        .unwrap()
+        .with_clock(Arc::new(ManualClock::new(CLOCK_START)));
+    engine.create_space("Personal").unwrap();
+    engine
+        .add_mount("Personal", "code", mount.path(), &[], &[])
+        .unwrap();
+
+    let path = mount.path().join("old.txt");
+    fs::write(&path, b"old").unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+
+    scan(&mut engine);
+    let entry = engine
+        .entries("Personal", "code", false)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.key.path.as_str() == "old.txt")
+        .unwrap();
+    assert!(entry.stat.is_some(), "{entry:?}");
+}
+
+#[test]
+fn restore_after_racy_scan_and_unscanned_edit() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = Engine::init(home.path(), "testdev")
+        .unwrap()
+        .with_clock(Arc::new(ManualClock::new(CLOCK_START)));
+    engine.create_space("Personal").unwrap();
+    engine
+        .add_mount("Personal", "code", mount.path(), &[], &[])
+        .unwrap();
+
+    let path = mount.path().join("doc.txt");
+    fs::write(&path, b"version-one").unwrap();
+    scan(&mut engine);
+    let old_seq = engine.history("Personal", "code", &lp("doc.txt")).unwrap()[0].sequence;
+    fs::write(&path, b"version-two").unwrap();
+    scan(&mut engine);
+    let current = engine
+        .entries("Personal", "code", false)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.key.path.as_str() == "doc.txt")
+        .unwrap();
+    assert_eq!(current.stat, None);
+
+    let restored = engine
+        .restore("Personal", "code", &lp("doc.txt"), old_seq)
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"version-one");
+    assert!(restored.sequence > current.sequence);
+
+    fs::write(&path, b"changed-on-disk").unwrap();
+    let err = engine
+        .restore("Personal", "code", &lp("doc.txt"), old_seq)
+        .unwrap_err();
+    assert!(matches!(err, EngineError::DestinationChanged(_)), "{err}");
+    assert_eq!(fs::read(&path).unwrap(), b"changed-on-disk");
+}
+
+#[test]
+fn dry_run_matches_real_scan_and_writes_nothing() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    fs::write(mount.path().join("a.txt"), b"alpha").unwrap();
+    fs::create_dir_all(mount.path().join("src")).unwrap();
+    fs::write(mount.path().join("src/b.txt"), b"bravo").unwrap();
+
+    let seq_before = last_seq(&engine);
+    let store_before = ObjectStore::open(home.path().join("store"))
+        .unwrap()
+        .list()
+        .unwrap();
+    let entries_before = engine.entries("Personal", "code", true).unwrap();
+
+    let dry = engine
+        .scan(
+            "Personal",
+            "code",
+            ScanOptions {
+                dry_run: true,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(dry.created, 3, "{dry:?}");
+    assert_eq!(last_seq(&engine), seq_before);
+    assert_eq!(
+        engine.entries("Personal", "code", true).unwrap(),
+        entries_before
+    );
+    assert_eq!(
+        ObjectStore::open(home.path().join("store"))
+            .unwrap()
+            .list()
+            .unwrap(),
+        store_before
+    );
+    let status = engine.status().unwrap();
+    assert!(status.mounts[0].last_scan_ms.is_none());
+
+    let real = scan(&mut engine);
+    assert_eq!(dry, real);
+    assert!(last_seq(&engine) > seq_before);
+    assert!(
+        engine
+            .status()
+            .unwrap()
+            .mounts
+            .iter()
+            .any(|m| m.last_scan_ms == Some(CLOCK_START))
+    );
+}
+
+#[test]
+fn scan_records_success_and_mount_errors() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    fs::write(mount.path().join("a.txt"), b"x").unwrap();
+    scan(&mut engine);
+    let status = engine.status().unwrap();
+    assert_eq!(status.mounts[0].last_scan_ms, Some(CLOCK_START));
+    assert!(status.mounts[0].last_error.is_none());
+
+    fs::remove_file(mount.path().join(".relay-mount")).unwrap();
+    let err = engine
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Fs(_)), "{err}");
+    let status = engine.status().unwrap();
+    assert_eq!(status.mounts[0].last_scan_ms, Some(CLOCK_START));
+    assert!(
+        status.mounts[0]
+            .last_error
+            .as_ref()
+            .is_some_and(|e| e.contains("marker")),
+        "{status:?}"
+    );
 }

@@ -55,6 +55,9 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         allow_mass_delete: bool,
+        /// Plan the scan and print the report without writing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List indexed entries
     Ls {
@@ -135,7 +138,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init { name } => cmd_init(&home, name, json),
         Command::Status => {
-            let engine = Engine::open(&home)?;
+            let engine = Engine::open_read_only(&home)?;
             cmd_status(&engine, json)
         }
         Command::Space { cmd } => match cmd {
@@ -150,7 +153,7 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             SpaceCmd::List => {
-                let engine = Engine::open(&home)?;
+                let engine = Engine::open_read_only(&home)?;
                 let spaces = engine.spaces()?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&spaces)?);
@@ -192,7 +195,7 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             MountCmd::List { space } => {
-                let engine = Engine::open(&home)?;
+                let engine = Engine::open_read_only(&home)?;
                 let mounts = engine.mounts(space.as_deref())?;
                 if json {
                     let rows: Vec<_> = mounts
@@ -211,6 +214,8 @@ fn run(cli: Cli) -> Result<()> {
                                     .as_ref()
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|| "-".to_owned()),
+                                format_rules("include", &cfg.includes),
+                                format_rules("exclude", &cfg.excludes),
                             ]
                         })
                         .collect();
@@ -222,20 +227,27 @@ fn run(cli: Cli) -> Result<()> {
         Command::Scan {
             target,
             allow_mass_delete,
+            dry_run,
         } => {
             let mut engine = Engine::open(&home)?;
-            cmd_scan(&mut engine, target.as_deref(), allow_mass_delete, json)
+            cmd_scan(
+                &mut engine,
+                target.as_deref(),
+                allow_mass_delete,
+                dry_run,
+                json,
+            )
         }
         Command::Ls {
             target,
             deleted,
             prefix,
         } => {
-            let engine = Engine::open(&home)?;
+            let engine = Engine::open_read_only(&home)?;
             cmd_ls(&engine, &target, deleted, prefix.as_deref(), json)
         }
         Command::History { target } => {
-            let engine = Engine::open(&home)?;
+            let engine = Engine::open_read_only(&home)?;
             cmd_history(&engine, &target, json)
         }
         Command::Restore { target, sequence } => {
@@ -243,7 +255,7 @@ fn run(cli: Cli) -> Result<()> {
             cmd_restore(&mut engine, &target, Sequence(sequence), json)
         }
         Command::Verify => {
-            let engine = Engine::open(&home)?;
+            let engine = Engine::open_read_only(&home)?;
             let report = engine.verify_objects()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -318,6 +330,11 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
                     m.marker_state.clone(),
                     format!("{} live", m.live_entries),
                     format!("{} tombstones", m.tombstones),
+                    match m.last_scan_ms {
+                        Some(ms) => format_utc_ms(ms),
+                        None => "never".to_owned(),
+                    },
+                    m.last_error.clone().unwrap_or_else(|| "-".to_owned()),
                 ]
             })
             .collect();
@@ -334,9 +351,13 @@ fn cmd_scan(
     engine: &mut Engine,
     target: Option<&str>,
     allow_mass_delete: bool,
+    dry_run: bool,
     json: bool,
 ) -> Result<()> {
-    let opts = ScanOptions { allow_mass_delete };
+    let opts = ScanOptions {
+        allow_mass_delete,
+        dry_run,
+    };
     let mut rows = Vec::new();
     let mut first_error: Option<EngineError> = None;
 
@@ -386,7 +407,7 @@ fn cmd_scan(
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
         for row in &rows {
-            print_scan_human(row);
+            print_scan_human(row, dry_run);
         }
     }
 
@@ -436,11 +457,12 @@ fn push_scan_result(
     }
 }
 
-fn print_scan_human(row: &ScanRow) {
+fn print_scan_human(row: &ScanRow, dry_run: bool) {
+    let prefix = if dry_run { "(dry run) " } else { "" };
     match (&row.report, &row.error) {
         (Some(report), _) => {
             println!(
-                "{}/{}: {} created, {} modified, {} deleted, {} unchanged",
+                "{prefix}{}/{}: {} created, {} modified, {} deleted, {} unchanged",
                 row.space,
                 row.mount,
                 report.created,
@@ -465,7 +487,7 @@ fn print_scan_human(row: &ScanRow) {
             }
         }
         (_, Some(error)) => {
-            println!("{}/{}: error: {error}", row.space, row.mount);
+            println!("{prefix}{}/{}: error: {error}", row.space, row.mount);
         }
         _ => {}
     }
@@ -656,10 +678,10 @@ fn default_device_name() -> String {
             }
         }
     }
-    if let Ok(value) = hostname_fallback() {
-        if relay_core::validate_name(&value).is_ok() {
-            return value;
-        }
+    if let Ok(value) = hostname_fallback()
+        && relay_core::validate_name(&value).is_ok()
+    {
+        return value;
     }
     "this-device".to_owned()
 }
@@ -694,7 +716,18 @@ fn print_engine_error(err: &EngineError) {
         EngineError::DestinationChanged(_) => {
             eprintln!("hint: scan first so Relay sees the on-disk change");
         }
+        EngineError::Busy { .. } => {
+            eprintln!("hint: stop `relay watch` or wait for the other command to finish");
+        }
         _ => {}
+    }
+}
+
+fn format_rules(kind: &str, rules: &[String]) -> String {
+    if rules.is_empty() {
+        format!("{kind}: -")
+    } else {
+        format!("{kind}: {}", rules.join(", "))
     }
 }
 

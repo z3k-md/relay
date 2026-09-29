@@ -112,7 +112,16 @@ fn cli_end_to_end() {
         .assert()
         .success()
         .stdout(predicate::str::contains("cli-dev"))
-        .stdout(predicate::str::contains("OK"));
+        .stdout(predicate::str::contains("OK"))
+        .stdout(predicate::str::contains("T"))
+        .stdout(predicate::str::contains("Z"));
+
+    relay()
+        .args(["--home", &home_s, "mount", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include:"))
+        .stdout(predicate::str::contains("exclude:"));
 }
 
 #[test]
@@ -186,4 +195,103 @@ fn missing_marker_is_clear_error() {
         .code(1)
         .stderr(predicate::str::contains("error:"))
         .stderr(predicate::str::contains("drive mounted"));
+}
+
+#[test]
+fn dry_run_prefixes_report_and_writes_nothing() {
+    let home = TempDir::new().unwrap();
+    let mount = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let mount_s = mount.path().to_str().unwrap().to_owned();
+    fs::write(mount.path().join("a.txt"), b"hello").unwrap();
+
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args([
+            "--home", &home_s, "mount", "add", "Personal", "code", &mount_s,
+        ])
+        .assert()
+        .success();
+
+    relay()
+        .args(["--home", &home_s, "scan", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(dry run)"))
+        .stdout(predicate::str::contains("created"));
+
+    let ls = relay()
+        .args(["--home", &home_s, "--json", "ls", "Personal/code"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&ls).unwrap();
+    assert_eq!(parsed.as_array().map(Vec::len), Some(0), "{parsed}");
+}
+
+#[test]
+fn second_writer_reports_busy() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+
+    let _engine = relay_engine::Engine::open(home.path()).unwrap();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("another relay process is using"))
+        .stderr(predicate::str::contains("relay watch"));
+}
+
+#[test]
+fn mount_list_prints_rules() {
+    let home = TempDir::new().unwrap();
+    let mount = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let mount_s = mount.path().to_str().unwrap().to_owned();
+
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args([
+            "--home",
+            &home_s,
+            "mount",
+            "add",
+            "Personal",
+            "code",
+            &mount_s,
+            "--include",
+            "src/**",
+            "--exclude",
+            "target/**",
+        ])
+        .assert()
+        .success();
+
+    relay()
+        .args(["--home", &home_s, "mount", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("include: src/**"))
+        .stdout(predicate::str::contains("exclude: target/**"));
 }

@@ -5,7 +5,8 @@ mod error;
 mod reports;
 mod scan;
 
-use std::fs;
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,14 +34,31 @@ pub use reports::{
 const DB_FILE: &str = "relay.db";
 const STORE_DIR: &str = "store";
 const LOGS_DIR: &str = "logs";
+const LOCK_FILE: &str = "relay.lock";
 const TMP_CLEAN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Engine knobs that are not part of the persisted device identity.
+#[derive(Clone, Debug)]
+pub struct EngineConfig {
+    /// If a file's mtime is newer than this, its stat hint is stored as `None`
+    /// so the next scan re-hashes (Git's "racy clean" case).
+    pub racy_window: Duration,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            racy_window: Duration::from_secs(2),
+        }
+    }
+}
 
 /// `$RELAY_HOME` if set; else the platform project data dir; else `~/.relay`.
 pub fn default_home() -> PathBuf {
-    if let Ok(home) = std::env::var("RELAY_HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home);
-        }
+    if let Ok(home) = std::env::var("RELAY_HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home);
     }
     if let Some(dirs) = directories::ProjectDirs::from("dev", "Relay", "Relay") {
         return dirs.data_dir().to_path_buf();
@@ -61,12 +79,16 @@ pub struct Engine {
     store: ObjectStore,
     device: Device,
     clock: Arc<dyn Clock>,
+    config: EngineConfig,
+    /// Exclusive lock on `<home>/relay.lock`. `None` for a read-only engine.
+    lock: Option<File>,
 }
 
 impl Engine {
     pub fn init(home: &Path, device_name: &str) -> Result<Engine, EngineError> {
         validate_name(device_name)?;
         ensure_layout(home)?;
+        let lock = acquire_lock(home)?;
         let mut db = Database::open(&home.join(DB_FILE))?;
         if db.repo().local_device()?.is_some() {
             return Err(EngineError::AlreadyInitialized);
@@ -86,6 +108,8 @@ impl Engine {
             store,
             device,
             clock,
+            config: EngineConfig::default(),
+            lock: Some(lock),
         })
     }
 
@@ -95,6 +119,7 @@ impl Engine {
             return Err(EngineError::NotInitialized);
         }
         ensure_layout(home)?;
+        let lock = acquire_lock(home)?;
         let db = Database::open(&db_path)?;
         let local = db
             .repo()
@@ -108,11 +133,42 @@ impl Engine {
             store,
             device: local.device,
             clock: Arc::new(SystemClock),
+            config: EngineConfig::default(),
+            lock: Some(lock),
+        })
+    }
+
+    /// Open the home for reads only. Does not take the writer lock.
+    pub fn open_read_only(home: &Path) -> Result<Engine, EngineError> {
+        let db_path = home.join(DB_FILE);
+        if !db_path.is_file() {
+            return Err(EngineError::NotInitialized);
+        }
+        let db = Database::open_read_only(&db_path)?;
+        let local = db
+            .repo()
+            .local_device()
+            .map_err(EngineError::from_db)?
+            .ok_or(EngineError::NotInitialized)?;
+        let store = ObjectStore::open(home.join(STORE_DIR))?;
+        Ok(Engine {
+            home: home.to_path_buf(),
+            db,
+            store,
+            device: local.device,
+            clock: Arc::new(SystemClock),
+            config: EngineConfig::default(),
+            lock: None,
         })
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Engine {
         self.clock = clock;
+        self
+    }
+
+    pub fn with_config(mut self, config: EngineConfig) -> Engine {
+        self.config = config;
         self
     }
 
@@ -125,6 +181,7 @@ impl Engine {
     }
 
     pub fn create_space(&mut self, name: &str) -> Result<Space, EngineError> {
+        self.ensure_writable()?;
         validate_name(name)?;
         let space = Space {
             id: relay_core::SpaceId::new(),
@@ -149,6 +206,7 @@ impl Engine {
         includes: &[String],
         excludes: &[String],
     ) -> Result<MountConfig, EngineError> {
+        self.ensure_writable()?;
         validate_name(space)?;
         validate_name(mount)?;
         let meta = fs::metadata(local_path).map_err(|err| {
@@ -308,6 +366,7 @@ impl Engine {
         path: &LogicalPath,
         sequence: Sequence,
     ) -> Result<EntryRecord, EngineError> {
+        self.ensure_writable()?;
         let (space_rec, config) = self.lookup_mount(space, mount)?;
         let local_path = config
             .local_path
@@ -339,25 +398,25 @@ impl Engine {
             }
         };
 
-        let current = self.db.repo().entry(&key)?;
-        let expected_existing = current.as_ref().and_then(|record| {
-            if matches!(record.content, EntryContent::File { .. }) && !record.is_deleted() {
-                record.stat.as_ref()
-            } else {
-                None
-            }
-        });
-
         let dest = to_os_path(&local_path, path);
+        let current = self.db.repo().entry(&key)?;
+        let expected_existing = restore_expected_stat(&self.store, &dest, current.as_ref())?;
+
         let mut reader = self.store.open_object(&object)?;
-        let stat = match materialize_file(&mut reader, &dest, object, executable, expected_existing)
-        {
+        let stat = match materialize_file(
+            &mut reader,
+            &dest,
+            object,
+            executable,
+            expected_existing.as_ref(),
+        ) {
             Ok(stat) => stat,
             Err(relay_fs::FsError::DestinationChanged(path)) => {
                 return Err(EngineError::DestinationChanged(path));
             }
             Err(err) => return Err(err.into()),
         };
+        let stat = scan::recorded_stat(stat, scan::wall_clock_now_ns(), self.config.racy_window);
 
         let now = self.clock.now_ms();
         let device = self.device.id;
@@ -374,7 +433,7 @@ impl Engine {
                     current.as_ref(),
                     key.clone(),
                     content.clone(),
-                    Some(stat),
+                    stat,
                     device,
                     now,
                     sequence,
@@ -410,6 +469,7 @@ impl Engine {
     }
 
     pub fn gc(&mut self, grace: Duration) -> Result<GcReport, EngineError> {
+        self.ensure_writable()?;
         let live = self.db.repo().live_objects()?;
         let sweep = self.store.sweep(&live, grace)?;
         let tmp_cleaned = self.store.clean_tmp(TMP_CLEAN_AGE)?;
@@ -451,6 +511,7 @@ impl Engine {
                     Err(_) => (false, "ERROR".to_owned()),
                 },
             };
+            let state = self.db.repo().mount_state(config.mount.id)?;
             mounts.push(MountStatus {
                 space: space.name,
                 mount: config.mount.name,
@@ -459,6 +520,8 @@ impl Engine {
                 marker_state,
                 live_entries,
                 tombstones,
+                last_scan_ms: state.as_ref().and_then(|s| s.last_scan_ms),
+                last_error: state.and_then(|s| s.last_error),
             });
         }
         let object_count = self.store.list()?.len() as u64;
@@ -495,12 +558,62 @@ impl Engine {
             .ok_or(EngineError::MountNotLocal)?;
         Ok((space_rec, config))
     }
+
+    fn ensure_writable(&self) -> Result<(), EngineError> {
+        if self.lock.is_none() {
+            Err(EngineError::ReadOnly)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn ensure_layout(home: &Path) -> Result<(), EngineError> {
     fs::create_dir_all(home)?;
     fs::create_dir_all(home.join(LOGS_DIR))?;
     Ok(())
+}
+
+fn acquire_lock(home: &Path) -> Result<File, EngineError> {
+    let path = home.join(LOCK_FILE);
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(EngineError::Busy {
+            home: home.to_path_buf(),
+        }),
+        Err(fs::TryLockError::Error(err)) => Err(EngineError::Io(err)),
+    }
+}
+
+fn restore_expected_stat(
+    store: &ObjectStore,
+    dest: &Path,
+    current: Option<&EntryRecord>,
+) -> Result<Option<relay_core::StatHint>, EngineError> {
+    let Some(record) = current else {
+        return Ok(None);
+    };
+    if record.is_deleted() || !matches!(record.content, EntryContent::File { .. }) {
+        return Ok(None);
+    }
+    match record.stat {
+        Some(stat) => Ok(Some(stat)),
+        None => match store.hash_file(dest, None) {
+            Ok(outcome) if Some(outcome.id) == record.content.object() => Ok(Some(outcome.stat)),
+            Ok(_) => Err(EngineError::DestinationChanged(dest.to_path_buf())),
+            Err(StoreError::SourceChanged { path }) => Err(EngineError::DestinationChanged(path)),
+            Err(StoreError::Io { path, source }) if source.kind() == io::ErrorKind::NotFound => {
+                Err(EngineError::DestinationChanged(path))
+            }
+            Err(err) => Err(err.into()),
+        },
+    }
 }
 
 fn paths_overlap(a: &Path, b: &Path) -> bool {
