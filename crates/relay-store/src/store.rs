@@ -277,7 +277,12 @@ impl ObjectStore {
             return Ok(());
         }
 
-        let file = File::open(tmp).map_err(|e| io_err(tmp, e))?;
+        // Windows' FlushFileBuffers needs a writable handle; a read-only one
+        // fails with "Access denied".
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(tmp)
+            .map_err(|e| io_err(tmp, e))?;
         file.sync_all().map_err(|e| io_err(tmp, e))?;
         drop(file);
 
