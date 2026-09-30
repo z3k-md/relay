@@ -285,43 +285,6 @@ before rename) and serves objects from it; it never touches the database.
 - Object import calls `sync_all` on a handle opened for writing. On Windows,
   `FlushFileBuffers` on a read-only handle fails with "Access denied".
 
-## D22. Receive-side mass-delete guard
-
-A scan already refuses to tombstone a large fraction of a mount (D7). That
-does not stop a peer from sending those tombstones (bad peer state, an
-accidental `rm -rf` on the other machine, or a bug). Relay preserves data
-when unsure, so the receiver holds a peer mass delete until the user decides.
-
-- **Detection.** In `Syncer::process_head`, before `apply_remote_batch`, count
-  tombstones whose local entry exists and is live. A per-connection,
-  per-(space, mount) counter tracks deletions already applied in the current
-  catch-up and resets when a `caught_up` batch for that space has been
-  applied. Baseline live is the current live count (the same `count_live`
-  the scan guard uses) plus deletions applied so far. The guard trips when
-  `is_large_fraction_delete(session + batch, baseline)` is true — the same
-  function and thresholds as the scan-side check (at least 25 entries and
-  more than half the mount).
-- **Hold.** If there is no stored decision for (peer, space, mount), persist a
-  hold and the held paths (this batch and any already queued for that peer
-  and space). Emit `DeletesHeld` once per hold per connection. Do not apply
-  the batch, advance `received`, or ack; that (peer, space) queue waits. Other
-  spaces and peers keep syncing. A reconnect re-requests from the unchanged
-  watermark.
-- **Decisions.** Written through `Engine::open_for_config` (`relay deletes
-  apply|restore`, or the desktop buttons). A running loop reloads on the
-  database change and recreates the Syncer.
-  - `apply` bypasses the guard for that hold and applies normally. After a
-    `caught_up` batch for the space is applied, the hold is deleted so a
-    future mass delete is held again.
-  - `restore` re-asserts every held path whose local entry is still live and
-    whose file still matches the index: a new local version with the same
-    content and a bumped vector (fresh sequence, history row, sent to peers).
-    That version is concurrent with the peer's tombstone; D18 rule 1 (exactly
-    one side is a tombstone → the live side wins, no copy) keeps the file
-    here and brings it back on the peer. Paths that changed locally are
-    skipped (the next scan records the change, which also beats the
-    tombstone). The hold is then deleted and the batch is applied.
-
 ## D20. Desktop app, releases and auto-update
 
 Desktop users run a Tauri 2 + Vue app (`apps/relay-desktop`). The sync
@@ -384,3 +347,51 @@ the index updates immediately. If the run lock is held (`EngineError::Running`
 or busy), scanning is skipped. `resolve_git_conflicts` deletes metadata
 copies under that `.git` directory; ref copies stay unless `--branches` so
 the user can merge in Git. Prior versions remain in history.
+
+## D22. Receive-side mass-delete guard
+
+A scan already refuses to tombstone a large fraction of a mount (D7). That
+does not stop a peer from sending those tombstones (bad peer state, an
+accidental `rm -rf` on the other machine, or a bug). Relay preserves data
+when unsure, so the receiver holds a peer mass delete until the user decides.
+
+- **Detection.** In `Syncer::process_head`, before `apply_remote_batch`, count
+  tombstones that would delete a live local entry: the local entry is live
+  and the tombstone's vector dominates it. Concurrent tombstones lose to the
+  live side (D18) and are not counted. A per-connection,
+  per-(space, mount) counter tracks deletions already applied in the current
+  catch-up and resets when a `caught_up` batch for that space has been
+  applied. Baseline live is the current live count (the same `count_live`
+  the scan guard uses) plus deletions applied so far. The guard trips when
+  `is_large_fraction_delete(session + batch, baseline)` is true — the same
+  function and thresholds as the scan-side check (at least 25 entries and
+  more than half the mount).
+- **Hold.** If there is no stored decision for (peer, space, mount), persist a
+  hold and the held paths (this batch and any already queued for that peer
+  and space). Emit `DeletesHeld` once per hold per connection. Do not apply
+  the batch, advance `received`, or ack; that (peer, space) queue waits. Other
+  spaces and peers keep syncing. A reconnect re-requests from the unchanged
+  watermark.
+- **Decisions.** Written through `Engine::open_for_config` (`relay deletes
+  apply|restore`, or the desktop buttons). A running loop reloads on the
+  database change and recreates the Syncer.
+  - A decided hold is kept until a `caught_up` batch for the space is applied,
+    then deleted so a future mass delete is held again. The decision is read
+    from the database on every batch, so it covers the whole catch-up and
+    survives reconnects.
+  - `apply` lets batches through unguarded.
+  - `restore`, on every batch, re-asserts each local file that a tombstone in
+    the batch would delete (and, the first time, every held path), provided
+    the entry is still live and the file still matches the index: a new
+    local version with the same content and a bumped vector (fresh sequence,
+    history row, sent to peers). That version is concurrent with the peer's
+    tombstone; D18 rule 1 (exactly one side is a tombstone → the live side
+    wins, no copy) keeps the file here and brings it back on the peer. Paths
+    that changed locally are skipped (the next scan records the change, which
+    also beats the tombstone). The held path list is emptied after the first
+    re-assert.
+- **Limit.** Tombstones arrive in index batches (D16) and the guard only sees
+  the batches so far, so a delete spread over several batches trips once the
+  running total passes the threshold; the deletes before that are applied.
+  History and objects are kept (no GC yet), so a later change can restore
+  those too.

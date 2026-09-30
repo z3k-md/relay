@@ -1112,6 +1112,42 @@ fn restore_held_mass_delete_converges() {
 }
 
 #[test]
+fn restore_covers_deletes_beyond_the_held_batch() {
+    let files: Vec<(String, Vec<u8>)> = (0..100)
+        .map(|i| (format!("f{i:02}.txt"), format!("body-{i}").into_bytes()))
+        .collect();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.sa = Syncer::with_index_batch_entries(10);
+    h.setup_shared_space(&pairs);
+
+    delete_first_n(h.mount_a.path(), 80);
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert_eq!(h.b.delete_holds().unwrap().len(), 1);
+    let after_hold = live_files(h.mount_b.path());
+
+    for i in 80..90 {
+        fs::remove_file(h.mount_a.path().join(format!("f{i:02}.txt"))).unwrap();
+    }
+    scan_allow_mass(&mut h.a);
+    h.b.decide_delete_hold("Personal", None, None, DeleteHoldDecision::Restore)
+        .unwrap();
+    h.reconnect();
+    h.push_both();
+    h.push_both();
+
+    assert_eq!(live_files(h.mount_b.path()), after_hold);
+    assert_eq!(live_files(h.mount_a.path()), after_hold);
+    assert!(after_hold.iter().any(|(path, _)| path == "f85.txt"));
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+    assert!(h.b.delete_holds().unwrap().is_empty());
+}
+
+#[test]
 fn hold_on_one_space_does_not_block_another() {
     let files = forty_files();
     let pairs = file_pairs(&files);

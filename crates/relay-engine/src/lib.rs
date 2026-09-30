@@ -764,14 +764,14 @@ impl Engine {
             .map_err(EngineError::from_db)
     }
 
-    pub(crate) fn clear_delete_hold(
+    pub(crate) fn clear_delete_hold_paths(
         &mut self,
         peer: DeviceId,
         space: relay_core::SpaceId,
         mount: relay_core::MountId,
     ) -> Result<(), EngineError> {
         self.db
-            .transaction(|repo| repo.clear_delete_hold(peer, space, mount))
+            .transaction(|repo| repo.replace_delete_hold_paths(peer, space, mount, &[]))
             .map_err(EngineError::from_db)
     }
 
