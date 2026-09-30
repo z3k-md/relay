@@ -259,7 +259,7 @@ noisy metadata copies; add `--branches` to delete the conflicting refs too.
 | `relay service install [--listen ADDR]` | Install or upgrade the background service and start it (macOS LaunchAgent; Windows scheduled task). Requires `relay init` first. Windows must be elevated. |
 | `relay service uninstall` / `start` / `stop` / `restart` / `status` | Remove or control the background service |
 | `relay service logs [-n N] [-f]` | Show the service log (`<relay home>/logs/relay.log`) |
-| `relay status` | Device, mounts, entry counts, peers and sync progress |
+| `relay status` | Device, mounts, entry counts, peers, sync progress, and live daemon state (or “not running”) |
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Pair with another device |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
 | `relay space create NAME` / `space list` | Manage Spaces (logical namespaces) |
@@ -270,6 +270,9 @@ noisy metadata copies; add `--branches` to delete the conflicting refs too.
 | `relay conflicts resolve SPACE/MOUNT/PATH --keep current\|copy` | Keep the current file or replace it with the conflict copy |
 | `relay conflicts resolve-git SPACE/MOUNT/PATH [--branches]` | Delete Git metadata conflict copies; `--branches` also deletes conflicting refs |
 | `relay deletes` / `deletes apply SPACE [--mount NAME] [--peer NAME]` / `deletes restore SPACE [--mount] [--peer]` | List held peer mass-deletes, or apply them here / restore the files on the peer |
+| `relay pause` / `relay resume` | Persist a pause flag; a running host stops watching and networking until resume |
+| `relay rescan [SPACE[/MOUNT]] [--no-wait]` | Ask a running host to scan now, or scan directly if none is running |
+| `relay activity [-n N] [--follow]` | Recent host activity (requires a running host) |
 | `relay watch` | Keep the local index live without syncing |
 | `relay scan [SPACE[/MOUNT]] [--allow-mass-delete] [--dry-run]` | Index changes once |
 | `relay ls SPACE/MOUNT [--deleted] [--prefix PATH]` | Show the logical index |
@@ -288,13 +291,15 @@ found missing or corrupt objects.
 `**/build/**`, `**/.venv/**` and `**/__pycache__/**`. A `.relayignore` file at
 the mount root adds more exclude globs, one per line. Rules are per device.
 
-A running Relay (`relay run` or the background service) picks up
-`peer add` / `peer remove`, `share` / `unshare`, `space create` / `space join`,
-`mount add` and `deletes apply` / `deletes restore` within about a second. For `scan`, `restore` and `gc`, prefer
-stopping the service first (`relay service stop`) so a one-shot write does not
-interleave with the live loop. Read-only commands (`status`, `ls`, `history`,
-`conflicts`, `verify`) work while it runs. `relay run` is still available if
-you want a foreground process instead of the service.
+A running Relay (`relay run`, the background service, or the desktop app)
+picks up `peer add` / `peer remove`, `share` / `unshare`, `space create` /
+`space join`, `mount add` and `deletes apply` / `deletes restore` within
+about a second. Use `relay rescan` (not `relay scan`) to index while a host
+is running. For `restore` and `gc`, prefer stopping the service first
+(`relay service stop`) so a one-shot write does not interleave with the live
+loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`)
+and `relay pause` / `resume` / `activity` work while it runs. `relay run` is
+still available if you want a foreground process instead of the service.
 
 ## Notes
 
@@ -388,6 +393,7 @@ crates/
   relay-net      QUIC transport: pinned mutual TLS, control and object streams
   relay-engine   scan, watch, sync state machine, remote apply, conflicts, history
   relay-daemon   reusable sync runner: network + engine loop with live config reload
+  relay-ipc      local-socket RPC between a running host and the CLI
 apps/
   relay-cli      the `relay` binary
 scripts/         install.sh, install.ps1, build-windows.sh, deploy.sh
@@ -400,9 +406,9 @@ docs/
 
 The phase plan is in [`docs/DESIGN.md`](docs/DESIGN.md) section 51. Next:
 
-1. **Phase 3**: Git-aware conflict grouping and resolve commands are in;
-   receive-side mass-delete guard is next.
-2. **Phase 4**: local IPC so the CLI talks to a running daemon (config
-   changes are already picked up by a live reload within about a second).
+1. **Phase 3**: Git-aware conflict grouping, resolve commands, and the
+   receive-side mass-delete guard are in.
+2. **Phase 4**: local IPC is in — the CLI talks to a running host for
+   status, pause/resume, rescan, and activity.
 3. **Phase 5+**: LAN discovery and pairing codes, more than two devices,
    relaying, encryption at rest.

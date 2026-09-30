@@ -454,3 +454,58 @@ period (D6).
 **Other platforms.** `PutBatch::put_file` is today's `put_file` (fully
 durable immediately) and `commit()` is a no-op. Linux and Windows behavior
 is unchanged.
+
+  History and objects are kept (no GC yet), so a later change can restore
+  those too.
+
+## D24. Local IPC and the host lock
+
+A running host (`relay run`, `relay service`, or the desktop app) exposes a
+blocking local-socket RPC so the CLI can inspect and steer it without
+opening the engine for write. Pairing, discovery, and extra auth tokens are
+out of scope.
+
+- **Transport.** The `interprocess` crate's local sockets, sync/blocking, one
+  thread per client. Unix: a socket file `<home>/relay.sock`. If that path
+  is longer than 100 bytes, the socket is
+  `$TMPDIR/relay-<16 hex chars of blake3(canonicalized home)>.sock`. After
+  bind, the file mode is set to `0600`. A stale socket file is removed only
+  by the process that already holds the host lock. Windows: a namespaced
+  named pipe `relay-<same 16 hex>`. `interprocess` 2.x does not expose a
+  safe per-user DACL builder under this workspace's `unsafe_code = forbid`,
+  so the pipe inherits the default local-user ACL; that is the documented
+  limit, not a second trust domain.
+- **Endpoint naming.** The 16-hex token is the first 8 bytes of
+  BLAKE3(canonicalized home path). Clients and the server derive the same
+  name from `--home`.
+- **Protocol.** Newline-delimited JSON.
+  Request `{"id":u64,"method":"...","params":{...}}` →
+  `{"id":u64,"result":...}` or
+  `{"id":u64,"error":{"code":"...","message":"..."}}`.
+  `PROTOCOL_VERSION` is 1. `hello` returns `{protocol, relay_version, host,
+  pid, started_at_ms}`; the client errors on a protocol mismatch.
+  Other methods: `status` (live state, listen address, connected peers,
+  per-mount watch/scan info), `pause` / `resume` (persist the flag and
+  return the new state), `rescan {space?, mount?}` (queue a full scan;
+  error if paused or nothing matches), `activity {limit?}` (last N of a
+  500-item in-memory ring), `subscribe` (the connection becomes a stream
+  of activity items until the client disconnects).
+- **Host lock.** `run()` takes an exclusive `File::try_lock` on
+  `<home>/relay.host.lock` for its whole lifetime, including paused mode.
+  A second `run()` fails immediately. If the existing host answers `hello`,
+  the error names its kind and pid. The engine's `relay.lock` /
+  `relay.run.lock` are separate: they are released in paused mode so
+  `relay scan` and other exclusive opens work.
+- **Pause.** The flag lives in `local_settings` (`key = paused`,
+  `value = 1|0`), written through `Engine::set_paused` (including
+  `open_for_config`). A running loop sees the `data_version` bump, exits,
+  drops the engine, does not start the network, reports `paused`, and waits
+  for IPC resume, a flag clear from another process (polled about once a
+  second), or `stop`. Desktop Pause/Resume write the same flag; the old
+  Tauri `settings.json` `paused` key is migrated once and then abandoned.
+- **Security.** Same OS user as the host. Unix socket `0600`; Windows named
+  pipe uses the default current-user ACL. No tokens, no cross-user access.
+- **Known limits.** One host per home. The desktop app hosts IPC itself; it
+  does not yet attach as a client of a `relay service` runner. Windows pipe
+  ACLs cannot be tightened further without `unsafe`. Subscribe is
+  firehose-from-now; a client that needs history calls `activity` first.
