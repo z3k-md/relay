@@ -1,0 +1,90 @@
+# CI for the Relay workspace (Rust crates + Tauri desktop crate).
+# The desktop frontend and sidecar paths are produced by the desktop app
+# in apps/relay-desktop (see docs/RELEASING.md).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/relay-desktop/package-lock.json
+
+      - name: Install pinned Rust toolchain
+        run: |
+          # rust-toolchain.toml is honoured by rustup (channel + rustfmt/clippy).
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build desktop frontend
+        working-directory: apps/relay-desktop
+        run: |
+          npm ci
+          npm run build
+
+      - name: Placeholder sidecar for tauri-build
+        run: |
+          set -euo pipefail
+          # tauri-build checks bundle.externalBin exists at compile time.
+          triple=$(rustc -vV | sed -n 's/host: //p')
+          dest="apps/relay-desktop/src-tauri/binaries/relay-${triple}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            dest="${dest}.exe"
+          fi
+          mkdir -p "$(dirname "$dest")"
+          printf 'placeholder' > "$dest"
+
+      - name: rustfmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --locked

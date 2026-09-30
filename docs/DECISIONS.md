@@ -283,3 +283,29 @@ before rename) and serves objects from it; it never touches the database.
   Otherwise a restarted peer waited for the idle timeout before reconnecting.
 - Object import calls `sync_all` on a handle opened for writing. On Windows,
   `FlushFileBuffers` on a read-only handle fails with "Access denied".
+
+## D20. Desktop app, releases and auto-update
+
+Desktop users run a Tauri 2 + Vue app (`apps/relay-desktop`). The sync
+runner is hosted in-process (the same engine the CLI embeds). The `relay`
+CLI is also bundled as a sidecar (`bundle.externalBin`) and placed on PATH
+so terminal workflows keep working.
+
+Releases are produced by GitHub Actions when a `v*` tag is pushed
+(`.github/workflows/release.yml`). `scripts/release.sh` bumps
+`[workspace.package] version`, the Tauri and npm `"version"` fields,
+commits, tags, and pushes. macOS is a universal (`aarch64` + `x86_64`)
+ad-hoc-signed `.dmg` (no notarization yet). Windows is a per-user NSIS
+installer (no admin). Linux desktop builds are not shipped; headless
+`relay service` remains the path for SSH and servers (see
+`scripts/deploy.sh`).
+
+Auto-updates use a Tauri minisign key. The public key lives in
+`tauri.conf.json` (`plugins.updater.pubkey`); the private key is the
+`TAURI_SIGNING_PRIVATE_KEY` Actions secret. `latest.json` is uploaded to
+GitHub Releases and the updater endpoint is
+`https://github.com/OWNER/REPO/releases/latest/download/latest.json`.
+That URL must be publicly downloadable: if the source repo is private,
+set the `RELEASE_REPO` variable and `RELEASE_TOKEN` secret so artifacts
+go to a public repo and point the endpoint there. Losing the private key
+means existing installs can never auto-update again.
