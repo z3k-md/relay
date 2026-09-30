@@ -269,6 +269,7 @@ noisy metadata copies; add `--branches` to delete the conflicting refs too.
 | `relay conflicts [--space SPACE]` | List conflict copies (Git repositories are one line each) |
 | `relay conflicts resolve SPACE/MOUNT/PATH --keep current\|copy` | Keep the current file or replace it with the conflict copy |
 | `relay conflicts resolve-git SPACE/MOUNT/PATH [--branches]` | Delete Git metadata conflict copies; `--branches` also deletes conflicting refs |
+| `relay deletes` / `deletes apply SPACE [--mount NAME] [--peer NAME]` / `deletes restore SPACE [--mount] [--peer]` | List held peer mass-deletes, or apply them here / restore the files on the peer |
 | `relay watch` | Keep the local index live without syncing |
 | `relay scan [SPACE[/MOUNT]] [--allow-mass-delete] [--dry-run]` | Index changes once |
 | `relay ls SPACE/MOUNT [--deleted] [--prefix PATH]` | Show the logical index |
@@ -288,8 +289,8 @@ found missing or corrupt objects.
 the mount root adds more exclude globs, one per line. Rules are per device.
 
 A running Relay (`relay run` or the background service) picks up
-`peer add` / `peer remove`, `share` / `unshare`, `space create` / `space join`
-and `mount add` within about a second. For `scan`, `restore` and `gc`, prefer
+`peer add` / `peer remove`, `share` / `unshare`, `space create` / `space join`,
+`mount add` and `deletes apply` / `deletes restore` within about a second. For `scan`, `restore` and `gc`, prefer
 stopping the service first (`relay service stop`) so a one-shot write does not
 interleave with the live loop. Read-only commands (`status`, `ls`, `history`,
 `conflicts`, `verify`) work while it runs. `relay run` is still available if
@@ -332,6 +333,10 @@ Relay's rule is to preserve data when unsure.
   deleted".
 - **Mass deletes are refused** (exit code 2) when a scan would delete at least
   25 entries and more than half the mount, or everything in it.
+- **Mass deletes from a peer are held** until you decide. If another device
+  tries to delete at least 25 entries and more than half a mount, Relay keeps
+  your files and asks (`relay deletes apply` or `relay deletes restore`).
+  Nothing is deleted until you choose.
 - **Unreadable, locked or mid-write files are skipped** and picked up later,
   never recorded as deleted or half-written.
 - **Downloads are verified** by BLAKE3 hash and written atomically (temp file,
