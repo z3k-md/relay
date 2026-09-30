@@ -23,8 +23,8 @@ edits keep both versions; per-file history and restore work on every device.
 a terminal open. The [desktop app](apps/relay-desktop/README.md) does the same
 from the tray, starts at login and updates itself from GitHub Releases.
 
-Not yet: device discovery (you type the other machine's address), Git-aware
-conflict handling, and relaying through a third device. See [Roadmap](#roadmap).
+Not yet: device discovery (you type the other machine's address) and relaying
+through a third device. See [Roadmap](#roadmap).
 
 ## Install
 
@@ -224,8 +224,15 @@ If the same file is changed on both machines before they sync (for example
 while one was offline), neither edit is lost. Both machines keep the same
 winner at the original path and the other version next to it as
 `Name.ext.relay-conflict-<device>-<n>`. The extension is deliberately not
-last, so games, build tools and test runners ignore conflict copies. Delete the
-copy (or merge it by hand) when you're done; that deletion syncs too.
+last, so games, build tools and test runners ignore conflict copies.
+
+`relay conflicts` lists ordinary copies and collapses each Git repository into
+one summary. Resolve a file with
+`relay conflicts resolve SPACE/MOUNT/COPY --keep current|copy` (`current`
+deletes the copy; `copy` replaces the original with the copy's current bytes,
+including any merge you edited into it). Prior versions stay in
+`relay history`. Those commands edit the files on disk, so they work even
+while `relay service` or the desktop app is running.
 
 A file deleted on one machine and edited on the other comes back with the
 edit.
@@ -234,9 +241,13 @@ edit.
 
 Syncing `.git` needs no special setup. Relay excludes Git's transient lock
 files and applies ref updates (`HEAD`, `refs/**`, `packed-refs`, `index`)
-after the objects they point to. Running Git on one machine at a time works
-best; if you commit on both machines while they are offline from each other,
-you get conflict copies inside `.git` that you resolve by hand.
+after the objects they point to. Concurrent commits on two machines while they
+are offline award every mutable file in that `.git` directory to the same
+device (the one with the greater device id), so `HEAD`, `index` and refs stay
+consistent. The losing ref is kept as
+`refs/heads/main.relay-conflict-<device>-<n>`, which Git shows as an ordinary
+branch. `relay conflicts resolve-git SPACE/MOUNT/path-to-.git` deletes the
+noisy metadata copies; add `--branches` to delete the conflicting refs too.
 
 ## Commands
 
@@ -255,7 +266,9 @@ you get conflict copies inside `.git` that you resolve by hand.
 | `relay space offers` / `space join NAME --from PEER` | See and accept spaces other devices shared with you |
 | `relay mount add SPACE MOUNT PATH [--include P]... [--exclude P]... [--dev-excludes]` | Map a directory into a Space, or attach a joined mount to a local folder |
 | `relay mount list [SPACE]` | List mounts and their rules |
-| `relay conflicts [--space SPACE]` | List conflict copies |
+| `relay conflicts [--space SPACE]` | List conflict copies (Git repositories are one line each) |
+| `relay conflicts resolve SPACE/MOUNT/PATH --keep current\|copy` | Keep the current file or replace it with the conflict copy |
+| `relay conflicts resolve-git SPACE/MOUNT/PATH [--branches]` | Delete Git metadata conflict copies; `--branches` also deletes conflicting refs |
 | `relay watch` | Keep the local index live without syncing |
 | `relay scan [SPACE[/MOUNT]] [--allow-mass-delete] [--dry-run]` | Index changes once |
 | `relay ls SPACE/MOUNT [--deleted] [--prefix PATH]` | Show the logical index |
@@ -382,8 +395,8 @@ docs/
 
 The phase plan is in [`docs/DESIGN.md`](docs/DESIGN.md) section 51. Next:
 
-1. **Phase 3**: Git-aware conflict grouping, receive-side mass-delete guard,
-   conflict resolution commands.
+1. **Phase 3**: Git-aware conflict grouping and resolve commands are in;
+   receive-side mass-delete guard is next.
 2. **Phase 4**: local IPC so the CLI talks to a running daemon (config
    changes are already picked up by a live reload within about a second).
 3. **Phase 5+**: LAN discovery and pairing codes, more than two devices,

@@ -235,7 +235,8 @@ same result from replicated data only:
 1. If exactly one side is a tombstone, the live side wins; no copy.
 2. If kinds differ and one is a directory, the directory wins; the other goes
    to a conflict copy.
-3. Otherwise `choose_winner` picks the version that keeps the path.
+3. Otherwise the winner is chosen by `choose_group_winner` for Git metadata
+   (see D21) or `choose_winner` for everything else.
 
 The path gets the winner's content with vector `merged(L, R)` and no bump
 (bumping would make each device's result different and never converge). The
@@ -243,8 +244,8 @@ loser is stored at `conflict_path(path, loser.modified_by,
 loser.vector[loser.modified_by])` with the loser's own vector, content,
 `modified_by` and `parent_object`. Before overwriting a local loser the local
 bytes are already in the object store, so the copy is materialized from the
-store. `relay conflicts` lists live conflict copies. Git-aware grouping of
-`.git` conflicts is deferred to Phase 3.
+store. `relay conflicts` lists live conflict copies. Git metadata copies are
+grouped per repository (D21).
 
 ## D19. Daemon threading
 
@@ -309,3 +310,40 @@ That URL must be publicly downloadable: if the source repo is private,
 set the `RELEASE_REPO` variable and `RELEASE_TOKEN` secret so artifacts
 go to a public repo and point the endpoint there. Losing the private key
 means existing installs can never auto-update again.
+
+## D21. Git repository conflict groups and conflict resolution
+
+Concurrent versions of mutable files inside one `.git` directory (anything
+under `.git/` except `<gitdir>/objects/**` and the `.git` directory entry
+itself) resolve as a group. The winner is the version whose writing
+`DeviceId` is greater (`choose_group_winner`). If both sides were written by
+the same device, the per-file rule (`choose_winner`) is the fallback.
+
+Device-id rank is used instead of per-file counters because counters are
+~unix seconds (D3): two files written in the same second on opposite devices
+can otherwise be awarded to different devices (HEAD from one, `index` from
+the other) and leave a repository that Git will not open. Object files stay
+on the per-file rule; they are content-addressed and grouping them would
+only hide a real divergence. The `.git` directory entry itself is a
+directory identity, not metadata. A file named `.gitignore` is not Git
+metadata.
+
+Every device computes the same result from replicated data only. Copy naming
+is unchanged: a losing `refs/heads/main` becomes
+`refs/heads/main.relay-conflict-<device>-<n>`, which Git shows as an ordinary
+branch.
+
+`relay conflicts` classifies each live copy as `File { original }` or
+`Git { git_dir, is_ref }` (`is_ref` means the copy is under `<git_dir>/refs/`).
+Git copies are grouped by `(space, mount, git_dir)` so a repository is one
+summary, not a pile of metadata files.
+
+Resolution is a filesystem operation inside the mount (`KeepCurrent` deletes
+the copy; `UseCopy` atomically replaces the original with the copy's current
+on-disk bytes, then deletes the copy). It works whether or not a sync loop
+is running; a running watcher records the change. After the edit the engine
+tries an exclusive `Engine::open` and a partial scan of the touched paths so
+the index updates immediately. If the run lock is held (`EngineError::Running`
+or busy), scanning is skipped. `resolve_git_conflicts` deletes metadata
+copies under that `.git` directory; ref copies stay unless `--branches` so
+the user can merge in Git. Prior versions remain in history.
