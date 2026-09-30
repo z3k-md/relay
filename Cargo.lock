@@ -3921,7 +3921,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3941,7 +3941,7 @@ dependencies = [
 
 [[package]]
 name = "relay-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "hex",
@@ -3956,7 +3956,7 @@ dependencies = [
 
 [[package]]
 name = "relay-crypto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rcgen",
  "relay-core",
@@ -3967,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "relay-daemon"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "relay-core",
@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "relay-db"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "proptest",
  "relay-core",
@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "relay-desktop"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "log",
@@ -4021,7 +4021,7 @@ dependencies = [
 
 [[package]]
 name = "relay-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "directories",
  "dunce",
@@ -4043,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "relay-fs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "notify",
@@ -4060,7 +4060,7 @@ dependencies = [
 
 [[package]]
 name = "relay-ipc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "hex",
@@ -4073,7 +4073,7 @@ dependencies = [
 
 [[package]]
 name = "relay-net"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "if-addrs 0.13.4",
@@ -4095,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "relay-policy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "globset",
  "relay-core",
@@ -4104,7 +4104,7 @@ dependencies = [
 
 [[package]]
 name = "relay-proto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "prost",
  "relay-core",
@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "relay-replica"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "hex",
  "prost",
@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "relay-store"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "relay-core",
