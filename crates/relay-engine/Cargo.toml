@@ -25,6 +25,7 @@ proptest.workspace = true
 relay-core.workspace = true
 relay-fs.workspace = true
 relay-proto.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [lints]

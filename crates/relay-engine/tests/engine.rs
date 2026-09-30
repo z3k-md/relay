@@ -1052,3 +1052,24 @@ fn own_writes_do_not_change_data_version_other_connection_does() {
         "a commit on a different rusqlite connection must change data_version"
     );
 }
+
+#[test]
+fn read_only_open_upgrades_an_older_schema() {
+    let home = new_home();
+    drop(init_engine(home.path()));
+    {
+        let conn = rusqlite::Connection::open(home.path().join("relay.db")).unwrap();
+        conn.execute_batch("DROP TABLE local_settings; PRAGMA user_version = 6;")
+            .unwrap();
+    }
+
+    let engine = Engine::open_read_only(home.path()).unwrap();
+    assert!(!engine.paused().unwrap());
+    drop(engine);
+
+    let conn = rusqlite::Connection::open(home.path().join("relay.db")).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+}

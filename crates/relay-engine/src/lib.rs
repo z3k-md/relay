@@ -54,6 +54,7 @@ const IDENTITY_DIR: &str = "identity";
 const LOCK_FILE: &str = "relay.lock";
 const RUN_LOCK_FILE: &str = "relay.run.lock";
 const TMP_CLEAN_AGE: Duration = Duration::from_secs(60 * 60);
+const SCHEMA_UPGRADE_WAIT: Duration = Duration::from_secs(5);
 
 /// Engine knobs that are not part of the persisted device identity.
 #[derive(Clone, Debug)]
@@ -187,7 +188,7 @@ impl Engine {
         if !db_path.is_file() {
             return Err(EngineError::NotInitialized);
         }
-        let db = Database::open_read_only(&db_path)?;
+        let db = open_read_only_db(home, &db_path)?;
         let local = db
             .repo()
             .local_device()
@@ -1097,6 +1098,28 @@ fn require_matching_identity(
         });
     }
     Ok(identity)
+}
+
+/// Read-only connections cannot migrate. An older schema (e.g. the first
+/// open after an app update) is upgraded through a normal writer open, which
+/// serializes migrations on the home lock, then the read-only open is retried.
+fn open_read_only_db(home: &Path, db_path: &Path) -> Result<Database, EngineError> {
+    let deadline = std::time::Instant::now() + SCHEMA_UPGRADE_WAIT;
+    let mut upgraded = false;
+    loop {
+        match Database::open_read_only(db_path) {
+            Err(relay_db::DbError::SchemaTooOld { .. }) if !upgraded => {
+                match Engine::open_for_config(home) {
+                    Ok(_) => upgraded = true,
+                    Err(EngineError::Busy { .. }) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            other => return Ok(other?),
+        }
+    }
 }
 
 fn acquire_lock(home: &Path) -> Result<File, EngineError> {
