@@ -60,6 +60,7 @@ impl ShellKind {
         }
     }
 
+    #[cfg(not(windows))]
     fn from_shell_path(path: &str) -> Option<Self> {
         let name = Path::new(path)
             .file_name()
