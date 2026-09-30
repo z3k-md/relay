@@ -55,8 +55,23 @@ pub fn paused(app: &AppHandle) -> bool {
     get_bool(app, KEY_PAUSED, false)
 }
 
-pub fn set_paused(app: &AppHandle, value: bool) -> anyhow::Result<()> {
-    set_bool(app, KEY_PAUSED, value)
+pub fn clear_paused(app: &AppHandle) -> anyhow::Result<()> {
+    let store = store(app)?;
+    store.delete(KEY_PAUSED);
+    store.save().map_err(|err| anyhow::anyhow!("{err}"))?;
+    Ok(())
+}
+
+/// Move a pre-IPC pause flag from Tauri settings into the database.
+pub fn migrate_paused_to_db(app: &AppHandle, home: &std::path::Path) -> anyhow::Result<()> {
+    if !paused(app) {
+        return Ok(());
+    }
+    if home.join("relay.db").is_file() {
+        let mut engine = relay_engine::Engine::open_for_config(home)?;
+        engine.set_paused(true)?;
+    }
+    clear_paused(app)
 }
 
 pub fn cli_install_attempted(app: &AppHandle) -> bool {
@@ -73,7 +88,6 @@ pub fn apply_first_run_defaults(app: &AppHandle) -> anyhow::Result<Settings> {
     }
     set_bool(app, KEY_START_AT_LOGIN, true)?;
     set_bool(app, KEY_AUTO_UPDATE, true)?;
-    set_bool(app, KEY_PAUSED, false)?;
     set_bool(app, KEY_DEFAULTS_APPLIED, true)?;
     Ok(Settings::default())
 }

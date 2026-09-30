@@ -12,8 +12,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::sidecar;
-use crate::{settings, tray};
-use relay_daemon::{DaemonEvent, DaemonOptions};
+use crate::tray;
+use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:47321";
 pub const DEFAULT_DEBOUNCE_MS: u64 = 200;
@@ -116,11 +116,6 @@ impl Runner {
             self.set_state(app, RunnerState::NotInitialized);
             return;
         }
-        if settings::paused(app) {
-            self.set_state(app, RunnerState::Paused);
-            return;
-        }
-
         self.stop_join();
         self.stop.store(false, Ordering::SeqCst);
         self.set_state(app, RunnerState::Starting);
@@ -151,13 +146,12 @@ impl Runner {
         self.start(app);
     }
 
-    pub fn pause(&self, app: &AppHandle) -> anyhow::Result<()> {
+    pub fn pause(&self, _app: &AppHandle) -> anyhow::Result<()> {
         if matches!(self.state(), RunnerState::ExternalService { .. }) {
             anyhow::bail!("{EXTERNAL_SERVICE_MESSAGE}");
         }
-        settings::set_paused(app, true)?;
-        self.stop_join();
-        self.set_state(app, RunnerState::Paused);
+        let mut engine = relay_engine::Engine::open_for_config(&self.home)?;
+        engine.set_paused(true)?;
         Ok(())
     }
 
@@ -165,8 +159,14 @@ impl Runner {
         if matches!(self.state(), RunnerState::ExternalService { .. }) {
             anyhow::bail!("{EXTERNAL_SERVICE_MESSAGE}");
         }
-        settings::set_paused(app, false)?;
-        self.start(app);
+        let mut engine = relay_engine::Engine::open_for_config(&self.home)?;
+        engine.set_paused(false)?;
+        if !matches!(
+            self.state(),
+            RunnerState::Starting | RunnerState::Running | RunnerState::Paused
+        ) {
+            self.start(app);
+        }
         Ok(())
     }
 
@@ -244,6 +244,7 @@ fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
                 ..WatchOptions::default()
             },
             verbose: false,
+            host: HostKind::Desktop,
         };
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -282,8 +283,12 @@ fn handle_daemon_event(app: &AppHandle, event: &DaemonEvent) {
     if let DaemonEvent::Watch(watch) = event {
         runner.apply_watch_peer(watch);
     }
-    if matches!(event, DaemonEvent::Started { .. }) {
-        runner.set_state(app, RunnerState::Running);
+    match event {
+        DaemonEvent::Started { .. } => runner.set_state(app, RunnerState::Running),
+        DaemonEvent::Paused => runner.set_state(app, RunnerState::Paused),
+        DaemonEvent::Resumed => runner.set_state(app, RunnerState::Starting),
+        DaemonEvent::Reloading => {}
+        _ => {}
     }
     runner.push_event(
         app,
@@ -311,6 +316,8 @@ fn describe_event(event: &DaemonEvent) -> (String, String) {
         ),
         DaemonEvent::Warning(msg) => ("warning".to_owned(), msg.clone()),
         DaemonEvent::Watch(watch) => describe_watch(watch),
+        DaemonEvent::Paused => ("paused".to_owned(), "Paused".to_owned()),
+        DaemonEvent::Resumed => ("resumed".to_owned(), "Resumed".to_owned()),
     }
 }
 

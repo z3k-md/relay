@@ -72,6 +72,13 @@ pub fn run() {
             let home = relay_engine::default_home();
             let _ = std::fs::create_dir_all(home.join("logs"));
 
+            if let Err(err) = settings::apply_first_run_defaults(app.handle()) {
+                log::warn!("settings defaults: {err:#}");
+            }
+            if let Err(err) = settings::migrate_paused_to_db(app.handle(), &home) {
+                log::warn!("paused-flag migration: {err:#}");
+            }
+
             let runner = Arc::new(Runner::new(home.clone()));
             app.manage(AppState {
                 home,
@@ -80,10 +87,6 @@ pub fn run() {
 
             if let Err(err) = tray::setup(app.handle()) {
                 log::warn!("tray setup failed: {err:#}");
-            }
-
-            if let Err(err) = settings::apply_first_run_defaults(app.handle()) {
-                log::warn!("settings defaults: {err:#}");
             }
             commands::apply_autostart(app.handle(), settings::load(app.handle()).start_at_login);
             commands::maybe_install_cli(app.handle());
