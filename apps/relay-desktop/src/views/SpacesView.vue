@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
 import { api } from "../lib/api";
-import type { OfferView, PeerView, SpaceView } from "../lib/types";
+import type { OfferView, PeerView, SpaceView, TransferLive } from "../lib/types";
+
+const props = defineProps<{
+  transfers?: TransferLive[];
+}>();
 
 const spaces = ref<SpaceView[]>([]);
 const offers = ref<OfferView[]>([]);
@@ -34,16 +38,43 @@ async function load() {
   }
 }
 
+function indexingLabel(space: string, mount: string): string | null {
+  const row = (props.transfers ?? []).find(
+    (transfer) =>
+      transfer.direction === "index" && transfer.space === space && transfer.mount === mount,
+  );
+  if (!row) return null;
+  const files = row.filesDone.toLocaleString();
+  return `Indexing… ${files} files`;
+}
+
 function folderName(path: string): string {
   const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
   return parts[parts.length - 1] ?? "folder";
 }
 
+const trimmedSpaceName = computed(() => spaceName.value.trim());
+
+function spaceNameIssue(name: string): string | null {
+  if (!name) return "Enter a name.";
+  if ([...name].length > 64) return "Use 64 characters or fewer.";
+  if (name.includes("/") || name.includes("\\")) return "Name can't include / or \\.";
+  if (/\p{Cc}/u.test(name)) return "Name can't include control characters.";
+  if (spaces.value.some((space) => space.name === name)) {
+    return "A space with this name already exists.";
+  }
+  return null;
+}
+
+const nameIssue = computed(() => spaceNameIssue(trimmedSpaceName.value));
+const canCreateSpace = computed(() => nameIssue.value === null);
+
 async function createSpace() {
+  if (busy.value || !canCreateSpace.value) return;
   busy.value = true;
   error.value = null;
   try {
-    await api.createSpace(spaceName.value.trim());
+    await api.createSpace(trimmedSpaceName.value);
     creating.value = false;
     spaceName.value = "";
     await load();
@@ -249,7 +280,10 @@ defineExpose({ load });
                 <span class="font-medium">{{ mount.name }}</span>
                 <span class="text-[var(--color-muted)]">
                   — {{ mount.path ?? "not attached on this device" }}
-                  <span v-if="mount.state && mount.state !== 'OK'"> · {{ mount.state }}</span>
+                  <span v-if="indexingLabel(space.name, mount.name)">
+                    · {{ indexingLabel(space.name, mount.name) }}
+                  </span>
+                  <span v-else-if="mount.state && mount.state !== 'OK'"> · {{ mount.state }}</span>
                 </span>
               </div>
               <button
@@ -284,15 +318,24 @@ defineExpose({ load });
       <input
         id="space-name"
         v-model="spaceName"
-        class="mt-1 mb-4 w-full rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-3 py-2"
+        class="mt-1 w-full rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-3 py-2"
         placeholder="Code"
+        maxlength="64"
+        autocomplete="off"
+        @keydown.enter="createSpace"
       />
+      <p
+        class="mt-1 mb-4 min-h-4 text-[12px]"
+        :class="trimmedSpaceName && nameIssue ? 'text-[var(--color-danger)]' : 'text-[var(--color-muted)]'"
+      >
+        {{ nameIssue }}
+      </p>
       <div class="flex justify-end gap-2">
         <button type="button" class="rounded-md px-2.5 py-1" @click="creating = false">Cancel</button>
         <button
           type="button"
-          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
-          :disabled="busy"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)] disabled:opacity-50"
+          :disabled="busy || !canCreateSpace"
           @click="createSpace"
         >
           Create

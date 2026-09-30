@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,6 +18,24 @@ use crate::error::EngineError;
 use crate::reports::{ScanOptions, ScanReport, Warning, is_large_fraction_delete, is_mass_delete};
 
 const SCAN_APPLY_ATTEMPTS: u32 = 3;
+
+thread_local! {
+    static SCAN_YIELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Ask the in-progress scan to stop before it commits. The watch loop uses
+/// this so adding a folder is not stuck behind a long index.
+pub(crate) fn request_scan_yield() {
+    SCAN_YIELD.with(|flag| flag.set(true));
+}
+
+pub(crate) fn clear_scan_yield() {
+    SCAN_YIELD.with(|flag| flag.set(false));
+}
+
+pub(crate) fn scan_yield_requested() -> bool {
+    SCAN_YIELD.with(|flag| flag.get())
+}
 
 pub(crate) enum ScanTick {
     Visited,
@@ -87,6 +106,7 @@ impl Engine {
         on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanReport, EngineError> {
         self.ensure_writable()?;
+        clear_scan_yield();
         let (space, config) = self.lookup_mount(space_name, mount_name)?;
         let mount_id = config.mount.id;
         let result = self.scan_attempts(&space, &config, opts, full, paths, on_tick);
@@ -150,7 +170,11 @@ impl Engine {
         let user_rules = MountRules::new(&config.includes, &config.excludes)?;
         let scanned = scan_mount_with(&local_path, &user_rules, &mut || {
             on_tick(ScanTick::Visited);
+            !scan_yield_requested()
         })?;
+        if scan_yield_requested() {
+            return Err(EngineError::Interrupted);
+        }
         let rules = match scanned.rules.clone() {
             Some(rules) => rules,
             None => effective_rules(&local_path, &user_rules, &mut Vec::new())?,
@@ -254,6 +278,9 @@ impl Engine {
         let mut batch = (!opts.dry_run).then(|| self.store.batch());
 
         for entry in entries {
+            if scan_yield_requested() {
+                return Err(EngineError::Interrupted);
+            }
             if count_visited {
                 on_tick(ScanTick::Visited);
             }
@@ -374,6 +401,10 @@ impl Engine {
             paths
         };
         report.deselected.sort();
+
+        if scan_yield_requested() {
+            return Err(EngineError::Interrupted);
+        }
 
         for (kind, _) in &writes {
             match kind {
@@ -770,6 +801,30 @@ mod tests {
             .add_mount("Personal", "code", mount.path(), &[], &[])
             .unwrap();
         (home, mount, engine)
+    }
+
+    #[test]
+    fn yield_during_scan_does_not_commit() {
+        let (_home, mount, mut engine) = ready();
+        fs::write(mount.path().join("a.txt"), b"aaa").unwrap();
+        fs::write(mount.path().join("b.txt"), b"bbb").unwrap();
+        let err = engine
+            .scan_mount("Personal", "code", ScanOptions::default(), &mut |_| {
+                request_scan_yield();
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Interrupted));
+        assert!(
+            engine
+                .entries("Personal", "code", false)
+                .unwrap()
+                .is_empty(),
+            "a paused scan must not commit a partial index"
+        );
+        let report = engine
+            .scan("Personal", "code", ScanOptions::default())
+            .unwrap();
+        assert!(report.created >= 2, "{report:?}");
     }
 
     #[test]

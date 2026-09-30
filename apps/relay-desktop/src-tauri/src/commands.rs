@@ -455,18 +455,43 @@ pub fn list_spaces(app: AppHandle) -> Result<Vec<SpaceView>, String> {
 #[tauri::command]
 pub fn create_space(app: AppHandle, name: String) -> Result<SpaceView, String> {
     let name = name.trim().to_owned();
-    with_write(&app, |engine| {
-        let space = engine.create_space(&name)?;
-        Ok(SpaceView {
-            name: space.name,
-            id: space.id.to_string(),
-            mounts: Vec::new(),
-            shared_with: Vec::new(),
-        })
+    relay_core::validate_name(&name).map_err(|err| error_chain(&err))?;
+    let home = app.state::<AppState>().home.clone();
+    // `open_for_config` is safe while the sync loop runs: the loop drops its
+    // writer lock and reloads after the commit. Stopping the loop to write
+    // restarts it, which waits on the sync thread and flashes console windows
+    // for `relay service status`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let space = loop {
+        match Engine::open_for_config(&home) {
+            Ok(mut engine) => {
+                if engine
+                    .spaces()
+                    .map_err(|err| error_chain(&err))?
+                    .iter()
+                    .any(|space| space.name == name)
+                {
+                    return Err(format!("a space named {name:?} already exists"));
+                }
+                break engine
+                    .create_space(&name)
+                    .map_err(|err| error_chain(&err))?;
+            }
+            Err(EngineError::Busy { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(err) => return Err(error_chain(&err)),
+        }
+    };
+    Ok(SpaceView {
+        name: space.name,
+        id: space.id.to_string(),
+        mounts: Vec::new(),
+        shared_with: Vec::new(),
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_mount(
     app: AppHandle,
     space: String,
@@ -496,7 +521,7 @@ pub fn add_mount(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn share(app: AppHandle, space: String, peer: String) -> Result<(), String> {
     if let Some(mut client) = host_client(&app)? {
         return client.share(&space, &peer).map_err(|err| error_chain(&err));

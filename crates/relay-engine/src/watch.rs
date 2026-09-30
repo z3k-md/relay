@@ -1,6 +1,6 @@
 //! Debounced filesystem watch loop. Events are hints; scans update the index.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -194,16 +194,33 @@ impl Engine {
         let mut replica_warned = false;
         let mut syncer = Syncer::new();
         let (tx, rx) = mpsc::channel::<LoopMsg>();
+        // Mount and share replies must not wait out a full index of a large
+        // folder. Those inputs travel on their own channel so a scan can notice
+        // them and pause.
+        let (priority_tx, priority_rx) = mpsc::channel::<SyncInput>();
         {
             let tx = tx.clone();
             std::thread::spawn(move || {
                 while let Ok(input) = sync_inputs.recv() {
-                    if tx.send(LoopMsg::Sync(input)).is_err() {
-                        break;
+                    match input {
+                        input @ (SyncInput::AddMount { .. } | SyncInput::Share { .. }) => {
+                            if priority_tx.send(input).is_err() {
+                                break;
+                            }
+                        }
+                        other => {
+                            if tx.send(LoopMsg::Sync(other)).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             });
         }
+        let mut priority = PriorityQueue {
+            rx: priority_rx,
+            buf: VecDeque::new(),
+        };
 
         let listed = self.mounts(None)?;
         let mut states: Vec<MountWatch> = listed
@@ -270,26 +287,14 @@ impl Engine {
             .collect();
         on_event(&WatchEvent::Started { mounts: names });
 
-        let initial: Vec<(String, String)> = states
-            .iter()
-            .map(|s| (s.space.clone(), s.mount.clone()))
-            .collect();
-        for (space, mount) in initial {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let result = self.scan_reporting(&space, &mount, None, on_event);
-            let committed = result.as_ref().is_ok_and(scan_committed);
-            if let Some(state) = states
-                .iter_mut()
-                .find(|s| s.space == space && s.mount == mount)
-            {
-                finish_watch_scan(state, true, 0, result, on_event);
-            }
-            if committed {
-                emit_sync(syncer.push_local_changes(self, &mut output), on_event);
-                emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
-            }
+        // Index inside the loop so an add-mount or share that arrives during
+        // startup can be applied before a large tree finishes hashing.
+        let due_at = Instant::now()
+            .checked_sub(opts.debounce.saturating_add(Duration::from_millis(1)))
+            .unwrap_or_else(Instant::now);
+        for state in &mut states {
+            state.full_pending = true;
+            state.last_event = Some(due_at);
         }
 
         // Retry a mailbox push even when the scan found nothing. A crash after
@@ -300,7 +305,14 @@ impl Engine {
         last_replica_pull = Some(Instant::now());
 
         while !stop.load(Ordering::Relaxed) {
-            match rx.recv_timeout(STOP_POLL) {
+            // Apply queued mount/share commands before waiting on watcher input
+            // or starting another index pass.
+            let incoming = if let Some(input) = priority.pop() {
+                Ok(LoopMsg::Sync(input))
+            } else {
+                rx.recv_timeout(STOP_POLL)
+            };
+            match incoming {
                 Ok(LoopMsg::Fs(signal)) => apply_signal(&mut states, signal, Instant::now()),
                 Ok(LoopMsg::Sync(input)) => match input {
                     SyncInput::Rescan { mounts } => {
@@ -361,7 +373,7 @@ impl Engine {
                         path,
                         reply,
                     } => {
-                        let result = apply_add_mount(
+                        apply_add_mount(
                             self,
                             &mut syncer,
                             &mut states,
@@ -371,8 +383,8 @@ impl Engine {
                             &path,
                             &mut output,
                             on_event,
+                            reply,
                         );
-                        let _ = reply.send(result);
                     }
                     SyncInput::Share { space, peer, reply } => {
                         let result = apply_share(self, &syncer, &space, &peer, &mut output);
@@ -405,20 +417,36 @@ impl Engine {
             );
 
             let jobs = flush_jobs(&mut states, now, &opts);
+            let mut yielded_for_command = false;
             for job in jobs {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let state = &mut states[job.index];
-                let committed = if job.full {
-                    self.run_watch_scan(state, true, on_event)
-                } else {
-                    self.run_watch_scan_paths(state, &job.paths, on_event)
-                };
-                if committed {
-                    emit_sync(syncer.push_local_changes(self, &mut output), on_event);
-                    emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
+                if priority.poll() {
+                    yielded_for_command = true;
+                    break;
                 }
+                let state = &mut states[job.index];
+                let step = if job.full {
+                    self.run_watch_scan(state, true, on_event, &mut || priority.poll())
+                } else {
+                    self.run_watch_scan_paths(state, &job.paths, on_event, &mut || priority.poll())
+                };
+                match step {
+                    ScanStep::Yielded => {
+                        yielded_for_command = true;
+                        break;
+                    }
+                    ScanStep::Finished { committed } => {
+                        if committed {
+                            emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+                            emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
+                        }
+                    }
+                }
+            }
+            if yielded_for_command {
+                continue;
             }
 
             if last_replica_pull
@@ -452,6 +480,7 @@ impl Engine {
         mount: &str,
         paths: Option<&[LogicalPath]>,
         on_event: &mut dyn FnMut(&WatchEvent),
+        poll_priority: &mut dyn FnMut() -> bool,
     ) -> Result<ScanReport, EngineError> {
         let mut files = 0u64;
         let mut bytes = 0u64;
@@ -477,6 +506,9 @@ impl Engine {
                     bytes_hashed: bytes,
                 });
             }
+            if poll_priority() {
+                crate::scan::request_scan_yield();
+            }
         };
         match paths {
             Some(paths) => {
@@ -491,12 +523,11 @@ impl Engine {
         state: &mut MountWatch,
         full: bool,
         on_event: &mut dyn FnMut(&WatchEvent),
-    ) -> bool {
+        poll_priority: &mut dyn FnMut() -> bool,
+    ) -> ScanStep {
         let paths = state.dirty.len();
-        let result = self.scan_reporting(&state.space, &state.mount, None, on_event);
-        let committed = result.as_ref().is_ok_and(scan_committed);
-        finish_watch_scan(state, full, paths, result, on_event);
-        committed
+        let result = self.scan_reporting(&state.space, &state.mount, None, on_event, poll_priority);
+        finish_or_yield(state, full, paths, result, on_event)
     }
 
     fn run_watch_scan_paths(
@@ -504,13 +535,34 @@ impl Engine {
         state: &mut MountWatch,
         paths: &[LogicalPath],
         on_event: &mut dyn FnMut(&WatchEvent),
-    ) -> bool {
+        poll_priority: &mut dyn FnMut() -> bool,
+    ) -> ScanStep {
         let n = paths.len();
-        let result = self.scan_reporting(&state.space, &state.mount, Some(paths), on_event);
-        let committed = result.as_ref().is_ok_and(scan_committed);
-        finish_watch_scan(state, false, n, result, on_event);
-        committed
+        let result =
+            self.scan_reporting(&state.space, &state.mount, Some(paths), on_event, poll_priority);
+        finish_or_yield(state, false, n, result, on_event)
     }
+}
+
+enum ScanStep {
+    Finished { committed: bool },
+    Yielded,
+}
+
+fn finish_or_yield(
+    state: &mut MountWatch,
+    full: bool,
+    paths: usize,
+    result: Result<ScanReport, EngineError>,
+    on_event: &mut dyn FnMut(&WatchEvent),
+) -> ScanStep {
+    if matches!(result, Err(EngineError::Interrupted)) {
+        // Leave the mount pending so the index resumes after the command.
+        return ScanStep::Yielded;
+    }
+    let committed = result.as_ref().is_ok_and(scan_committed);
+    finish_watch_scan(state, full, paths, result, on_event);
+    ScanStep::Finished { committed }
 }
 
 fn apply_add_peer(
@@ -551,16 +603,30 @@ fn apply_add_mount(
     path: &Path,
     output: &mut dyn FnMut(SyncOutput),
     on_event: &mut dyn FnMut(&WatchEvent),
-) -> Result<AddMountApplied, String> {
-    let config = engine
-        .add_mount(space, mount, path, &[], &[])
-        .map_err(|err| err.to_string())?;
+    reply: mpsc::Sender<Result<AddMountApplied, String>>,
+) {
+    let config = match engine.add_mount(space, mount, path, &[], &[]) {
+        Ok(config) => config,
+        Err(err) => {
+            let _ = reply.send(Err(err.to_string()));
+            return;
+        }
+    };
     let space_id = config.mount.space;
     let mount_id = config.mount.id;
     let name = config.mount.name.clone();
     let local_path = config.local_path.clone();
+    // Reply before watcher setup or UI events. Those run on this thread, and a
+    // desktop command waiting on the reply can be the UI thread those events
+    // need. The index itself runs later, off this reply.
+    let _ = reply.send(Ok(AddMountApplied {
+        name: name.clone(),
+        path: local_path.clone(),
+        space_id,
+        mount_id,
+    }));
 
-    if let Some(root) = local_path.clone() {
+    if let Some(root) = local_path {
         let mut state = MountWatch {
             space_id,
             mount_id,
@@ -591,13 +657,27 @@ fn apply_add_mount(
             reason: err.to_string(),
         });
     }
+}
 
-    Ok(AddMountApplied {
-        name,
-        path: local_path,
-        space_id,
-        mount_id,
-    })
+struct PriorityQueue {
+    rx: mpsc::Receiver<SyncInput>,
+    buf: VecDeque<SyncInput>,
+}
+
+impl PriorityQueue {
+    /// Pull every waiting mount/share command into the buffer.
+    /// True when at least one is waiting.
+    fn poll(&mut self) -> bool {
+        while let Ok(input) = self.rx.try_recv() {
+            self.buf.push_back(input);
+        }
+        !self.buf.is_empty()
+    }
+
+    fn pop(&mut self) -> Option<SyncInput> {
+        self.poll();
+        self.buf.pop_front()
+    }
 }
 
 fn apply_share(

@@ -131,6 +131,12 @@ pub enum EngineError {
 
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    /// The watch loop paused a scan to apply a mount or share. Callers other
+    /// than the watch loop do not request this.
+    #[doc(hidden)]
+    #[error("scan paused")]
+    Interrupted,
 }
 
 impl EngineError {

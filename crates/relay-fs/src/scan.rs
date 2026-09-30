@@ -98,14 +98,17 @@ pub fn effective_rules(
 /// [`crate::MountMarker::verify`] first. The marker file itself is skipped.
 /// An error reading the root is fatal; per-entry IO errors become warnings.
 pub fn scan_mount(root: &Path, rules: &MountRules) -> Result<ScanResult, FsError> {
-    scan_mount_with(root, rules, &mut || {})
+    scan_mount_with(root, rules, &mut || true)
 }
 
 /// Like [`scan_mount`], calling `on_entry` once per collected entry during the walk.
+///
+/// `on_entry` returns `false` to stop the walk early. The returned entries are
+/// then only what was visited; callers must not treat that as a complete mount.
 pub fn scan_mount_with(
     root: &Path,
     rules: &MountRules,
-    on_entry: &mut dyn FnMut(),
+    on_entry: &mut dyn FnMut() -> bool,
 ) -> Result<ScanResult, FsError> {
     ensure_root(root)?;
     let mut result = ScanResult::default();
@@ -218,7 +221,7 @@ fn walk_tree(
     include_start: bool,
     entries: &mut Vec<ScannedEntry>,
     warnings: &mut Vec<ScanWarning>,
-    on_entry: &mut dyn FnMut(),
+    on_entry: &mut dyn FnMut() -> bool,
 ) -> Result<(), FsError> {
     let early = RefCell::new(WalkEarly::default());
     let walker = WalkDir::new(start)
@@ -244,7 +247,9 @@ fn walk_tree(
                 }
                 if let Some(scanned) = collect_entry(root, &entry, rules, warnings)? {
                     entries.push(scanned);
-                    on_entry();
+                    if !on_entry() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -258,7 +263,9 @@ fn walk_tree(
     for os_path in extra_symlinks {
         if let Some(scanned) = collect_symlink_path(root, &os_path, rules, warnings) {
             entries.push(scanned);
-            on_entry();
+            if !on_entry() {
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -412,7 +419,7 @@ fn examine_existing(
             true,
             sink.entries,
             sink.warnings,
-            &mut || {},
+            &mut || true,
         )?;
         return Ok(());
     }

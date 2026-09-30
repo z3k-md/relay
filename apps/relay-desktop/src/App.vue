@@ -233,7 +233,7 @@ onUnmounted(() => {
             @resume="resume"
           />
           <PeersView v-else-if="page === 'peers'" />
-          <SpacesView v-else-if="page === 'spaces'" />
+          <SpacesView v-else-if="page === 'spaces'" :transfers="transfers" />
           <ConflictsView v-else-if="page === 'conflicts'" />
           <ActivityView v-else-if="page === 'activity'" ref="activityRef" />
           <SettingsView
