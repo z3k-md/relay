@@ -8,7 +8,7 @@ use relay_core::{
 };
 use relay_fs::{ScanScope, ScanWarning, ScopeKind, effective_rules, scan_mount, to_logical_path};
 use relay_policy::MountRules;
-use relay_store::StoreError;
+use relay_store::{PutBatch, StoreError};
 
 use crate::Engine;
 use crate::error::EngineError;
@@ -223,12 +223,14 @@ impl Engine {
         let mut stat_updates = Vec::new();
         let mut new_objects = Vec::new();
         let wall_now_ns = wall_clock_now_ns();
+        let mut batch = (!opts.dry_run).then(|| self.store.batch());
 
         for entry in entries {
             scanned_paths.insert(entry.path.clone());
             let prev = prev_by_path.get(&entry.path);
             let mut observe = ObserveCtx {
                 store: &self.store,
+                batch: batch.as_mut(),
                 unstable: &mut unstable,
                 warnings: &mut report.warnings,
                 new_objects: &mut new_objects,
@@ -347,6 +349,10 @@ impl Engine {
                 ChangeKind::Modified => report.modified += 1,
                 ChangeKind::Deleted => report.deleted += 1,
             }
+        }
+
+        if let Some(batch) = batch.as_mut() {
+            batch.commit()?;
         }
 
         Ok(ScanPlan {
@@ -523,6 +529,7 @@ fn is_mount_scan_error(err: &EngineError) -> bool {
 
 struct ObserveCtx<'a> {
     store: &'a relay_store::ObjectStore,
+    batch: Option<&'a mut PutBatch>,
     unstable: &'a mut HashSet<LogicalPath>,
     warnings: &'a mut Vec<Warning>,
     new_objects: &'a mut Vec<(relay_core::ObjectId, u64)>,
@@ -540,10 +547,10 @@ fn observation_for(
     match entry.kind {
         EntryKind::File => {
             if needs_rehash(prev, &entry.stat) {
-                let hashed = if ctx.dry_run {
-                    ctx.store.hash_file(&entry.os_path, Some(&entry.stat))
+                let hashed = if let Some(batch) = ctx.batch.as_mut() {
+                    batch.put_file(&entry.os_path, Some(&entry.stat))
                 } else {
-                    ctx.store.put_file(&entry.os_path, Some(&entry.stat))
+                    ctx.store.hash_file(&entry.os_path, Some(&entry.stat))
                 };
                 match hashed {
                     Ok(outcome) => {
