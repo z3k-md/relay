@@ -35,8 +35,16 @@ use relay_core::{
 /// sync and say so in their `Error` frame.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// ALPN protocol id negotiated on every QUIC connection.
+/// ALPN protocol id negotiated on every sync QUIC connection.
 pub const ALPN: &[u8] = b"relay/1";
+
+/// ALPN for the pairing handshake. Same UDP port as sync.
+pub const PAIR_ALPN: &[u8] = b"relay-pair/1";
+
+pub const PAIR_CONFIRM_B: &[u8] = b"relay-pair/1 confirm B";
+pub const PAIR_CONFIRM_A: &[u8] = b"relay-pair/1 confirm A";
+pub const PAIR_ID_INITIATOR: &[u8] = b"relay-pair-initiator";
+pub const PAIR_ID_JOINER: &[u8] = b"relay-pair-joiner";
 
 /// Upper bound on one encoded control frame. A batch never approaches this;
 /// senders split large index transfers into many batches.
@@ -237,6 +245,71 @@ pub struct Counter {
 }
 
 /// First (and only) frame the requester writes on an object stream.
+/// One length-prefixed pairing message on the pairing stream.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PairingMessage {
+    #[prost(oneof = "pairing_message::Body", tags = "1, 2, 3, 4, 5")]
+    pub body: Option<pairing_message::Body>,
+}
+
+pub mod pairing_message {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Body {
+        #[prost(message, tag = "1")]
+        Join(super::PairJoin),
+        #[prost(message, tag = "2")]
+        Start(super::PairStart),
+        #[prost(message, tag = "3")]
+        ConfirmB(super::PairConfirm),
+        #[prost(message, tag = "4")]
+        ConfirmA(super::PairConfirmA),
+        #[prost(message, tag = "5")]
+        JoinInfo(super::PairDeviceInfo),
+    }
+}
+
+impl PairingMessage {
+    pub fn new(body: pairing_message::Body) -> Self {
+        Self { body: Some(body) }
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PairJoin {
+    #[prost(string, tag = "1")]
+    pub nameplate: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub spake2_b: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PairStart {
+    #[prost(bytes = "vec", tag = "1")]
+    pub spake2_a: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PairConfirm {
+    #[prost(bytes = "vec", tag = "1")]
+    pub mac: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PairConfirmA {
+    #[prost(bytes = "vec", tag = "1")]
+    pub mac: Vec<u8>,
+    #[prost(message, tag = "2")]
+    pub info: Option<PairDeviceInfo>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PairDeviceInfo {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, repeated, tag = "2")]
+    pub addresses: Vec<String>,
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ObjectRequest {
     #[prost(bytes = "vec", tag = "1")]
