@@ -1,30 +1,137 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
 import { api } from "../lib/api";
-import type { PeerView } from "../lib/types";
+import type { PeerView, SpaceView } from "../lib/types";
 
 const peers = ref<PeerView[]>([]);
+const spaces = ref<SpaceView[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
 const adding = ref(false);
+const pairing = ref(false);
+const joining = ref(false);
 const name = ref("");
 const deviceId = ref("");
 const address = ref("");
 const confirmName = ref<string | null>(null);
 const busy = ref(false);
+const share = ref<string[]>([]);
+const pairCode = ref("");
+const pairExpires = ref(0);
+const pairNow = ref(Date.now());
+const pairDone = ref<string | null>(null);
+const pairFailed = ref<string | null>(null);
+const joinCode = ref("");
+const joinAddr = ref("");
+let statusTimer: number | undefined;
+let tickTimer: number | undefined;
+
+const remaining = computed(() => {
+  const ms = pairExpires.value - pairNow.value;
+  if (ms <= 0) return "expired";
+  const total = Math.ceil(ms / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+});
 
 async function load() {
   loading.value = true;
   error.value = null;
   try {
-    peers.value = await api.listPeers();
+    const [nextPeers, nextSpaces] = await Promise.all([api.listPeers(), api.listSpaces()]);
+    peers.value = nextPeers;
+    spaces.value = nextSpaces;
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
     loading.value = false;
+  }
+}
+
+function stopPairWatch() {
+  if (statusTimer !== undefined) {
+    window.clearInterval(statusTimer);
+    statusTimer = undefined;
+  }
+  if (tickTimer !== undefined) {
+    window.clearInterval(tickTimer);
+    tickTimer = undefined;
+  }
+}
+
+async function startPair() {
+  busy.value = true;
+  error.value = null;
+  pairDone.value = null;
+  pairFailed.value = null;
+  try {
+    const started = await api.pairStart(share.value);
+    pairCode.value = started.code;
+    pairExpires.value = started.expiresAtMs;
+    pairNow.value = Date.now();
+    pairing.value = true;
+    tickTimer = window.setInterval(() => {
+      pairNow.value = Date.now();
+    }, 1000);
+    statusTimer = window.setInterval(async () => {
+      try {
+        const status = await api.pairStatus();
+        if (status.state === "paired") {
+          pairDone.value = status.peerName;
+          stopPairWatch();
+          await load();
+        } else if (status.state === "failed") {
+          pairFailed.value = status.reason;
+          stopPairWatch();
+        } else if (status.state === "expired") {
+          pairFailed.value = "This code expired. Start a new pairing.";
+          stopPairWatch();
+        }
+      } catch (err) {
+        pairFailed.value = err instanceof Error ? err.message : String(err);
+        stopPairWatch();
+      }
+    }, 750);
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+    pairing.value = false;
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function closePair() {
+  stopPairWatch();
+  if (pairCode.value && !pairDone.value && !pairFailed.value) {
+    try {
+      await api.pairCancel();
+    } catch {
+      /* already closed or host gone */
+    }
+  }
+  pairing.value = false;
+  pairCode.value = "";
+  pairFailed.value = null;
+  pairDone.value = null;
+}
+
+async function joinPair() {
+  busy.value = true;
+  error.value = null;
+  try {
+    await api.pairJoin(joinCode.value.trim(), joinAddr.value.trim() || undefined);
+    joining.value = false;
+    joinCode.value = "";
+    joinAddr.value = "";
+    await load();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    busy.value = false;
   }
 }
 
@@ -61,35 +168,59 @@ async function removePeer() {
 }
 
 onMounted(load);
+onUnmounted(() => {
+  stopPairWatch();
+  if (pairCode.value && !pairDone.value) {
+    api.pairCancel().catch(() => {});
+  }
+});
 defineExpose({ load });
 </script>
 
 <template>
   <div>
-    <div class="mb-3 flex items-center justify-between">
+    <div class="mb-3 flex items-center justify-between gap-2">
       <h2 class="text-[15px] font-semibold">Peers</h2>
-      <button
-        type="button"
-        class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
-        @click="adding = true"
-      >
-        Add peer
-      </button>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button
+          type="button"
+          class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+          @click="joining = true"
+        >
+          Enter a code
+        </button>
+        <button
+          type="button"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
+          @click="pairing = true"
+        >
+          Pair a device
+        </button>
+      </div>
     </div>
     <ErrorBanner :message="error" />
     <p v-if="loading" class="text-[var(--color-muted)]">Loading peers…</p>
     <EmptyState
       v-else-if="peers.length === 0"
       title="No peers yet"
-      body="Add your other computer — a Mac and a Windows PC, for example — using its device id and LAN or Tailscale address."
+      body="Pair your other computer with a short code — a Mac and a Windows PC, on the LAN or over Tailscale."
     >
-      <button
-        type="button"
-        class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
-        @click="adding = true"
-      >
-        Add peer
-      </button>
+      <div class="flex flex-wrap gap-2">
+        <button
+          type="button"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
+          @click="pairing = true"
+        >
+          Pair a device
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+          @click="joining = true"
+        >
+          Enter a code
+        </button>
+      </div>
     </EmptyState>
     <ul v-else class="space-y-2">
       <li
@@ -120,6 +251,102 @@ defineExpose({ load });
         </button>
       </li>
     </ul>
+    <p class="mt-3 text-[12px] text-[var(--color-muted)]">
+      <button type="button" class="underline" @click="adding = true">Add a peer by device id</button>
+      if you already know the other machine’s id and address.
+    </p>
+
+    <Modal :open="pairing" title="Pair a device" @close="closePair">
+      <div v-if="pairDone">
+        <p>
+          Paired with <strong>{{ pairDone }}</strong
+          >. They can join any spaces you shared from their Spaces view.
+        </p>
+        <div class="mt-4 flex justify-end">
+          <button
+            type="button"
+            class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
+            @click="closePair"
+          >
+            Done
+          </button>
+        </div>
+      </div>
+      <div v-else-if="pairFailed">
+        <p class="text-[var(--color-danger)]">{{ pairFailed }}</p>
+        <div class="mt-4 flex justify-end">
+          <button type="button" class="rounded-md px-2.5 py-1" @click="closePair">Close</button>
+        </div>
+      </div>
+      <div v-else-if="pairCode">
+        <p class="text-[12px] text-[var(--color-muted)]">
+          Enter this code on the other device. It expires in {{ remaining }}.
+        </p>
+        <p class="mono my-4 text-center text-[28px] font-semibold tracking-wide">{{ pairCode }}</p>
+        <p class="text-[12px] text-[var(--color-muted)]">Waiting for the other device…</p>
+        <div class="mt-4 flex justify-end">
+          <button type="button" class="rounded-md px-2.5 py-1" @click="closePair">Cancel</button>
+        </div>
+      </div>
+      <div v-else>
+        <p class="mb-3 text-[12px] text-[var(--color-muted)]">
+          Optionally share spaces now. The other device still has to join them.
+        </p>
+        <label
+          v-for="space in spaces"
+          :key="space.id"
+          class="mb-2 flex items-center gap-2"
+        >
+          <input v-model="share" type="checkbox" :value="space.name" />
+          <span>{{ space.name }}</span>
+        </label>
+        <p v-if="spaces.length === 0" class="text-[12px] text-[var(--color-muted)]">
+          No spaces yet — you can share later.
+        </p>
+        <div class="mt-4 flex justify-end gap-2">
+          <button type="button" class="rounded-md px-2.5 py-1" @click="closePair">Cancel</button>
+          <button
+            type="button"
+            class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)] disabled:opacity-60"
+            :disabled="busy"
+            @click="startPair"
+          >
+            Show code
+          </button>
+        </div>
+      </div>
+    </Modal>
+
+    <Modal :open="joining" title="Enter a code" @close="joining = false">
+      <label class="block text-[12px] text-[var(--color-muted)]" for="join-code">Pairing code</label>
+      <input
+        id="join-code"
+        v-model="joinCode"
+        class="mono mt-1 mb-3 w-full rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-3 py-2"
+        placeholder="12-3456-7890"
+        autocomplete="off"
+      />
+      <label class="block text-[12px] text-[var(--color-muted)]" for="join-addr">
+        Address (Tailscale or VPN; leave blank on the same LAN)
+      </label>
+      <input
+        id="join-addr"
+        v-model="joinAddr"
+        class="mt-1 mb-4 w-full rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-3 py-2"
+        placeholder="my-mac:47321 or 100.x.y.z:47321"
+      />
+      <div class="flex justify-end gap-2">
+        <button type="button" class="rounded-md px-2.5 py-1" @click="joining = false">Cancel</button>
+        <button
+          type="button"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)] disabled:opacity-60"
+          :disabled="busy || !joinCode.trim()"
+          @click="joinPair"
+        >
+          Pair
+        </button>
+      </div>
+    </Modal>
 
     <Modal :open="adding" title="Add a peer" @close="adding = false">
       <label class="block text-[12px] text-[var(--color-muted)]" for="peer-name">Name</label>

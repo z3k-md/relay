@@ -16,6 +16,7 @@ use crate::runner::RunnerState;
 use crate::sidecar::{self, CliInstallResult, CliStatus};
 use crate::updates::{self, UpdateInfo};
 use crate::{AppState, settings};
+use relay_ipc::Client;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -285,6 +286,90 @@ pub fn remove_peer(app: AppHandle, name: String) -> Result<(), String> {
         engine.remove_peer(&name)?;
         Ok(())
     })
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairStartView {
+    pub code: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum PairStatusView {
+    Idle,
+    Waiting,
+    Paired { peer_name: String, peer_id: String },
+    Failed { reason: String },
+    Expired,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairJoinView {
+    pub peer_name: String,
+    pub peer_id: String,
+}
+
+fn pairing_client(app: &AppHandle) -> Result<Client, String> {
+    let state = app.state::<AppState>();
+    if matches!(state.runner.state(), RunnerState::Paused) {
+        return Err("Relay is paused; resume before pairing.".to_owned());
+    }
+    match Client::connect(&state.home) {
+        Ok(Some(client)) => Ok(client),
+        Ok(None) => Err("Relay is not running; resume sync and try again.".to_owned()),
+        Err(err) => Err(error_chain(&err)),
+    }
+}
+
+#[tauri::command]
+pub fn pair_start(app: AppHandle, share: Vec<String>) -> Result<PairStartView, String> {
+    let mut client = pairing_client(&app)?;
+    let started = client.pair_start(&share).map_err(|err| error_chain(&err))?;
+    Ok(PairStartView {
+        code: started.code,
+        expires_at_ms: started.expires_at_ms,
+    })
+}
+
+#[tauri::command]
+pub fn pair_status(app: AppHandle) -> Result<PairStatusView, String> {
+    let mut client = pairing_client(&app)?;
+    let status = client.pair_status().map_err(|err| error_chain(&err))?;
+    Ok(match status {
+        relay_ipc::PairStatus::Idle => PairStatusView::Idle,
+        relay_ipc::PairStatus::Waiting => PairStatusView::Waiting,
+        relay_ipc::PairStatus::Paired { peer_name, peer_id } => {
+            PairStatusView::Paired { peer_name, peer_id }
+        }
+        relay_ipc::PairStatus::Failed { reason } => PairStatusView::Failed { reason },
+        relay_ipc::PairStatus::Expired => PairStatusView::Expired,
+    })
+}
+
+#[tauri::command]
+pub fn pair_join(
+    app: AppHandle,
+    code: String,
+    addr: Option<String>,
+) -> Result<PairJoinView, String> {
+    let mut client = pairing_client(&app)?;
+    let addr = addr.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let joined = client
+        .pair_join(code.trim(), addr)
+        .map_err(|err| error_chain(&err))?;
+    Ok(PairJoinView {
+        peer_name: joined.peer_name,
+        peer_id: joined.peer_id,
+    })
+}
+
+#[tauri::command]
+pub fn pair_cancel(app: AppHandle) -> Result<(), String> {
+    let mut client = pairing_client(&app)?;
+    client.pair_cancel().map_err(|err| error_chain(&err))
 }
 
 #[tauri::command]

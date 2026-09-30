@@ -4,6 +4,9 @@ import type {
   CliInstallResult,
   CliStatus,
   ConflictView,
+  PairJoinResult,
+  PairStartResult,
+  PairStatus,
   GitResolveReport,
   DeleteHold,
   MountView,
@@ -42,6 +45,11 @@ export const api = {
   addPeer: (name: string, deviceId: string, address: string) =>
     call<PeerView>("add_peer", { name, deviceId, address }),
   removePeer: (name: string) => call<void>("remove_peer", { name }),
+  pairStart: (share: string[]) => call<PairStartResult>("pair_start", { share }),
+  pairStatus: () => call<PairStatus>("pair_status"),
+  pairJoin: (code: string, addr?: string) =>
+    call<PairJoinResult>("pair_join", { code, addr: addr || null }),
+  pairCancel: () => call<void>("pair_cancel"),
   listSpaces: () => call<SpaceView[]>("list_spaces"),
   createSpace: (name: string) => call<SpaceView>("create_space", { name }),
   addMount: (space: string, mount: string, path: string) =>

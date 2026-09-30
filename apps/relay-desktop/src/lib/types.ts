@@ -27,6 +27,23 @@ export interface PeerView {
   connected: boolean;
 }
 
+export interface PairStartResult {
+  code: string;
+  expiresAtMs: number;
+}
+
+export type PairStatus =
+  | { state: "idle" }
+  | { state: "waiting" }
+  | { state: "paired"; peerName: string; peerId: string }
+  | { state: "failed"; reason: string }
+  | { state: "expired" };
+
+export interface PairJoinResult {
+  peerName: string;
+  peerId: string;
+}
+
 export interface MountView {
   name: string;
   path: string | null;
