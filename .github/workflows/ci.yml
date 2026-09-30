@@ -1,9 +1,10 @@
 # CI for the Relay workspace (Rust crates + Tauri desktop crate).
 #
 # Linux lints and tests everything except the desktop crate (Linux desktop
-# builds are not shipped, so it skips the webkit/gtk system packages). macOS
-# and Windows build the frontend and lint the desktop crate. relay-desktop has
-# no tests, so every OS runs nextest without it.
+# builds are not shipped, so it skips the webkit/gtk system packages) and
+# typechecks/builds the frontend. macOS and Windows lint the desktop crate
+# against a placeholder frontend. relay-desktop has no tests, so every OS runs
+# nextest without it.
 name: CI
 
 on:
@@ -90,26 +91,30 @@ jobs:
         run: cargo clippy --workspace --exclude relay-desktop --all-targets --locked -- -D warnings
 
       - name: Setup Node.js
-        if: matrix.desktop
+        if: matrix.lint
         uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: apps/relay-desktop/package-lock.json
 
-      - name: Build desktop frontend
-        if: matrix.desktop
-        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}/apps/relay-desktop
+      - name: Typecheck and build desktop frontend
+        if: matrix.lint
+        working-directory: apps/relay-desktop
         run: |
           npm ci
           npm run build
 
-      - name: Placeholder sidecar for tauri-build
+      - name: Placeholder frontend and sidecar for tauri-build
         if: matrix.desktop
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
         run: |
           set -euo pipefail
-          # tauri-build checks bundle.externalBin exists at compile time.
+          # generate_context! only needs frontendDist to exist; the real
+          # frontend is built on Linux. tauri-build checks that
+          # bundle.externalBin exists at compile time.
+          mkdir -p apps/relay-desktop/dist
+          printf '<!doctype html><title>Relay</title>\n' > apps/relay-desktop/dist/index.html
           triple=$(rustc -vV | sed -n 's/host: //p')
           dest="apps/relay-desktop/src-tauri/binaries/relay-${triple}"
           if [ "${{ runner.os }}" = "Windows" ]; then
