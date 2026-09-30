@@ -107,6 +107,13 @@ pub enum WatchEvent {
         path: String,
         reason: String,
     },
+    DeletesHeld {
+        peer: String,
+        space: String,
+        mount: String,
+        deletions: usize,
+        live: usize,
+    },
     Stopped,
 }
 
@@ -415,6 +422,19 @@ fn watch_from_sync(event: &SyncEvent) -> WatchEvent {
             peer: peer.to_string(),
             path: path.clone(),
             reason: reason.clone(),
+        },
+        SyncEvent::DeletesHeld {
+            peer,
+            space,
+            mount,
+            deletions,
+            live,
+        } => WatchEvent::DeletesHeld {
+            peer: peer.to_string(),
+            space: space.clone(),
+            mount: mount.clone(),
+            deletions: *deletions,
+            live: *live,
         },
     }
 }

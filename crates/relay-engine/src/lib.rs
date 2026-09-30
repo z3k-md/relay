@@ -37,8 +37,9 @@ pub use relay_db::{HistoryRecord, MountConfig};
 pub use relay_fs::{FsError, ScanWarning};
 pub use relay_store::ObjectStore;
 pub use reports::{
-    GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR, MountStatus,
-    PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport, Status, VerifyReport, Warning,
+    DeleteHold, DeleteHoldDecision, GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT,
+    MASS_DELETE_NUMERATOR, MountStatus, PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport,
+    Status, VerifyReport, Warning,
 };
 pub use resolve::{
     GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
@@ -627,6 +628,163 @@ impl Engine {
         })
     }
 
+    pub fn delete_holds(&self) -> Result<Vec<DeleteHold>, EngineError> {
+        Ok(self
+            .db
+            .repo()
+            .list_delete_holds()?
+            .into_iter()
+            .map(|row| DeleteHold {
+                peer: row.peer.id,
+                peer_name: row.peer.name,
+                space: row.space.name,
+                space_id: row.space.id,
+                mount: row.mount.name,
+                mount_id: row.mount.id,
+                deletions: row.deletions,
+                live: row.live,
+                held_at_ms: row.held_at_ms,
+                decision: row.decision.map(DeleteHoldDecision::from),
+            })
+            .collect())
+    }
+
+    pub fn decide_delete_hold(
+        &mut self,
+        space: &str,
+        mount: Option<&str>,
+        peer: Option<&str>,
+        decision: DeleteHoldDecision,
+    ) -> Result<usize, EngineError> {
+        self.ensure_writable()?;
+        let space_rec = self
+            .db
+            .repo()
+            .space_by_name(space)?
+            .ok_or_else(|| EngineError::UnknownSpace(space.to_owned()))?;
+        let mount_id = match mount {
+            Some(name) => Some(
+                self.db
+                    .repo()
+                    .mount_by_name(space_rec.id, name)?
+                    .ok_or_else(|| EngineError::UnknownMount {
+                        space: space.to_owned(),
+                        mount: name.to_owned(),
+                    })?
+                    .id,
+            ),
+            None => None,
+        };
+        let peer_id = match peer {
+            Some(name) => Some(
+                self.db
+                    .repo()
+                    .peer_by_name(name)?
+                    .ok_or_else(|| EngineError::UnknownPeer(name.to_owned()))?
+                    .device
+                    .id,
+            ),
+            None => None,
+        };
+        let now = self.clock.now_ms();
+        self.db
+            .transaction(|repo| {
+                repo.decide_delete_holds(space_rec.id, mount_id, peer_id, decision.into(), now)
+            })
+            .map_err(EngineError::from_db)
+    }
+
+    /// Re-issue a local version of each still-matching live entry so a peer
+    /// tombstone becomes concurrent with a live winner (D18 rule 1).
+    pub(crate) fn reassert_live(&mut self, keys: &[EntryKey]) -> Result<(), EngineError> {
+        self.ensure_writable()?;
+        let now = self.clock.now_ms();
+        let device = self.device.id;
+        let mut writes = Vec::new();
+        for key in keys {
+            let Some(current) = self.db.repo().entry(key)? else {
+                continue;
+            };
+            if current.is_deleted() {
+                continue;
+            }
+            let Some(config) = self.db.repo().mount_config(key.mount)? else {
+                continue;
+            };
+            let Some(root) = config.local_path.as_ref() else {
+                continue;
+            };
+            if !live_entry_matches_disk(&self.store, root, &current)? {
+                continue;
+            }
+            writes.push(current);
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .transaction(|repo| {
+                for prev in &writes {
+                    let sequence = repo.next_sequence()?;
+                    let record = EntryRecord::local_write(
+                        Some(prev),
+                        prev.key.clone(),
+                        prev.content.clone(),
+                        prev.stat,
+                        device,
+                        now,
+                        sequence,
+                    );
+                    repo.put_entry(&record)?;
+                }
+                Ok::<(), EngineError>(())
+            })
+            .map_err(|err| match err {
+                EngineError::Db(inner) => EngineError::from_db(inner),
+                other => other,
+            })
+    }
+
+    pub(crate) fn persist_delete_hold(
+        &mut self,
+        peer: DeviceId,
+        space: relay_core::SpaceId,
+        mount: relay_core::MountId,
+        deletions: usize,
+        live: usize,
+        paths: &[relay_core::LogicalPath],
+    ) -> Result<(), EngineError> {
+        let now = self.clock.now_ms();
+        self.db
+            .transaction(|repo| {
+                repo.upsert_delete_hold(peer, space, mount, deletions, live, now)?;
+                repo.replace_delete_hold_paths(peer, space, mount, paths)?;
+                Ok(())
+            })
+            .map_err(EngineError::from_db)
+    }
+
+    pub(crate) fn clear_delete_hold(
+        &mut self,
+        peer: DeviceId,
+        space: relay_core::SpaceId,
+        mount: relay_core::MountId,
+    ) -> Result<(), EngineError> {
+        self.db
+            .transaction(|repo| repo.clear_delete_hold(peer, space, mount))
+            .map_err(EngineError::from_db)
+    }
+
+    pub(crate) fn clear_delete_holds_for_peer_space(
+        &mut self,
+        peer: DeviceId,
+        space: relay_core::SpaceId,
+    ) -> Result<(), EngineError> {
+        self.db
+            .transaction(|repo| repo.clear_delete_holds_for_peer_space(peer, space))
+            .map_err(EngineError::from_db)
+    }
+
     pub fn status(&self) -> Result<Status, EngineError> {
         let local = self
             .db
@@ -882,6 +1040,45 @@ fn restore_expected_stat(
             }
             Err(err) => Err(err.into()),
         },
+    }
+}
+
+fn live_entry_matches_disk(
+    store: &ObjectStore,
+    root: &Path,
+    record: &EntryRecord,
+) -> Result<bool, EngineError> {
+    let dest = match resolve_os_path(root, &record.key.path)? {
+        Some(path) => path,
+        None => return Ok(false),
+    };
+    match &record.content {
+        EntryContent::Directory => match fs::symlink_metadata(&dest) {
+            Ok(meta) => Ok(meta.is_dir() && !meta.file_type().is_symlink()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(EngineError::Io(err)),
+        },
+        EntryContent::File { object, .. } => match record.stat {
+            Some(stat) => match fs::symlink_metadata(&dest) {
+                Ok(meta) => Ok(relay_core::StatHint::from_metadata(&meta) == stat),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(err) => Err(EngineError::Io(err)),
+            },
+            None => match store.hash_file(&dest, None) {
+                Ok(outcome) => Ok(outcome.id == *object),
+                Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                    Ok(false)
+                }
+                Err(StoreError::SourceChanged { .. }) => Ok(false),
+                Err(err) => Err(err.into()),
+            },
+        },
+        EntryContent::Symlink { .. } => match fs::symlink_metadata(&dest) {
+            Ok(meta) => Ok(meta.file_type().is_symlink()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(EngineError::Io(err)),
+        },
+        EntryContent::Deleted => Ok(false),
     }
 }
 

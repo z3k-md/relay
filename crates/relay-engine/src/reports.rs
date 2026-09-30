@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use relay_core::{Device, DeviceId, LogicalPath, ObjectId, Sequence};
+use relay_core::{Device, DeviceId, LogicalPath, MountId, ObjectId, Sequence, SpaceId};
 use relay_fs::ScanWarning;
 use serde::Serialize;
 
@@ -144,6 +144,45 @@ pub struct MountStatus {
     pub tombstones: usize,
     pub last_scan_ms: Option<i64>,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteHoldDecision {
+    Apply,
+    Restore,
+}
+
+impl From<relay_db::DeleteHoldDecision> for DeleteHoldDecision {
+    fn from(value: relay_db::DeleteHoldDecision) -> Self {
+        match value {
+            relay_db::DeleteHoldDecision::Apply => Self::Apply,
+            relay_db::DeleteHoldDecision::Restore => Self::Restore,
+        }
+    }
+}
+
+impl From<DeleteHoldDecision> for relay_db::DeleteHoldDecision {
+    fn from(value: DeleteHoldDecision) -> Self {
+        match value {
+            DeleteHoldDecision::Apply => Self::Apply,
+            DeleteHoldDecision::Restore => Self::Restore,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeleteHold {
+    pub peer: DeviceId,
+    pub peer_name: String,
+    pub space: String,
+    pub space_id: SpaceId,
+    pub mount: String,
+    pub mount_id: MountId,
+    pub deletions: usize,
+    pub live: usize,
+    pub held_at_ms: i64,
+    pub decision: Option<DeleteHoldDecision>,
 }
 
 pub(crate) fn is_large_fraction_delete(deletions: usize, live: usize) -> bool {

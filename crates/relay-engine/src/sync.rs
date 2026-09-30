@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use relay_core::{DeviceId, ObjectId, Sequence, SpaceId};
+use relay_core::{DeviceId, EntryContent, EntryKey, MountId, ObjectId, Sequence, SpaceId};
 use relay_db::PeerOfferRow;
 use relay_proto::{
     Ack, INDEX_BATCH_ENTRIES, IndexBatch, IndexRequest, RemoteEntry, entry_from_wire,
@@ -87,6 +87,13 @@ pub enum SyncEvent {
         path: String,
         reason: String,
     },
+    DeletesHeld {
+        peer: DeviceId,
+        space: String,
+        mount: String,
+        deletions: usize,
+        live: usize,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -106,6 +113,12 @@ struct Connected {
     /// it, so a restart or re-request picks those entries up again.
     holes: HashMap<SpaceId, u64>,
     resync_at: HashMap<SpaceId, Instant>,
+    /// Live-local tombstones already applied for this catch-up, per mount.
+    session_deletes: HashMap<(SpaceId, MountId), usize>,
+    /// `DeletesHeld` already emitted for this connection.
+    held_emitted: HashSet<(SpaceId, MountId)>,
+    /// Mounts whose restore/apply decision is consuming this catch-up.
+    bypass: HashSet<(SpaceId, MountId)>,
 }
 
 struct PendingBatch {
@@ -117,6 +130,7 @@ struct PendingBatch {
     fetch_attempts: HashMap<ObjectId, u32>,
     attempts: u32,
     retry_at: Option<Instant>,
+    caught_up: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,6 +307,9 @@ impl Syncer {
                 incoming: HashMap::new(),
                 holes: HashMap::new(),
                 resync_at: HashMap::new(),
+                session_deletes: HashMap::new(),
+                held_emitted: HashSet::new(),
+                bypass: HashSet::new(),
             },
         );
         events.push(SyncEvent::PeerConnected {
@@ -544,6 +561,7 @@ impl Syncer {
             fetch_attempts: HashMap::new(),
             attempts: 0,
             retry_at: None,
+            caught_up: batch.caught_up,
         };
         if let Some(conn) = self.connected.get_mut(&peer) {
             conn.incoming
@@ -632,11 +650,19 @@ impl Syncer {
         let failed = head.failed_objects.clone();
         let batch_after = head.after_sequence;
         let batch_through = head.through_sequence;
+        let caught_up = head.caught_up;
+        let queued: Vec<_> = queue.iter().map(|b| b.entries.clone()).collect();
         let failed_min = entries
             .iter()
             .filter(|e| e.content.object().is_some_and(|o| failed.contains(&o)))
             .map(|e| e.sequence.0)
             .min();
+
+        let batch_deletes = live_tombstones(engine, &entries)?;
+        match self.mass_delete_guard(engine, peer, space, &batch_deletes, &queued, events)? {
+            MassDeleteAction::Hold => return Ok(()),
+            MassDeleteAction::Proceed => {}
+        }
 
         let outcome = engine.apply_remote_batch(peer, space, entries, &failed)?;
         for w in &outcome.warnings {
@@ -666,6 +692,19 @@ impl Syncer {
                 head.retry_at = Some(Instant::now() + RETRY_DELAY);
             }
             return Ok(());
+        }
+
+        if let Some(conn) = self.connected.get_mut(&peer) {
+            for (mount, paths) in &batch_deletes {
+                *conn.session_deletes.entry((space, *mount)).or_default() += paths.len();
+            }
+            if caught_up {
+                conn.session_deletes.retain(|(s, _), _| *s != space);
+                conn.bypass.retain(|(s, _)| *s != space);
+            }
+        }
+        if caught_up {
+            engine.clear_delete_holds_for_peer_space(peer, space)?;
         }
 
         let through = match self.connected.get_mut(&peer) {
@@ -739,4 +778,177 @@ impl Syncer {
         }
         self.process_head(engine, peer, space, out, events)
     }
+
+    fn mass_delete_guard(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        space: SpaceId,
+        batch_deletes: &HashMap<MountId, Vec<relay_core::LogicalPath>>,
+        queued: &[Vec<relay_proto::RemoteEntry>],
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<MassDeleteAction, EngineError> {
+        let existing = engine.db.repo().list_delete_holds()?;
+        let holds: Vec<_> = existing
+            .into_iter()
+            .filter(|h| h.peer.id == peer && h.space.id == space)
+            .collect();
+        let queued_deletes = live_tombstones_many(engine, queued)?;
+
+        let mut mounts: HashSet<MountId> = batch_deletes.keys().copied().collect();
+        for hold in &holds {
+            mounts.insert(hold.mount.id);
+        }
+
+        let mut restore_mounts = Vec::new();
+        let mut new_holds = Vec::new();
+        let mut held = false;
+        for mount in mounts {
+            if self
+                .connected
+                .get(&peer)
+                .is_some_and(|c| c.bypass.contains(&(space, mount)))
+            {
+                continue;
+            }
+            let hold = holds.iter().find(|h| h.mount.id == mount);
+            match hold.and_then(|h| h.decision) {
+                Some(relay_db::DeleteHoldDecision::Apply) => {
+                    if let Some(conn) = self.connected.get_mut(&peer) {
+                        conn.bypass.insert((space, mount));
+                    }
+                }
+                Some(relay_db::DeleteHoldDecision::Restore) => restore_mounts.push(mount),
+                None if hold.is_some() => held = true,
+                None => {
+                    let batch_n = batch_deletes.get(&mount).map(Vec::len).unwrap_or(0);
+                    let session = self
+                        .connected
+                        .get(&peer)
+                        .and_then(|c| c.session_deletes.get(&(space, mount)).copied())
+                        .unwrap_or(0);
+                    let live = engine.db.repo().count_live(mount)?;
+                    let baseline = live.saturating_add(session);
+                    if crate::reports::is_large_fraction_delete(
+                        session.saturating_add(batch_n),
+                        baseline,
+                    ) {
+                        new_holds.push((mount, session.saturating_add(batch_n), baseline));
+                        held = true;
+                    }
+                }
+            }
+        }
+
+        for (mount, deletions, live) in new_holds {
+            let mut paths = queued_deletes.get(&mount).cloned().unwrap_or_default();
+            paths.sort();
+            paths.dedup();
+            engine.persist_delete_hold(peer, space, mount, deletions, live, &paths)?;
+            let already = self
+                .connected
+                .get(&peer)
+                .is_some_and(|c| c.held_emitted.contains(&(space, mount)));
+            if !already {
+                if let Some(conn) = self.connected.get_mut(&peer) {
+                    conn.held_emitted.insert((space, mount));
+                }
+                events.push(delete_held_event(
+                    engine, peer, space, mount, deletions, live,
+                )?);
+            }
+        }
+
+        if held {
+            return Ok(MassDeleteAction::Hold);
+        }
+
+        let mut restore_keys = Vec::new();
+        for mount in restore_mounts {
+            for path in engine
+                .db
+                .repo()
+                .list_delete_hold_paths(peer, space, mount)?
+            {
+                restore_keys.push(EntryKey { space, mount, path });
+            }
+            engine.clear_delete_hold(peer, space, mount)?;
+            if let Some(conn) = self.connected.get_mut(&peer) {
+                conn.bypass.insert((space, mount));
+            }
+        }
+        if !restore_keys.is_empty() {
+            engine.reassert_live(&restore_keys)?;
+        }
+        Ok(MassDeleteAction::Proceed)
+    }
+}
+
+enum MassDeleteAction {
+    Proceed,
+    Hold,
+}
+
+fn live_tombstones(
+    engine: &Engine,
+    entries: &[relay_proto::RemoteEntry],
+) -> Result<HashMap<MountId, Vec<relay_core::LogicalPath>>, EngineError> {
+    let mut out: HashMap<MountId, Vec<relay_core::LogicalPath>> = HashMap::new();
+    for entry in entries {
+        if !matches!(entry.content, EntryContent::Deleted) {
+            continue;
+        }
+        let Some(local) = engine.db.repo().entry(&entry.key)? else {
+            continue;
+        };
+        if local.is_deleted() {
+            continue;
+        }
+        out.entry(entry.key.mount)
+            .or_default()
+            .push(entry.key.path.clone());
+    }
+    Ok(out)
+}
+
+fn live_tombstones_many(
+    engine: &Engine,
+    batches: &[Vec<relay_proto::RemoteEntry>],
+) -> Result<HashMap<MountId, Vec<relay_core::LogicalPath>>, EngineError> {
+    let mut out: HashMap<MountId, Vec<relay_core::LogicalPath>> = HashMap::new();
+    for entries in batches {
+        for (mount, paths) in live_tombstones(engine, entries)? {
+            out.entry(mount).or_default().extend(paths);
+        }
+    }
+    Ok(out)
+}
+
+fn delete_held_event(
+    engine: &Engine,
+    peer: DeviceId,
+    space: SpaceId,
+    mount: MountId,
+    deletions: usize,
+    live: usize,
+) -> Result<SyncEvent, EngineError> {
+    let space_name = engine
+        .db
+        .repo()
+        .space(space)?
+        .map(|s| s.name)
+        .unwrap_or_else(|| space.to_string());
+    let mount_name = engine
+        .db
+        .repo()
+        .mount_config(mount)?
+        .map(|c| c.mount.name)
+        .unwrap_or_else(|| mount.to_string());
+    Ok(SyncEvent::DeletesHeld {
+        peer,
+        space: space_name,
+        mount: mount_name,
+        deletions,
+        live,
+    })
 }
