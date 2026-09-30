@@ -320,7 +320,10 @@ async fn resolve_join_addrs(
         }
         if Instant::now() >= deadline {
             return Err(
-                "no device advertising that pairing code (use --addr over Tailscale/VPN)".into(),
+                "no device on this network is showing that pairing code. Check the code, \
+                 allow Relay local network access (macOS: System Settings > Privacy & \
+                 Security > Local Network), or enter the other computer's address"
+                    .into(),
             );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
