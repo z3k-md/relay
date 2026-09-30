@@ -138,6 +138,20 @@ pub enum NetCommand {
 /// Handle to a running network runtime. `send` never blocks and never panics
 /// after shutdown. [`Drop`] signals shutdown and joins the runtime thread
 /// (expected to be brief after the endpoint closes).
+/// Cloneable sink for [`NetCommand`]s (used by the host IPC thread).
+#[derive(Clone)]
+pub struct NetSender {
+    tx: UnboundedSender<NetCommand>,
+}
+
+impl NetSender {
+    pub fn send(&self, cmd: NetCommand) {
+        if self.tx.send(cmd).is_err() {
+            tracing::debug!("net command dropped: runtime stopped");
+        }
+    }
+}
+
 pub struct NetHandle {
     cmd_tx: UnboundedSender<NetCommand>,
     local_addr: SocketAddr,
@@ -147,8 +161,12 @@ pub struct NetHandle {
 impl NetHandle {
     /// Queue a command. Never blocks. After shutdown the command is dropped.
     pub fn send(&self, cmd: NetCommand) {
-        if self.cmd_tx.send(cmd).is_err() {
-            tracing::debug!("net command dropped: runtime stopped");
+        self.sender().send(cmd);
+    }
+
+    pub fn sender(&self) -> NetSender {
+        NetSender {
+            tx: self.cmd_tx.clone(),
         }
     }
 

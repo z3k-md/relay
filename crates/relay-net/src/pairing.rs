@@ -112,10 +112,10 @@ pub(crate) async fn accept_incoming(inner: Arc<Inner>, conn: Connection) {
 
 fn session_is_open(inner: &Inner) -> bool {
     let slot = inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
-    match slot.as_ref() {
-        Some(session) if !session.consumed && Instant::now() < session.expires_at => true,
-        _ => false,
-    }
+    matches!(
+        slot.as_ref(),
+        Some(session) if !session.consumed && Instant::now() < session.expires_at
+    )
 }
 
 async fn wait_session_open(inner: &Inner) -> bool {
@@ -503,6 +503,13 @@ async fn read_pair(recv: &mut RecvStream) -> Result<Body, String> {
     msg.body.ok_or_else(|| "empty pairing message".to_owned())
 }
 
+pub(crate) fn negotiated_alpn(conn: &Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()?
+        .downcast_ref::<quinn::crypto::rustls::HandshakeData>()?
+        .protocol
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,11 +532,4 @@ mod tests {
         assert_eq!(ka, kb);
         assert_eq!(ka.len(), 32);
     }
-}
-
-pub(crate) fn negotiated_alpn(conn: &Connection) -> Option<Vec<u8>> {
-    conn.handshake_data()?
-        .downcast_ref::<quinn::crypto::rustls::HandshakeData>()?
-        .protocol
-        .clone()
 }

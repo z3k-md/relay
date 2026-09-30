@@ -827,6 +827,38 @@ impl Repo<'_> {
         })
     }
 
+    pub fn update_peer(
+        &self,
+        id: DeviceId,
+        name: &str,
+        addresses: &[String],
+        now_ms: i64,
+    ) -> Result<PeerRecord, DbError> {
+        self.upsert_device(
+            &Device {
+                id,
+                name: name.to_owned(),
+            },
+            now_ms,
+        )?;
+        let device_ref = self
+            .device_ref(id)?
+            .ok_or_else(|| DbError::Corrupt("upserted peer device is missing".into()))?;
+        let addresses_json = serde_json::to_string(addresses)?;
+        self.conn.execute(
+            "UPDATE peers SET name = ?1, addresses = ?2 WHERE device_ref = ?3",
+            params![name, addresses_json, device_ref],
+        )?;
+        Ok(PeerRecord {
+            device: Device {
+                id,
+                name: name.to_owned(),
+            },
+            addresses: addresses.to_vec(),
+            added_at_ms: now_ms,
+        })
+    }
+
     pub fn remove_peer_by_name(&self, name: &str) -> Result<bool, DbError> {
         let Some(peer) = self.peer_by_name(name)? else {
             return Ok(false);

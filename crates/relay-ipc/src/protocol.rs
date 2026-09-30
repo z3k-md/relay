@@ -176,6 +176,41 @@ pub struct RescanResult {
     pub queued: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairStartParams {
+    #[serde(default)]
+    pub share: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairStartResult {
+    pub code: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairJoinParams {
+    pub code: String,
+    #[serde(default)]
+    pub addr: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairJoinResult {
+    pub peer_name: String,
+    pub peer_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum PairStatus {
+    Idle,
+    Waiting,
+    Paired { peer_name: String, peer_id: String },
+    Failed { reason: String },
+    Expired,
+}
+
 pub fn encode_line<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     serde_json::to_string(value)
 }

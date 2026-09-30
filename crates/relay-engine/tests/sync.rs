@@ -276,6 +276,7 @@ impl Harness {
                         },
                     ));
                 }
+                SyncOutput::SetPeers => {}
                 SyncOutput::FetchObject { object, .. } => {
                     // The engine that emitted FetchObject is the requester.
                     let (src, dst, from_peer) = if from_a {
@@ -661,17 +662,18 @@ fn reconnect_after_drop_and_restart_sends_only_new_changes() {
     assert!(sent_new >= 1);
     h.pump(
         outs.into_iter()
-            .map(|o| match o {
-                SyncOutput::Send { body, .. } => (
+            .filter_map(|o| match o {
+                SyncOutput::Send { body, .. } => Some((
                     false,
                     SyncInput::Frame {
                         peer: h.id_a(),
                         body,
                     },
-                ),
+                )),
                 SyncOutput::FetchObject { object, .. } => {
-                    (false, copy_object(&h.a, &h.b, h.id_a(), object))
+                    Some((false, copy_object(&h.a, &h.b, h.id_a(), object)))
                 }
+                SyncOutput::SetPeers => None,
             })
             .collect(),
         None,

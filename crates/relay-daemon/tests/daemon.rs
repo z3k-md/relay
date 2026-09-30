@@ -344,3 +344,96 @@ fn ipc_hello_status_rescan_pause_and_host_lock() {
 
     stop_daemon(session);
 }
+
+#[test]
+fn pair_via_ipc_shares_and_syncs_without_reload() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let mount_a = TempDir::new().unwrap();
+    let mount_b = TempDir::new().unwrap();
+    fs::write(mount_a.path().join("hello.txt"), b"from-a").unwrap();
+
+    {
+        let mut engine = Engine::init(home_a.path(), "alice").unwrap();
+        engine.create_space("S").unwrap();
+        engine
+            .add_mount("S", "docs", mount_a.path(), &[], &[])
+            .unwrap();
+    }
+    Engine::init(home_b.path(), "bob").unwrap();
+
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    drain(&session_a);
+    drain(&session_b);
+
+    let mut client_a = wait_ipc(home_a.path());
+    let started = client_a.pair_start(&["S".to_owned()]).expect("pair_start");
+    assert_eq!(
+        started.code.chars().filter(|c| c.is_ascii_digit()).count(),
+        10
+    );
+
+    let mut client_b = wait_ipc(home_b.path());
+    let joined = client_b
+        .pair_join(&started.code, Some(&addr_a.to_string()))
+        .expect("pair_join");
+    assert_eq!(joined.peer_name, "alice");
+
+    assert!(
+        wait_until(CONVERGE, || {
+            let a = Engine::open_read_only(home_a.path()).ok();
+            let b = Engine::open_read_only(home_b.path()).ok();
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    let ap = a.peers().unwrap_or_default();
+                    let bp = b.peers().unwrap_or_default();
+                    ap.iter().any(|p| p.name == "bob") && bp.iter().any(|p| p.name == "alice")
+                }
+                _ => false,
+            }
+        }),
+        "peers were not recorded after pairing"
+    );
+
+    assert!(
+        wait_until(CONVERGE, || {
+            Engine::open_read_only(home_b.path())
+                .ok()
+                .and_then(|e| e.offers().ok())
+                .is_some_and(|offers| offers.iter().any(|o| o.name == "S"))
+        }),
+        "bob did not see offer for S"
+    );
+
+    let reloads_a = drain(&session_a)
+        .into_iter()
+        .filter(|e| matches!(e, DaemonEvent::Reloading))
+        .count();
+    let reloads_b = drain(&session_b)
+        .into_iter()
+        .filter(|e| matches!(e, DaemonEvent::Reloading))
+        .count();
+    assert_eq!(reloads_a, 0, "alice reloaded during pairing");
+    assert_eq!(reloads_b, 0, "bob reloaded during pairing");
+
+    {
+        let mut engine = Engine::open_for_config(home_b.path()).unwrap();
+        engine.join_space("S", "alice").unwrap();
+        engine
+            .add_mount("S", "docs", mount_b.path(), &[], &[])
+            .unwrap();
+    }
+
+    assert!(
+        wait_until(CONVERGE, || mount_b.path().join("hello.txt").exists()
+            && fs::read(mount_b.path().join("hello.txt")).ok().as_deref()
+                == Some(b"from-a")),
+        "file did not sync after pairing"
+    );
+
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}

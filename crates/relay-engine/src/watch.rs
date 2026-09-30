@@ -286,6 +286,33 @@ impl Engine {
                     SyncInput::Rescan { mounts } => {
                         mark_rescan(&mut states, &mounts, Instant::now());
                     }
+                    SyncInput::AddPeer {
+                        peer,
+                        name,
+                        addresses,
+                        share,
+                    } => {
+                        if let Err(err) = apply_add_peer(self, peer, &name, &addresses, &share) {
+                            on_event(&WatchEvent::SyncWarning {
+                                peer: peer.to_string(),
+                                path: String::new(),
+                                reason: err.to_string(),
+                            });
+                        } else {
+                            output(SyncOutput::SetPeers);
+                        }
+                    }
+                    SyncInput::PeerAddresses { peer, addresses } => {
+                        if let Err(err) = self.set_peer_addresses(peer, &addresses) {
+                            on_event(&WatchEvent::SyncWarning {
+                                peer: peer.to_string(),
+                                path: String::new(),
+                                reason: err.to_string(),
+                            });
+                        } else {
+                            output(SyncOutput::SetPeers);
+                        }
+                    }
                     other => {
                         emit_sync(syncer.handle(self, other, &mut output), on_event);
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
@@ -367,6 +394,22 @@ impl Engine {
         finish_watch_scan(state, false, n, result, on_event);
         committed
     }
+}
+
+fn apply_add_peer(
+    engine: &mut Engine,
+    peer: relay_core::DeviceId,
+    name: &str,
+    addresses: &[String],
+    share: &[SpaceId],
+) -> Result<(), EngineError> {
+    engine.upsert_peer(name, peer, addresses)?;
+    for space in share {
+        if let Err(err) = engine.share_space_id(*space, peer) {
+            tracing::warn!(%peer, %space, error = %err, "could not share space with new peer");
+        }
+    }
+    Ok(())
 }
 
 fn scan_committed(report: &ScanReport) -> bool {

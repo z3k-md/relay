@@ -78,13 +78,14 @@ pub fn merge_peer_addresses(existing: &[String], discovered: &[String]) -> Vec<S
     out
 }
 
-/// Cap and dedupe an advertised or received list, then append `observed`.
+/// Prefer the observed remote (the path that just worked), then advertised
+/// addresses, deduped and capped at [`MAX_PEER_ADDRESSES`].
 pub fn collect_peer_addresses(advertised: &[String], observed: Option<SocketAddr>) -> Vec<String> {
     let extra = observed
         .map(format_socket_addr)
         .into_iter()
         .collect::<Vec<_>>();
-    merge_peer_addresses(&extra, advertised)
+    merge_peer_addresses(advertised, &extra)
 }
 
 #[cfg(test)]
@@ -158,6 +159,19 @@ mod tests {
             Some(observed),
         );
         assert_eq!(addrs, vec!["192.168.1.20:47321", "100.64.1.2:47321"]);
+    }
+
+    #[test]
+    fn collect_puts_observed_first() {
+        let observed = "127.0.0.1:47321".parse().unwrap();
+        let addrs = collect_peer_addresses(
+            &["10.0.0.5:47321".into(), "10.3.0.2:47321".into()],
+            Some(observed),
+        );
+        assert_eq!(
+            addrs,
+            vec!["127.0.0.1:47321", "10.0.0.5:47321", "10.3.0.2:47321"]
+        );
     }
 
     #[test]

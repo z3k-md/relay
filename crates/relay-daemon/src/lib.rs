@@ -85,7 +85,7 @@ fn run_loop(
     opts: &DaemonOptions,
     stop: &AtomicBool,
     on_event: &mut dyn FnMut(&DaemonEvent),
-    host: &Host,
+    host: &Arc<Host>,
 ) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         if is_paused(home) {
@@ -113,10 +113,21 @@ fn run_loop(
 
         let (tx, rx) = mpsc::channel::<SyncInput>();
         host.set_sync_tx(Some(tx.clone()));
+        host.set_known_peers(
+            peers
+                .iter()
+                .map(|p| PeerConfig {
+                    id: p.id,
+                    name: p.name.clone(),
+                    addresses: p.addresses.clone(),
+                })
+                .collect(),
+        );
         let listen_error = Arc::new(Mutex::new(None::<String>));
         let sink = {
             let listen_error = Arc::clone(&listen_error);
             let tx = tx.clone();
+            let host = Arc::clone(host);
             move |event: NetEvent| {
                 let input = match event {
                     NetEvent::PeerConnected { peer, name, .. } => {
@@ -148,6 +159,28 @@ fn run_loop(
                         }
                         return;
                     }
+                    NetEvent::Paired {
+                        peer,
+                        name,
+                        addresses,
+                        ..
+                    } => {
+                        let share = host.take_pair_share();
+                        host.finish_pair(Ok((name.clone(), peer.to_string())));
+                        SyncInput::AddPeer {
+                            peer,
+                            name,
+                            addresses,
+                            share,
+                        }
+                    }
+                    NetEvent::PairFailed { reason } => {
+                        host.finish_pair(Err(reason));
+                        return;
+                    }
+                    NetEvent::PeerAddresses { peer, addresses } => {
+                        SyncInput::PeerAddresses { peer, addresses }
+                    }
                 };
                 let _ = tx.send(input);
             }
@@ -175,6 +208,7 @@ fn run_loop(
         })?;
 
         let listen = net.local_addr();
+        host.set_net(Some(net.sender()));
         host.set_listen(Some(listen.to_string()));
         host.set_state(HostState::Running, None);
         on_event(&DaemonEvent::Started {
@@ -202,13 +236,29 @@ fn run_loop(
             let result = engine.run(
                 watch,
                 rx,
-                |output| {
-                    net.send(match output {
-                        SyncOutput::Send { peer, body } => NetCommand::Send { peer, body },
-                        SyncOutput::FetchObject { peer, object } => {
-                            NetCommand::FetchObject { peer, object }
+                |output| match output {
+                    SyncOutput::Send { peer, body } => {
+                        net.send(NetCommand::Send { peer, body });
+                    }
+                    SyncOutput::FetchObject { peer, object } => {
+                        net.send(NetCommand::FetchObject { peer, object });
+                    }
+                    SyncOutput::SetPeers => {
+                        if let Ok(engine) = Engine::open_read_only(home)
+                            && let Ok(peers) = engine.peers()
+                        {
+                            let configs: Vec<PeerConfig> = peers
+                                .iter()
+                                .map(|p| PeerConfig {
+                                    id: p.id,
+                                    name: p.name.clone(),
+                                    addresses: p.addresses.clone(),
+                                })
+                                .collect();
+                            host.set_known_peers(configs.clone());
+                            net.send(NetCommand::SetPeers(configs));
                         }
-                    });
+                    }
                 },
                 &run_stop,
                 &mut |event| {
@@ -221,6 +271,7 @@ fn run_loop(
         })?;
 
         host.set_sync_tx(None);
+        host.set_net(None);
         net.shutdown();
         drop(engine);
 

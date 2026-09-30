@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+relay-core.workspace = true
 relay-engine.workspace = true
 relay-ipc.workspace = true
 relay-net.workspace = true

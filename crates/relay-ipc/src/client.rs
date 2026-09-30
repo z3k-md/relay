@@ -9,7 +9,8 @@ use interprocess::local_socket::{Stream, prelude::*};
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, Hello, PROTOCOL_VERSION, Request, RescanParams, RescanResult, Response, Status,
+    ActivityItem, Hello, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams,
+    PairStartResult, PairStatus, Request, RescanParams, RescanResult, Response, Status,
     decode_line, encode_line,
 };
 
@@ -73,6 +74,40 @@ impl Client {
             "rescan",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
+    }
+
+    pub fn pair_start(&mut self, share: &[String]) -> Result<PairStartResult, IpcError> {
+        let params = PairStartParams {
+            share: share.to_vec(),
+        };
+        self.call(
+            "pair_start",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    pub fn pair_status(&mut self) -> Result<PairStatus, IpcError> {
+        self.call("pair_status", serde_json::json!({}))
+    }
+
+    pub fn pair_join(
+        &mut self,
+        code: &str,
+        addr: Option<&str>,
+    ) -> Result<PairJoinResult, IpcError> {
+        let params = PairJoinParams {
+            code: code.to_owned(),
+            addr: addr.map(ToOwned::to_owned),
+        };
+        self.call(
+            "pair_join",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    pub fn pair_cancel(&mut self) -> Result<(), IpcError> {
+        let _: serde_json::Value = self.call("pair_cancel", serde_json::json!({}))?;
+        Ok(())
     }
 
     pub fn activity(&mut self, limit: Option<u32>) -> Result<Vec<ActivityItem>, IpcError> {

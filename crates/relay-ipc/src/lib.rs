@@ -11,8 +11,9 @@ mod server;
 pub use client::{Client, Subscribe};
 pub use endpoint::{Endpoint, home_token};
 pub use protocol::{
-    ActivityItem, Hello, HostKind, HostState, MountLive, PROTOCOL_VERSION, PeerLive, Request,
-    RescanParams, RescanResult, RpcError, RpcErrorBody, Status, Watching, decode_line, encode_line,
+    ActivityItem, Hello, HostKind, HostState, MountLive, PROTOCOL_VERSION, PairJoinParams,
+    PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive, Request, RescanParams,
+    RescanResult, RpcError, RpcErrorBody, Status, Watching, decode_line, encode_line,
 };
 pub use server::{Handler, Server};
 

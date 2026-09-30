@@ -138,6 +138,80 @@ impl Engine {
         })
     }
 
+    pub fn upsert_peer(
+        &mut self,
+        name: &str,
+        id: DeviceId,
+        addresses: &[String],
+    ) -> Result<PeerInfo, EngineError> {
+        self.ensure_writable()?;
+        if id == self.device.id {
+            return Err(EngineError::DuplicatePeer(name.to_owned()));
+        }
+        let name = self.unique_peer_name(name, id)?;
+        validate_name(&name)?;
+        let now = self.clock.now_ms();
+        if self.db.repo().peer_by_id(id)?.is_some() {
+            let record = self
+                .db
+                .transaction(|repo| repo.update_peer(id, &name, addresses, now))
+                .map_err(EngineError::from_db)?;
+            return Ok(PeerInfo {
+                name: record.device.name,
+                id: record.device.id,
+                addresses: record.addresses,
+                added_at_ms: record.added_at_ms,
+            });
+        }
+        self.add_peer(&name, id, addresses)
+    }
+
+    fn unique_peer_name(&self, name: &str, id: DeviceId) -> Result<String, EngineError> {
+        if let Some(existing) = self.db.repo().peer_by_name(name)?
+            && existing.device.id != id
+        {
+            let candidate = format!("{name}-{}", id.short());
+            validate_name(&candidate)?;
+            return Ok(candidate);
+        }
+        Ok(name.to_owned())
+    }
+
+    pub fn set_peer_addresses(
+        &mut self,
+        id: DeviceId,
+        addresses: &[String],
+    ) -> Result<PeerInfo, EngineError> {
+        self.ensure_writable()?;
+        let Some(existing) = self.db.repo().peer_by_id(id)? else {
+            return Err(EngineError::UnknownPeer(id.to_string()));
+        };
+        let now = self.clock.now_ms();
+        let record = self
+            .db
+            .transaction(|repo| repo.update_peer(id, &existing.device.name, addresses, now))
+            .map_err(EngineError::from_db)?;
+        Ok(PeerInfo {
+            name: record.device.name,
+            id: record.device.id,
+            addresses: record.addresses,
+            added_at_ms: record.added_at_ms,
+        })
+    }
+
+    pub fn share_space_id(&mut self, space: SpaceId, peer: DeviceId) -> Result<(), EngineError> {
+        self.ensure_writable()?;
+        if self.db.repo().space(space)?.is_none() {
+            return Err(EngineError::UnknownSpace(space.to_string()));
+        }
+        if self.db.repo().peer_by_id(peer)?.is_none() {
+            return Err(EngineError::UnknownPeer(peer.to_string()));
+        }
+        self.db
+            .transaction(|repo| repo.share_space(space, peer))
+            .map_err(EngineError::from_db)
+    }
+
     pub fn remove_peer(&mut self, name: &str) -> Result<(), EngineError> {
         self.ensure_writable()?;
         let removed = self

@@ -50,12 +50,23 @@ pub enum SyncInput {
     Rescan {
         mounts: Vec<(SpaceId, MountId)>,
     },
+    AddPeer {
+        peer: DeviceId,
+        name: String,
+        addresses: Vec<String>,
+        share: Vec<SpaceId>,
+    },
+    PeerAddresses {
+        peer: DeviceId,
+        addresses: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum SyncOutput {
     Send { peer: DeviceId, body: frame::Body },
     FetchObject { peer: DeviceId, object: ObjectId },
+    SetPeers,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -210,7 +221,9 @@ impl Syncer {
                     &mut events,
                 )?;
             }
-            SyncInput::Rescan { .. } => {}
+            SyncInput::Rescan { .. }
+            | SyncInput::AddPeer { .. }
+            | SyncInput::PeerAddresses { .. } => {}
         }
         Ok(events)
     }

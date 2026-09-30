@@ -34,6 +34,7 @@ const MAX_CONCURRENT_FETCHES: usize = 8;
 const CHUNK: usize = 64 * 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DIAL_ATTEMPT: Duration = Duration::from_secs(2);
 
 pub(crate) fn close_code(code: u32) -> VarInt {
     VarInt::from_u32(code)
@@ -899,10 +900,13 @@ async fn try_dial(
             }
             tracing::debug!(peer = %peer_id, %sa, "dialing");
             match endpoint.connect_with(client.clone(), sa, SERVER_NAME) {
-                Ok(connecting) => match connecting.await {
-                    Ok(conn) => return Some(conn),
-                    Err(e) => {
+                Ok(connecting) => match tokio::time::timeout(DIAL_ATTEMPT, connecting).await {
+                    Ok(Ok(conn)) => return Some(conn),
+                    Ok(Err(e)) => {
                         tracing::debug!(peer = %peer_id, %sa, error = %e, "dial failed");
+                    }
+                    Err(_) => {
+                        tracing::debug!(peer = %peer_id, %sa, "dial timed out");
                     }
                 },
                 Err(e) => {

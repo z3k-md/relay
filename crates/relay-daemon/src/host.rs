@@ -2,15 +2,20 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use relay_core::{PairingCode, SpaceId};
 use relay_engine::{Engine, ScanReport, SyncInput, WatchEvent};
 use relay_ipc::{
-    ActivityItem, Handler, Hello, HostKind, HostState, MountLive, PROTOCOL_VERSION, PeerLive,
-    RescanParams, RpcErrorBody, Status, Watching,
+    ActivityItem, Handler, Hello, HostKind, HostState, MountLive, PROTOCOL_VERSION, PairJoinParams,
+    PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive, RescanParams,
+    RpcErrorBody, Status, Watching,
 };
+use relay_net::{NetCommand, NetSender, PeerConfig};
 
 const ACTIVITY_CAP: usize = 500;
+const PAIR_TTL: Duration = Duration::from_secs(10 * 60);
+const PAIR_JOIN_WAIT: Duration = Duration::from_secs(60);
 
 pub(crate) struct Host {
     pub home: PathBuf,
@@ -26,7 +31,22 @@ pub(crate) struct Host {
     pub activity: Mutex<VecDeque<ActivityItem>>,
     pub subscribers: Mutex<Vec<mpsc::Sender<ActivityItem>>>,
     pub sync_tx: Mutex<Option<mpsc::Sender<SyncInput>>>,
+    pub net: Mutex<Option<NetSender>>,
+    pub known_peers: Mutex<Vec<PeerConfig>>,
+    pub pair: Mutex<PairPhase>,
+    pub pair_cv: Condvar,
+    pub pair_share: Mutex<Vec<SpaceId>>,
     pub wake: Wake,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PairPhase {
+    Idle,
+    Waiting { expires_at_ms: u64 },
+    Joining,
+    Paired { peer_name: String, peer_id: String },
+    Failed { reason: String },
+    Expired,
 }
 
 pub(crate) struct Wake {
@@ -92,8 +112,236 @@ impl Host {
             activity: Mutex::new(VecDeque::new()),
             subscribers: Mutex::new(Vec::new()),
             sync_tx: Mutex::new(None),
+            net: Mutex::new(None),
+            known_peers: Mutex::new(Vec::new()),
+            pair: Mutex::new(PairPhase::Idle),
+            pair_cv: Condvar::new(),
+            pair_share: Mutex::new(Vec::new()),
             wake: Wake::new(),
         })
+    }
+
+    pub fn set_net(&self, net: Option<NetSender>) {
+        if let Ok(mut g) = self.net.lock() {
+            *g = net;
+        }
+    }
+
+    pub fn set_known_peers(&self, peers: Vec<PeerConfig>) {
+        if let Ok(mut g) = self.known_peers.lock() {
+            *g = peers;
+        }
+    }
+
+    pub fn take_pair_share(&self) -> Vec<SpaceId> {
+        self.pair_share
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+
+    pub fn finish_pair(&self, result: Result<(String, String), String>) {
+        if let Ok(mut g) = self.pair.lock() {
+            *g = match result {
+                Ok((peer_name, peer_id)) => {
+                    self.push_activity(ActivityItem {
+                        at_ms: now_ms(),
+                        kind: "pair".into(),
+                        summary: format!("paired with {peer_name}"),
+                        detail: Some(peer_id.clone()),
+                    });
+                    PairPhase::Paired { peer_name, peer_id }
+                }
+                Err(reason) => {
+                    let expired = reason.contains("expired");
+                    self.push_activity(ActivityItem {
+                        at_ms: now_ms(),
+                        kind: "pair".into(),
+                        summary: if expired {
+                            "pairing code expired".into()
+                        } else {
+                            format!("pairing failed: {reason}")
+                        },
+                        detail: Some(reason.clone()),
+                    });
+                    if expired {
+                        PairPhase::Expired
+                    } else {
+                        PairPhase::Failed { reason }
+                    }
+                }
+            };
+        }
+        self.pair_cv.notify_all();
+    }
+
+    fn net_sender(&self) -> Result<NetSender, RpcErrorBody> {
+        self.net
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| RpcErrorBody::new("unavailable", "sync loop is not running"))
+    }
+
+    fn require_running(&self) -> Result<(), RpcErrorBody> {
+        let state = self.state.lock().map(|g| *g).unwrap_or(HostState::Error);
+        match state {
+            HostState::Paused => Err(RpcErrorBody::new(
+                "paused",
+                "Relay is paused; resume before pairing",
+            )),
+            HostState::Running => Ok(()),
+            _ => Err(RpcErrorBody::new(
+                "unavailable",
+                "Relay is not running; resume sync and try again",
+            )),
+        }
+    }
+
+    fn pair_start(&self, params: PairStartParams) -> Result<PairStartResult, RpcErrorBody> {
+        self.require_running()?;
+        let net = self.net_sender()?;
+        let engine = Engine::open_read_only(&self.home)
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
+        let mut share = Vec::new();
+        for name in &params.share {
+            let space = engine
+                .spaces()
+                .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
+                .into_iter()
+                .find(|s| s.name == *name)
+                .ok_or_else(|| RpcErrorBody::new("not_found", format!("unknown space {name:?}")))?;
+            share.push(space.id);
+        }
+        let code = PairingCode::generate();
+        let expires_at = SystemTime::now() + PAIR_TTL;
+        let expires_at_ms = expires_at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if let Ok(mut g) = self.pair_share.lock() {
+            *g = share;
+        }
+        if let Ok(mut g) = self.pair.lock() {
+            *g = PairPhase::Waiting { expires_at_ms };
+        }
+        net.send(NetCommand::PairStart {
+            code: code.digits().to_owned(),
+            expires_at,
+        });
+        self.push_activity(ActivityItem {
+            at_ms: now_ms(),
+            kind: "pair".into(),
+            summary: "waiting for a device to enter the pairing code".into(),
+            detail: None,
+        });
+        Ok(PairStartResult {
+            code: code.format(),
+            expires_at_ms,
+        })
+    }
+
+    fn pair_status(&self) -> PairStatus {
+        let phase = self
+            .pair
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(PairPhase::Idle);
+        match phase {
+            PairPhase::Idle => PairStatus::Idle,
+            PairPhase::Waiting { expires_at_ms } => {
+                if now_ms() >= expires_at_ms {
+                    if let Ok(mut g) = self.pair.lock()
+                        && matches!(*g, PairPhase::Waiting { .. })
+                    {
+                        *g = PairPhase::Expired;
+                    }
+                    PairStatus::Expired
+                } else {
+                    PairStatus::Waiting
+                }
+            }
+            PairPhase::Joining => PairStatus::Waiting,
+            PairPhase::Paired { peer_name, peer_id } => PairStatus::Paired { peer_name, peer_id },
+            PairPhase::Failed { reason } => PairStatus::Failed { reason },
+            PairPhase::Expired => PairStatus::Expired,
+        }
+    }
+
+    fn pair_join(&self, params: PairJoinParams) -> Result<PairJoinResult, RpcErrorBody> {
+        self.require_running()?;
+        let net = self.net_sender()?;
+        let code = PairingCode::parse(&params.code)
+            .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+        if let Ok(mut g) = self.pair.lock() {
+            *g = PairPhase::Joining;
+        }
+        net.send(NetCommand::PairJoin {
+            code: code.digits().to_owned(),
+            addr: params.addr,
+        });
+        let deadline = Instant::now() + PAIR_JOIN_WAIT;
+        let mut guard = self
+            .pair
+            .lock()
+            .map_err(|_| RpcErrorBody::new("internal", "pairing lock"))?;
+        loop {
+            match &*guard {
+                PairPhase::Paired { peer_name, peer_id } => {
+                    return Ok(PairJoinResult {
+                        peer_name: peer_name.clone(),
+                        peer_id: peer_id.clone(),
+                    });
+                }
+                PairPhase::Failed { reason } => {
+                    return Err(RpcErrorBody::new("pair_failed", reason.clone()));
+                }
+                PairPhase::Expired => {
+                    return Err(RpcErrorBody::new("expired", "pairing code expired"));
+                }
+                PairPhase::Idle => {
+                    return Err(RpcErrorBody::new("cancelled", "pairing cancelled"));
+                }
+                _ => {}
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(RpcErrorBody::new(
+                    "timeout",
+                    "timed out waiting to pair (60s)",
+                ));
+            }
+            let (next, wait) = self
+                .pair_cv
+                .wait_timeout(guard, left)
+                .map_err(|_| RpcErrorBody::new("internal", "pairing wait"))?;
+            guard = next;
+            if wait.timed_out()
+                && !matches!(
+                    *guard,
+                    PairPhase::Paired { .. } | PairPhase::Failed { .. } | PairPhase::Expired
+                )
+            {
+                return Err(RpcErrorBody::new(
+                    "timeout",
+                    "timed out waiting to pair (60s)",
+                ));
+            }
+        }
+    }
+
+    fn pair_cancel(&self) -> Result<(), RpcErrorBody> {
+        if let Ok(net) = self.net_sender() {
+            net.send(NetCommand::PairCancel);
+        }
+        if let Ok(mut g) = self.pair.lock() {
+            *g = PairPhase::Idle;
+        }
+        if let Ok(mut g) = self.pair_share.lock() {
+            g.clear();
+        }
+        self.pair_cv.notify_all();
+        Ok(())
     }
 
     pub fn set_state(&self, state: HostState, message: Option<String>) {
@@ -310,6 +558,21 @@ impl Handler for Host {
                 tx.send(SyncInput::Rescan { mounts })
                     .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
                 serde_json::to_value(relay_ipc::RescanResult { queued }).map_err(internal)
+            }
+            "pair_start" => {
+                let params: PairStartParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(self.pair_start(params)?).map_err(internal)
+            }
+            "pair_status" => serde_json::to_value(self.pair_status()).map_err(internal),
+            "pair_join" => {
+                let params: PairJoinParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(self.pair_join(params)?).map_err(internal)
+            }
+            "pair_cancel" => {
+                self.pair_cancel()?;
+                Ok(serde_json::json!({}))
             }
             "activity" => {
                 let limit = params
