@@ -395,3 +395,47 @@ when unsure, so the receiver holds a peer mass delete until the user decides.
   running total passes the threshold; the deletes before that are applied.
   History and objects are kept (no GC yet), so a later change can restore
   those too.
+
+## D23. Batched object durability on macOS
+
+A first scan of a large tree was dominated by object-store flushes, not CPU.
+On Apple platforms Rust's `File::sync_all` is `fcntl(F_FULLFSYNC)`, which
+flushes the whole volume cache. `ObjectStore::put_file` did that twice per
+new object (temp file, then parent directory), so N files cost 2N full
+drive flushes.
+
+`ObjectStore::batch()` returns a `PutBatch`. Scan uses one batch for the
+plan and calls `commit()` after the plan is accepted (after the mass-delete
+guard) and **before** the SQLite transaction that records those objects.
+Restore, remote fetch/`import_verified`, and `put`/`put_file` from bytes
+are unchanged. A dropped batch installs nothing.
+
+**Apple.** Each `PutBatch::put_file` copies and hashes into a tmp file,
+`fsync`s it (not `F_FULLFSYNC`), then closes the fd and keeps a `TempPath`.
+Duplicates in the same batch (and objects already in the store) report
+`already_present` and drop the tmp. Staged names are not visible to
+`contains` or other callers. `commit()` then:
+
+1. One `F_FULLFSYNC` barrier on any file or directory in the store. This
+   flushes the volume, so every staged tmp's bytes are durable.
+2. Rename each tmp onto its content-addressed path (same "destination
+   already exists → verify → success" handling as a single put).
+3. Plain `fsync` of each touched object directory.
+4. A final `F_FULLFSYNC` barrier so those directory entries are durable.
+
+The name must not appear before step 1. `put`/`put_file` treat an existing
+destination as already present, so a renamed-but-not-durable file after a
+crash would be trusted later. The barrier-before-rename order keeps the
+invariant: an object file only appears under its content-addressed name
+once its bytes are durable, and the index never commits a row that
+references an object that is not durably installed.
+
+A batch auto-commits when it reaches 1024 objects or 256 MiB staged. That
+is safe because each auto-commit uses the same barrier-before-rename
+order. Auto-commit can leave durable objects without an index row if the
+scan later fails; GC already keeps young unreferenced objects for a grace
+period (D6).
+
+**Other platforms.** `PutBatch::put_file` is today's `put_file` (fully
+durable immediately) and `commit()` is a no-op. Linux and Windows behavior
+is unchanged.
