@@ -66,6 +66,7 @@ pub fn run() {
             commands::resume_sync,
             commands::check_for_updates,
             commands::install_update,
+            commands::restart_app,
             commands::get_settings,
             commands::set_settings,
             commands::open_logs_folder,

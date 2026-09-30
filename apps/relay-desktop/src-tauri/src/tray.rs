@@ -38,9 +38,10 @@ pub fn setup(app: &AppHandle) -> anyhow::Result<()> {
             "open" => show_main_window(app),
             "pause" => toggle_pause(app),
             "updates" => {
+                show_main_window(app);
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let _ = updates::check_and_maybe_install(&app, false).await;
+                    let _ = updates::check_and_maybe_install(&app, true).await;
                 });
             }
             "quit" => quit_app(app),

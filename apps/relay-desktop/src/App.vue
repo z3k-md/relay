@@ -2,6 +2,7 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onMounted, onUnmounted, ref } from "vue";
 import ErrorBanner from "./components/ErrorBanner.vue";
+import UpdateStatus from "./components/UpdateStatus.vue";
 import ActivityView from "./views/ActivityView.vue";
 import ConflictsView from "./views/ConflictsView.vue";
 import OverviewView from "./views/OverviewView.vue";
@@ -10,6 +11,11 @@ import SettingsView from "./views/SettingsView.vue";
 import SetupView from "./views/SetupView.vue";
 import SpacesView from "./views/SpacesView.vue";
 import { api } from "./lib/api";
+import {
+  installUpdate as runInstallUpdate,
+  listenForUpdateProgress,
+  stopUpdateProgressListener,
+} from "./lib/updateProgress";
 import type {
   ActivityItem,
   Overview,
@@ -78,11 +84,8 @@ async function resume() {
 }
 
 async function installUpdate() {
-  try {
-    await api.installUpdate();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  }
+  error.value = null;
+  await runInstallUpdate();
 }
 
 onMounted(async () => {
@@ -103,10 +106,12 @@ onMounted(async () => {
       update.value = event.payload;
     }),
   );
+  await listenForUpdateProgress();
   await refresh();
 });
 
 onUnmounted(() => {
+  stopUpdateProgressListener();
   for (const off of unlistens) {
     off();
   }
@@ -168,6 +173,7 @@ onUnmounted(() => {
         </aside>
         <main class="min-w-0 flex-1 overflow-auto p-4">
           <ErrorBanner :message="error" />
+          <UpdateStatus v-if="page !== 'settings'" class="mb-4" />
           <OverviewView
             v-if="page === 'overview'"
             :overview="overview"

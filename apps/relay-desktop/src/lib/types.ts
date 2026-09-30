@@ -122,13 +122,23 @@ export interface Settings {
 }
 
 export interface UpdateInfo {
+  opId: number;
   configured: boolean;
   available: boolean;
   version: string | null;
   notes: string | null;
   message: string;
   installing: boolean;
+  restartAtMs: number | null;
+  error: boolean;
 }
+
+export type UpdateProgress =
+  | { kind: "checking"; opId: number }
+  | { kind: "downloading"; opId: number; downloaded: number; total: number | null }
+  | { kind: "installing"; opId: number }
+  | { kind: "ready"; opId: number; version: string; restartAtMs: number }
+  | { kind: "finished"; opId: number; message: string; error: boolean };
 
 export interface UpdateAvailable {
   version: string;

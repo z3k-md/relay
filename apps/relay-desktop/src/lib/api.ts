@@ -92,6 +92,7 @@ export const api = {
   resumeSync: () => call<RunnerState>("resume_sync"),
   checkForUpdates: () => call<UpdateInfo>("check_for_updates"),
   installUpdate: () => call<UpdateInfo>("install_update"),
+  restartApp: () => call<void>("restart_app"),
   getSettings: () => call<Settings>("get_settings"),
   setSettings: (patch: Partial<Settings>) =>
     call<Settings>("set_settings", { patch }),

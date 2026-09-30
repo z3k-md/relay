@@ -4,6 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import Modal from "../components/Modal.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { api, copyText } from "../lib/api";
+import { updateActive } from "../lib/updateProgress";
 import type { DeleteHold, Overview, RunnerState, UpdateAvailable } from "../lib/types";
 
 const props = defineProps<{
@@ -122,7 +123,7 @@ function runnerDetail(state: RunnerState): string | null {
     </div>
 
     <div
-      v-if="update"
+      v-if="update && !updateActive"
       class="mb-4 rounded-lg border border-teal-300/70 bg-teal-50 px-3 py-2 dark:border-teal-900 dark:bg-teal-950/50"
     >
       <div class="flex flex-wrap items-center justify-between gap-2">
@@ -132,7 +133,8 @@ function runnerDetail(state: RunnerState): string | null {
         </div>
         <button
           type="button"
-          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)] disabled:opacity-50"
+          :disabled="updateActive"
           @click="emit('installUpdate')"
         >
           Install update

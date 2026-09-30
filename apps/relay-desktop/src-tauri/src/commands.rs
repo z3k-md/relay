@@ -696,6 +696,11 @@ pub async fn install_update(app: AppHandle) -> Result<UpdateInfo, String> {
 }
 
 #[tauri::command]
+pub fn restart_app(app: AppHandle) {
+    updates::restart_now(&app);
+}
+
+#[tauri::command]
 pub fn get_settings(app: AppHandle) -> Result<settings::Settings, String> {
     Ok(settings::load(&app))
 }

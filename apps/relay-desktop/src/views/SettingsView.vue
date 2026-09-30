@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
+import UpdateStatus from "../components/UpdateStatus.vue";
 import { api } from "../lib/api";
-import type { CliStatus, Settings, UpdateInfo } from "../lib/types";
+import { checkForUpdates, updateActive } from "../lib/updateProgress";
+import type { CliStatus, Settings } from "../lib/types";
 
 const props = defineProps<{
   version: string;
@@ -12,9 +14,9 @@ const settings = ref<Settings>({ startAtLogin: true, autoUpdate: true });
 const cli = ref<CliStatus | null>(null);
 const loading = ref(true);
 const error = ref<string | null>(null);
-const updateResult = ref<UpdateInfo | null>(null);
 const cliMessage = ref<string | null>(null);
 const busy = ref(false);
+const checking = computed(() => updateActive.value);
 
 async function load() {
   loading.value = true;
@@ -44,9 +46,7 @@ async function checkUpdates() {
   busy.value = true;
   error.value = null;
   try {
-    updateResult.value = await api.checkForUpdates();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    await checkForUpdates();
   } finally {
     busy.value = false;
   }
@@ -109,16 +109,14 @@ defineExpose({ load });
           </div>
           <button
             type="button"
-            class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
-            :disabled="busy"
+            class="rounded-md border border-[var(--color-line)] px-2.5 py-1 disabled:opacity-50"
+            :disabled="busy || checking"
             @click="checkUpdates"
           >
             Check for updates
           </button>
         </div>
-        <p v-if="updateResult" class="mt-2 text-[12px] text-[var(--color-muted)]">
-          {{ updateResult.message }}
-        </p>
+        <UpdateStatus class="mt-3" />
       </section>
 
       <section class="rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2">
