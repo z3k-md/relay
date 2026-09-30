@@ -5,10 +5,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use relay_core::conflict::{ConflictWinner, choose_winner, conflict_path};
+use relay_core::conflict::{ConflictWinner, choose_group_winner, choose_winner, conflict_path};
 use relay_core::{
     DeviceId, EntryContent, EntryKey, EntryKind, EntryRecord, LogicalPath, MOUNT_MARKER, MountId,
-    ObjectId, SpaceId, StatHint, TEMP_PREFIX, VersionRelation, compare_versions,
+    ObjectId, SpaceId, StatHint, TEMP_PREFIX, VersionRelation, compare_versions, is_git_metadata,
 };
 use relay_db::MountConfig;
 use relay_fs::{
@@ -823,7 +823,13 @@ fn conflict_outcome(local: &EntryRecord, remote: &EntryRecord) -> (bool, bool) {
     if local_dir != remote_dir && (local_dir || remote_dir) {
         return (remote_dir, true);
     }
-    match choose_winner(local, remote) {
+    let choose: fn(&EntryRecord, &EntryRecord) -> ConflictWinner =
+        if is_git_metadata(&local.key.path) {
+            choose_group_winner
+        } else {
+            choose_winner
+        };
+    match choose(local, remote) {
         ConflictWinner::A => (false, true),
         ConflictWinner::B => (true, true),
     }

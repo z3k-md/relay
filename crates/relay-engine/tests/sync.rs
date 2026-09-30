@@ -3,9 +3,13 @@
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
-use relay_core::{DeviceId, ObjectId};
-use relay_engine::{Engine, EngineConfig, ScanOptions, SyncEvent, SyncInput, SyncOutput, Syncer};
+use relay_core::conflict::conflict_path;
+use relay_core::{DeviceId, LogicalPath, ObjectId};
+use relay_engine::{
+    Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent, SyncInput, SyncOutput, Syncer,
+};
 use relay_proto::{IndexBatch, entry_to_wire, frame, space_id_bytes};
 use tempfile::TempDir;
 
@@ -748,4 +752,146 @@ fn nonempty_dir_tombstone_is_kept() {
             .into_iter()
             .any(|e| e.key.path.as_str() == "keep" && e.is_deleted());
     assert!(!tombstoned, "non-empty dir must not store the tombstone");
+}
+
+fn entry_at(engine: &Engine, path: &str) -> relay_engine::EntryRecord {
+    engine
+        .entries("Personal", "code", false)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.key.path.as_str() == path)
+        .unwrap_or_else(|| panic!("missing {path}"))
+}
+
+#[test]
+fn git_metadata_conflicts_share_one_device_winner() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[
+        ("repo/.git/HEAD", b"ref: refs/heads/main\n"),
+        ("repo/.git/index", b"DIRC-base"),
+        ("repo/.git/refs/heads/main", b"base-main\n"),
+        ("repo/src/a.txt", b"src"),
+    ]);
+    h.disconnect();
+
+    let clock_a = Arc::new(ManualClock::new(2_000_000_000_000));
+    let clock_b = Arc::new(ManualClock::new(2_000_000_000_000));
+    h.a.set_clock(clock_a.clone());
+    h.b.set_clock(clock_b.clone());
+
+    let index = LogicalPath::new("repo/.git/index").unwrap();
+    let main = LogicalPath::new("repo/.git/refs/heads/main").unwrap();
+
+    // Opposite per-file counters: choose_winner would pick B for index and A
+    // for main. The group rule must award both to the greater DeviceId.
+    clock_a.set(2_000_000_000_000);
+    fs::write(h.mount_a.path().join("repo/.git/index"), b"index-a").unwrap();
+    h.a.scan_paths(
+        "Personal",
+        "code",
+        std::slice::from_ref(&index),
+        ScanOptions::default(),
+    )
+    .unwrap();
+    clock_a.set(3_000_000_000_000);
+    fs::write(
+        h.mount_a.path().join("repo/.git/refs/heads/main"),
+        b"main-a\n",
+    )
+    .unwrap();
+    h.a.scan_paths(
+        "Personal",
+        "code",
+        std::slice::from_ref(&main),
+        ScanOptions::default(),
+    )
+    .unwrap();
+
+    clock_b.set(2_000_000_000_000);
+    fs::write(
+        h.mount_b.path().join("repo/.git/refs/heads/main"),
+        b"main-b\n",
+    )
+    .unwrap();
+    h.b.scan_paths(
+        "Personal",
+        "code",
+        std::slice::from_ref(&main),
+        ScanOptions::default(),
+    )
+    .unwrap();
+    clock_b.set(3_000_000_000_000);
+    fs::write(h.mount_b.path().join("repo/.git/index"), b"index-b").unwrap();
+    h.b.scan_paths(
+        "Personal",
+        "code",
+        std::slice::from_ref(&index),
+        ScanOptions::default(),
+    )
+    .unwrap();
+
+    let index_a = entry_at(&h.a, "repo/.git/index");
+    let index_b = entry_at(&h.b, "repo/.git/index");
+    let main_a = entry_at(&h.a, "repo/.git/refs/heads/main");
+    let main_b = entry_at(&h.b, "repo/.git/refs/heads/main");
+    assert!(
+        index_a.vector.get(&h.id_a()) < index_b.vector.get(&h.id_b()),
+        "per-file rule would pick B for index"
+    );
+    assert!(
+        main_a.vector.get(&h.id_a()) > main_b.vector.get(&h.id_b()),
+        "per-file rule would pick A for main"
+    );
+
+    h.connect();
+    h.push_both();
+    h.push_both();
+
+    let winner_is_a = h.id_a() > h.id_b();
+    let (expected_index, expected_main, loser_main) = if winner_is_a {
+        (&b"index-a"[..], &b"main-a\n"[..], &main_b)
+    } else {
+        (&b"index-b"[..], &b"main-b\n"[..], &main_a)
+    };
+    let copy = conflict_path(
+        &main,
+        &loser_main.modified_by,
+        loser_main.vector.get(&loser_main.modified_by),
+    )
+    .unwrap();
+
+    let winner = if winner_is_a { h.id_a() } else { h.id_b() };
+    for (engine, root) in [(&h.a, h.mount_a.path()), (&h.b, h.mount_b.path())] {
+        assert_eq!(
+            fs::read(root.join("repo/.git/index")).unwrap(),
+            expected_index
+        );
+        assert_eq!(
+            fs::read(root.join("repo/.git/refs/heads/main")).unwrap(),
+            expected_main
+        );
+        assert_eq!(entry_at(engine, "repo/.git/index").modified_by, winner);
+        assert_eq!(
+            entry_at(engine, "repo/.git/refs/heads/main").modified_by,
+            winner
+        );
+        assert!(
+            engine
+                .entries("Personal", "code", false)
+                .unwrap()
+                .iter()
+                .any(|e| e.key.path == copy),
+            "missing losing ref copy {copy}"
+        );
+    }
+
+    assert_eq!(
+        fs::read(h.mount_a.path().join(copy.as_str())).unwrap(),
+        fs::read(h.mount_b.path().join(copy.as_str())).unwrap()
+    );
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+    assert_eq!(live_files(h.mount_a.path()), live_files(h.mount_b.path()));
 }

@@ -6,6 +6,7 @@ mod error;
 mod order;
 mod peers;
 mod reports;
+mod resolve;
 mod scan;
 mod sync;
 mod watch;
@@ -24,7 +25,9 @@ use relay_store::StoreError;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::EngineError;
-pub use peers::{OfferInfo, PeerInfo};
+pub use peers::{
+    ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict, group_git_conflicts,
+};
 pub use relay_core::{
     Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount, ObjectId, Sequence, Space,
     VectorOrdering,
@@ -36,6 +39,9 @@ pub use relay_store::ObjectStore;
 pub use reports::{
     GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR, MountStatus,
     PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport, Status, VerifyReport, Warning,
+};
+pub use resolve::{
+    GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
 };
 pub use sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
 pub use watch::{RunExit, WatchEvent, WatchOptions};
@@ -203,6 +209,10 @@ impl Engine {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Engine {
         self.clock = clock;
         self
+    }
+
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
     }
 
     pub fn with_config(mut self, config: EngineConfig) -> Engine {

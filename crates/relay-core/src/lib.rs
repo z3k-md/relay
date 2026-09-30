@@ -6,6 +6,7 @@
 pub mod conflict;
 pub mod entry;
 pub mod error;
+pub mod git;
 pub mod ids;
 pub mod local;
 pub mod model;
@@ -15,6 +16,7 @@ pub mod version;
 
 pub use entry::{EntryContent, EntryKey, EntryKind, EntryRecord, StatHint};
 pub use error::CoreError;
+pub use git::{git_dir_of, is_git_metadata};
 pub use ids::{DeviceId, MountId, ObjectId, Sequence, SpaceId};
 pub use local::{LocalChange, Observation, derive_local_change, needs_rehash};
 pub use model::{Device, Mount, Space, validate_name};

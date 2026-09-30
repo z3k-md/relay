@@ -33,6 +33,23 @@ pub fn choose_winner(a: &EntryRecord, b: &EntryRecord) -> ConflictWinner {
     }
 }
 
+/// Winner for a repository-level group: the version whose `modified_by`
+/// [`DeviceId`] is greater. Same writer falls back to [`choose_winner`].
+///
+/// Device-id rank is independent of per-file counters (which are ~unix seconds)
+/// so every mutable file in one `.git` directory is awarded to the same device.
+pub fn choose_group_winner(a: &EntryRecord, b: &EntryRecord) -> ConflictWinner {
+    if a.modified_by != b.modified_by {
+        if a.modified_by > b.modified_by {
+            ConflictWinner::A
+        } else {
+            ConflictWinner::B
+        }
+    } else {
+        choose_winner(a, b)
+    }
+}
+
 /// Path for the losing version, derived only from replicated data.
 pub fn conflict_path(
     original: &LogicalPath,
@@ -54,6 +71,21 @@ pub fn conflict_path(
 
 pub fn is_conflict_copy(path: &LogicalPath) -> bool {
     path.file_name().contains(CONFLICT_MARKER)
+}
+
+/// Inverse of [`conflict_path`]: strip [`CONFLICT_MARKER`] and the device/counter
+/// suffix from the file name. `None` if this is not a conflict copy.
+pub fn original_path(copy: &LogicalPath) -> Option<LogicalPath> {
+    let name = copy.file_name();
+    let idx = name.find(CONFLICT_MARKER)?;
+    if idx == 0 {
+        return None;
+    }
+    let orig_name = &name[..idx];
+    match copy.parent() {
+        Some(parent) => parent.join(orig_name).ok(),
+        None => LogicalPath::new(orig_name).ok(),
+    }
 }
 
 #[cfg(test)]
@@ -102,5 +134,47 @@ mod tests {
         assert_eq!(c.as_str(), "src/foo.go.relay-conflict-abababab-42");
         assert!(is_conflict_copy(&c));
         assert!(!is_conflict_copy(&p));
+    }
+
+    #[test]
+    fn original_path_round_trips_conflict_path() {
+        let cases = [
+            "src/foo.go",
+            "foo.go",
+            "repo/.git/refs/heads/main",
+            "repo/.git/index",
+            "dir/Name.ext",
+        ];
+        let device = DeviceId::from_bytes([0xab; 32]);
+        for raw in cases {
+            let original = LogicalPath::new(raw).unwrap();
+            let copy = conflict_path(&original, &device, 17).unwrap();
+            assert_eq!(original_path(&copy).as_ref(), Some(&original), "{copy}");
+            assert!(original_path(&original).is_none(), "{original}");
+        }
+        assert!(original_path(&LogicalPath::new("src/foo.go").unwrap()).is_none());
+    }
+
+    #[test]
+    fn group_winner_is_symmetric() {
+        let a = record(1, b"a", 5_000);
+        let b = record(2, b"b", 5_000);
+        let ab = choose_group_winner(&a, &b);
+        let ba = choose_group_winner(&b, &a);
+        assert_ne!(
+            ab, ba,
+            "swapping inputs must swap the label, not the outcome"
+        );
+        assert_eq!(ab, ConflictWinner::B);
+    }
+
+    #[test]
+    fn group_winner_falls_back_when_same_device() {
+        let a = record(7, b"a", 9_000);
+        let mut b = record(7, b"b", 3_000);
+        b.modified_by = a.modified_by;
+        assert_eq!(choose_winner(&a, &b), ConflictWinner::A);
+        assert_eq!(choose_group_winner(&a, &b), ConflictWinner::A);
+        assert_eq!(choose_group_winner(&b, &a), ConflictWinner::B);
     }
 }

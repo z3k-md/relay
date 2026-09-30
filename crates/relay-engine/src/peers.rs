@@ -1,9 +1,63 @@
-use relay_core::{Device, DeviceId, EntryRecord, Mount, Space, SpaceId, validate_name};
+use std::collections::BTreeMap;
+
+use relay_core::conflict::original_path;
+use relay_core::{
+    Device, DeviceId, EntryRecord, LogicalPath, Mount, Space, SpaceId, git_dir_of, validate_name,
+};
 use relay_db::{OfferedMount, PeerOfferRow, StoredOffer};
 use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
+
+/// How a live conflict copy is shown and grouped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConflictClass {
+    File { original: LogicalPath },
+    Git { git_dir: LogicalPath, is_ref: bool },
+}
+
+/// A live conflict copy plus its listing classification.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConflictInfo {
+    pub space: String,
+    pub mount: String,
+    pub class: ConflictClass,
+    pub record: EntryRecord,
+}
+
+/// Classify a conflict-copy path as an ordinary file or Git metadata.
+pub fn classify_conflict(path: &LogicalPath) -> ConflictClass {
+    if let Some(git_dir) = git_dir_of(path)
+        && path != &git_dir
+    {
+        let is_ref = git_dir
+            .join("refs")
+            .ok()
+            .is_some_and(|refs| path.starts_with(&refs));
+        return ConflictClass::Git { git_dir, is_ref };
+    }
+    ConflictClass::File {
+        original: original_path(path).unwrap_or_else(|| path.clone()),
+    }
+}
+
+/// Group Git conflict copies by `(space, mount, git_dir)`.
+pub fn group_git_conflicts(
+    items: &[ConflictInfo],
+) -> BTreeMap<(String, String, LogicalPath), Vec<&ConflictInfo>> {
+    let mut groups = BTreeMap::new();
+    for item in items {
+        if let ConflictClass::Git { git_dir, .. } = &item.class {
+            groups
+                .entry((item.space.clone(), item.mount.clone(), git_dir.clone()))
+                .or_insert_with(Vec::new)
+                .push(item);
+        }
+    }
+    groups
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PeerInfo {
@@ -211,16 +265,36 @@ impl Engine {
     }
 
     pub fn conflicts(&self, space: Option<&str>) -> Result<Vec<EntryRecord>, EngineError> {
+        Ok(self
+            .conflict_infos(space)?
+            .into_iter()
+            .map(|c| c.record)
+            .collect())
+    }
+
+    /// Live conflict copies with a file-vs-Git classification (D21).
+    pub fn conflict_infos(&self, space: Option<&str>) -> Result<Vec<ConflictInfo>, EngineError> {
         let listed = self.mounts(space)?;
         let mut out = Vec::new();
-        for (_, config) in listed {
+        for (space_rec, config) in listed {
             for entry in self.db.repo().entries_for_mount(config.mount.id)? {
                 if !entry.is_deleted() && relay_core::conflict::is_conflict_copy(&entry.key.path) {
-                    out.push(entry);
+                    let class = classify_conflict(&entry.key.path);
+                    out.push(ConflictInfo {
+                        space: space_rec.name.clone(),
+                        mount: config.mount.name.clone(),
+                        class,
+                        record: entry,
+                    });
                 }
             }
         }
-        out.sort_by(|a, b| a.key.path.cmp(&b.key.path));
+        out.sort_by(|a, b| {
+            a.space
+                .cmp(&b.space)
+                .then_with(|| a.mount.cmp(&b.mount))
+                .then_with(|| a.record.key.path.cmp(&b.record.key.path))
+        });
         Ok(out)
     }
 

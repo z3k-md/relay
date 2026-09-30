@@ -87,6 +87,12 @@ pub enum EngineError {
     #[error("restore is not supported: {0}")]
     RestoreUnsupported(String),
 
+    #[error("{0} is not a live conflict copy")]
+    NotAConflictCopy(LogicalPath),
+
+    #[error("cannot resolve a directory conflict copy at {0}")]
+    DirectoryConflict(LogicalPath),
+
     #[error("destination changed: {}", .0.display())]
     DestinationChanged(PathBuf),
 
