@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use relay_core::conflict::conflict_path;
-use relay_core::{DeviceId, LogicalPath, ObjectId};
+use relay_core::{DeviceId, EntryContent, LogicalPath, ObjectId};
 use relay_engine::{
     DeleteHoldDecision, Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent, SyncInput,
     SyncOutput, Syncer,
@@ -1137,14 +1137,115 @@ fn restore_covers_deletes_beyond_the_held_batch() {
     h.push_both();
     h.push_both();
 
-    assert_eq!(live_files(h.mount_b.path()), after_hold);
-    assert_eq!(live_files(h.mount_a.path()), after_hold);
+    let original: BTreeSet<_> = files.into_iter().collect();
+    assert_eq!(live_files(h.mount_b.path()), original);
+    assert_eq!(live_files(h.mount_a.path()), original);
     assert!(after_hold.iter().any(|(path, _)| path == "f85.txt"));
     assert_eq!(
         index_triples(&h.a, "Personal", "code"),
         index_triples(&h.b, "Personal", "code")
     );
     assert!(h.b.delete_holds().unwrap().is_empty());
+}
+
+#[test]
+fn restore_keeps_user_recreated_applied_delete() {
+    let files: Vec<(String, Vec<u8>)> = (0..100)
+        .map(|i| (format!("f{i:02}.txt"), format!("body-{i}").into_bytes()))
+        .collect();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.sa = Syncer::with_index_batch_entries(10);
+    h.setup_shared_space(&pairs);
+
+    delete_first_n(h.mount_a.path(), 80);
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert_eq!(h.b.delete_holds().unwrap().len(), 1);
+
+    let recreated = h.mount_b.path().join("f00.txt");
+    assert!(!recreated.exists(), "f00.txt should already be deleted");
+    fs::write(&recreated, b"user-kept").unwrap();
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+
+    h.b.decide_delete_hold("Personal", None, None, DeleteHoldDecision::Restore)
+        .unwrap();
+    h.reconnect();
+    h.push_both();
+    h.push_both();
+
+    assert_eq!(fs::read(&recreated).unwrap(), b"user-kept");
+    assert_eq!(
+        fs::read(h.mount_a.path().join("f00.txt")).unwrap(),
+        b"user-kept"
+    );
+    let mut expected: BTreeSet<_> = files.into_iter().collect();
+    expected.retain(|(path, _)| path != "f00.txt");
+    expected.insert(("f00.txt".into(), b"user-kept".to_vec()));
+    assert_eq!(live_files(h.mount_a.path()), expected);
+    assert_eq!(live_files(h.mount_b.path()), expected);
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+}
+
+#[test]
+fn restore_skips_applied_delete_when_object_missing() {
+    let files: Vec<(String, Vec<u8>)> = (0..100)
+        .map(|i| (format!("f{i:02}.txt"), format!("body-{i}").into_bytes()))
+        .collect();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.strict = false;
+    h.sa = Syncer::with_index_batch_entries(10);
+    h.setup_shared_space(&pairs);
+
+    delete_first_n(h.mount_a.path(), 80);
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert_eq!(h.b.delete_holds().unwrap().len(), 1);
+    assert!(!h.mount_b.path().join("f00.txt").exists());
+
+    let missing = LogicalPath::new("f00.txt").unwrap();
+    let object =
+        h.b.history("Personal", "code", &missing)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find_map(|version| match version.content {
+                EntryContent::File { object, .. } => Some(object),
+                _ => None,
+            })
+            .expect("prior file version");
+    fs::remove_file(h.b.store().path_for(&object)).unwrap();
+
+    h.events.clear();
+    h.b.decide_delete_hold("Personal", None, None, DeleteHoldDecision::Restore)
+        .unwrap();
+    h.reconnect();
+    h.push_both();
+    h.push_both();
+
+    assert!(
+        h.events.iter().any(|e| matches!(
+            e,
+            SyncEvent::SyncWarning { path, reason, .. }
+                if path == "f00.txt" && reason.contains("missing")
+        )),
+        "expected missing-object warning, got {:?}",
+        h.events
+    );
+    assert!(!h.mount_b.path().join("f00.txt").exists());
+    let mut expected: BTreeSet<_> = files.into_iter().collect();
+    expected.remove(&("f00.txt".into(), b"body-0".to_vec()));
+    assert_eq!(live_files(h.mount_b.path()), expected);
+    assert_eq!(live_files(h.mount_a.path()), expected);
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
 }
 
 #[test]
