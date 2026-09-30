@@ -20,12 +20,31 @@ paired devices over QUIC (TLS 1.3, each device pinned by its public key).
 Edits, creates and deletes flow both ways within about a second; concurrent
 edits keep both versions; per-file history and restore work on every device.
 `relay service install` runs it in the background so you do not have to keep
-a terminal open.
+a terminal open. The [desktop app](apps/relay-desktop/README.md) does the same
+from the tray, starts at login and updates itself from GitHub Releases.
 
 Not yet: device discovery (you type the other machine's address), Git-aware
 conflict handling, and relaying through a third device. See [Roadmap](#roadmap).
 
 ## Install
+
+### Desktop app (recommended)
+
+Download the latest release from this repository's GitHub Releases page:
+`Relay_<version>_universal.dmg` for macOS, `Relay_<version>_x64-setup.exe` for
+Windows (per-user install, no admin). The app syncs in the background from
+the tray, starts at login, installs updates by itself, and puts the `relay`
+command on your PATH.
+
+- macOS: the app is not notarized yet. After dragging it to Applications, run
+  `xattr -dr com.apple.quarantine /Applications/Relay.app` once (or right-click
+  > Open). Later updates install without this.
+- Windows: SmartScreen may warn on first install: More info > Run anyway.
+
+Cutting releases and the one-time signing setup are in
+[docs/RELEASING.md](docs/RELEASING.md). Use either the desktop app or
+`relay service` on a machine, not both; the app stands aside when the
+service is running.
 
 ### Dev loop: upgrade both machines with one command
 
