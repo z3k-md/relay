@@ -512,6 +512,103 @@ fn cli_identity_peers_share_and_conflicts() {
         .stdout(predicate::str::contains("removed peer bravo"));
 }
 
+#[test]
+fn version_includes_git_rev_parens() {
+    relay()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("relay "))
+        .stdout(predicate::str::contains("("));
+}
+
+#[test]
+fn run_log_file_captures_listening_line() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+
+    let log_path = home.path().join("logs").join("relay.log");
+    let log_s = log_path.to_str().unwrap().to_owned();
+    let bin = assert_cmd::cargo::cargo_bin("relay");
+    let mut child = StdCommand::new(&bin)
+        .args([
+            "--home",
+            &home_s,
+            "run",
+            "--listen",
+            "127.0.0.1:0",
+            "--log-file",
+            &log_s,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let found = wait_until(Duration::from_secs(15), || {
+        fs::read_to_string(&log_path).is_ok_and(|s| s.contains("listening on"))
+    });
+
+    #[cfg(unix)]
+    {
+        let pid = child.id().to_string();
+        let _ = StdCommand::new("kill").args(["-INT", &pid]).status();
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(found, "log file missing listening on:\n{log}");
+    assert!(log.contains("==== relay "), "missing start header:\n{log}");
+    assert!(
+        log.contains("started "),
+        "missing started timestamp:\n{log}"
+    );
+}
+
+#[test]
+fn service_logs_prints_tail() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let log_dir = home.path().join("logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    let mut body = String::new();
+    for i in 1..=60 {
+        body.push_str(&format!("line-{i}\n"));
+    }
+    fs::write(log_dir.join("relay.log"), body).unwrap();
+
+    relay()
+        .args(["--home", &home_s, "service", "logs", "-n", "3"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("line-58"))
+        .stdout(predicate::str::contains("line-60"))
+        .stdout(predicate::str::contains("line-1").not());
+}
+
+#[test]
+fn service_status_errors_off_macos_windows() {
+    if cfg!(any(target_os = "macos", windows)) {
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "service", "status"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("supported on macOS and Windows"));
+}
+
 fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {

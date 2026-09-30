@@ -15,7 +15,13 @@ use relay_engine::{
 };
 use relay_net::{NetCommand, NetConfig, NetEvent, PeerConfig};
 
+mod output;
+mod service;
+
+use service::ServiceCmd;
+
 const DEFAULT_LISTEN: &str = "0.0.0.0:47321";
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RELAY_GIT_REV"), ")");
 
 const DEV_EXCLUDES: &[&str] = &[
     "**/node_modules/**",
@@ -27,7 +33,7 @@ const DEV_EXCLUDES: &[&str] = &[
 ];
 
 #[derive(Parser, Debug)]
-#[command(name = "relay", version, about = "Local-first multi-device file sync")]
+#[command(name = "relay", version = VERSION, about = "Local-first multi-device file sync")]
 struct Cli {
     /// Relay home directory (database, object store, logs)
     #[arg(long, global = true)]
@@ -122,6 +128,14 @@ enum Command {
         poll: bool,
         #[arg(long)]
         verbose: bool,
+        /// Append run output to this file instead of the terminal
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
+    /// Manage the background Relay service (macOS LaunchAgent / Windows Scheduled Task)
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
     },
     /// Watch mounts and keep the index live without syncing. Event times are UTC `HH:MM:SS`.
     Watch {
@@ -186,11 +200,18 @@ enum MountCmd {
 }
 
 fn main() -> ExitCode {
-    init_logging();
     let cli = Cli::parse();
+    if let Err(err) = prepare_output(&cli) {
+        eprintln!("error: {err:#}");
+        return ExitCode::from(1);
+    }
+    init_logging();
     match run(cli) {
         Ok(code) => code,
         Err(err) => {
+            if output::is_configured() {
+                let _ = output::write_line(&format!("error: {err:#}"));
+            }
             if let Some(engine) = err.downcast_ref::<EngineError>() {
                 print_engine_error(engine);
                 return ExitCode::from(engine_exit_code(engine));
@@ -201,12 +222,30 @@ fn main() -> ExitCode {
     }
 }
 
+fn prepare_output(cli: &Cli) -> Result<()> {
+    if let Command::Run {
+        log_file: Some(path),
+        ..
+    } = &cli.command
+    {
+        output::configure(path, VERSION)?;
+        output::install_panic_hook();
+    }
+    Ok(())
+}
+
 fn init_logging() {
     let filter = std::env::var("RELAY_LOG").unwrap_or_else(|_| "warn".to_owned());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_writer(std::io::stderr)
-        .try_init();
+    let subscriber =
+        tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(filter));
+    if output::is_configured() {
+        let _ = subscriber
+            .with_ansi(false)
+            .with_writer(output::TracingWriter)
+            .try_init();
+    } else {
+        let _ = subscriber.with_writer(std::io::stderr).try_init();
+    }
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
@@ -222,8 +261,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let engine = Engine::open_read_only(&home)?;
             cmd_status(&engine, json).map(|()| ExitCode::SUCCESS)
         }
-        Command::Peer { cmd } => cmd_peer(&home, cmd, json),
-        Command::Share { space, peer } => {
+        Command::Peer { cmd } => {
+            if matches!(cmd, PeerCmd::List) {
+                cmd_peer(&home, cmd, json)
+            } else {
+                service::paused(&home, json, || cmd_peer(&home, cmd, json))
+            }
+        }
+        Command::Share { space, peer } => service::paused(&home, json, || {
             let mut engine = Engine::open(&home)?;
             engine.share(&space, &peer)?;
             if json {
@@ -237,8 +282,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("shared {space} with {peer}");
             }
             Ok(ExitCode::SUCCESS)
-        }
-        Command::Unshare { space, peer } => {
+        }),
+        Command::Unshare { space, peer } => service::paused(&home, json, || {
             let mut engine = Engine::open(&home)?;
             engine.unshare(&space, &peer)?;
             if json {
@@ -252,13 +297,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("unshared {space} from {peer}");
             }
             Ok(ExitCode::SUCCESS)
-        }
+        }),
         Command::Conflicts { space } => {
             let engine = Engine::open_read_only(&home)?;
             cmd_conflicts(&engine, space.as_deref(), json).map(|()| ExitCode::SUCCESS)
         }
         Command::Space { cmd } => match cmd {
-            SpaceCmd::Create { name } => {
+            SpaceCmd::Create { name } => service::paused(&home, json, || {
                 let mut engine = Engine::open(&home)?;
                 let space = engine.create_space(&name)?;
                 if json {
@@ -267,7 +312,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("created space {}", space.name);
                 }
                 Ok(ExitCode::SUCCESS)
-            }
+            }),
             SpaceCmd::List => {
                 let engine = Engine::open_read_only(&home)?;
                 let spaces = engine.spaces()?;
@@ -305,7 +350,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 Ok(ExitCode::SUCCESS)
             }
-            SpaceCmd::Join { name_or_id, from } => {
+            SpaceCmd::Join { name_or_id, from } => service::paused(&home, json, || {
                 let mut engine = Engine::open(&home)?;
                 let space = engine.join_space(&name_or_id, &from)?;
                 if json {
@@ -317,7 +362,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     );
                 }
                 Ok(ExitCode::SUCCESS)
-            }
+            }),
         },
         Command::Mount { cmd } => match cmd {
             MountCmd::Add {
@@ -327,7 +372,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 mut excludes,
                 includes,
                 dev_excludes,
-            } => {
+            } => service::paused(&home, json, || {
                 if dev_excludes {
                     excludes.extend(DEV_EXCLUDES.iter().map(|s| (*s).to_owned()));
                 }
@@ -347,7 +392,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("added mount {space}/{mount} at {shown}");
                 }
                 Ok(ExitCode::SUCCESS)
-            }
+            }),
             MountCmd::List { space } => {
                 let engine = Engine::open_read_only(&home)?;
                 let mounts = engine.mounts(space.as_deref())?;
@@ -459,6 +504,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             full_scan_secs,
             poll,
             verbose,
+            log_file: _,
         } => {
             let opts = WatchOptions {
                 debounce: Duration::from_millis(debounce_ms),
@@ -468,6 +514,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
             cmd_run(&home, listen, opts, verbose, json)
         }
+        Command::Service { cmd } => service::run(&home, cmd, json),
     }
 }
 
@@ -515,7 +562,9 @@ fn cmd_run(
         .map(|p| (p.id.to_string(), p.name.clone()))
         .collect();
     if peers.is_empty() && !json {
-        println!("no peers yet; add one with `relay peer add <name> <device-id> --addr host:port`");
+        output::out_line(
+            "no peers yet; add one with `relay peer add <name> <device-id> --addr host:port`",
+        );
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -548,7 +597,7 @@ fn cmd_run(
                 reason,
             },
             NetEvent::ListenFailed { error } => {
-                eprintln!("error: network listener stopped: {error}");
+                output::err_line(&format!("error: network listener stopped: {error}"));
                 listen_failed.store(true, Ordering::SeqCst);
                 return;
             }
@@ -572,15 +621,22 @@ fn cmd_run(
         },
         Box::new(sink),
     )
-    .with_context(|| format!("starting the network on {listen}"))?;
+    .map_err(|err| {
+        let err = anyhow::Error::from(err).context(format!("starting the network on {listen}"));
+        if service::is_addr_in_use(&err) {
+            err.context(service::listen_in_use_hint())
+        } else {
+            err
+        }
+    })?;
     if !json {
-        println!(
+        output::out_line(&format!(
             "{} listening on {} as {} ({})",
             utc_hms(),
             net.local_addr(),
             engine.device().name,
             engine.device().id
-        );
+        ));
     }
 
     let result = engine.run(
@@ -614,17 +670,17 @@ fn print_watch_event(
 ) {
     if json {
         match serde_json::to_string(event) {
-            Ok(line) => println!("{line}"),
-            Err(err) => eprintln!("error: failed to serialize event: {err}"),
+            Ok(line) => output::out_line(&line),
+            Err(err) => output::err_line(&format!("error: failed to serialize event: {err}")),
         }
         return;
     }
     match event {
         WatchEvent::Started { mounts } => {
             if mounts.is_empty() {
-                println!("{} watching (no local mounts)", utc_hms());
+                output::out_line(&format!("{} watching (no local mounts)", utc_hms()));
             } else {
-                println!("{} watching {}", utc_hms(), mounts.join(", "));
+                output::out_line(&format!("{} watching {}", utc_hms(), mounts.join(", ")));
             }
         }
         WatchEvent::Scanned {
@@ -638,17 +694,26 @@ fn print_watch_event(
                 return;
             }
             if *full && !report.has_changes() {
-                println!("{} {space}/{mount}: full scan, 0 changes", utc_hms());
+                output::out_line(&format!(
+                    "{} {space}/{mount}: full scan, 0 changes",
+                    utc_hms()
+                ));
                 return;
             }
             let summary = watch_change_summary(report);
             if *full {
-                println!("{} {space}/{mount}: full scan, {summary}", utc_hms());
+                output::out_line(&format!(
+                    "{} {space}/{mount}: full scan, {summary}",
+                    utc_hms()
+                ));
             } else {
-                println!("{} {space}/{mount}: {summary} ({paths} paths)", utc_hms());
+                output::out_line(&format!(
+                    "{} {space}/{mount}: {summary} ({paths} paths)",
+                    utc_hms()
+                ));
             }
             for warning in &report.warnings {
-                println!("  warning: {warning}");
+                output::out_line(&format!("  warning: {warning}"));
             }
         }
         WatchEvent::ScanFailed {
@@ -656,7 +721,7 @@ fn print_watch_event(
             mount,
             error,
         } => {
-            eprintln!("error: {space}/{mount}: {error}");
+            output::err_line(&format!("error: {space}/{mount}: {error}"));
             print_watch_error_hints(error);
         }
         WatchEvent::WatcherUnavailable {
@@ -664,25 +729,31 @@ fn print_watch_event(
             mount,
             error,
         } => {
-            eprintln!("error: {space}/{mount}: {error}");
+            output::err_line(&format!("error: {space}/{mount}: {error}"));
         }
-        WatchEvent::Stopped => println!("stopped"),
+        WatchEvent::Stopped => output::out_line("stopped"),
         WatchEvent::PeerConnected { peer, name } => {
             let label = names.get(peer).unwrap_or(name);
-            println!("{} connected to {label}", utc_hms());
+            output::out_line(&format!("{} connected to {label}", utc_hms()));
         }
         WatchEvent::PeerDisconnected { peer } => {
-            println!(
+            output::out_line(&format!(
                 "{} disconnected from {}",
                 utc_hms(),
                 peer_label(names, peer)
-            );
+            ));
         }
         WatchEvent::OffersReceived { peer, spaces } => {
             let label = peer_label(names, peer);
-            println!("{} {label} offers: {}", utc_hms(), spaces.join(", "));
+            output::out_line(&format!(
+                "{} {label} offers: {}",
+                utc_hms(),
+                spaces.join(", ")
+            ));
             for name in spaces {
-                println!("  to accept: stop relay, then `relay space join {name} --from {label}`");
+                output::out_line(&format!(
+                    "  to accept: stop relay, then `relay space join {name} --from {label}`"
+                ));
             }
         }
         WatchEvent::RemoteApplied {
@@ -698,10 +769,10 @@ fn print_watch_event(
                 return;
             }
             let peer = peer_label(names, peer);
-            println!(
+            output::out_line(&format!(
                 "{} {space}/{mount} from {peer}: {written} written, {deleted} deleted, {conflicts} conflicts, {skipped} skipped",
                 utc_hms()
-            );
+            ));
         }
         WatchEvent::SentChanges {
             peer,
@@ -709,10 +780,16 @@ fn print_watch_event(
             entries,
         } => {
             let peer = peer_label(names, peer);
-            println!("{} sent {entries} changes of {space} to {peer}", utc_hms());
+            output::out_line(&format!(
+                "{} sent {entries} changes of {space} to {peer}",
+                utc_hms()
+            ));
         }
         WatchEvent::SyncWarning { peer, path, reason } => {
-            eprintln!("warning: {} {path}: {reason}", peer_label(names, peer));
+            output::err_line(&format!(
+                "warning: {} {path}: {reason}",
+                peer_label(names, peer)
+            ));
         }
     }
 }
@@ -730,14 +807,14 @@ fn watch_change_summary(report: &ScanReport) -> String {
 
 fn print_watch_error_hints(error: &str) {
     if error.contains("refusing to delete") {
-        eprintln!("hint: re-run with --allow-mass-delete if this was intentional");
+        output::err_line("hint: re-run with --allow-mass-delete if this was intentional");
     } else if error.contains("marker")
         || error.contains("mount root")
         || error.contains("not a directory")
     {
-        eprintln!("hint: is the drive mounted / was the folder moved?");
+        output::err_line("hint: is the drive mounted / was the folder moved?");
     } else if error.contains("another relay process") {
-        eprintln!("hint: stop `relay watch` or wait for the other command to finish");
+        output::err_line("hint: stop `relay watch` or wait for the other command to finish");
     }
 }
 
@@ -840,8 +917,23 @@ fn cmd_conflicts(engine: &Engine, space: Option<&str>, json: bool) -> Result<()>
 
 fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     let status = engine.status()?;
+    let service = if service::supported() {
+        match service::status_info(engine.home()) {
+            Ok(info) => Some(info),
+            Err(err) => {
+                eprintln!("warning: could not query the background service: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        let mut value = serde_json::to_value(&status)?;
+        if let Some(info) = service {
+            value["service"] = serde_json::to_value(info)?;
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     println!(
@@ -904,6 +996,9 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
                 );
             }
         }
+    }
+    if let Some(info) = service {
+        println!("{}", service::format_status_line(&info));
     }
     Ok(())
 }

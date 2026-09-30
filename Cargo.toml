@@ -34,7 +34,7 @@ relay-net = { path = "crates/relay-net" }
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 directories = "5"
 globset = "0.4"
 hex = "0.4"
