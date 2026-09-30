@@ -30,7 +30,7 @@ impl ObjectStore {
         PutBatch::with_cap(self.clone(), DEFAULT_MAX_OBJECTS, DEFAULT_MAX_BYTES)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_vendor = "apple"))]
     pub(crate) fn batch_with_cap(&self, max_objects: usize, max_bytes: u64) -> PutBatch {
         PutBatch::with_cap(self.clone(), max_objects, max_bytes)
     }
