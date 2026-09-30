@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bump Relay's shared version, commit, tag, and push so GitHub Actions
-# builds the desktop app and CLI.
+# Bump Relay's shared version, commit, push, and start the release workflow
+# on main so GitHub Actions builds the desktop app and CLI.
 #
 #   ./scripts/release.sh                 # patch (default)
 #   ./scripts/release.sh minor
@@ -18,7 +18,8 @@ BUMP="patch"
 
 usage() {
     cat <<'EOF'
-Bump the workspace version, commit, tag vX.Y.Z, and push to origin.
+Bump the workspace version, commit, push to origin, and start the release
+workflow for vX.Y.Z on main (needs gh; falls back to pushing the tag).
 
 Usage:
   ./scripts/release.sh [--dry-run] [patch|minor|major|X.Y.Z]
@@ -237,10 +238,18 @@ git add Cargo.toml Cargo.lock \
     apps/relay-desktop/src-tauri/tauri.conf.json \
     apps/relay-desktop/package.json
 git commit -m "Release v${NEXT}"
-git tag "v${NEXT}"
 git push origin main
-git push origin "v${NEXT}"
+
+# Dispatching on main (instead of pushing a tag) lets the build reuse and
+# refresh main's Rust cache. The release job creates the tag when it publishes.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    gh workflow run release.yml --repo "$REPO" --ref main -f tag="v${NEXT}"
+else
+    echo "gh is missing or not logged in; pushing tag v${NEXT} instead (slower, uncached build)" >&2
+    git tag "v${NEXT}"
+    git push origin "v${NEXT}"
+fi
 
 echo
-echo "Pushed v${NEXT}. Watch the build at:"
+echo "Started the v${NEXT} release. Watch the build at:"
 echo "  $ACTIONS_URL"

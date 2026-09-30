@@ -86,10 +86,15 @@ The script requires a clean `main` that matches `origin/main`. It bumps
 `[workspace.package] version` in the root `Cargo.toml`, the `"version"`
 fields in `apps/relay-desktop/src-tauri/tauri.conf.json` and
 `apps/relay-desktop/package.json`, refreshes `Cargo.lock`, commits
-`Release vX.Y.Z`, tags `vX.Y.Z`, and pushes the branch and the tag.
+`Release vX.Y.Z`, pushes `main`, and dispatches the release workflow on
+`main` with `tag=vX.Y.Z` (`gh` must be logged in; otherwise it pushes the
+tag instead). Running on `main` matters for speed: Actions caches saved by
+a tag run are visible only to that tag, while `main`'s caches are shared by
+every later release. The tag is created when the release is published.
 
-GitHub Actions (`.github/workflows/release.yml`) then builds for about
-10–15 minutes. It creates a draft release, builds into it:
+GitHub Actions (`.github/workflows/release.yml`) then builds: about
+15 minutes cold, a few minutes with a warm cache. It creates a draft
+release, builds into it:
 
 - macOS universal (`aarch64` + `x86_64`) via `--target universal-apple-darwin`
 - Windows `x86_64-pc-windows-msvc` NSIS

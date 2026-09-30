@@ -1,4 +1,6 @@
-# Build and publish Relay desktop + CLI on v* tags.
+# Build and publish Relay desktop + CLI. scripts/release.sh dispatches this on
+# main with the new tag (so the Rust cache is shared across releases); pushing
+# a v* tag by hand also works, just without saving a cache.
 #
 # 1. create:   a draft release (drafts are invisible to the updater)
 # 2. build:    macOS universal + Windows bundles and CLI binaries into it
@@ -174,6 +176,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.sidecar_target }}
+          # Caches saved from a tag run are only visible to that tag, so only
+          # main (scripts/release.sh dispatches there) saves.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       - name: Install frontend dependencies
         working-directory: apps/relay-desktop
