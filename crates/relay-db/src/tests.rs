@@ -152,13 +152,13 @@ fn migrations_are_idempotent_on_reopen() {
     let path = dir.path().join("nested").join("relay.sqlite");
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
     }
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
         db.repo().init_local_device(&device(9, "again"), 1).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
     }
 }
 
@@ -176,7 +176,7 @@ fn schema_too_new_is_rejected() {
         err,
         DbError::SchemaTooNew {
             found: 99,
-            supported: 4
+            supported: 5
         }
     ));
 }
@@ -219,7 +219,7 @@ fn v1_database_upgrades_to_current_without_data_loss() {
     write_v1_db(&path);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 4);
+    assert_eq!(db.schema_version().unwrap(), 5);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -254,7 +254,7 @@ fn upgrade_collapses_duplicate_history_rows() {
     }
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 4);
+    assert_eq!(db.schema_version().unwrap(), 5);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
@@ -274,7 +274,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooOld {
                 found: 1,
-                supported: 4
+                supported: 5
             }
         ),
         "{err}"
@@ -297,7 +297,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooNew {
                 found: 99,
-                supported: 4
+                supported: 5
             }
         ),
         "{err}"
@@ -319,7 +319,7 @@ fn open_read_only_reads_without_writing() {
         db.repo().create_space(&space, 1).unwrap();
     }
     let db = Database::open_read_only(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 4);
+    assert_eq!(db.schema_version().unwrap(), 5);
     let names: Vec<_> = db
         .repo()
         .list_spaces()
@@ -328,6 +328,108 @@ fn open_read_only_reads_without_writing() {
         .map(|s| s.name)
         .collect();
     assert_eq!(names, vec![space_name]);
+}
+
+fn write_v4_db(path: &std::path::Path) {
+    write_v1_db(path);
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(include_str!("../migrations/0002_mount_state.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!(
+        "../migrations/0003_stat_ctime_and_history_unique.sql"
+    ))
+    .unwrap();
+    conn.execute_batch(include_str!("../migrations/0004_peers_and_sync.sql"))
+        .unwrap();
+    conn.pragma_update(None, "user_version", 4u32).unwrap();
+}
+
+#[test]
+fn v4_database_upgrades_to_delete_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    write_v4_db(&path);
+
+    let version: i64 = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(version, 4);
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 5);
+    let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
+    assert_eq!(space.name, "Legacy");
+    let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
+    assert_eq!(mount.name, "docs");
+    assert!(db.repo().list_delete_holds().unwrap().is_empty());
+}
+
+#[test]
+fn fresh_database_has_delete_hold_tables() {
+    let db = Database::open_in_memory().unwrap();
+    assert_eq!(db.schema_version().unwrap(), 5);
+    db.repo().init_local_device(&device(1, "dev"), 1).unwrap();
+    let space = space("Personal");
+    db.repo().create_space(&space, 1).unwrap();
+    let mount = mount(space.id, "code");
+    db.repo().create_mount(&mount, 1).unwrap();
+    let peer = device(9, "laptop");
+    db.repo()
+        .add_peer(&peer, &["127.0.0.1:1".into()], 2)
+        .unwrap();
+
+    db.repo()
+        .upsert_delete_hold(peer.id, space.id, mount.id, 30, 40, 1_000)
+        .unwrap();
+    db.repo()
+        .replace_delete_hold_paths(peer.id, space.id, mount.id, &[path("a.txt"), path("b.txt")])
+        .unwrap();
+
+    let holds = db.repo().list_delete_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].deletions, 30);
+    assert_eq!(holds[0].live, 40);
+    assert!(holds[0].decision.is_none());
+    let paths = db
+        .repo()
+        .list_delete_hold_paths(peer.id, space.id, mount.id)
+        .unwrap();
+    assert_eq!(
+        paths.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        vec!["a.txt", "b.txt"]
+    );
+
+    let n = db
+        .repo()
+        .decide_delete_holds(
+            space.id,
+            Some(mount.id),
+            Some(peer.id),
+            crate::DeleteHoldDecision::Restore,
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    let hold = db
+        .repo()
+        .delete_hold(peer.id, space.id, mount.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(hold.decision, Some(crate::DeleteHoldDecision::Restore));
+    assert_eq!(hold.decided_at_ms, Some(2_000));
+
+    db.repo()
+        .clear_delete_hold(peer.id, space.id, mount.id)
+        .unwrap();
+    assert!(db.repo().list_delete_holds().unwrap().is_empty());
+    assert!(
+        db.repo()
+            .list_delete_hold_paths(peer.id, space.id, mount.id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

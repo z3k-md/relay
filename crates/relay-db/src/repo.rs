@@ -74,6 +74,43 @@ pub struct SyncProgress {
     pub last_sync_ms: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteHoldDecision {
+    Apply,
+    Restore,
+}
+
+impl DeleteHoldDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Restore => "restore",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, DbError> {
+        match value {
+            "apply" => Ok(Self::Apply),
+            "restore" => Ok(Self::Restore),
+            other => Err(DbError::Corrupt(format!(
+                "unknown delete hold decision {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteHoldRow {
+    pub peer: Device,
+    pub space: Space,
+    pub mount: Mount,
+    pub deletions: usize,
+    pub live: usize,
+    pub held_at_ms: i64,
+    pub decision: Option<DeleteHoldDecision>,
+    pub decided_at_ms: Option<i64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountState {
     pub last_scan_ms: Option<i64>,
@@ -790,6 +827,10 @@ impl Repo<'_> {
             params![device_ref],
         )?;
         self.conn.execute(
+            "DELETE FROM delete_holds WHERE device_ref = ?1",
+            params![device_ref],
+        )?;
+        self.conn.execute(
             "DELETE FROM peers WHERE device_ref = ?1",
             params![device_ref],
         )?;
@@ -1053,6 +1094,248 @@ impl Repo<'_> {
                     last_sync_ms,
                 },
             ));
+        }
+        Ok(out)
+    }
+
+    pub fn list_delete_holds(&self) -> Result<Vec<DeleteHoldRow>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT d.device_id, p.name,
+                    s.id, s.name,
+                    m.id, m.name,
+                    h.deletions, h.live, h.held_at_ms, h.decision, h.decided_at_ms
+             FROM delete_holds h
+             JOIN devices d ON d.ref = h.device_ref
+             JOIN peers p ON p.device_ref = h.device_ref
+             JOIN spaces s ON s.id = h.space_id
+             JOIN mounts m ON m.id = h.mount_id
+             ORDER BY p.name, s.name, m.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, [u8; 32]>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, [u8; 16]>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, [u8; 16]>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                peer_id,
+                peer_name,
+                space_id,
+                space_name,
+                mount_id,
+                mount_name,
+                deletions,
+                live,
+                held_at_ms,
+                decision,
+                decided_at_ms,
+            ) = row?;
+            out.push(DeleteHoldRow {
+                peer: Device {
+                    id: DeviceId::from_bytes(peer_id),
+                    name: peer_name,
+                },
+                space: Space {
+                    id: space_from_bytes(space_id),
+                    name: space_name,
+                },
+                mount: Mount {
+                    id: mount_from_bytes(mount_id),
+                    space: space_from_bytes(space_id),
+                    name: mount_name,
+                },
+                deletions: usize::try_from(deletions).map_err(|_| DbError::IntegerOverflow)?,
+                live: usize::try_from(live).map_err(|_| DbError::IntegerOverflow)?,
+                held_at_ms,
+                decision: decision
+                    .as_deref()
+                    .map(DeleteHoldDecision::parse)
+                    .transpose()?,
+                decided_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn delete_hold(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+    ) -> Result<Option<DeleteHoldRow>, DbError> {
+        Ok(self
+            .list_delete_holds()?
+            .into_iter()
+            .find(|h| h.peer.id == peer && h.space.id == space && h.mount.id == mount))
+    }
+
+    pub fn upsert_delete_hold(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+        deletions: usize,
+        live: usize,
+        held_at_ms: i64,
+    ) -> Result<(), DbError> {
+        let device_ref = self.device_ref(peer)?.ok_or(DbError::NotFound)?;
+        let space = space_bytes(space);
+        let mount = mount_bytes(mount);
+        let deletions = i64::try_from(deletions).map_err(|_| DbError::IntegerOverflow)?;
+        let live = i64::try_from(live).map_err(|_| DbError::IntegerOverflow)?;
+        self.conn.execute(
+            "INSERT INTO delete_holds (
+                 device_ref, space_id, mount_id, deletions, live, held_at_ms, decision, decided_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)
+             ON CONFLICT(device_ref, space_id, mount_id) DO UPDATE SET
+                deletions = excluded.deletions,
+                live = excluded.live,
+                held_at_ms = excluded.held_at_ms",
+            params![
+                device_ref,
+                space.as_slice(),
+                mount.as_slice(),
+                deletions,
+                live,
+                held_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn decide_delete_holds(
+        &self,
+        space: SpaceId,
+        mount: Option<MountId>,
+        peer: Option<DeviceId>,
+        decision: DeleteHoldDecision,
+        decided_at_ms: i64,
+    ) -> Result<usize, DbError> {
+        let space = space_bytes(space);
+        let mount = mount.map(mount_bytes);
+        let peer_ref = match peer {
+            Some(id) => Some(self.device_ref(id)?.ok_or(DbError::NotFound)?),
+            None => None,
+        };
+        let changed = self.conn.execute(
+            "UPDATE delete_holds
+             SET decision = ?1, decided_at_ms = ?2
+             WHERE space_id = ?3
+               AND (?4 IS NULL OR mount_id = ?4)
+               AND (?5 IS NULL OR device_ref = ?5)",
+            params![
+                decision.as_str(),
+                decided_at_ms,
+                space.as_slice(),
+                mount.as_ref().map(|m| m.as_slice()),
+                peer_ref
+            ],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn clear_delete_hold(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+    ) -> Result<(), DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(());
+        };
+        let space = space_bytes(space);
+        let mount = mount_bytes(mount);
+        self.conn.execute(
+            "DELETE FROM delete_holds WHERE device_ref = ?1 AND space_id = ?2 AND mount_id = ?3",
+            params![device_ref, space.as_slice(), mount.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_delete_holds_for_peer_space(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+    ) -> Result<(), DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(());
+        };
+        let space = space_bytes(space);
+        self.conn.execute(
+            "DELETE FROM delete_holds WHERE device_ref = ?1 AND space_id = ?2",
+            params![device_ref, space.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_delete_hold_paths(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+        paths: &[relay_core::LogicalPath],
+    ) -> Result<(), DbError> {
+        let device_ref = self.device_ref(peer)?.ok_or(DbError::NotFound)?;
+        let space_b = space_bytes(space);
+        let mount_b = mount_bytes(mount);
+        self.conn.execute(
+            "DELETE FROM delete_hold_paths
+             WHERE device_ref = ?1 AND space_id = ?2 AND mount_id = ?3",
+            params![device_ref, space_b.as_slice(), mount_b.as_slice()],
+        )?;
+        for path in paths {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO delete_hold_paths (device_ref, space_id, mount_id, path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    device_ref,
+                    space_b.as_slice(),
+                    mount_b.as_slice(),
+                    path.as_str()
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_delete_hold_paths(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+    ) -> Result<Vec<relay_core::LogicalPath>, DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(Vec::new());
+        };
+        let space = space_bytes(space);
+        let mount = mount_bytes(mount);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT path FROM delete_hold_paths
+             WHERE device_ref = ?1 AND space_id = ?2 AND mount_id = ?3
+             ORDER BY path",
+        )?;
+        let rows = stmt.query_map(
+            params![device_ref, space.as_slice(), mount.as_slice()],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            out.push(
+                relay_core::LogicalPath::new(&raw)
+                    .map_err(|err| DbError::Corrupt(err.to_string()))?,
+            );
         }
         Ok(out)
     }

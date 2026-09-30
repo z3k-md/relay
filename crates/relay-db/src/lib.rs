@@ -12,8 +12,8 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 pub use error::DbError;
 pub use repo::{
-    HistoryRecord, LocalDevice, MountConfig, MountState, OfferedMount, PeerOfferRow, PeerRecord,
-    Repo, StoredOffer, SyncProgress,
+    DeleteHoldDecision, DeleteHoldRow, HistoryRecord, LocalDevice, MountConfig, MountState,
+    OfferedMount, PeerOfferRow, PeerRecord, Repo, StoredOffer, SyncProgress,
 };
 
 #[derive(Debug)]
