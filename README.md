@@ -15,15 +15,17 @@ else, so the repository is the same on both machines.
 
 ## Status
 
-**Phase 2: two-device sync.** Relay watches your folders and syncs them with
+**Phase 5: device pairing.** Relay watches your folders and syncs them with
 paired devices over QUIC (TLS 1.3, each device pinned by its public key).
-Edits, creates and deletes flow both ways within about a second; concurrent
-edits keep both versions; per-file history and restore work on every device.
-`relay service install` runs it in the background so you do not have to keep
-a terminal open. The [desktop app](apps/relay-desktop/README.md) does the same
-from the tray, starts at login and updates itself from GitHub Releases.
+On the same LAN, `relay pair` on one machine and `relay pair CODE` on the
+other is enough; over Tailscale, add `--addr`. Edits, creates and deletes
+flow both ways within about a second; concurrent edits keep both versions;
+per-file history and restore work on every device. `relay service install`
+runs it in the background so you do not have to keep a terminal open. The
+[desktop app](apps/relay-desktop/README.md) does the same from the tray,
+starts at login and updates itself from GitHub Releases.
 
-Not yet: device discovery (you type the other machine's address) and relaying
+Not yet: more than two devices as a first-class topology, or relaying
 through a third device. See [Roadmap](#roadmap).
 
 ## Install
@@ -149,15 +151,40 @@ Open a new terminal afterwards so `relay` is on your PATH.
 ## Sync your Mac and your Windows PC
 
 Relay uses UDP port 47321. Both machines must be able to reach each other:
-same LAN, or both on [Tailscale](https://tailscale.com) (then use the
-`100.x.y.z` addresses). Find a machine's LAN address with
-`ipconfig getifaddr en0` on macOS or `ipconfig` on Windows.
+same LAN, or both on [Tailscale](https://tailscale.com).
 
 If you used `./scripts/deploy.sh --pc you@pc-host --pair`, both devices
 already have an identity, the background service is running, and each side
 has the other as a peer. Skip to creating a space.
 
-**1. On the Mac, create a space, add the folder and share it**
+**1. Pair the two machines**
+
+On one machine (a host must be running, or `relay pair` starts one for you):
+
+```bash
+relay pair
+```
+
+It prints a code such as `12-3456-7890`. Pass `--share SPACE` if that space
+already exists and you want the other device to see it as an offer. On the
+other machine, on the same LAN:
+
+```bash
+relay pair 12-3456-7890
+```
+
+Over Tailscale or another VPN, mDNS does not reach, so pass an address
+(MagicDNS name or `100.x.y.z`):
+
+```bash
+relay pair 12-3456-7890 --addr my-mac:47321
+```
+
+The desktop app has the same two actions under Peers: **Pair a device** and
+**Enter a code**. `relay peer add NAME ID --addr HOST:PORT` is still there
+as the manual/advanced path.
+
+**2. On the Mac, create a space, add the folder and share it**
 
 ```bash
 relay space create Mods
@@ -170,7 +197,7 @@ Desktop or Downloads). A running Relay picks up configuration changes
 (`peer`, `share`, `space`, `mount`) within about a second; you never need to
 Ctrl-C or restart the service first.
 
-**2. On the PC, join and attach a folder**
+**3. On the PC, join and attach a folder**
 
 Over SSH or locally:
 
@@ -188,24 +215,14 @@ empty folder on the second machine is simplest.
 Edit on the Mac, and the change is on the PC a moment later; it works the
 other way too.
 
-**Without SSH** (zip installer, pair by hand)
+**Without SSH** (zip installer)
 
 Build `dist/relay-windows-x86_64.zip` with `./scripts/build-windows.sh`, copy
 it to the PC, extract it, and run `install.ps1` from an elevated PowerShell.
-Then on each machine, `relay init` if `relay id` fails, and:
-
-```bash
-# Mac
-relay peer add pc <PC-DEVICE-ID> --addr 192.168.1.20:47321
-```
-
-```powershell
-# PC
-relay peer add mac <MAC-DEVICE-ID> --addr 192.168.1.10:47321
-```
-
-`relay id` prints `<64-hex-device-id> <name>`. Addresses are optional on one
-side, but giving both lets either machine reconnect first.
+Then `relay init` if `relay id` fails, and pair as above (`relay pair` /
+`relay pair CODE`). If the machines are only reachable over Tailscale, use
+`--addr`. `relay peer add NAME ID --addr HOST:PORT` remains the
+manual/advanced fallback when you already have both device ids.
 
 **Check on it**
 
@@ -260,7 +277,8 @@ noisy metadata copies; add `--branches` to delete the conflicting refs too.
 | `relay service uninstall` / `start` / `stop` / `restart` / `status` | Remove or control the background service |
 | `relay service logs [-n N] [-f]` | Show the service log (`<relay home>/logs/relay.log`) |
 | `relay status` | Device, mounts, entry counts, peers, sync progress, and live daemon state (or “not running”) |
-| `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Pair with another device |
+| `relay pair [--share SPACE]...` / `relay pair CODE [--addr HOST:PORT]` | Pair with another device (LAN code, or `--addr` over Tailscale) |
+| `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id (advanced / manual) |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
 | `relay space create NAME` / `space list` | Manage Spaces (logical namespaces) |
 | `relay space offers` / `space join NAME --from PEER` | See and accept spaces other devices shared with you |
@@ -320,7 +338,8 @@ Set-NetConnectionProfile -NetworkCategory Private
 Relay's rule is to preserve data when unsure.
 
 - **Only paired devices can connect.** Each device's id is its Ed25519 public
-  key; TLS handshakes succeed only with keys you added with `relay peer add`.
+  key; TLS handshakes succeed only with keys established by `relay pair` or
+  `relay peer add`.
   A space syncs only with peers it is explicitly shared with, in both
   directions.
 - **Nothing is overwritten blind.** Before replacing a local file with a
@@ -390,7 +409,7 @@ crates/
   relay-db       SQLite schema, migrations and the local index repository
   relay-crypto   device identity: Ed25519 key, self-signed certificate
   relay-proto    peer wire protocol (protobuf via prost)
-  relay-net      QUIC transport: pinned mutual TLS, control and object streams
+  relay-net      QUIC transport: pinned mutual TLS, pairing, LAN discovery
   relay-engine   scan, watch, sync state machine, remote apply, conflicts, history
   relay-daemon   reusable sync runner: network + engine loop with live config reload
   relay-ipc      local-socket RPC between a running host and the CLI
@@ -410,5 +429,5 @@ The phase plan is in [`docs/DESIGN.md`](docs/DESIGN.md) section 51. Next:
    receive-side mass-delete guard are in.
 2. **Phase 4**: local IPC is in — the CLI talks to a running host for
    status, pause/resume, rescan, and activity.
-3. **Phase 5+**: LAN discovery and pairing codes, more than two devices,
-   relaying, encryption at rest.
+3. **Phase 5**: pairing codes and LAN discovery are in. Next: more than
+   two devices as a first-class topology, relaying, encryption at rest.

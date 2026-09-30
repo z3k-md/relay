@@ -510,3 +510,69 @@ out of scope.
   does not yet attach as a client of a `relay service` runner. Windows pipe
   security is the default (see Security). Subscribe is
   firehose-from-now; a client that needs history calls `activity` first.
+
+## D25. Device pairing and LAN discovery
+
+Pairing replaces copying device ids by hand. A short code plus the existing
+QUIC port is enough on the same LAN; over Tailscale the joiner also types an
+address. There is no internet rendezvous and no NAT traversal.
+
+- **Code.** Format `NN-NNNN-NNNN` (ten decimal digits). The first two digits
+  are a public *nameplate* used only to pick the right mDNS instance. The
+  remaining eight are the secret. Entropy is 10^8 (about 26.6 bits) on
+  the secret, plus the nameplate to avoid colliding sessions. Codes are
+  generated with `rand`. Input may include dashes or spaces. A session lasts
+  10 minutes, allows exactly one authentication attempt (any failed confirm
+  aborts it), and is cancelled on success, explicit cancel, or expiry.
+- **Protocol.** Same UDP port as sync, second ALPN `relay-pair/1`. The TLS
+  verifier accepts any well-formed Relay device certificate because rustls
+  cannot see ALPN at verify time. Trust is enforced immediately after the
+  handshake, before any stream is accepted: sync ALPN (`relay/1`) from a
+  device not in the trusted set is closed; pairing ALPN with no open session
+  is closed. `drive_connection` still refuses untrusted peers. The joiner
+  dials with pairing ALPN and a verifier that accepts any Relay device cert,
+  and reads the initiator `DeviceId` from that cert.
+- **SPAKE2 and transcript.** One bidirectional stream, length-prefixed
+  protobuf. Joiner sends nameplate + SPAKE2 message B; initiator replies
+  with message A. Both derive K with the `spake2` crate (Ed25519 group,
+  identities `relay-pair-initiator` / `relay-pair-joiner`, password = the
+  full 10-digit code). Confirmation MACs are
+  `blake3::keyed_hash(K, label || transcript)` with labels
+  `relay-pair/1 confirm B` and `… confirm A`. The transcript is nameplate ||
+  initiator DeviceId || joiner DeviceId (both as observed from the TLS
+  certificates) || both SPAKE2 messages. Binding the TLS-observed ids
+  defeats a MITM that presents its own certificate. Device info
+  `{name, addresses}` is sent only after both MACs verify, on the same TLS
+  connection.
+- **Addresses.** Each side advertises every non-loopback, non-link-local
+  interface IP (IPv4 and global IPv6, including Tailscale `100.64.0.0/10`
+  and `fd7a:115c:a1e0::/48`) plus the listen port. The receiver also adds
+  the observed remote address and prefers it (that path just worked).
+  Entries are deduped and capped at 8. The sync dialer gives each stored
+  address a short attempt so a dead LAN IP does not hide a working
+  loopback or Tailscale one.
+- **mDNS.** While the host runs it advertises `_relay._udp.local.` The
+  instance name is derived from the device id. TXT: `id`, `name`, `v=1`,
+  and `pair=<nameplate>` only while a pairing session is open. Browse is
+  continuous. A joiner without `--addr` dials the resolved instance whose
+  `pair` TXT matches its nameplate. For already-trusted peers, newly
+  resolved LAN addresses are merged in front of stored ones (Tailscale
+  entries stay), capped at 8, written through `SyncInput::PeerAddresses` on
+  the engine loop, then pushed live with `NetCommand::SetPeers`. Multicast
+  failures are logged and never stop the host.
+- **Runtime writes.** Pairing and address merges must go through the loop's
+  engine (`SyncInput::AddPeer` / `PeerAddresses`) and `SetPeers`. A write
+  from another connection bumps SQLite `data_version` and the loop reloads,
+  dropping QUIC. `open_for_config` is the wrong path here (D19, D24).
+- **IPC / CLI / desktop.** `pair_start {share?}` / `pair_status` /
+  `pair_join {code, addr?}` (blocks up to 60s) / `pair_cancel`. On
+  `NetEvent::Paired` the initiator's host upserts the peer, shares the
+  requested spaces, and updates the trusted set live. The joiner learns
+  those spaces through the existing offer flow. `relay pair` and the
+  desktop Peers view are the primary path; `relay peer add` remains the
+  manual/advanced fallback. Over Tailscale, mDNS does not cross the
+  overlay: the joiner passes `--addr` (`my-mac:47321` via MagicDNS or
+  `100.x.y.z:47321`).
+- **Known limits.** No internet rendezvous, no hole punching, no pairing
+  through a third device. Two devices that cannot reach each other's UDP
+  port cannot pair. Peer revocation is still `relay peer remove`.
