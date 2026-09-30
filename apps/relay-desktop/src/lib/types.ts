@@ -52,6 +52,19 @@ export type ConflictClass =
   | { kind: "file"; original: string }
   | { kind: "git"; gitDir: string; isRef: boolean };
 
+export interface DeleteHold {
+  peer: string;
+  peerName: string;
+  space: string;
+  spaceId: string;
+  mount: string;
+  mountId: string;
+  deletions: number;
+  live: number;
+  heldAtMs: number;
+  decision: "apply" | "restore" | null;
+}
+
 export interface ConflictView {
   path: string;
   space: string;

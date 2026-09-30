@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use relay_core::DeviceId;
 use relay_engine::{
-    ConflictClass, Engine, EngineError, Resolution, resolve_conflict as engine_resolve_conflict,
-    resolve_git_conflicts as engine_resolve_git,
+    ConflictClass, DeleteHoldDecision, Engine, EngineError, Resolution,
+    resolve_conflict as engine_resolve_conflict, resolve_git_conflicts as engine_resolve_git,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -80,6 +80,21 @@ pub struct OfferView {
 pub enum ConflictClassView {
     File { original: String },
     Git { git_dir: String, is_ref: bool },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteHoldView {
+    pub peer: String,
+    pub peer_name: String,
+    pub space: String,
+    pub space_id: String,
+    pub mount: String,
+    pub mount_id: String,
+    pub deletions: u32,
+    pub live: u32,
+    pub held_at_ms: i64,
+    pub decision: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -415,6 +430,52 @@ pub fn join_space(app: AppHandle, space: String, from_peer: String) -> Result<Sp
             shared_with: vec![from_peer.clone()],
         })
     })
+}
+
+#[tauri::command]
+pub fn list_delete_holds(app: AppHandle) -> Result<Vec<DeleteHoldView>, String> {
+    let state = app.state::<AppState>();
+    let engine = open_ro(&state.home)?;
+    let holds = engine.delete_holds().map_err(|err| error_chain(&err))?;
+    Ok(holds
+        .into_iter()
+        .map(|h| DeleteHoldView {
+            peer: h.peer.to_string(),
+            peer_name: h.peer_name,
+            space: h.space,
+            space_id: h.space_id.to_string(),
+            mount: h.mount,
+            mount_id: h.mount_id.to_string(),
+            deletions: h.deletions as u32,
+            live: h.live as u32,
+            held_at_ms: h.held_at_ms,
+            decision: h.decision.map(|d| match d {
+                DeleteHoldDecision::Apply => "apply".to_owned(),
+                DeleteHoldDecision::Restore => "restore".to_owned(),
+            }),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn decide_delete_hold(
+    app: AppHandle,
+    space: String,
+    mount: Option<String>,
+    peer: Option<String>,
+    decision: String,
+) -> Result<u32, String> {
+    let decision = match decision.as_str() {
+        "apply" => DeleteHoldDecision::Apply,
+        "restore" => DeleteHoldDecision::Restore,
+        other => return Err(format!("unknown decision {other:?}")),
+    };
+    let state = app.state::<AppState>();
+    let mut engine = Engine::open_for_config(&state.home).map_err(|err| error_chain(&err))?;
+    let n = engine
+        .decide_delete_hold(&space, mount.as_deref(), peer.as_deref(), decision)
+        .map_err(|err| error_chain(&err))?;
+    Ok(n as u32)
 }
 
 #[tauri::command]

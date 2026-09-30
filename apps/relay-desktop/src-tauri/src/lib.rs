@@ -55,6 +55,8 @@ pub fn run() {
             commands::list_conflicts,
             commands::resolve_conflict,
             commands::resolve_git_conflicts,
+            commands::list_delete_holds,
+            commands::decide_delete_hold,
             commands::get_activity,
             commands::pause_sync,
             commands::resume_sync,

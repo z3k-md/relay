@@ -5,6 +5,7 @@ import type {
   CliStatus,
   ConflictView,
   GitResolveReport,
+  DeleteHold,
   MountView,
   OfferView,
   Overview,
@@ -70,6 +71,14 @@ export const api = {
       gitDir,
       includeBranches,
     }),
+  listDeleteHolds: () => call<DeleteHold[]>("list_delete_holds"),
+  decideDeleteHold: (
+    space: string,
+    decision: "apply" | "restore",
+    mount?: string,
+    peer?: string,
+  ) =>
+    call<number>("decide_delete_hold", { space, decision, mount, peer }),
   getActivity: () => call<ActivityItem[]>("get_activity"),
   pauseSync: () => call<RunnerState>("pause_sync"),
   resumeSync: () => call<RunnerState>("resume_sync"),

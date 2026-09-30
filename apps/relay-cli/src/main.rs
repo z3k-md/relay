@@ -11,8 +11,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use relay_core::{DeviceId, EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
 use relay_daemon::{DaemonEvent, DaemonOptions};
 use relay_engine::{
-    ConflictClass, ConflictInfo, Engine, EngineError, Resolution, ScanOptions, ScanReport,
-    WatchEvent, WatchOptions, default_home, group_git_conflicts, resolve_conflict,
+    ConflictClass, ConflictInfo, DeleteHoldDecision, Engine, EngineError, Resolution, ScanOptions,
+    ScanReport, WatchEvent, WatchOptions, default_home, group_git_conflicts, resolve_conflict,
     resolve_git_conflicts,
 };
 
@@ -74,6 +74,11 @@ enum Command {
         space: Option<String>,
         #[command(subcommand)]
         cmd: Option<ConflictsCmd>,
+    },
+    /// Held mass deletes from a peer
+    Deletes {
+        #[command(subcommand)]
+        cmd: Option<DeletesCmd>,
     },
     /// Space commands
     Space {
@@ -210,6 +215,26 @@ enum PeerCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum DeletesCmd {
+    /// Apply the peer's deletions on this device
+    Apply {
+        space: String,
+        #[arg(long)]
+        mount: Option<String>,
+        #[arg(long)]
+        peer: Option<String>,
+    },
+    /// Keep the files here and send them back to the peer
+    Restore {
+        space: String,
+        #[arg(long)]
+        mount: Option<String>,
+        #[arg(long)]
+        peer: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum MountCmd {
     Add {
         space: String,
@@ -333,6 +358,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .map(|()| ExitCode::SUCCESS)
             }
         },
+        Command::Deletes { cmd } => cmd_deletes(&home, cmd, json),
         Command::Space { cmd } => match cmd {
             SpaceCmd::Create { name } => {
                 let mut engine = Engine::open_for_config(&home)?;
@@ -795,6 +821,19 @@ fn print_watch_event(
                 peer_label(names, peer)
             ));
         }
+        WatchEvent::DeletesHeld {
+            peer,
+            space,
+            mount,
+            deletions,
+            live,
+        } => {
+            let peer = peer_label(names, peer);
+            output::out_line(&format!(
+                "{} {peer} wants to delete {deletions} of {live} files in {space}/{mount}; nothing has been deleted. Decide with `relay deletes apply` or `relay deletes restore`",
+                utc_hms()
+            ));
+        }
     }
 }
 
@@ -1092,6 +1131,7 @@ fn conflict_json(info: &ConflictInfo) -> ConflictJson {
 
 fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     let status = engine.status()?;
+    let holds = engine.delete_holds()?;
     let service = if service::supported() {
         match service::status_info(engine.home()) {
             Ok(info) => Some(info),
@@ -1105,6 +1145,7 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     };
     if json {
         let mut value = serde_json::to_value(&status)?;
+        value["delete_holds"] = serde_json::to_value(&holds)?;
         if let Some(info) = service {
             value["service"] = serde_json::to_value(info)?;
         }
@@ -1172,10 +1213,113 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
             }
         }
     }
+    if !holds.is_empty() {
+        println!("held deletes");
+        for hold in &holds {
+            let decision = match hold.decision {
+                Some(DeleteHoldDecision::Apply) => "apply",
+                Some(DeleteHoldDecision::Restore) => "restore",
+                None => "pending",
+            };
+            println!(
+                "  {} wants to delete {} of {} files in {}/{} (held {}, {decision})",
+                hold.peer_name,
+                hold.deletions,
+                hold.live,
+                hold.space,
+                hold.mount,
+                format_utc_ms(hold.held_at_ms)
+            );
+        }
+    }
     if let Some(info) = service {
         println!("{}", service::format_status_line(&info));
     }
     Ok(())
+}
+
+fn cmd_deletes(home: &Path, cmd: Option<DeletesCmd>, json: bool) -> Result<ExitCode> {
+    match cmd {
+        None => {
+            let engine = Engine::open_read_only(home)?;
+            let holds = engine.delete_holds()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&holds)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if holds.is_empty() {
+                println!("no held deletes");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for hold in holds {
+                let decision = match hold.decision {
+                    Some(DeleteHoldDecision::Apply) => "apply",
+                    Some(DeleteHoldDecision::Restore) => "restore",
+                    None => "pending",
+                };
+                println!(
+                    "{}  {}/{}  wants to delete {} of {} files  held {}  {decision}",
+                    hold.peer_name,
+                    hold.space,
+                    hold.mount,
+                    hold.deletions,
+                    hold.live,
+                    format_utc_ms(hold.held_at_ms)
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(DeletesCmd::Apply { space, mount, peer }) => decide_delete_hold(
+            home,
+            &space,
+            mount.as_deref(),
+            peer.as_deref(),
+            DeleteHoldDecision::Apply,
+            json,
+        ),
+        Some(DeletesCmd::Restore { space, mount, peer }) => decide_delete_hold(
+            home,
+            &space,
+            mount.as_deref(),
+            peer.as_deref(),
+            DeleteHoldDecision::Restore,
+            json,
+        ),
+    }
+}
+
+fn decide_delete_hold(
+    home: &Path,
+    space: &str,
+    mount: Option<&str>,
+    peer: Option<&str>,
+    decision: DeleteHoldDecision,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut engine = Engine::open_for_config(home)?;
+    let n = engine.decide_delete_hold(space, mount, peer, decision)?;
+    let word = match decision {
+        DeleteHoldDecision::Apply => "apply",
+        DeleteHoldDecision::Restore => "restore",
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "updated": n,
+                "decision": word,
+                "space": space,
+                "mount": mount,
+                "peer": peer,
+            }))?
+        );
+    } else {
+        println!("marked {n} hold(s) as {word}");
+        println!(
+            "a running service or app picks this up automatically; otherwise it takes effect at the next `relay run`"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_scan(

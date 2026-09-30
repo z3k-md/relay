@@ -390,6 +390,16 @@ fn describe_watch(event: &WatchEvent) -> (String, String) {
         WatchEvent::SyncWarning { peer, path, reason } => {
             ("warning".to_owned(), format!("{peer} {path}: {reason}"))
         }
+        WatchEvent::DeletesHeld {
+            peer,
+            space,
+            mount,
+            deletions,
+            live,
+        } => (
+            "deletesHeld".to_owned(),
+            format!("{peer} wants to delete {deletions} of {live} files in {space}/{mount}"),
+        ),
         WatchEvent::Stopped => ("stop".to_owned(), "Sync loop stopped".to_owned()),
     }
 }
