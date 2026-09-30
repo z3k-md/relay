@@ -145,11 +145,24 @@ export interface UpdateAvailable {
   notes: string;
 }
 
+export type CliShell = "zsh" | "bash" | "fish";
+
+export interface CliShellHint {
+  shell: CliShell;
+  configFile: string;
+  snippet: string;
+  hint: string;
+  configured: boolean;
+}
+
 export interface CliStatus {
   sidecarPath: string | null;
   installPath: string | null;
   onPath: boolean;
   hint: string | null;
+  detectedShell: CliShell | null;
+  shellHints: CliShellHint[];
+  pathConfigured: boolean;
 }
 
 export interface CliInstallResult {
@@ -157,6 +170,8 @@ export interface CliInstallResult {
   onPath: boolean;
   hint: string | null;
   message: string;
+  detectedShell: CliShell | null;
+  pathConfigured: boolean;
 }
 
 export type Page =

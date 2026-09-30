@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::Engine;
 use crate::error::EngineError;
 use crate::reports::{ScanOptions, ScanReport};
-use crate::sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
+use crate::sync::{AddMountApplied, SyncEvent, SyncInput, SyncOutput, Syncer};
 
 const STOP_POLL: Duration = Duration::from_millis(100);
 const RELOAD_POLL: Duration = Duration::from_secs(1);
@@ -313,6 +313,29 @@ impl Engine {
                             output(SyncOutput::SetPeers);
                         }
                     }
+                    SyncInput::AddMount {
+                        space,
+                        mount,
+                        path,
+                        reply,
+                    } => {
+                        let result = apply_add_mount(
+                            self,
+                            &mut syncer,
+                            &mut states,
+                            watcher.as_mut(),
+                            &space,
+                            &mount,
+                            &path,
+                            &mut output,
+                            on_event,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    SyncInput::Share { space, peer, reply } => {
+                        let result = apply_share(self, &syncer, &space, &peer, &mut output);
+                        let _ = reply.send(result);
+                    }
                     other => {
                         emit_sync(syncer.handle(self, other, &mut output), on_event);
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
@@ -409,6 +432,87 @@ fn apply_add_peer(
             tracing::warn!(%peer, %space, error = %err, "could not share space with new peer");
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_add_mount(
+    engine: &mut Engine,
+    syncer: &mut Syncer,
+    states: &mut Vec<MountWatch>,
+    watcher: Option<&mut MountWatcher>,
+    space: &str,
+    mount: &str,
+    path: &Path,
+    output: &mut dyn FnMut(SyncOutput),
+    on_event: &mut dyn FnMut(&WatchEvent),
+) -> Result<AddMountApplied, String> {
+    let config = engine
+        .add_mount(space, mount, path, &[], &[])
+        .map_err(|err| err.to_string())?;
+    let space_id = config.mount.space;
+    let mount_id = config.mount.id;
+    let name = config.mount.name.clone();
+    let local_path = config.local_path.clone();
+
+    if let Some(root) = local_path.clone() {
+        let mut state = MountWatch {
+            space_id,
+            mount_id,
+            space: space.to_owned(),
+            mount: name.clone(),
+            root,
+            dirty: HashSet::new(),
+            first_event: None,
+            last_event: Some(Instant::now()),
+            full_pending: true,
+            last_full: None,
+            failed: false,
+            watcher_attached: false,
+        };
+        if let Some(watcher) = watcher {
+            attach_watcher(watcher, &mut state, on_event);
+        }
+        states.push(state);
+        on_event(&WatchEvent::Started {
+            mounts: vec![format!("{space}/{name}")],
+        });
+    }
+
+    if let Err(err) = syncer.refresh_offers_for_space(engine, space_id, output) {
+        on_event(&WatchEvent::SyncWarning {
+            peer: String::new(),
+            path: String::new(),
+            reason: err.to_string(),
+        });
+    }
+
+    Ok(AddMountApplied {
+        name,
+        path: local_path,
+        space_id,
+        mount_id,
+    })
+}
+
+fn apply_share(
+    engine: &mut Engine,
+    syncer: &Syncer,
+    space: &str,
+    peer: &str,
+    output: &mut dyn FnMut(SyncOutput),
+) -> Result<(), String> {
+    engine.share(space, peer).map_err(|err| err.to_string())?;
+    let peer_id = engine
+        .peers()
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .find(|p| p.name == peer)
+        .map(|p| p.id)
+        .ok_or_else(|| format!("unknown peer {peer}"))?;
+    syncer
+        .refresh_offers(engine, peer_id, output)
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 

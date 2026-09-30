@@ -114,8 +114,20 @@ pub fn run() {
             Ok(())
         });
 
-    if let Err(err) = builder.run(tauri::generate_context!()) {
-        eprintln!("Relay failed to start: {err}");
-        std::process::exit(1);
-    }
+    let app = match builder.build(tauri::generate_context!()) {
+        Ok(app) => app,
+        Err(err) => {
+            eprintln!("Relay failed to start: {err}");
+            std::process::exit(1);
+        }
+    };
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            // Cmd-Q / dock Quit / app.exit all land here. Tray Quit also calls
+            // stop_join first; a second call is a no-op once the thread is gone.
+            if let Some(state) = app.try_state::<AppState>() {
+                state.runner.stop_join();
+            }
+        }
+    });
 }

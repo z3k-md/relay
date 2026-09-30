@@ -7,9 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use relay_core::{PairingCode, SpaceId};
 use relay_engine::{Engine, ScanReport, SyncInput, WatchEvent};
 use relay_ipc::{
-    ActivityItem, Handler, Hello, HostKind, HostState, MountLive, PROTOCOL_VERSION, PairJoinParams,
-    PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive, RescanParams,
-    RpcErrorBody, Status, Watching,
+    ActivityItem, AddMountParams, AddMountResult, Handler, Hello, HostKind, HostState, MountLive,
+    PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
+    PeerLive, RescanParams, RpcErrorBody, ShareParams, Status, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -196,6 +196,84 @@ impl Host {
                 "Relay is not running; resume sync and try again",
             )),
         }
+    }
+
+    fn sync_tx(&self) -> Option<mpsc::Sender<SyncInput>> {
+        self.sync_tx.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Apply a config write on the running engine loop when possible; otherwise
+    /// fall back to `open_for_config` (paused or between reload cycles).
+    fn add_mount(&self, params: AddMountParams) -> Result<AddMountResult, RpcErrorBody> {
+        if let Some(tx) = self.sync_tx() {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(SyncInput::AddMount {
+                space: params.space.clone(),
+                mount: params.mount.clone(),
+                path: params.path.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
+            let applied = reply_rx
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|_| RpcErrorBody::new("unavailable", "timed out applying add_mount"))?
+                .map_err(|message| RpcErrorBody::new("failed", message))?;
+            if let Ok(mut live) = self.mounts.lock()
+                && !live
+                    .iter()
+                    .any(|m| m.space == params.space && m.mount == applied.name)
+            {
+                live.push(MountLive {
+                    space: params.space,
+                    mount: applied.name.clone(),
+                    path: applied.path.clone(),
+                    watching: if self.use_watcher {
+                        Watching::Native
+                    } else {
+                        Watching::Poll
+                    },
+                    last_scan_ms: None,
+                    last_scan_summary: None,
+                    last_error: None,
+                });
+            }
+            return Ok(AddMountResult {
+                name: applied.name,
+                path: applied.path,
+            });
+        }
+
+        let mut engine = Engine::open_for_config(&self.home)
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
+        let config = engine
+            .add_mount(&params.space, &params.mount, &params.path, &[], &[])
+            .map_err(|err| RpcErrorBody::new("failed", err.to_string()))?;
+        Ok(AddMountResult {
+            name: config.mount.name,
+            path: config.local_path,
+        })
+    }
+
+    fn share(&self, params: ShareParams) -> Result<(), RpcErrorBody> {
+        if let Some(tx) = self.sync_tx() {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(SyncInput::Share {
+                space: params.space,
+                peer: params.peer,
+                reply: reply_tx,
+            })
+            .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
+            return reply_rx
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|_| RpcErrorBody::new("unavailable", "timed out applying share"))?
+                .map_err(|message| RpcErrorBody::new("failed", message));
+        }
+
+        let mut engine = Engine::open_for_config(&self.home)
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
+        engine
+            .share(&params.space, &params.peer)
+            .map_err(|err| RpcErrorBody::new("failed", err.to_string()))
     }
 
     fn pair_start(&self, params: PairStartParams) -> Result<PairStartResult, RpcErrorBody> {
@@ -558,6 +636,17 @@ impl Handler for Host {
                 tx.send(SyncInput::Rescan { mounts })
                     .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
                 serde_json::to_value(relay_ipc::RescanResult { queued }).map_err(internal)
+            }
+            "add_mount" => {
+                let params: AddMountParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(self.add_mount(params)?).map_err(internal)
+            }
+            "share" => {
+                let params: ShareParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                self.share(params)?;
+                Ok(serde_json::json!({}))
             }
             "pair_start" => {
                 let params: PairStartParams = serde_json::from_value(params)

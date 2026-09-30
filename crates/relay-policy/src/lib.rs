@@ -13,7 +13,7 @@ use thiserror::Error;
 /// The mount marker and in-flight temp files use the same names as
 /// [`relay_core::MOUNT_MARKER`] and [`relay_core::TEMP_PREFIX`].
 pub const DEFAULT_EXCLUDES: &[&str] = &[
-    ".relay-mount",
+    "**/.relay-mount",
     "**/.relay-tmp-*",
     "**/.git/**/*.lock",
     "**/.git/gc.pid",
@@ -286,7 +286,11 @@ mod tests {
 
     #[test]
     fn default_excludes_match_core_constants() {
-        assert_eq!(DEFAULT_EXCLUDES[0], relay_core::MOUNT_MARKER);
+        assert!(
+            DEFAULT_EXCLUDES[0].ends_with(relay_core::MOUNT_MARKER),
+            "marker exclude should end with {}",
+            relay_core::MOUNT_MARKER
+        );
         assert!(
             DEFAULT_EXCLUDES[1].contains(relay_core::TEMP_PREFIX),
             "temp exclude should mention {}",
@@ -391,6 +395,7 @@ mod tests {
     fn default_junk_and_marker_are_excluded() {
         let r = default_rules();
         assert!(!r.is_selected(&lp(".relay-mount"), EntryKind::File));
+        assert!(!r.is_selected(&lp("nested/.relay-mount"), EntryKind::File));
         assert!(!r.is_selected(&lp(".DS_Store"), EntryKind::File));
         assert!(!r.is_selected(&lp("foo/.DS_Store"), EntryKind::File));
         assert!(!r.is_selected(&lp("docs/Thumbs.db"), EntryKind::File));

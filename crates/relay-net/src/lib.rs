@@ -38,6 +38,10 @@ use session::{
 };
 use tls::{TlsMaterials, install_ring_provider, make_server_config};
 
+/// Upper bound for Quinn `wait_idle` during shutdown. The drain itself can take
+/// multiple seconds; waiting that long blocked desktop quit via `stop_join`.
+const SHUTDOWN_IDLE_WAIT: Duration = Duration::from_millis(150);
+
 /// A peer the local device is willing to talk to.
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
@@ -137,7 +141,7 @@ pub enum NetCommand {
 
 /// Handle to a running network runtime. `send` never blocks and never panics
 /// after shutdown. [`Drop`] signals shutdown and joins the runtime thread
-/// (expected to be brief after the endpoint closes).
+/// (endpoint close with a short idle bound, not the full QUIC drain).
 /// Cloneable sink for [`NetCommand`]s (used by the host IPC thread).
 #[derive(Clone)]
 pub struct NetSender {
@@ -175,7 +179,11 @@ impl NetHandle {
         self.local_addr
     }
 
-    /// Close connections, wait briefly for idle, and join the runtime thread.
+    /// Close connections and join the runtime thread.
+    ///
+    /// Caps Quinn's optional `wait_idle` drain: the close timer routinely takes
+    /// multiple seconds, which made the desktop app hang on quit. A short bound
+    /// is enough to flush CONNECTION_CLOSE without blocking the UI.
     pub fn shutdown(mut self) {
         self.shutdown_inner();
     }
@@ -364,7 +372,10 @@ async fn run(
         handle.abort();
     }
     endpoint.close(close_code(CLOSE_SHUTDOWN), b"shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+    // Quinn's close/drain timer often runs for seconds; keep this brief so app
+    // quit (which joins this thread) returns promptly while still giving
+    // CONNECTION_CLOSE a moment to leave the socket.
+    let _ = tokio::time::timeout(SHUTDOWN_IDLE_WAIT, endpoint.wait_idle()).await;
 }
 
 async fn handle_incoming(inner: Arc<Inner>, conn: quinn::Connection) {

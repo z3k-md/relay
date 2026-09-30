@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ActivityItem,
   CliInstallResult,
+  CliShell,
   CliStatus,
   ConflictView,
   PairJoinResult,
@@ -98,7 +99,8 @@ export const api = {
     call<Settings>("set_settings", { patch }),
   openLogsFolder: () => call<void>("open_logs_folder"),
   cliStatus: () => call<CliStatus>("cli_status"),
-  installCli: () => call<CliInstallResult>("install_cli"),
+  installCli: (shell?: CliShell) =>
+    call<CliInstallResult>("install_cli", { shell: shell ?? null }),
 };
 
 export function runnerLabel(state: RunnerState): string {

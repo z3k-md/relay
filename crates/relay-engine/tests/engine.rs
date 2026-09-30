@@ -52,6 +52,31 @@ fn object_id(content: &EntryContent) -> relay_engine::ObjectId {
 }
 
 #[test]
+fn mount_marker_is_not_indexed() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    fs::write(mount.path().join("note.txt"), b"hello").unwrap();
+    // Marker was written by add_mount; ensure a rescan still ignores it.
+    assert!(mount.path().join(".relay-mount").is_file());
+    scan(&mut engine);
+
+    let paths: Vec<_> = engine
+        .entries("Personal", "code", true)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.key.path.to_string())
+        .collect();
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p == ".relay-mount" || p.ends_with("/.relay-mount")),
+        "marker must not be indexed: {paths:?}"
+    );
+    assert!(paths.iter().any(|p| p == "note.txt"), "{paths:?}");
+}
+
+#[test]
 fn phase0_success_path() {
     let home = new_home();
     let mount = new_home();

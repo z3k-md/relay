@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use relay_core::{
     EntryContent, EntryKey, EntryKind, EntryRecord, LocalChange, LogicalPath, MountId, Observation,
-    Sequence, derive_local_change, needs_rehash,
+    Sequence, derive_local_change, is_bookkeeping_path, needs_rehash,
 };
 use relay_fs::{ScanScope, ScanWarning, ScopeKind, effective_rules, scan_mount, to_logical_path};
 use relay_policy::MountRules;
@@ -690,6 +690,9 @@ fn is_protected(protection: &Protection, path: &LogicalPath) -> bool {
 }
 
 fn is_deselected(rules: &MountRules, path: &LogicalPath, kind: EntryKind) -> bool {
+    if is_bookkeeping_path(path) {
+        return true;
+    }
     if !rules.is_selected(path, kind) {
         return true;
     }

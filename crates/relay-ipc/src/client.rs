@@ -9,9 +9,9 @@ use interprocess::local_socket::{Stream, prelude::*};
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, Hello, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams,
-    PairStartResult, PairStatus, Request, RescanParams, RescanResult, Response, Status,
-    decode_line, encode_line,
+    ActivityItem, AddMountParams, AddMountResult, Hello, PROTOCOL_VERSION, PairJoinParams,
+    PairJoinResult, PairStartParams, PairStartResult, PairStatus, Request, RescanParams,
+    RescanResult, Response, ShareParams, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -74,6 +74,35 @@ impl Client {
             "rescan",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
+    }
+
+    pub fn add_mount(
+        &mut self,
+        space: &str,
+        mount: &str,
+        path: &Path,
+    ) -> Result<AddMountResult, IpcError> {
+        let params = AddMountParams {
+            space: space.to_owned(),
+            mount: mount.to_owned(),
+            path: path.to_path_buf(),
+        };
+        self.call(
+            "add_mount",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    pub fn share(&mut self, space: &str, peer: &str) -> Result<(), IpcError> {
+        let params = ShareParams {
+            space: space.to_owned(),
+            peer: peer.to_owned(),
+        };
+        let _: serde_json::Value = self.call(
+            "share",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )?;
+        Ok(())
     }
 
     pub fn pair_start(&mut self, share: &[String]) -> Result<PairStartResult, IpcError> {

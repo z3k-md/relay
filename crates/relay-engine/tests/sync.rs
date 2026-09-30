@@ -6,11 +6,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use relay_core::conflict::conflict_path;
-use relay_core::{DeviceId, EntryContent, LogicalPath, ObjectId};
+use relay_core::{DeviceId, EntryContent, LogicalPath, MOUNT_MARKER, ObjectId};
 use relay_engine::{
     DeleteHoldDecision, Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent, SyncInput,
     SyncOutput, Syncer,
 };
+use relay_fs::MountMarker;
 use relay_proto::{IndexBatch, entry_to_wire, frame, space_id_bytes};
 use tempfile::TempDir;
 
@@ -1284,4 +1285,85 @@ fn hold_on_one_space_does_not_block_another() {
     assert_eq!(h.b.delete_holds().unwrap().len(), 1);
     assert_eq!(live_files(h.mount_b.path()).len(), 40);
     assert_eq!(fs::read(work_b.path().join("note.txt")).unwrap(), b"v2");
+}
+
+#[test]
+fn mount_marker_is_not_indexed_or_replicated() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("hello.txt", b"hi")]);
+
+    for (label, engine) in [("a", &h.a), ("b", &h.b)] {
+        let paths: Vec<_> = engine
+            .entries("Personal", "code", true)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key.path.to_string())
+            .collect();
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p == MOUNT_MARKER || p.ends_with(&format!("/{MOUNT_MARKER}"))),
+            "{label} indexed the mount marker: {paths:?}"
+        );
+        assert!(paths.iter().any(|p| p == "hello.txt"), "{label}: {paths:?}");
+    }
+
+    let marker_a = MountMarker::read(h.mount_a.path()).unwrap();
+    let marker_b = MountMarker::read(h.mount_b.path()).unwrap();
+    assert_eq!(marker_a.space, marker_b.space);
+    assert_eq!(marker_a.mount, marker_b.mount);
+    // Each device writes its own local bookkeeping file; it is not synced.
+    assert_ne!(marker_a.created_by, marker_b.created_by);
+    assert_eq!(marker_a.created_by, h.id_a());
+    assert_eq!(marker_b.created_by, h.id_b());
+
+    // A hostile peer that forges a marker entry must not overwrite local bookkeeping.
+    h.strict = false;
+    let before = fs::read(h.mount_b.path().join(MOUNT_MARKER)).unwrap();
+    let space = h.a.spaces().unwrap().into_iter().next().unwrap();
+    let local =
+        h.a.entries("Personal", "code", false)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.key.path.as_str() == "hello.txt")
+            .unwrap();
+    let mut wire = entry_to_wire(&local);
+    wire.path = MOUNT_MARKER.into();
+    let forged = b"forged-marker-as-user-content";
+    h.a.store().put_bytes(forged).unwrap();
+    wire.content = Some(relay_proto::wire_entry::Content::File(
+        relay_proto::WireFile {
+            object: ObjectId::of(forged).as_bytes().to_vec(),
+            size: forged.len() as u64,
+            executable: false,
+        },
+    ));
+    let batch = IndexBatch {
+        space_id: space_id_bytes(&space.id),
+        entries: vec![wire],
+        through_sequence: local.sequence.0 + 10,
+        caught_up: true,
+        after_sequence: 0,
+    };
+    h.drive(
+        SyncInput::Frame {
+            peer: h.id_a(),
+            body: frame::Body::IndexBatch(batch),
+        },
+        false,
+    );
+    assert_eq!(
+        fs::read(h.mount_b.path().join(MOUNT_MARKER)).unwrap(),
+        before
+    );
+    assert_eq!(
+        MountMarker::read(h.mount_b.path()).unwrap().created_by,
+        h.id_b()
+    );
+    assert!(
+        !h.b.entries("Personal", "code", true)
+            .unwrap()
+            .iter()
+            .any(|e| e.key.path.as_str() == MOUNT_MARKER)
+    );
 }

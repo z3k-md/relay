@@ -13,11 +13,11 @@ const emit = defineEmits<{
   <Teleport to="body">
     <div
       v-if="open"
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      class="fixed inset-0 z-50 flex cursor-pointer items-center justify-center bg-black/40 p-4"
       @click.self="emit('close')"
     >
       <div
-        class="w-full max-w-md rounded-xl border border-[var(--color-line)] bg-[var(--color-panel)] p-4 shadow-xl"
+        class="w-full max-w-md cursor-auto rounded-xl border border-[var(--color-line)] bg-[var(--color-panel)] p-4 shadow-xl"
         role="dialog"
         aria-modal="true"
       >

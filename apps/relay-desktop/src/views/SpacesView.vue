@@ -60,7 +60,11 @@ async function addFolder(space: string) {
   const mount = folderName(selected);
   busy.value = true;
   try {
-    await api.addMount(space, mount, selected);
+    const added = await api.addMount(space, mount, selected);
+    const target = spaces.value.find((s) => s.name === space);
+    if (target && !target.mounts.some((m) => m.name === added.name)) {
+      target.mounts.push(added);
+    }
     await load();
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
@@ -71,11 +75,17 @@ async function addFolder(space: string) {
 
 async function doShare() {
   if (!shareFor.value || !sharePeer.value) return;
+  const spaceName = shareFor.value;
+  const peerName = sharePeer.value;
   busy.value = true;
   error.value = null;
   try {
-    await api.share(shareFor.value, sharePeer.value);
+    await api.share(spaceName, peerName);
     shareFor.value = null;
+    const target = spaces.value.find((s) => s.name === spaceName);
+    if (target && !target.sharedWith.includes(peerName)) {
+      target.sharedWith.push(peerName);
+    }
     await load();
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);

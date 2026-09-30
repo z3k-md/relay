@@ -34,8 +34,46 @@ pub use version::{VectorOrdering, VersionRelation, VersionVector, compare_versio
 /// File at the root of every materialized mount holding its Space and Mount
 /// ids. A scan refuses to run if it is missing, so an unmounted drive or a
 /// moved folder is never mistaken for "every file was deleted".
+///
+/// Local bookkeeping only: never indexed, never replicated, never materialized
+/// from a peer as user content.
 pub const MOUNT_MARKER: &str = ".relay-mount";
 
 /// Prefix for in-flight files written next to their destination so the final
 /// rename stays on one volume. Never indexed.
 pub const TEMP_PREFIX: &str = ".relay-tmp-";
+
+/// True when a single path component is Relay bookkeeping (mount marker or
+/// in-flight temp), not user content.
+pub fn is_bookkeeping_component(name: &str) -> bool {
+    name == MOUNT_MARKER || name.starts_with(TEMP_PREFIX)
+}
+
+/// True when any component of `path` is Relay bookkeeping.
+pub fn is_bookkeeping_path(path: &LogicalPath) -> bool {
+    path.components().any(is_bookkeeping_component)
+}
+
+#[cfg(test)]
+mod bookkeeping_tests {
+    use super::*;
+
+    #[test]
+    fn bookkeeping_helpers() {
+        assert!(is_bookkeeping_component(MOUNT_MARKER));
+        assert!(is_bookkeeping_component(&format!("{TEMP_PREFIX}abc")));
+        assert!(!is_bookkeeping_component("notes.txt"));
+        assert!(is_bookkeeping_path(
+            &LogicalPath::new(MOUNT_MARKER).unwrap()
+        ));
+        assert!(is_bookkeeping_path(
+            &LogicalPath::new(&format!("dir/{MOUNT_MARKER}")).unwrap()
+        ));
+        assert!(is_bookkeeping_path(
+            &LogicalPath::new(&format!("dir/{TEMP_PREFIX}x")).unwrap()
+        ));
+        assert!(!is_bookkeeping_path(
+            &LogicalPath::new("dir/notes.txt").unwrap()
+        ));
+    }
+}

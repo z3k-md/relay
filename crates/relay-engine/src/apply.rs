@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use relay_core::conflict::{ConflictWinner, choose_group_winner, choose_winner, conflict_path};
 use relay_core::{
-    DeviceId, EntryContent, EntryKey, EntryKind, EntryRecord, LogicalPath, MOUNT_MARKER, MountId,
-    ObjectId, SpaceId, StatHint, TEMP_PREFIX, VersionRelation, compare_versions, is_git_metadata,
+    DeviceId, EntryContent, EntryKey, EntryKind, EntryRecord, LogicalPath, MountId, ObjectId,
+    SpaceId, StatHint, TEMP_PREFIX, VersionRelation, compare_versions, is_bookkeeping_path,
+    is_git_metadata,
 };
 use relay_db::MountConfig;
 use relay_fs::{
@@ -726,8 +727,7 @@ fn deselected(rules: &MountRules, path: &LogicalPath, kind: EntryKind) -> bool {
 }
 
 fn is_reserved(path: &LogicalPath) -> bool {
-    path.components()
-        .any(|c| c == MOUNT_MARKER || c.starts_with(TEMP_PREFIX))
+    is_bookkeeping_path(path)
 }
 
 fn dest_path(root: &Path, path: &LogicalPath) -> Result<PathBuf, EngineError> {

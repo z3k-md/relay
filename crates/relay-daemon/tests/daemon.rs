@@ -346,6 +346,82 @@ fn ipc_hello_status_rescan_pause_and_host_lock() {
 }
 
 #[test]
+fn ipc_add_mount_and_share_without_reload() {
+    let home = TempDir::new().unwrap();
+    let mount_a = TempDir::new().unwrap();
+    let mount_b = TempDir::new().unwrap();
+    fs::write(mount_a.path().join("a.txt"), b"aaa").unwrap();
+    fs::write(mount_b.path().join("b.txt"), b"bbb").unwrap();
+
+    let peer_id = {
+        let mut engine = Engine::init(home.path(), "alice").unwrap();
+        engine.create_space("Personal").unwrap();
+        engine
+            .add_mount("Personal", "one", mount_a.path(), &[], &[])
+            .unwrap();
+        let peer = relay_core::DeviceId::random();
+        engine
+            .upsert_peer("bob", peer, &["127.0.0.1:9".to_owned()])
+            .unwrap();
+        peer
+    };
+
+    let session = start_daemon(home.path());
+    assert!(wait_started(&session).is_some(), "daemon did not start");
+    assert!(
+        wait_until(CONVERGE, || live_has(
+            home.path(),
+            "Personal",
+            "one",
+            "a.txt"
+        )),
+        "initial mount was not indexed"
+    );
+    drain(&session);
+
+    let mut client = wait_ipc(home.path());
+    let added = client
+        .add_mount("Personal", "two", mount_b.path())
+        .expect("add_mount via ipc");
+    assert_eq!(added.name, "two");
+    assert!(added.path.is_some());
+
+    client.share("Personal", "bob").expect("share via ipc");
+
+    assert!(
+        wait_until(CONVERGE, || live_has(
+            home.path(),
+            "Personal",
+            "two",
+            "b.txt"
+        )),
+        "ipc-added mount was not indexed without reload"
+    );
+
+    let engine = Engine::open_read_only(home.path()).unwrap();
+    let status = engine.status().unwrap();
+    let bob = status
+        .peers
+        .iter()
+        .find(|p| p.name == "bob")
+        .expect("bob peer in status");
+    assert!(
+        bob.spaces.iter().any(|s| s.space == "Personal"),
+        "Personal should be shared with bob: {:?}",
+        bob.spaces
+    );
+    assert_eq!(bob.id, peer_id);
+
+    let reloads = drain(&session)
+        .into_iter()
+        .filter(|e| matches!(e, DaemonEvent::Reloading))
+        .count();
+    assert_eq!(reloads, 0, "live add_mount/share must not reload the host");
+
+    stop_daemon(session);
+}
+
+#[test]
 fn pair_via_ipc_shares_and_syncs_without_reload() {
     let home_a = TempDir::new().unwrap();
     let home_b = TempDir::new().unwrap();

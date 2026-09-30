@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import UpdateStatus from "../components/UpdateStatus.vue";
 import { api } from "../lib/api";
 import { checkForUpdates, updateActive } from "../lib/updateProgress";
-import type { CliStatus, Settings } from "../lib/types";
+import type { CliShell, CliStatus, Settings } from "../lib/types";
 
 const props = defineProps<{
   version: string;
@@ -17,6 +17,27 @@ const error = ref<string | null>(null);
 const cliMessage = ref<string | null>(null);
 const busy = ref(false);
 const checking = computed(() => updateActive.value);
+const selectedShell = ref<CliShell>("zsh");
+
+const selectedHint = computed(() => {
+  const hints = cli.value?.shellHints ?? [];
+  return hints.find((h) => h.shell === selectedShell.value) ?? null;
+});
+
+const displayHint = computed(() => {
+  if (cli.value?.onPath) return null;
+  return selectedHint.value?.hint ?? cli.value?.hint ?? null;
+});
+
+const cliButtonLabel = computed(() => {
+  if (!cli.value?.installPath) return "Install";
+  if (cli.value.onPath) return "Reinstall";
+  return "Add to PATH";
+});
+
+const showShellPicker = computed(
+  () => !!cli.value && !cli.value.onPath && (cli.value.shellHints?.length ?? 0) > 0,
+);
 
 async function load() {
   loading.value = true;
@@ -25,6 +46,9 @@ async function load() {
     const [s, c] = await Promise.all([api.getSettings(), api.cliStatus()]);
     settings.value = s;
     cli.value = c;
+    if (c.detectedShell) {
+      selectedShell.value = c.detectedShell;
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -56,15 +80,23 @@ async function installCli() {
   busy.value = true;
   error.value = null;
   try {
-    const result = await api.installCli();
+    const shell = showShellPicker.value ? selectedShell.value : undefined;
+    const result = await api.installCli(shell);
     cliMessage.value = result.message;
     cli.value = await api.cliStatus();
+    if (result.detectedShell) {
+      selectedShell.value = result.detectedShell;
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
     busy.value = false;
   }
 }
+
+watch(selectedShell, () => {
+  cliMessage.value = null;
+});
 
 onMounted(load);
 defineExpose({ load });
@@ -131,15 +163,34 @@ defineExpose({ load });
           </div>
           <button
             type="button"
-            class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+            class="rounded-md border border-[var(--color-line)] px-2.5 py-1 disabled:opacity-50"
             :disabled="busy"
             @click="installCli"
           >
-            Install
+            {{ cliButtonLabel }}
           </button>
         </div>
+        <div
+          v-if="showShellPicker"
+          class="mt-2 flex items-center gap-2 text-[12px] text-[var(--color-muted)]"
+        >
+          <label for="cli-shell" class="shrink-0">Shell</label>
+          <select
+            id="cli-shell"
+            v-model="selectedShell"
+            class="rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-2 py-1"
+          >
+            <option
+              v-for="hint in cli?.shellHints ?? []"
+              :key="hint.shell"
+              :value="hint.shell"
+            >
+              {{ hint.shell }}
+            </option>
+          </select>
+        </div>
         <p v-if="cliMessage" class="mt-2 text-[12px]">{{ cliMessage }}</p>
-        <p v-if="cli?.hint" class="mono mt-1 text-[12px] text-[var(--color-muted)]">{{ cli.hint }}</p>
+        <p v-if="displayHint" class="mono mt-1 text-[12px] text-[var(--color-muted)]">{{ displayHint }}</p>
       </section>
 
       <button

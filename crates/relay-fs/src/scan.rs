@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 
-use relay_core::{EntryKind, LogicalPath, MOUNT_MARKER, StatHint, TEMP_PREFIX};
+use relay_core::{
+    EntryKind, LogicalPath, MOUNT_MARKER, StatHint, is_bookkeeping_component, is_bookkeeping_path,
+};
 use relay_policy::{MountRules, PolicyError, parse_relayignore};
 use walkdir::{DirEntry, WalkDir};
 
@@ -330,7 +332,7 @@ fn examine_requested(
 }
 
 fn skip_requested_path(root: &Path, path: &LogicalPath, rules: &MountRules) -> bool {
-    if path.file_name().starts_with(TEMP_PREFIX) || path.as_str() == MOUNT_MARKER {
+    if is_bookkeeping_component(path.file_name()) {
         return true;
     }
     ancestor_blocks(root, path, rules)
@@ -512,11 +514,7 @@ fn filter_entry(
         return false;
     };
 
-    if name.starts_with(TEMP_PREFIX) {
-        return false;
-    }
-
-    if entry.path() == root.join(MOUNT_MARKER) {
+    if is_bookkeeping_component(name) {
         return false;
     }
 
@@ -657,6 +655,10 @@ fn finish_entry(
         warnings.push(ScanWarning::SpecialFile(os_path));
         return Ok(None);
     };
+
+    if is_bookkeeping_path(&path) {
+        return Ok(None);
+    }
 
     if !rules.is_selected(&path, kind) {
         return Ok(None);
@@ -893,7 +895,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use relay_core::{DeviceId, MountId, SpaceId};
+    use relay_core::{DeviceId, MountId, SpaceId, TEMP_PREFIX};
     use tempfile::tempdir;
 
     use crate::marker::MountMarker;

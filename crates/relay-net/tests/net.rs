@@ -362,6 +362,30 @@ fn object_fetch_round_trip_and_missing() {
 }
 
 #[test]
+fn shutdown_returns_promptly_with_live_peer() {
+    // Previously waited up to 2s on Quinn wait_idle's close timer. A short
+    // SHUTDOWN_IDLE_WAIT must keep this well under a second with a live session.
+    let mut bob = spawn("bob", vec![]);
+    let bob_id = bob.id;
+    let bob_addr = bob.handle.local_addr();
+    let mut alice = spawn("alice", vec![trust(bob_id, "bob", Some(bob_addr))]);
+    let alice_id = alice.id;
+    bob.handle
+        .send(NetCommand::SetPeers(vec![trust(alice_id, "alice", None)]));
+
+    wait_connected(&mut alice.events, bob_id, "bob");
+    wait_connected(&mut bob.events, alice_id, "alice");
+
+    let started = Instant::now();
+    alice.handle.shutdown();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(750),
+        "shutdown with live peer took {elapsed:?}; likely still awaiting long QUIC wait_idle"
+    );
+}
+
+#[test]
 fn reconnects_after_peer_restart() {
     let bob_id_dir = TempDir::new().unwrap();
     let identity = Arc::new(DeviceIdentity::generate(bob_id_dir.path()).unwrap());

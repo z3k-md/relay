@@ -51,6 +51,25 @@ select {
   font: inherit;
 }
 
+button,
+a,
+[role="button"],
+summary,
+select,
+input[type="checkbox"],
+input[type="radio"],
+label:has(input[type="checkbox"]),
+label:has(input[type="radio"]) {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled,
+input:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
 :focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { onMounted, onUnmounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 import ErrorBanner from "./components/ErrorBanner.vue";
 import UpdateStatus from "./components/UpdateStatus.vue";
 import ActivityView from "./views/ActivityView.vue";
@@ -41,15 +41,29 @@ const update = ref<UpdateAvailable | null>(null);
 const activityRef = ref<{ prepend: (item: ActivityItem) => void } | null>(null);
 
 const unlistens: UnlistenFn[] = [];
+let overviewTimer: number | undefined;
+let refreshGen = 0;
+
+const overviewKinds = new Set([
+  "peerConnected",
+  "peerDisconnected",
+  "reloading",
+  "pair",
+  "started",
+]);
 
 async function refresh() {
+  const gen = ++refreshGen;
   try {
-    overview.value = await api.getOverview();
+    const next = await api.getOverview();
+    if (gen !== refreshGen) return;
+    overview.value = next;
     error.value = null;
   } catch (err) {
+    if (gen !== refreshGen) return;
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
-    loading.value = false;
+    if (gen === refreshGen) loading.value = false;
   }
 }
 
@@ -99,6 +113,7 @@ onMounted(async () => {
   unlistens.push(
     await listen<ActivityItem>("relay://activity", (event) => {
       activityRef.value?.prepend(event.payload);
+      if (overviewKinds.has(event.payload.kind)) void refresh();
     }),
   );
   unlistens.push(
@@ -107,10 +122,18 @@ onMounted(async () => {
     }),
   );
   await listenForUpdateProgress();
+  overviewTimer = window.setInterval(() => {
+    void refresh();
+  }, 5000);
   await refresh();
 });
 
+watch(page, (next) => {
+  if (next === "overview") void refresh();
+});
+
 onUnmounted(() => {
+  if (overviewTimer !== undefined) window.clearInterval(overviewTimer);
   stopUpdateProgressListener();
   for (const off of unlistens) {
     off();

@@ -1,6 +1,8 @@
 //! Engine-native peer sync I/O. The CLI/daemon maps these 1:1 onto relay-net.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use relay_core::version::VectorOrdering;
@@ -23,6 +25,15 @@ const MAX_ATTEMPTS: u32 = 3;
 const MAX_FETCH_ATTEMPTS: u32 = 3;
 /// Delay before re-requesting a range whose objects could not be fetched.
 const RESYNC_DELAY: Duration = Duration::from_secs(30);
+
+/// Result of a live [`SyncInput::AddMount`] applied on the engine loop.
+#[derive(Clone, Debug)]
+pub struct AddMountApplied {
+    pub name: String,
+    pub path: Option<PathBuf>,
+    pub space_id: SpaceId,
+    pub mount_id: MountId,
+}
 
 #[derive(Clone, Debug)]
 pub enum SyncInput {
@@ -59,6 +70,19 @@ pub enum SyncInput {
     PeerAddresses {
         peer: DeviceId,
         addresses: Vec<String>,
+    },
+    /// Add a local mount through the loop writer (D19 / D24 / D25).
+    AddMount {
+        space: String,
+        mount: String,
+        path: PathBuf,
+        reply: mpsc::Sender<Result<AddMountApplied, String>>,
+    },
+    /// Share a space with a peer through the loop writer.
+    Share {
+        space: String,
+        peer: String,
+        reply: mpsc::Sender<Result<(), String>>,
     },
 }
 
@@ -223,9 +247,46 @@ impl Syncer {
             }
             SyncInput::Rescan { .. }
             | SyncInput::AddPeer { .. }
-            | SyncInput::PeerAddresses { .. } => {}
+            | SyncInput::PeerAddresses { .. }
+            | SyncInput::AddMount { .. }
+            | SyncInput::Share { .. } => {}
         }
         Ok(events)
+    }
+
+    /// Re-send current space offers to a connected peer after a live share or
+    /// mount change. No-op if that peer is not connected.
+    pub fn refresh_offers(
+        &self,
+        engine: &Engine,
+        peer: DeviceId,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<(), EngineError> {
+        if !self.connected.contains_key(&peer) {
+            return Ok(());
+        }
+        let offers = engine.space_offers_for_peer(peer)?;
+        out(SyncOutput::Send {
+            peer,
+            body: frame::Body::SpaceOffers(offers),
+        });
+        Ok(())
+    }
+
+    /// Refresh offers for every connected peer that currently shares `space`.
+    pub fn refresh_offers_for_space(
+        &self,
+        engine: &Engine,
+        space: SpaceId,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<(), EngineError> {
+        let peers: Vec<DeviceId> = self.connected.keys().copied().collect();
+        for peer in peers {
+            if engine.db.repo().is_shared(space, peer)? {
+                self.refresh_offers(engine, peer, out)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn push_local_changes(

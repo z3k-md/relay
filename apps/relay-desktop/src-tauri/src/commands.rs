@@ -13,7 +13,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::error::{anyhow_chain, error_chain};
 use crate::runner::RunnerState;
-use crate::sidecar::{self, CliInstallResult, CliStatus};
+use crate::sidecar::{self, CliInstallResult, CliStatus, ShellKind};
 use crate::updates::{self, UpdateInfo};
 use crate::{AppState, settings};
 use relay_ipc::Client;
@@ -324,6 +324,16 @@ fn pairing_client(app: &AppHandle) -> Result<Client, String> {
     }
 }
 
+/// Prefer the running host's IPC so config writes do not `stop_join` the sync
+/// thread. Returns `Ok(None)` only when nothing is listening on the socket.
+fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
+    let state = app.state::<AppState>();
+    match Client::connect(&state.home) {
+        Ok(client) => Ok(client),
+        Err(err) => Err(error_chain(&err)),
+    }
+}
+
 #[tauri::command]
 pub fn pair_start(app: AppHandle, share: Vec<String>) -> Result<PairStartView, String> {
     let mut client = pairing_client(&app)?;
@@ -457,6 +467,17 @@ pub fn add_mount(
     path: String,
 ) -> Result<MountView, String> {
     let path = PathBuf::from(path);
+    if let Some(mut client) = host_client(&app)? {
+        let added = client
+            .add_mount(&space, &mount, &path)
+            .map_err(|err| error_chain(&err))?;
+        return Ok(MountView {
+            name: added.name,
+            path: added.path.as_ref().map(|p| p.display().to_string()),
+            attached: added.path.is_some(),
+            state: "OK".to_owned(),
+        });
+    }
     with_write(&app, |engine| {
         let config = engine.add_mount(&space, &mount, &path, &[], &[])?;
         Ok(MountView {
@@ -470,6 +491,9 @@ pub fn add_mount(
 
 #[tauri::command]
 pub fn share(app: AppHandle, space: String, peer: String) -> Result<(), String> {
+    if let Some(mut client) = host_client(&app)? {
+        return client.share(&space, &peer).map_err(|err| error_chain(&err));
+    }
     with_write(&app, |engine| {
         engine.share(&space, &peer)?;
         Ok(())
@@ -740,8 +764,14 @@ pub fn cli_status() -> Result<CliStatus, String> {
 }
 
 #[tauri::command]
-pub fn install_cli(app: AppHandle) -> Result<CliInstallResult, String> {
-    let result = sidecar::install_cli().map_err(anyhow_chain)?;
+pub fn install_cli(app: AppHandle, shell: Option<String>) -> Result<CliInstallResult, String> {
+    let shell = match shell.as_deref() {
+        None => None,
+        Some(value) => {
+            Some(ShellKind::parse(value).ok_or_else(|| format!("unsupported shell: {value}"))?)
+        }
+    };
+    let result = sidecar::install_cli(shell, true).map_err(anyhow_chain)?;
     let _ = settings::set_cli_install_attempted(&app);
     Ok(result)
 }
@@ -763,7 +793,8 @@ pub fn maybe_install_cli(app: &AppHandle) {
         return;
     }
     let _ = settings::set_cli_install_attempted(app);
-    if let Err(err) = sidecar::install_cli() {
+    // Symlink only — do not rewrite shell rc files during automatic install.
+    if let Err(err) = sidecar::install_cli(None, false) {
         log::info!("automatic CLI install skipped: {err:#}");
     }
 }
