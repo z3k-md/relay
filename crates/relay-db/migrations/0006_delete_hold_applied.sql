@@ -1,0 +1,1 @@
+ALTER TABLE delete_hold_paths ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;

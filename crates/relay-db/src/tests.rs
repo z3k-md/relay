@@ -152,13 +152,13 @@ fn migrations_are_idempotent_on_reopen() {
     let path = dir.path().join("nested").join("relay.sqlite");
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
         db.repo().init_local_device(&device(9, "again"), 1).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
 }
 
@@ -176,7 +176,7 @@ fn schema_too_new_is_rejected() {
         err,
         DbError::SchemaTooNew {
             found: 99,
-            supported: 5
+            supported: 6
         }
     ));
 }
@@ -219,7 +219,7 @@ fn v1_database_upgrades_to_current_without_data_loss() {
     write_v1_db(&path);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 5);
+    assert_eq!(db.schema_version().unwrap(), 6);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -254,7 +254,7 @@ fn upgrade_collapses_duplicate_history_rows() {
     }
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 5);
+    assert_eq!(db.schema_version().unwrap(), 6);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
@@ -274,7 +274,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooOld {
                 found: 1,
-                supported: 5
+                supported: 6
             }
         ),
         "{err}"
@@ -297,7 +297,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooNew {
                 found: 99,
-                supported: 5
+                supported: 6
             }
         ),
         "{err}"
@@ -319,7 +319,7 @@ fn open_read_only_reads_without_writing() {
         db.repo().create_space(&space, 1).unwrap();
     }
     let db = Database::open_read_only(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 5);
+    assert_eq!(db.schema_version().unwrap(), 6);
     let names: Vec<_> = db
         .repo()
         .list_spaces()
@@ -358,7 +358,7 @@ fn v4_database_upgrades_to_delete_holds() {
     assert_eq!(version, 4);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 5);
+    assert_eq!(db.schema_version().unwrap(), 6);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -369,7 +369,7 @@ fn v4_database_upgrades_to_delete_holds() {
 #[test]
 fn fresh_database_has_delete_hold_tables() {
     let db = Database::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 5);
+    assert_eq!(db.schema_version().unwrap(), 6);
     db.repo().init_local_device(&device(1, "dev"), 1).unwrap();
     let space = space("Personal");
     db.repo().create_space(&space, 1).unwrap();
@@ -392,6 +392,10 @@ fn fresh_database_has_delete_hold_tables() {
     assert_eq!(holds[0].deletions, 30);
     assert_eq!(holds[0].live, 40);
     assert!(holds[0].decision.is_none());
+    db.repo()
+        .insert_delete_hold_applied_paths(peer.id, space.id, mount.id, &[path("gone.txt")])
+        .unwrap();
+
     let paths = db
         .repo()
         .list_delete_hold_paths(peer.id, space.id, mount.id)
@@ -399,6 +403,14 @@ fn fresh_database_has_delete_hold_tables() {
     assert_eq!(
         paths.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
         vec!["a.txt", "b.txt"]
+    );
+    let applied = db
+        .repo()
+        .list_delete_hold_applied_paths(peer.id, space.id, mount.id)
+        .unwrap();
+    assert_eq!(
+        applied.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+        vec!["gone.txt"]
     );
 
     let n = db
@@ -429,6 +441,103 @@ fn fresh_database_has_delete_hold_tables() {
             .list_delete_hold_paths(peer.id, space.id, mount.id)
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        db.repo()
+            .list_delete_hold_applied_paths(peer.id, space.id, mount.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn write_v5_db(path: &std::path::Path) {
+    write_v4_db(path);
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(include_str!("../migrations/0005_delete_holds.sql"))
+        .unwrap();
+    let peer = [8u8; 32];
+    conn.execute(
+        "INSERT INTO devices (device_id, name, status, created_at_ms)
+         VALUES (?1, 'laptop', 'active', 2)",
+        params![peer.as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO peers (device_ref, name, addresses, added_at_ms)
+         VALUES (2, 'laptop', '[]', 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO delete_holds (device_ref, space_id, mount_id, deletions, live, held_at_ms)
+         VALUES (2, ?1, ?2, 30, 40, 1000)",
+        params![[1u8; 16].as_slice(), [2u8; 16].as_slice()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO delete_hold_paths (device_ref, space_id, mount_id, path)
+         VALUES (2, ?1, ?2, 'held.txt')",
+        params![[1u8; 16].as_slice(), [2u8; 16].as_slice()],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 5u32).unwrap();
+}
+
+#[test]
+fn v5_database_upgrades_to_applied_hold_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("relay.sqlite");
+    write_v5_db(&db_path);
+
+    let version: i64 = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(version, 5);
+
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 6);
+    let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
+    let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
+    let peer = db.repo().peer_by_name("laptop").unwrap().unwrap();
+
+    assert_eq!(
+        db.repo()
+            .list_delete_hold_paths(peer.device.id, space.id, mount.id)
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>(),
+        vec!["held.txt"]
+    );
+    assert!(
+        db.repo()
+            .list_delete_hold_applied_paths(peer.device.id, space.id, mount.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    db.repo()
+        .insert_delete_hold_applied_paths(peer.device.id, space.id, mount.id, &[path("gone.txt")])
+        .unwrap();
+    assert_eq!(
+        db.repo()
+            .list_delete_hold_applied_paths(peer.device.id, space.id, mount.id)
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gone.txt"]
+    );
+    assert_eq!(
+        db.repo()
+            .list_delete_hold_paths(peer.device.id, space.id, mount.id)
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>(),
+        vec!["held.txt"]
     );
 }
 

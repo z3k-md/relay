@@ -1296,8 +1296,35 @@ impl Repo<'_> {
         )?;
         for path in paths {
             self.conn.execute(
-                "INSERT OR IGNORE INTO delete_hold_paths (device_ref, space_id, mount_id, path)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO delete_hold_paths
+                     (device_ref, space_id, mount_id, path, applied)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![
+                    device_ref,
+                    space_b.as_slice(),
+                    mount_b.as_slice(),
+                    path.as_str()
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn insert_delete_hold_applied_paths(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+        paths: &[relay_core::LogicalPath],
+    ) -> Result<(), DbError> {
+        let device_ref = self.device_ref(peer)?.ok_or(DbError::NotFound)?;
+        let space_b = space_bytes(space);
+        let mount_b = mount_bytes(mount);
+        for path in paths {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO delete_hold_paths
+                     (device_ref, space_id, mount_id, path, applied)
+                 VALUES (?1, ?2, ?3, ?4, 1)",
                 params![
                     device_ref,
                     space_b.as_slice(),
@@ -1315,6 +1342,25 @@ impl Repo<'_> {
         space: SpaceId,
         mount: MountId,
     ) -> Result<Vec<relay_core::LogicalPath>, DbError> {
+        self.list_delete_hold_paths_marked(peer, space, mount, Some(false))
+    }
+
+    pub fn list_delete_hold_applied_paths(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+    ) -> Result<Vec<relay_core::LogicalPath>, DbError> {
+        self.list_delete_hold_paths_marked(peer, space, mount, Some(true))
+    }
+
+    fn list_delete_hold_paths_marked(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        mount: MountId,
+        applied: Option<bool>,
+    ) -> Result<Vec<relay_core::LogicalPath>, DbError> {
         let Some(device_ref) = self.device_ref(peer)? else {
             return Ok(Vec::new());
         };
@@ -1323,10 +1369,16 @@ impl Repo<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT path FROM delete_hold_paths
              WHERE device_ref = ?1 AND space_id = ?2 AND mount_id = ?3
+               AND (?4 IS NULL OR applied = ?4)
              ORDER BY path",
         )?;
         let rows = stmt.query_map(
-            params![device_ref, space.as_slice(), mount.as_slice()],
+            params![
+                device_ref,
+                space.as_slice(),
+                mount.as_slice(),
+                applied.map(i64::from)
+            ],
             |row| row.get::<_, String>(0),
         )?;
         let mut out = Vec::new();
