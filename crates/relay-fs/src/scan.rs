@@ -1187,6 +1187,9 @@ mod tests {
     }
 
     fn assert_entries_match(got: &[ScannedEntry], expected: &[ScannedEntry]) {
+        // Directory stats are unused by the engine, and on Windows a directory
+        // listed from its parent reports NTFS's lazily updated cached mtime,
+        // which differs from reading the directory itself.
         let summarize = |entries: &[ScannedEntry]| {
             entries
                 .iter()
@@ -1194,7 +1197,7 @@ mod tests {
                     (
                         e.path.as_str().to_owned(),
                         e.kind,
-                        e.stat,
+                        (e.kind != EntryKind::Directory).then_some(e.stat),
                         e.symlink_target.clone(),
                     )
                 })
