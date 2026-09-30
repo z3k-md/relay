@@ -8,8 +8,10 @@
 //! <root>/tmp/            (in-flight writes)
 //! ```
 
+mod batch;
 mod error;
 mod store;
 
+pub use batch::PutBatch;
 pub use error::StoreError;
 pub use store::{ObjectStore, PutOutcome, SweepReport};

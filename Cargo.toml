@@ -57,6 +57,7 @@ ctrlc = { version = "3", features = ["termination"] }
 directories = "5"
 globset = "0.4"
 hex = "0.4"
+libc = "0.2"
 notify = "8"
 prost = "0.14"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

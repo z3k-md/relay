@@ -355,7 +355,7 @@ impl ObjectStore {
     }
 }
 
-fn open_live_file(
+pub(crate) fn open_live_file(
     source: &Path,
     expected: Option<&StatHint>,
 ) -> Result<(File, StatHint), StoreError> {
@@ -389,7 +389,7 @@ pub(crate) fn stat_unchanged(
         && StatHint::from_metadata(&path_meta) == *before)
 }
 
-fn copy_hashed(
+pub(crate) fn copy_hashed(
     src: &mut impl Read,
     dst: &mut impl Write,
     src_path: &Path,
@@ -424,7 +424,7 @@ fn hash_path(path: &Path) -> io::Result<ObjectId> {
     Ok(ObjectId::from(hasher.finalize()))
 }
 
-fn create_tmp(dir: &Path) -> Result<NamedTempFile, StoreError> {
+pub(crate) fn create_tmp(dir: &Path) -> Result<NamedTempFile, StoreError> {
     tempfile::Builder::new()
         .prefix("put-")
         .tempfile_in(dir)
@@ -514,11 +514,11 @@ fn is_older_than(meta: &fs::Metadata, now: SystemTime, older_than: Duration) -> 
     }
 }
 
-fn create_dir(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn create_dir(path: &Path) -> Result<(), StoreError> {
     fs::create_dir_all(path).map_err(|e| io_err(path, e))
 }
 
-fn io_err(path: impl AsRef<Path>, source: io::Error) -> StoreError {
+pub(crate) fn io_err(path: impl AsRef<Path>, source: io::Error) -> StoreError {
     StoreError::Io {
         path: path.as_ref().to_owned(),
         source,
