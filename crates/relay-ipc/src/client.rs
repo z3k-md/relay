@@ -192,7 +192,7 @@ fn connect_now(endpoint: &Endpoint) -> std::io::Result<Stream> {
     match endpoint {
         Endpoint::NamedPipe(name) => {
             use interprocess::local_socket::{GenericNamespaced, ToNsName};
-            let name = name.to_ns_name::<GenericNamespaced>()?;
+            let name = name.as_str().to_ns_name::<GenericNamespaced>()?;
             Stream::connect(name)
         }
         Endpoint::SocketFile(_) => Err(std::io::Error::other(

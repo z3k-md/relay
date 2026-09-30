@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::IpcError;
 
+#[cfg(not(windows))]
 const SOCK_NAME: &str = "relay.sock";
+#[cfg(not(windows))]
 const UNIX_PATH_LIMIT: usize = 100;
 
 /// First 16 hex characters of BLAKE3(canonicalized home path).
@@ -25,8 +27,7 @@ impl Endpoint {
         let token = home_token(home);
         #[cfg(windows)]
         {
-            let _ = home;
-            return Self::NamedPipe(format!("relay-{token}"));
+            Self::NamedPipe(format!("relay-{token}"))
         }
         #[cfg(not(windows))]
         {

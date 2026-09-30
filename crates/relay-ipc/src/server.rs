@@ -169,7 +169,7 @@ fn bind_listener(endpoint: &Endpoint) -> Result<Listener, IpcError> {
 
     match endpoint {
         Endpoint::NamedPipe(name) => {
-            let name = name.to_ns_name::<GenericNamespaced>()?;
+            let name = name.as_str().to_ns_name::<GenericNamespaced>()?;
             Ok(ListenerOptions::new()
                 .name(name)
                 .reclaim_name(true)
