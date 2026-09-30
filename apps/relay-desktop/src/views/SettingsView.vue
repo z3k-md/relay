@@ -8,6 +8,7 @@ import type { CliShell, CliStatus, Settings } from "../lib/types";
 
 const props = defineProps<{
   version: string;
+  mobile: boolean;
 }>();
 
 const settings = ref<Settings>({ startAtLogin: true, autoUpdate: true });
@@ -43,6 +44,10 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
+    if (props.mobile) {
+      settings.value = await api.getSettings();
+      return;
+    }
     const [s, c] = await Promise.all([api.getSettings(), api.cliStatus()]);
     settings.value = s;
     cli.value = c;
@@ -108,7 +113,13 @@ defineExpose({ load });
     <ErrorBanner :message="error" />
     <p v-if="loading" class="text-[var(--color-muted)]">Loading settings…</p>
     <div v-else class="space-y-4">
-      <section class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)]">
+      <p v-if="mobile" class="text-[var(--color-muted)]">
+        Relay syncs while this app is open. Version {{ props.version }}.
+      </p>
+      <section
+        v-if="!mobile"
+        class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)]"
+      >
         <label class="flex items-center justify-between gap-3 px-3 py-2">
           <span class="font-medium">Start at login</span>
           <input
@@ -127,11 +138,16 @@ defineExpose({ load });
         </label>
       </section>
 
-      <section class="rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2">
+      <section
+        v-if="!mobile"
+        class="rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2"
+      >
         <div class="flex items-center justify-between gap-3">
           <div>
             <p class="font-medium">Updates</p>
-            <p class="text-[12px] text-[var(--color-muted)]">Version {{ props.version }}</p>
+            <p class="text-[12px] text-[var(--color-muted)]">
+              Version {{ props.version }}. Checked at startup and every 15 minutes.
+            </p>
           </div>
           <button
             type="button"
@@ -145,7 +161,10 @@ defineExpose({ load });
         <UpdateStatus class="mt-3" />
       </section>
 
-      <section class="rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2">
+      <section
+        v-if="!mobile"
+        class="rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2"
+      >
         <div class="flex items-center justify-between gap-3">
           <div>
             <p class="font-medium">Command-line tool</p>
@@ -188,6 +207,7 @@ defineExpose({ load });
       </section>
 
       <button
+        v-if="!mobile"
         type="button"
         class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
         @click="api.openLogsFolder()"

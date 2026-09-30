@@ -87,6 +87,11 @@ enum Command {
     Share { space: String, peer: String },
     /// Stop sharing a space with a peer
     Unshare { space: String, peer: String },
+    /// Recovery secret for space keys (write it down; Relay cannot restore it)
+    Recovery {
+        #[command(subcommand)]
+        cmd: RecoveryCmd,
+    },
     /// Durable mailbox for offline catch-up
     Replica {
         #[command(subcommand)]
@@ -271,6 +276,10 @@ enum SpaceCmd {
         #[arg(long = "from")]
         from: String,
     },
+    /// Rotate the space key. Future mailbox objects use the new generation.
+    Rotate {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -285,6 +294,18 @@ enum PeerCmd {
     Remove {
         name: String,
     },
+    /// Stop syncing with a peer. Does not delete data already on that device.
+    Revoke {
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RecoveryCmd {
+    /// Print the recovery secret (creates one on first use)
+    Show,
+    /// Install space keys wrapped by a recovery secret from the mailbox
+    Import { key: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -458,6 +479,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Recovery { cmd } => cmd_recovery(&home, cmd, json),
         Command::Replica { cmd } => cmd_replica(&home, cmd, json),
         Command::Group { cmd } => cmd_group(&home, cmd, json),
         Command::Policy { cmd } => cmd_policy(&home, cmd, json),
@@ -533,6 +555,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         "joined space {} ({}); attach mounts with `relay mount add`",
                         space.name, space.id
                     );
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            SpaceCmd::Rotate { name } => {
+                let mut engine = Engine::open_for_config(&home)?;
+                engine.rotate_space_key(&name)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({"rotated": name}))?
+                    );
+                } else {
+                    println!("rotated key for space {name}");
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -751,6 +786,8 @@ fn cmd_run(
             watch: opts,
             verbose,
             host,
+            enable_stun: true,
+            loopback_only: false,
         },
         &stop,
         &mut |event| match event {
@@ -879,6 +916,8 @@ fn start_pair_host(home: &Path, listen: SocketAddr) -> Result<PairHost> {
                     watch: WatchOptions::default(),
                     verbose: false,
                     host: HostKind::Cli,
+                    enable_stun: true,
+                    loopback_only: false,
                 },
                 &flag,
                 &mut |_| {},
@@ -1093,6 +1132,9 @@ fn print_watch_event(
             paths,
             report,
         } => {
+            if !*full && !report.has_changes() && !verbose {
+                return;
+            }
             if *full && !report.has_changes() && !verbose {
                 return;
             }
@@ -1297,7 +1339,8 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
                     } else {
                         peer.addresses.join(", ")
                     };
-                    println!("{}  {}  {addrs}", peer.name, peer.id);
+                    let mark = if peer.revoked { " revoked" } else { "" };
+                    println!("{}  {}  {addrs}{mark}", peer.name, peer.id);
                 }
             }
         }
@@ -1311,6 +1354,48 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
                 );
             } else {
                 println!("removed peer {name}");
+            }
+        }
+        PeerCmd::Revoke { name } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.revoke_peer(&name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"revoked": name}))?
+                );
+            } else {
+                println!("revoked peer {name}");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_recovery(home: &Path, cmd: RecoveryCmd, json: bool) -> Result<ExitCode> {
+    match cmd {
+        RecoveryCmd::Show => {
+            let mut engine = Engine::open_for_config(home)?;
+            let key = engine.reveal_recovery_key()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"recovery_key": key}))?
+                );
+            } else {
+                println!("{key}");
+            }
+        }
+        RecoveryCmd::Import { key } => {
+            let mut engine = Engine::open_for_config(home)?;
+            let installed = engine.import_recovery_key(&key)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"installed": installed}))?
+                );
+            } else {
+                println!("installed {installed} space key generation(s)");
             }
         }
     }

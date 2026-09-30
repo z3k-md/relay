@@ -14,6 +14,7 @@ members = [
     "crates/relay-daemon",
     "crates/relay-ipc",
     "apps/relay-cli",
+    "apps/relay-sim",
     "apps/relay-desktop/src-tauri",
 ]
 # Plain `cargo build` / `cargo test` skip the desktop app: it needs the
@@ -33,6 +34,7 @@ default-members = [
     "crates/relay-daemon",
     "crates/relay-ipc",
     "apps/relay-cli",
+    "apps/relay-sim",
 ]
 
 [workspace.package]

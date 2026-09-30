@@ -115,6 +115,7 @@ fn start_from_identity(
             listen,
             peers,
             store_root: store_dir.path().to_owned(),
+            enable_stun: false,
         },
         Box::new(move |ev| {
             let _ = tx.send(ev);

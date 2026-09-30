@@ -13,6 +13,7 @@ export interface Overview {
   suggestedName: string;
   runner: RunnerState;
   version: string;
+  mobile: boolean;
   peerCount: number;
   connectedPeers: number;
   spaceCount: number;

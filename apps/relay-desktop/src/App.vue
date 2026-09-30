@@ -15,6 +15,7 @@ import {
   installUpdate as runInstallUpdate,
   listenForUpdateProgress,
   stopUpdateProgressListener,
+  updateActive,
 } from "./lib/updateProgress";
 import type {
   ActivityItem,
@@ -124,10 +125,12 @@ onMounted(async () => {
     }),
   );
   unlistens.push(
-    await listen<UpdateAvailable>("relay://update-available", (event) => {
+    await listen<UpdateAvailable | null>("relay://update-available", (event) => {
       update.value = event.payload;
     }),
   );
+  const pending = await api.pendingUpdate().catch(() => null);
+  if (pending) update.value = pending;
   await listenForUpdateProgress();
   overviewTimer = window.setInterval(() => {
     void refresh();
@@ -203,21 +206,41 @@ onUnmounted(() => {
         </aside>
         <main class="min-w-0 flex-1 overflow-auto p-4">
           <ErrorBanner :message="error" />
+          <div
+            v-if="update && !updateActive && !overview.mobile"
+            class="mb-4 rounded-lg border border-teal-300/70 bg-teal-50 px-3 py-2 dark:border-teal-900 dark:bg-teal-950/50"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p class="font-medium">Relay {{ update.version }} is available</p>
+                <p v-if="update.notes" class="line-clamp-2 text-[var(--color-muted)]">{{ update.notes }}</p>
+              </div>
+              <button
+                type="button"
+                class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
+                @click="installUpdate"
+              >
+                Install update
+              </button>
+            </div>
+          </div>
           <UpdateStatus v-if="page !== 'settings'" class="mb-4" />
           <OverviewView
             v-if="page === 'overview'"
             :overview="overview"
             :transfers="transfers"
-            :update="update"
             @pause="pause"
             @resume="resume"
-            @install-update="installUpdate"
           />
           <PeersView v-else-if="page === 'peers'" />
           <SpacesView v-else-if="page === 'spaces'" />
           <ConflictsView v-else-if="page === 'conflicts'" />
           <ActivityView v-else-if="page === 'activity'" ref="activityRef" />
-          <SettingsView v-else-if="page === 'settings'" :version="overview.version" />
+          <SettingsView
+            v-else-if="page === 'settings'"
+            :version="overview.version"
+            :mobile="overview.mobile"
+          />
         </main>
       </div>
     </template>

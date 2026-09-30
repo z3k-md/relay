@@ -1084,9 +1084,11 @@ fn read_only_open_upgrades_an_older_schema() {
     drop(init_engine(home.path()));
     {
         let conn = rusqlite::Connection::open(home.path().join("relay.db")).unwrap();
-        // Roll schema back to v7 so open_read_only must migrate through 0008–0010.
+        // Roll schema back to v7 so open_read_only must migrate through 0008–0011.
         conn.execute_batch(
             "
+            DROP TABLE IF EXISTS peer_box_keys;
+            DROP TABLE IF EXISTS space_key_wraps;
             DROP TABLE IF EXISTS replica_push;
             DROP TABLE IF EXISTS peer_policy_snapshots;
             DROP TABLE IF EXISTS replication_policy_groups;
@@ -1130,5 +1132,5 @@ fn read_only_open_upgrades_an_older_schema() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }

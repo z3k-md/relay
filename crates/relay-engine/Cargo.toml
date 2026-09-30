@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 directories.workspace = true
 dunce = "1"
+hex.workspace = true
 relay-core.workspace = true
 relay-crypto.workspace = true
 relay-db.workspace = true

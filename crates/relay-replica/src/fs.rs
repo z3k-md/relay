@@ -2,9 +2,14 @@
 //!
 //! Layout under the configured root:
 //! ```text
-//! objects/<aa>/<bb>/<full 64-char hex>
+//! objects/<aa>/<bb>/<full 64-char hex>          plaintext, legacy
+//! objects/sealed/<space_hex>/<object hex>      space-key ciphertext
 //! entries/<device_hex>/<space_hex>.log
 //! acks/<reader_hex>/<author_hex>/<space_hex>
+//! keys/box/<device_hex>                        X25519 public || signature
+//! keys/wrap/<space_hex>/<generation>/<device>
+//! keys/recovery/<space_hex>/<generation>
+//! nat/<device_hex>                             one address per line
 //! tmp/
 //! ```
 //!
@@ -27,9 +32,21 @@ use crate::error::ReplicaError;
 use crate::{DurableReplica, GcReport, ReplicaMode};
 
 const OBJECTS_DIR: &str = "objects";
+const SEALED_DIR: &str = "sealed";
 const ENTRIES_DIR: &str = "entries";
 const ACKS_DIR: &str = "acks";
+const KEYS_DIR: &str = "keys";
+const NAT_DIR: &str = "nat";
 const TMP_DIR: &str = "tmp";
+
+/// A space-key wrap read from the mailbox.
+#[derive(Clone, Debug)]
+pub struct StoredKeyWrap {
+    pub space: SpaceId,
+    pub generation: u32,
+    pub recipient: DeviceId,
+    pub wrapped: Vec<u8>,
+}
 
 #[derive(Debug)]
 pub struct FsReplica {
@@ -75,8 +92,11 @@ impl FsReplica {
             log_sig: Mutex::new(HashMap::new()),
         };
         create_dir(&replica.objects_dir())?;
+        create_dir(&replica.objects_dir().join(SEALED_DIR))?;
         create_dir(&replica.entries_dir())?;
         create_dir(&replica.acks_dir())?;
+        create_dir(&replica.root.join(KEYS_DIR))?;
+        create_dir(&replica.root.join(NAT_DIR))?;
         create_dir(&replica.tmp_dir())?;
         Ok(replica)
     }
@@ -120,6 +140,248 @@ impl FsReplica {
             .join(reader.to_string())
             .join(author.to_string())
             .join(space_hex(space))
+    }
+
+    fn sealed_object_path(&self, space: SpaceId, id: &ObjectId) -> PathBuf {
+        self.objects_dir()
+            .join(SEALED_DIR)
+            .join(space_hex(space))
+            .join(id.to_hex())
+    }
+
+    pub fn put_sealed_object(
+        &self,
+        space: SpaceId,
+        id: &ObjectId,
+        sealed: &[u8],
+    ) -> Result<(), ReplicaError> {
+        let dest = self.sealed_object_path(space, id);
+        if dest.is_file() {
+            return Ok(());
+        }
+        if let Some(parent) = dest.parent() {
+            create_dir(parent)?;
+        }
+        atomic_write(&dest, sealed, &self.tmp_dir())
+    }
+
+    pub fn get_sealed_object(
+        &self,
+        space: SpaceId,
+        id: &ObjectId,
+    ) -> Result<Option<Vec<u8>>, ReplicaError> {
+        let path = self.sealed_object_path(space, id);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        fs::read(&path)
+            .map(Some)
+            .map_err(|e| ReplicaError::io(&path, e))
+    }
+
+    pub fn remove_plaintext_object(&self, id: &ObjectId) -> Result<(), ReplicaError> {
+        let path = self.object_path(id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ReplicaError::io(&path, e)),
+        }
+    }
+
+    pub fn put_box_key(&self, device: DeviceId, body: &[u8]) -> Result<(), ReplicaError> {
+        let dest = self
+            .root
+            .join(KEYS_DIR)
+            .join("box")
+            .join(device.to_string());
+        write_if_changed(&dest, body, &self.tmp_dir())
+    }
+
+    pub fn list_box_keys(&self) -> Result<Vec<(DeviceId, Vec<u8>)>, ReplicaError> {
+        let dir = self.root.join(KEYS_DIR).join("box");
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| ReplicaError::io(&dir, e))? {
+            let entry = entry.map_err(|e| ReplicaError::io(&dir, e))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Ok(device) = name.parse::<DeviceId>() else {
+                continue;
+            };
+            let bytes = fs::read(entry.path()).map_err(|e| ReplicaError::io(entry.path(), e))?;
+            out.push((device, bytes));
+        }
+        Ok(out)
+    }
+
+    pub fn put_key_wrap(
+        &self,
+        space: SpaceId,
+        generation: u32,
+        recipient: DeviceId,
+        wrapped: &[u8],
+    ) -> Result<(), ReplicaError> {
+        let dest = self
+            .root
+            .join(KEYS_DIR)
+            .join("wrap")
+            .join(space_hex(space))
+            .join(generation.to_string())
+            .join(recipient.to_string());
+        write_if_changed(&dest, wrapped, &self.tmp_dir())
+    }
+
+    pub fn list_key_wraps(&self) -> Result<Vec<StoredKeyWrap>, ReplicaError> {
+        let root = self.root.join(KEYS_DIR).join("wrap");
+        if !root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for space_ent in fs::read_dir(&root).map_err(|e| ReplicaError::io(&root, e))? {
+            let space_ent = space_ent.map_err(|e| ReplicaError::io(&root, e))?;
+            let Some(space_name) = space_ent.file_name().to_str().map(|s| s.to_owned()) else {
+                continue;
+            };
+            let Ok(space) = parse_space_hex(&space_name) else {
+                continue;
+            };
+            let space_dir = space_ent.path();
+            if !space_dir.is_dir() {
+                continue;
+            }
+            for gen_ent in fs::read_dir(&space_dir).map_err(|e| ReplicaError::io(&space_dir, e))? {
+                let gen_ent = gen_ent.map_err(|e| ReplicaError::io(&space_dir, e))?;
+                let Some(gen_name) = gen_ent.file_name().to_str().map(|s| s.to_owned()) else {
+                    continue;
+                };
+                let Ok(generation) = gen_name.parse::<u32>() else {
+                    continue;
+                };
+                let gen_dir = gen_ent.path();
+                if !gen_dir.is_dir() {
+                    continue;
+                }
+                for rec_ent in fs::read_dir(&gen_dir).map_err(|e| ReplicaError::io(&gen_dir, e))? {
+                    let rec_ent = rec_ent.map_err(|e| ReplicaError::io(&gen_dir, e))?;
+                    let Some(rec_name) = rec_ent.file_name().to_str().map(|s| s.to_owned()) else {
+                        continue;
+                    };
+                    let Ok(recipient) = rec_name.parse::<DeviceId>() else {
+                        continue;
+                    };
+                    let bytes = fs::read(rec_ent.path())
+                        .map_err(|e| ReplicaError::io(rec_ent.path(), e))?;
+                    out.push(StoredKeyWrap {
+                        space,
+                        generation,
+                        recipient,
+                        wrapped: bytes,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn put_recovery_wrap(
+        &self,
+        space: SpaceId,
+        generation: u32,
+        wrapped: &[u8],
+    ) -> Result<(), ReplicaError> {
+        let dest = self
+            .root
+            .join(KEYS_DIR)
+            .join("recovery")
+            .join(space_hex(space))
+            .join(generation.to_string());
+        write_if_changed(&dest, wrapped, &self.tmp_dir())
+    }
+
+    pub fn list_recovery_wraps(&self) -> Result<Vec<(SpaceId, u32, Vec<u8>)>, ReplicaError> {
+        let root = self.root.join(KEYS_DIR).join("recovery");
+        if !root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for space_ent in fs::read_dir(&root).map_err(|e| ReplicaError::io(&root, e))? {
+            let space_ent = space_ent.map_err(|e| ReplicaError::io(&root, e))?;
+            let Some(space_name) = space_ent.file_name().to_str().map(|s| s.to_owned()) else {
+                continue;
+            };
+            let Ok(space) = parse_space_hex(&space_name) else {
+                continue;
+            };
+            let space_dir = space_ent.path();
+            if !space_dir.is_dir() {
+                continue;
+            }
+            for gen_ent in fs::read_dir(&space_dir).map_err(|e| ReplicaError::io(&space_dir, e))? {
+                let gen_ent = gen_ent.map_err(|e| ReplicaError::io(&space_dir, e))?;
+                if !gen_ent.path().is_file() {
+                    continue;
+                }
+                let Some(gen_name) = gen_ent.file_name().to_str().map(|s| s.to_owned()) else {
+                    continue;
+                };
+                let Ok(generation) = gen_name.parse::<u32>() else {
+                    continue;
+                };
+                let bytes =
+                    fs::read(gen_ent.path()).map_err(|e| ReplicaError::io(gen_ent.path(), e))?;
+                out.push((space, generation, bytes));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn put_nat_candidates(
+        &self,
+        device: DeviceId,
+        addrs: &[String],
+    ) -> Result<(), ReplicaError> {
+        let dest = self.root.join(NAT_DIR).join(device.to_string());
+        let mut body = String::new();
+        for addr in addrs.iter().take(8) {
+            if addr.len() > 200 || addr.contains('\n') {
+                continue;
+            }
+            body.push_str(addr);
+            body.push('\n');
+        }
+        write_if_changed(&dest, body.as_bytes(), &self.tmp_dir())
+    }
+
+    pub fn list_nat_candidates(&self) -> Result<Vec<(DeviceId, Vec<String>)>, ReplicaError> {
+        let dir = self.root.join(NAT_DIR);
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| ReplicaError::io(&dir, e))? {
+            let entry = entry.map_err(|e| ReplicaError::io(&dir, e))?;
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_owned()) else {
+                continue;
+            };
+            let Ok(device) = name.parse::<DeviceId>() else {
+                continue;
+            };
+            let text =
+                fs::read_to_string(entry.path()).map_err(|e| ReplicaError::io(entry.path(), e))?;
+            let addrs = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .take(8)
+                .map(str::to_owned)
+                .collect();
+            out.push((device, addrs));
+        }
+        Ok(out)
     }
 
     fn read_log(&self, path: &Path) -> Result<Vec<StoredEntry>, ReplicaError> {
@@ -605,6 +867,16 @@ fn parse_space_hex(s: &str) -> Result<SpaceId, ()> {
 
 fn create_dir(path: &Path) -> Result<(), ReplicaError> {
     fs::create_dir_all(path).map_err(|e| ReplicaError::io(path, e))
+}
+
+fn write_if_changed(dest: &Path, bytes: &[u8], tmp_dir: &Path) -> Result<(), ReplicaError> {
+    if fs::read(dest).ok().as_deref() == Some(bytes) {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        create_dir(parent)?;
+    }
+    atomic_write(dest, bytes, tmp_dir)
 }
 
 fn atomic_write(dest: &Path, bytes: &[u8], tmp_dir: &Path) -> Result<(), ReplicaError> {

@@ -1,10 +1,20 @@
-//! Device identity.
+//! Device identity and space-key cryptography.
 //!
 //! Each device owns one Ed25519 key pair. Its [`DeviceId`] *is* the raw
 //! 32-byte public key, so a peer's identity is checked by comparing the key in
 //! its TLS certificate against the pinned id; no certificate authority is
 //! involved. The certificate itself is regenerated from the key on every start
 //! and carries no meaning beyond holding the key.
+//!
+//! Space keys are separate: an X25519 box key wraps a random 256-bit key per
+//! space, and mailbox objects are sealed with that key (see `secret`).
+
+mod secret;
+
+pub use secret::{
+    BoxKeyPair, format_recovery, open_object, open_recovery, parse_recovery, random_bytes,
+    seal_object, seal_recovery, sealed_generation, verify_device, wrap_key,
+};
 
 use std::fs;
 use std::io::{self, Write};
@@ -32,6 +42,10 @@ pub enum CryptoError {
     Certificate(String),
     #[error("peer certificate is invalid: {0}")]
     PeerCertificate(String),
+    #[error("sealed bytes are invalid")]
+    Seal,
+    #[error("key wrap is invalid")]
+    Wrap,
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> CryptoError + '_ {
@@ -115,6 +129,11 @@ impl DeviceIdentity {
             .self_signed(&self.key)
             .map_err(|e| CryptoError::Certificate(e.to_string()))?;
         Ok(cert.der().to_vec())
+    }
+
+    /// Ed25519 signature over `message` (the device identity key).
+    pub fn sign(&self, message: &[u8]) -> Result<[u8; 64], CryptoError> {
+        secret::sign_pem(&self.key.serialize_pem(), message)
     }
 
     /// PKCS#8 DER private key, for handing to rustls.

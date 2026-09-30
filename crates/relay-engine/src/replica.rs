@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use relay_core::{EntryContent, MountId, ObjectId, Sequence};
+use relay_core::{EntryContent, MountId, ObjectId, Sequence, merge_peer_addresses};
+
+use crate::secrets::MailboxRead;
 use relay_proto::{RemoteEntry, entry_from_wire, entry_to_wire};
 use relay_replica::{DurableReplica, FsReplica, ReplicaError, ReplicaMode};
 use serde::Serialize;
@@ -14,6 +16,7 @@ use crate::Engine;
 use crate::error::EngineError;
 
 const REPLICA_PATH_KEY: &str = "replica_path";
+const NAT_HINT: &str = "nat_hint";
 const PUSH_BATCH: usize = 256;
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -32,6 +35,8 @@ pub struct ReplicaPull {
     pub deleted: usize,
     pub conflicts: usize,
     pub skipped: usize,
+    /// Peer address lists changed because of mailbox NAT candidates.
+    pub addresses_changed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,8 +73,10 @@ impl Engine {
             std::fs::create_dir_all(path)?;
             dunce::canonicalize(path)?
         };
-        // Ensure the replica layout exists.
-        let _ = FsReplica::open(&canonical)?;
+        // Ensure the replica layout exists and publish our box key so a peer
+        // can wrap space keys before the next push.
+        let replica = FsReplica::open(&canonical)?;
+        self.publish_box_key(&replica)?;
         self.db
             .transaction(|repo| {
                 repo.set_local_setting(REPLICA_PATH_KEY, &canonical.to_string_lossy())
@@ -101,17 +108,38 @@ impl Engine {
         Ok(ReplicaStatus { path, pushed })
     }
 
+    /// Local sequences not yet appended to the mailbox.
+    ///
+    /// `None` when no mailbox is configured. `Some(0)` means every indexed
+    /// change in each space has been appended. This is the sender's view:
+    /// peers may still be behind on pull.
+    pub fn replica_backlog(&self) -> Result<Option<u64>, EngineError> {
+        if self.replica_path()?.is_none() {
+            return Ok(None);
+        }
+        let mut behind = 0u64;
+        for space in self.db.repo().list_spaces()? {
+            let pushed = self.db.repo().replica_pushed_seq(space.id)?;
+            let latest = self.db.repo().max_sequence_in_space(space.id)?;
+            behind = behind.saturating_add(latest.0.saturating_sub(pushed.0));
+        }
+        Ok(Some(behind))
+    }
+
     pub fn push_replica(&mut self) -> Result<ReplicaPush, EngineError> {
         self.ensure_writable()?;
         let Some(path) = self.replica_path()? else {
             return Ok(ReplicaPush::default());
         };
         let mut replica = open_replica(&path)?;
+        self.prepare_mailbox(&replica)?;
+        let _ = self.exchange_nat_on(&replica)?;
         let local = self.device().id;
         let spaces = self.db.repo().list_spaces()?;
         let mut report = ReplicaPush::default();
 
         for space in spaces {
+            self.publish_space_wraps(&replica, space.id)?;
             let mut pushed = self.db.repo().replica_pushed_seq(space.id)?;
             let mut advanced = false;
             loop {
@@ -132,15 +160,17 @@ impl Engine {
                     wires.push(entry_to_wire(entry));
                 }
                 for object in &objects {
-                    if replica.get_object(object)?.is_none() {
-                        let bytes = self.store.read(object)?;
-                        replica.put_object(*object, &bytes)?;
+                    if self.put_space_object(&replica, space.id, *object)? {
                         report.objects += 1;
                     }
                 }
                 replica.append_entries(local, space.id, &wires)?;
                 report.entries += wires.len();
                 pushed = changes.last().map(|e| e.sequence).unwrap_or(pushed);
+                // Crash window D29 describes: the mailbox has the entries, the
+                // local watermark does not. `relay-sim` holds the process here
+                // so a kill lands in that window. Unset in normal runs.
+                stall_before_replica_watermark();
                 self.db
                     .transaction(|repo| repo.set_replica_pushed_seq(space.id, pushed))
                     .map_err(EngineError::from_db)?;
@@ -161,9 +191,14 @@ impl Engine {
             return Ok(ReplicaPull::default());
         };
         let mut replica = open_replica(&path)?;
+        self.prepare_mailbox(&replica)?;
+        let addresses_changed = self.exchange_nat_on(&replica)?;
         let local = self.device().id;
         let spaces = self.db.repo().list_spaces()?;
-        let mut report = ReplicaPull::default();
+        let mut report = ReplicaPull {
+            addresses_changed,
+            ..ReplicaPull::default()
+        };
         let mut peers_touched = HashSet::new();
 
         for space in spaces {
@@ -208,14 +243,12 @@ impl Engine {
                     if let Some(obj) = entry.content.object()
                         && !self.store.contains(&obj)
                     {
-                        match replica.get_object(&obj)? {
-                            Some(bytes) => {
+                        match self.take_space_object(&replica, space.id, obj)? {
+                            MailboxRead::Ready(bytes) => {
                                 self.store.put_bytes(&bytes)?;
                                 objects_fetched += 1;
                             }
-                            None => {
-                                break;
-                            }
+                            MailboxRead::Missing | MailboxRead::Locked => break,
                         }
                     }
 
@@ -288,9 +321,86 @@ impl Engine {
     pub(crate) fn pull_replica_watch(&mut self) -> Result<ReplicaPull, EngineError> {
         self.pull_replica()
     }
+
+    pub fn set_nat_hint(&mut self, addrs: &[String]) -> Result<(), EngineError> {
+        self.ensure_writable()?;
+        let value = addrs
+            .iter()
+            .filter(|addr| !addr.is_empty() && addr.len() <= 200 && !addr.contains('\n'))
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.db
+            .transaction(|repo| repo.set_local_setting(NAT_HINT, &value))
+            .map_err(EngineError::from_db)
+    }
+
+    /// Publish this device's NAT candidates and merge peers' candidates into
+    /// their stored addresses. Returns whether any peer address list changed.
+    pub fn exchange_nat(&mut self) -> Result<bool, EngineError> {
+        self.ensure_writable()?;
+        let Some(path) = self.replica_path()? else {
+            return Ok(false);
+        };
+        let replica = open_replica(&path)?;
+        self.exchange_nat_on(&replica)
+    }
+
+    pub(crate) fn exchange_nat_on(&mut self, replica: &FsReplica) -> Result<bool, EngineError> {
+        if let Some(hint) = self.db.repo().local_setting(NAT_HINT)? {
+            let addrs: Vec<String> = hint
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !addrs.is_empty() {
+                replica.put_nat_candidates(self.device.id, &addrs)?;
+            }
+        }
+        let found = replica.list_nat_candidates()?;
+        let mut updates = Vec::new();
+        for (device, addrs) in found {
+            if device == self.device.id {
+                continue;
+            }
+            let Some(peer) = self.db.repo().peer_by_id(device)? else {
+                continue;
+            };
+            let merged = merge_peer_addresses(&peer.addresses, &addrs);
+            if merged != peer.addresses {
+                updates.push((device, merged));
+            }
+        }
+        for (device, addrs) in &updates {
+            self.set_peer_addresses(*device, addrs)?;
+        }
+        Ok(!updates.is_empty())
+    }
 }
 
-fn open_replica(path: &Path) -> Result<FsReplica, EngineError> {
+/// `RELAY_SIM_STALL` is a file path set by `relay-sim` on its daemon
+/// processes. When that file exists, a push that has already appended to the
+/// mailbox waits before advancing the local watermark. The waiter writes
+/// `<flag>.entered` and returns when the flag is removed, or after 60 seconds.
+fn stall_before_replica_watermark() {
+    let Ok(path) = std::env::var("RELAY_SIM_STALL") else {
+        return;
+    };
+    let flag = PathBuf::from(path);
+    if !flag.is_file() {
+        return;
+    }
+    let entered = flag.with_extension("entered");
+    let _ = std::fs::write(&entered, b"stalled\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while flag.is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub(crate) fn open_replica(path: &Path) -> Result<FsReplica, EngineError> {
     if !path.exists() || !path.is_dir() {
         return Err(EngineError::Replica(format!(
             "replica path is missing or not a directory: {}",

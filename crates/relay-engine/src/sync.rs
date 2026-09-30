@@ -79,6 +79,10 @@ pub enum SyncInput {
         peer: DeviceId,
         addresses: Vec<String>,
     },
+    /// Addresses to publish as this device's NAT candidates (LAN and reflexive).
+    NatHint {
+        addresses: Vec<String>,
+    },
     /// Add a local mount through the loop writer (D19 / D24 / D25).
     AddMount {
         space: String,
@@ -274,6 +278,7 @@ impl Syncer {
             SyncInput::Rescan { .. }
             | SyncInput::AddPeer { .. }
             | SyncInput::PeerAddresses { .. }
+            | SyncInput::NatHint { .. }
             | SyncInput::AddMount { .. }
             | SyncInput::Share { .. } => {}
         }

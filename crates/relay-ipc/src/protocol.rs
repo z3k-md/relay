@@ -107,6 +107,26 @@ impl HostState {
     }
 }
 
+/// Whether this host has finished the work it can do by itself.
+///
+/// `ready` is not cluster convergence. Another device may still be applying
+/// what this one already pushed. `relay-sim wait-converged` checks every node.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Idle {
+    /// Host is running and no scan or transfer is in flight.
+    pub quiet: bool,
+    /// Local sequences not yet appended to the mailbox.
+    /// Absent when this device has no mailbox configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_behind: Option<u64>,
+}
+
+impl Idle {
+    pub fn ready(&self) -> bool {
+        self.quiet && self.replica_behind.unwrap_or(0) == 0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub state: HostState,
@@ -119,6 +139,9 @@ pub struct Status {
     /// Live indexing and peer transfers. Empty when nothing is in flight.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transfers: Vec<TransferLive>,
+    /// Quiescence of this host. Omitted by older hosts; treat that as not idle.
+    #[serde(default)]
+    pub idle: Idle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

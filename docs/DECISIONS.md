@@ -516,7 +516,8 @@ out of scope.
 
 Pairing replaces copying device ids by hand. A short code plus the existing
 QUIC port is enough on the same LAN; over Tailscale the joiner also types an
-address. There is no internet rendezvous and no NAT traversal.
+address. There is no internet rendezvous and no NAT traversal in this phase
+(D32 later hole-punches through the mailbox).
 
 - **Code.** Format `NN-NNNN-NNNN` (ten decimal digits). The first two digits
   are a public *nameplate* used only to pick the right mDNS instance. The
@@ -576,13 +577,14 @@ address. There is no internet rendezvous and no NAT traversal.
   `100.x.y.z:47321`).
 - **Known limits.** No internet rendezvous, no hole punching, no pairing
   through a third device. Two devices that cannot reach each other's UDP
-  port cannot pair. Peer revocation is still `relay peer remove`.
+  port cannot pair. Peer revocation in this phase is `relay peer remove`
+  (D30 adds `relay peer revoke`).
 
 ## D26. Space membership
 
 A space shared with several peers is a membership set. Relaying files through
 a middle machine that has the folder attached is ordinary index exchange —
-not a separate protocol. There is still no NAT traversal, no encryption at
+not a separate protocol. This phase still has no NAT traversal, no encryption at
 rest, and no durable cloud replica for devices that never overlap online.
 
 - **Members on the offer.** `SpaceOffer` lists the other peers that space is
@@ -651,8 +653,9 @@ Share remains required — a policy never grants sync by itself.
   group removes the group link from policies but keeps direct peer targets
   and the policy itself.
 - **Out of scope.** No durability classes, no metadata-only mode, no GUI
-  policy editor. Nested `.relayignore` is still root-only. Still no durable
-  replica, encryption at rest, automatic text merge, or NAT traversal.
+  policy editor. Nested `.relayignore` is still root-only. This phase still
+  has no durable replica, encryption at rest, automatic text merge, or NAT
+  traversal (those land in D29–D32).
 
 ## D28. Sync progress is a snapshot
 
@@ -708,5 +711,62 @@ objects at rest is the next phase — this phase stores plaintext CAS bytes.
   (`--mirror`) keeps the object of the latest live entry per path even after
   ack; older versions follow the mailbox rule. A transient apply does not
   advance the received cursor.
-- **Out of scope.** No hosted backend, no NAT, no encryption at rest, no
-  automatic text merge. Nested `.relayignore` is still root-only.
+- **Out of scope for D29.** No hosted backend. Nested `.relayignore` is still
+  root-only. Encryption, text merge, and NAT are D30–D32.
+
+## D30. Encryption at rest
+
+Mailbox object payloads are sealed with a random 256-bit space key
+(XChaCha20-Poly1305). The object id stays `BLAKE3(plaintext)`. A device
+X25519 box key, signed by the Ed25519 identity, wraps the space key for
+each member whose box key is in the mailbox. Entry logs stay metadata.
+The local object store and working tree stay plaintext. Legacy plaintext
+mailbox objects still open.
+
+- **Recovery.** `relay recovery show` prints a secret that wraps every space
+  key this device can open. `relay recovery import` installs those keys on
+  a new device. The secret is not recoverable if it was never written down.
+- **Revoke.** `relay peer revoke` marks the device revoked, unshares every
+  space, and drops it from the dial set. That is a soft revoke: data already
+  decrypted on that device remains. `relay space rotate` starts a new
+  generation for future objects; older generations still open.
+- **Known limits.** No hosted backend. Logs are not encrypted. A revoked
+  device that already held a generation can still decrypt objects sealed
+  with that generation until they age out of the mailbox.
+
+## D31. Automatic text merge
+
+Concurrent file edits that share `parent_object` and are UTF-8 without NUL
+bytes are three-way merged. A clean merge becomes one object with the merged
+version vector and no conflict copy. The merge is symmetric, so both peers
+compute the same bytes. Overlapping edits, binary files, git metadata, and
+equal vectors with different content (`Diverged`) keep the D18 conflict-copy
+path so both versions remain and `relay conflicts` still resolves them.
+
+## D32. NAT hole punching
+
+When a replica path is set, each device writes its listen candidates
+(advertised LAN addresses plus a STUN reflexive address, if STUN answered
+on the QUIC socket before Quinn takes it) to `nat/<device>` in the mailbox.
+Peers merge those addresses into the dial list. Both sides dialing the
+reflexive address is the hole punch. No hosted account and no TURN relay.
+Peer-only mode (no mailbox) stays LAN, Tailscale, or a manual address.
+Symmetric NAT still fails closed to those reachable addresses.
+
+## D33. Android is a foreground Tauri shell
+
+A phone is a normal Relay device. The first mobile build is Android only.
+It is the existing Tauri and Vue shell with the engine in-process. The
+desktop tray, autostart, single-instance plugin, updater, CLI sidecar, and
+close-to-tray behavior are not part of the Android build.
+
+- **Home.** The device database lives in the app data directory. Android does
+  not use the desktop `directories` path or a bundled `relay` binary.
+- **Sync.** The host runs while the app process is alive. Leaving the app can
+  stop sync; a foreground service is later work. Connectivity is unchanged:
+  LAN, or an explicit address such as Tailscale. NAT traversal is still D32.
+- **Mounts.** No Android-specific folder picker yet. The supported place for
+  phone files is the app sandbox; pointing a mount at an arbitrary path is
+  not a supported workflow.
+- **Out of scope.** iOS, Play Store signing, background execution, and photo
+  library access.

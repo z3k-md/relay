@@ -13,6 +13,7 @@ if-addrs.workspace = true
 mdns-sd.workspace = true
 prost.workspace = true
 quinn.workspace = true
+rand.workspace = true
 relay-core.workspace = true
 relay-crypto.workspace = true
 relay-proto.workspace = true

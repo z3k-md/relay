@@ -5,3 +5,4 @@ uploads/
 *.db-shm
 /dist
 /.relay-deploy
+/.relay-sim/

@@ -66,6 +66,8 @@ pub struct PeerInfo {
     pub id: DeviceId,
     pub addresses: Vec<String>,
     pub added_at_ms: i64,
+    /// Soft-revoked devices stay listed but are not dialed or shared with.
+    pub revoked: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,6 +146,7 @@ impl Engine {
             id: record.device.id,
             addresses: record.addresses,
             added_at_ms: record.added_at_ms,
+            revoked: false,
         })
     }
 
@@ -170,6 +173,7 @@ impl Engine {
                 id: record.device.id,
                 addresses: record.addresses,
                 added_at_ms: record.added_at_ms,
+                revoked: self.db.repo().device_status(id)?.as_deref() == Some("revoked"),
             });
         }
         self.add_peer(&name, id, addresses)
@@ -205,6 +209,7 @@ impl Engine {
             id: record.device.id,
             addresses: record.addresses,
             added_at_ms: record.added_at_ms,
+            revoked: self.db.repo().device_status(id)?.as_deref() == Some("revoked"),
         })
     }
 
@@ -234,18 +239,18 @@ impl Engine {
     }
 
     pub fn peers(&self) -> Result<Vec<PeerInfo>, EngineError> {
-        Ok(self
-            .db
-            .repo()
-            .list_peers()?
-            .into_iter()
-            .map(|p| PeerInfo {
+        let mut out = Vec::new();
+        for p in self.db.repo().list_peers()? {
+            let revoked = self.db.repo().device_status(p.device.id)?.as_deref() == Some("revoked");
+            out.push(PeerInfo {
                 name: p.device.name,
                 id: p.device.id,
                 addresses: p.addresses,
                 added_at_ms: p.added_at_ms,
-            })
-            .collect())
+                revoked,
+            });
+        }
+        Ok(out)
     }
 
     pub fn share(&mut self, space: &str, peer: &str) -> Result<(), EngineError> {
@@ -260,6 +265,9 @@ impl Engine {
             .repo()
             .peer_by_name(peer)?
             .ok_or_else(|| EngineError::UnknownPeer(peer.to_owned()))?;
+        if self.db.repo().device_status(peer_rec.device.id)?.as_deref() == Some("revoked") {
+            return Err(EngineError::PeerRevoked(peer.to_owned()));
+        }
         self.db
             .transaction(|repo| repo.share_space(space_rec.id, peer_rec.device.id))
             .map_err(EngineError::from_db)?;

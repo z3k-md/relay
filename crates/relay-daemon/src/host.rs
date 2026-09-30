@@ -10,10 +10,10 @@ use relay_engine::{
     bookends, index_row,
 };
 use relay_ipc::{
-    ActivityItem, AddMountParams, AddMountResult, Handler, Hello, HostKind, HostState, MountLive,
-    PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
-    PeerLive, RescanParams, RpcErrorBody, ShareParams, Status, TransferDirection as IpcDirection,
-    TransferLive, Watching,
+    ActivityItem, AddMountParams, AddMountResult, Handler, Hello, HostKind, HostState, Idle,
+    MountLive, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult,
+    PairStatus, PeerLive, RescanParams, RpcErrorBody, ShareParams, Status,
+    TransferDirection as IpcDirection, TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -604,6 +604,7 @@ impl Host {
                 row.bytes_per_sec = 0;
             }
         }
+        let quiet = state == HostState::Running && transfers.is_empty();
         Status {
             state,
             message: self.message.lock().ok().and_then(|g| g.clone()),
@@ -611,6 +612,10 @@ impl Host {
             peers: self.peers.lock().map(|g| g.clone()).unwrap_or_default(),
             mounts: self.mounts.lock().map(|g| g.clone()).unwrap_or_default(),
             transfers,
+            idle: Idle {
+                quiet,
+                replica_behind: replica_backlog(&self.home),
+            },
         }
     }
 
@@ -793,6 +798,14 @@ impl Handler for Host {
     }
 }
 
+fn replica_backlog(home: &Path) -> Option<u64> {
+    Engine::open_read_only(home)
+        .ok()?
+        .replica_backlog()
+        .ok()
+        .flatten()
+}
+
 fn set_paused_flag(home: &Path, paused: bool) -> Result<(), RpcErrorBody> {
     let mut engine = Engine::open_for_config(home)
         .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
@@ -846,6 +859,14 @@ fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
         event,
         WatchEvent::Transfers(_) | WatchEvent::ScanProgress { .. }
     ) {
+        return None;
+    }
+    // A partial rescan of an unchanged file still finishes, so the index row
+    // can close. It is not activity.
+    if let WatchEvent::Scanned { full, report, .. } = event
+        && !*full
+        && !report.has_changes()
+    {
         return None;
     }
     let (kind, summary, detail) = match event {

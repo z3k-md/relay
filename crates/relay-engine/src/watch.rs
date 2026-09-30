@@ -292,7 +292,11 @@ impl Engine {
             }
         }
 
-        emit_replica(self.pull_replica_watch(), &mut replica_warned, on_event);
+        // Retry a mailbox push even when the scan found nothing. A crash after
+        // the append and before the watermark leaves the entries in the mailbox
+        // and the local cursor behind; the next edit would be the only retry.
+        emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
+        emit_pull(self, &mut replica_warned, on_event, &mut output);
         last_replica_pull = Some(Instant::now());
 
         while !stop.load(Ordering::Relaxed) {
@@ -335,6 +339,20 @@ impl Engine {
                             });
                         } else {
                             output(SyncOutput::SetPeers);
+                        }
+                    }
+                    SyncInput::NatHint { addresses } => {
+                        if let Err(err) = self.set_nat_hint(&addresses).and_then(|_| {
+                            if self.exchange_nat()? {
+                                output(SyncOutput::SetPeers);
+                            }
+                            Ok(())
+                        }) {
+                            on_event(&WatchEvent::SyncWarning {
+                                peer: String::new(),
+                                path: String::new(),
+                                reason: err.to_string(),
+                            });
                         }
                     }
                     SyncInput::AddMount {
@@ -407,7 +425,7 @@ impl Engine {
                 .is_none_or(|t| now.saturating_duration_since(t) >= REPLICA_PULL_INTERVAL)
             {
                 last_replica_pull = Some(now);
-                emit_replica(self.pull_replica_watch(), &mut replica_warned, on_event);
+                emit_pull(self, &mut replica_warned, on_event, &mut output);
             }
 
             if let Some(baseline) = baseline
@@ -622,6 +640,31 @@ fn emit_sync(result: Result<Vec<SyncEvent>, EngineError>, on_event: &mut dyn FnM
     }
 }
 
+fn emit_pull(
+    engine: &mut Engine,
+    warned: &mut bool,
+    on_event: &mut dyn FnMut(&WatchEvent),
+    output: &mut dyn FnMut(SyncOutput),
+) {
+    match engine.pull_replica_watch() {
+        Ok(pull) => {
+            if pull.addresses_changed {
+                output(SyncOutput::SetPeers);
+            }
+        }
+        Err(err) => {
+            if !*warned {
+                *warned = true;
+                on_event(&WatchEvent::SyncWarning {
+                    peer: String::new(),
+                    path: String::new(),
+                    reason: format!("replica: {err}"),
+                });
+            }
+        }
+    }
+}
+
 fn emit_replica<T>(
     result: Result<T, EngineError>,
     warned: &mut bool,
@@ -723,15 +766,16 @@ fn finish_watch_scan(
             if full {
                 state.last_full = Some(Instant::now());
             }
-            if full || report.has_changes() {
-                on_event(&WatchEvent::Scanned {
-                    space: state.space.clone(),
-                    mount: state.mount.clone(),
-                    full,
-                    paths,
-                    report,
-                });
-            }
+            // Always emit, including a partial scan with no changes. A progress
+            // tick may already have opened an index row, and the host clears
+            // that row on Scanned. Callers hide the no-change partial from logs.
+            on_event(&WatchEvent::Scanned {
+                space: state.space.clone(),
+                mount: state.mount.clone(),
+                full,
+                paths,
+                report,
+            });
         }
         Err(err) => {
             state.failed = true;

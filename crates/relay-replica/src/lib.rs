@@ -1,14 +1,17 @@
-//! Durable non-materializing mailbox (D29).
+//! Durable non-materializing mailbox (D29, D30).
 //!
 //! Stores content-addressed objects and length-prefixed [`WireEntry`] logs so a
 //! device can catch up when its peer is offline. Does not reconstruct a
-//! filesystem. Encryption at rest is a later phase.
+//! filesystem. Object payloads are sealed with the space key when the engine
+//! has one; legacy plaintext objects are still readable. Entry logs stay
+//! metadata (paths and object ids). NAT candidate files live beside the logs
+//! so peers can exchange reflexive addresses without a hosted rendezvous.
 
 mod error;
 mod fs;
 
 pub use error::ReplicaError;
-pub use fs::FsReplica;
+pub use fs::{FsReplica, StoredKeyWrap};
 
 use std::time::Duration;
 

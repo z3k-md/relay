@@ -28,8 +28,10 @@ install` runs it in the background so you do not have to keep a terminal
 open. The [desktop app](apps/relay-desktop/README.md) does the same from the
 tray, starts at login and updates itself from GitHub Releases.
 
-Not yet: encryption at rest, automatic text merge, or NAT traversal. See
-[Roadmap](#roadmap). Optional replication policies can limit which subtrees
+Mailbox objects are encrypted with a per-space key. Text files with a
+shared parent merge automatically when edits do not overlap. When a mailbox
+is configured, peers exchange STUN addresses through it and hole-punch.
+See [Roadmap](#roadmap). Optional replication policies can limit which subtrees
 sync to which devices (`relay policy` / `relay group`); omit them and a shared
 space syncs everything to every peer it is shared with. An optional durable
 mailbox directory lets a device catch up when the other is offline
@@ -418,6 +420,24 @@ cargo fmt --all
 process (deterministic, no network); `crates/relay-net/tests/net.rs` tests the
 QUIC transport on localhost.
 
+`relay-sim` runs real daemon processes against temporary homes so an agent can
+drive a lab from the shell. `wait-converged` returns when every mount tree matches, each index matches
+its own disk, mailbox pushes are caught up, and nothing is being received or
+scanned. It holds that for a short settle so a sample during the file watcher
+debounce cannot pass early.
+
+```bash
+cargo run -p relay-sim -- up mac pc --mailbox shared
+cargo run -p relay-sim -- write mac mods/hello.txt v1
+cargo run -p relay-sim -- wait-converged --timeout 20s
+cargo run -p relay-sim -- report
+cargo run -p relay-sim -- down
+```
+
+`sim/scripts/pair-and-sync.sh` and `sim/scripts/kill-during-mailbox-push.sh`
+are the same flow as scripts. The lab defaults to `./.relay-sim`, or
+`RELAY_SIM_LAB` / `--lab`.
+
 ```text
 crates/
   relay-core     pure domain types: ids, logical paths, version vectors, entries
@@ -442,12 +462,7 @@ docs/
 
 ## Roadmap
 
-Phases 0–8 are in (including the desktop app, pairing, conflicts,
-history/restore, space membership, replication policies, and a durable
-shared-folder mailbox). Nested `.relayignore` is still root-only.
-
-Still not started:
-
-- Encryption at rest
-- Automatic text merge
-- NAT traversal
+Through the durable mailbox: encryption at rest, automatic text merge, and
+NAT hole punching. Nested `.relayignore` is still root-only. There is no
+hosted backend and no TURN relay; symmetric NATs still need a reachable
+address. Unclean text merges keep both versions as conflict copies.

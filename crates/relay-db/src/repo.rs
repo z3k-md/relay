@@ -2363,6 +2363,108 @@ impl Repo<'_> {
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+
+    pub fn device_status(&self, id: DeviceId) -> Result<Option<String>, DbError> {
+        let id = device_id_bytes(id);
+        self.conn
+            .query_row(
+                "SELECT status FROM devices WHERE device_id = ?1",
+                params![id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn set_device_status(&self, id: DeviceId, status: &str) -> Result<(), DbError> {
+        let id = device_id_bytes(id);
+        self.conn.execute(
+            "UPDATE devices SET status = ?1 WHERE device_id = ?2",
+            params![status, id.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn put_peer_box_key(&self, id: DeviceId, public_key: &[u8; 32]) -> Result<(), DbError> {
+        let id = device_id_bytes(id);
+        self.conn.execute(
+            "INSERT INTO peer_box_keys (device_id, public_key) VALUES (?1, ?2)
+             ON CONFLICT(device_id) DO UPDATE SET public_key = excluded.public_key",
+            params![id.as_slice(), public_key.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn peer_box_key(&self, id: DeviceId) -> Result<Option<[u8; 32]>, DbError> {
+        let id = device_id_bytes(id);
+        self.conn
+            .query_row(
+                "SELECT public_key FROM peer_box_keys WHERE device_id = ?1",
+                params![id.as_slice()],
+                |row| row.get::<_, [u8; 32]>(0),
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn put_space_key_wrap(&self, wrap: &SpaceKeyWrap) -> Result<(), DbError> {
+        let space = space_bytes(wrap.space);
+        let recipient = device_id_bytes(wrap.recipient);
+        let generation = i64::from(wrap.generation);
+        self.conn.execute(
+            "INSERT INTO space_key_wraps (space_id, generation, purpose, recipient, wrapped)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(space_id, generation, purpose, recipient)
+             DO UPDATE SET wrapped = excluded.wrapped",
+            params![
+                space.as_slice(),
+                generation,
+                wrap.purpose,
+                recipient.as_slice(),
+                wrap.wrapped,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn space_key_wraps(&self, space: SpaceId) -> Result<Vec<SpaceKeyWrap>, DbError> {
+        let space_b = space_bytes(space);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT generation, purpose, recipient, wrapped
+             FROM space_key_wraps WHERE space_id = ?1 ORDER BY generation",
+        )?;
+        let rows = stmt.query_map(params![space_b.as_slice()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, [u8; 32]>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (generation, purpose, recipient, wrapped) = row?;
+            let generation = u32::try_from(generation).map_err(|_| DbError::IntegerOverflow)?;
+            out.push(SpaceKeyWrap {
+                space,
+                generation,
+                purpose,
+                recipient: DeviceId::from_bytes(recipient),
+                wrapped,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One wrapped copy of a space key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceKeyWrap {
+    pub space: SpaceId,
+    pub generation: u32,
+    pub purpose: String,
+    pub recipient: DeviceId,
+    pub wrapped: Vec<u8>,
 }
 
 fn parse_peer(

@@ -13,7 +13,9 @@ use relay_engine::{
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+#[cfg(not(target_os = "android"))]
 use crate::sidecar;
+#[cfg(not(target_os = "android"))]
 use crate::tray;
 use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 
@@ -111,7 +113,7 @@ impl Runner {
     }
 
     pub fn start(&self, app: &AppHandle) {
-        if sidecar::service_is_running(&self.home) {
+        if external_service_running(&self.home) {
             self.set_state(
                 app,
                 RunnerState::ExternalService {
@@ -186,7 +188,7 @@ impl Runner {
             inner.state = state.clone();
         }
         let _ = app.emit("relay://state", &state);
-        tray::refresh(app);
+        refresh_tray(app);
     }
 
     fn push_event(&self, app: &AppHandle, item: ActivityItem) {
@@ -210,7 +212,7 @@ impl Runner {
             }
         }
         let _ = app.emit("relay://activity", &item);
-        tray::refresh(app);
+        refresh_tray(app);
     }
 
     fn apply_progress(&self, app: &AppHandle, event: &WatchEvent) {
@@ -273,7 +275,7 @@ impl Runner {
             );
         }
         let _ = app.emit("relay://transfers", &ui_transfers(&update.0));
-        tray::refresh(app);
+        refresh_tray(app);
     }
 
     pub fn transfer_summary(&self) -> Option<String> {
@@ -302,7 +304,7 @@ impl Runner {
 fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
     let mut backoff = BACKOFF_MIN;
     while !stop.load(Ordering::SeqCst) {
-        if sidecar::service_is_running(&home) {
+        if external_service_running(&home) {
             if let Some(runner) = app.try_state::<crate::AppState>() {
                 runner.runner.set_state(
                     &app,
@@ -324,6 +326,8 @@ fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
             },
             verbose: false,
             host: HostKind::Desktop,
+            enable_stun: true,
+            loopback_only: false,
         };
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -370,10 +374,7 @@ fn handle_daemon_event(app: &AppHandle, event: &DaemonEvent) {
         DaemonEvent::Reloading => {}
         _ => {}
     }
-    if matches!(
-        event,
-        DaemonEvent::Watch(WatchEvent::Transfers(_) | WatchEvent::ScanProgress { .. })
-    ) {
+    if hide_from_activity(event) {
         return;
     }
     runner.push_event(
@@ -384,6 +385,16 @@ fn handle_daemon_event(app: &AppHandle, event: &DaemonEvent) {
             message,
         },
     );
+}
+
+fn hide_from_activity(event: &DaemonEvent) -> bool {
+    match event {
+        DaemonEvent::Watch(WatchEvent::Transfers(_) | WatchEvent::ScanProgress { .. }) => true,
+        DaemonEvent::Watch(WatchEvent::Scanned { full, report, .. }) => {
+            !*full && !report.has_changes()
+        }
+        _ => false,
+    }
 }
 
 fn describe_event(event: &DaemonEvent) -> (String, String) {
@@ -625,6 +636,26 @@ fn ui_transfers(rows: &[TransferLive]) -> Vec<UiTransfer> {
         .collect()
 }
 
+fn external_service_running(home: &Path) -> bool {
+    #[cfg(not(target_os = "android"))]
+    {
+        sidecar::service_is_running(home)
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = home;
+        false
+    }
+}
+
+fn refresh_tray(app: &AppHandle) {
+    #[cfg(not(target_os = "android"))]
+    tray::refresh(app);
+    #[cfg(target_os = "android")]
+    let _ = app;
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn status_line(state: &RunnerState, connected: usize, summary: Option<&str>) -> String {
     match state {
         RunnerState::NotInitialized => "Relay — Not initialized".to_owned(),

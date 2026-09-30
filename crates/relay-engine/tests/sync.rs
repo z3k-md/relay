@@ -566,6 +566,29 @@ fn modify_and_delete_propagate_both_ways() {
 }
 
 #[test]
+fn nonoverlapping_text_edits_merge_without_a_conflict_copy() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("foo.txt", b"alpha\nbeta\n")]);
+    fs::write(h.mount_a.path().join("foo.txt"), b"ALPHA\nbeta\n").unwrap();
+    fs::write(h.mount_b.path().join("foo.txt"), b"alpha\nBETA\n").unwrap();
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    h.push_both();
+    assert!(h.a.conflicts(None).unwrap().is_empty());
+    assert!(h.b.conflicts(None).unwrap().is_empty());
+    let merged = b"ALPHA\nBETA\n";
+    assert_eq!(fs::read(h.mount_a.path().join("foo.txt")).unwrap(), merged);
+    assert_eq!(fs::read(h.mount_b.path().join("foo.txt")).unwrap(), merged);
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+}
+
+#[test]
 fn concurrent_edits_same_winner_and_conflict_copy() {
     let mut h = Harness::pair();
     h.setup_shared_space(&[("foo.go", b"base")]);

@@ -43,6 +43,20 @@ macOS produces `.app` / `.dmg` (ad-hoc signed). Windows produces a per-user NSIS
 
 If `relay service` is already running, the app does not start a second sync loop. Uninstall the service (`relay service uninstall`) to switch to in-app sync.
 
+## Android
+
+The Android app is the same Vue UI and in-process engine. It does not ship the tray, autostart, updater, or the `relay` CLI. Sync runs while the app process is alive. Device data is stored in the app data directory.
+
+One-time setup: Android SDK, NDK 29 (`ndk;29.0.13846066`, the version Tauri CLI 2.12 asks for), and JDK 17+. From this directory, with `ANDROID_HOME` and `NDK_HOME` set:
+
+```bash
+npm install
+npm run tauri android init
+npm run tauri android build -- --apk --target aarch64
+```
+
+`android init` writes `src-tauri/gen/android`. The debug APK is under `src-tauri/gen/android/app/build/outputs/apk/`. iOS is not set up.
+
 ## First-run defaults
 
 On the first launch Relay enables start-at-login (LaunchAgent on macOS, user autostart elsewhere) and tries to install the `relay` CLI (`~/.local/bin/relay` on macOS/Linux; user PATH on Windows). Autostart launches with `--hidden` so the window stays in the tray.

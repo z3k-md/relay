@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use relay_core::conflict::{ConflictWinner, choose_group_winner, choose_winner, conflict_path};
 use relay_core::{
-    DeviceId, EntryContent, EntryKey, EntryKind, EntryRecord, LogicalPath, MountId, ObjectId,
-    SpaceId, StatHint, TEMP_PREFIX, VersionRelation, compare_versions, is_bookkeeping_path,
-    is_git_metadata,
+    DeviceId, EntryContent, EntryKey, EntryKind, EntryRecord, LogicalPath, MergeOutcome, MountId,
+    ObjectId, SpaceId, StatHint, TEMP_PREFIX, VectorOrdering, VersionRelation, compare_versions,
+    is_bookkeeping_path, is_git_metadata, merge_text,
 };
 use relay_db::MountConfig;
 use relay_fs::{
@@ -377,6 +377,9 @@ impl Engine {
         let Some(local) = local else {
             return self.apply_remote_newer(remote, None, mounts);
         };
+        if let Some(done) = self.try_auto_merge(remote, local, mounts)? {
+            return Ok(done);
+        }
         let remote_rec = remote.clone().into_record(local.sequence, None);
         let (winner_remote, copy_loser) = conflict_outcome(local, &remote_rec);
 
@@ -502,6 +505,111 @@ impl Engine {
 
         note_live(mounts, remote);
         Ok(TryApply::Done(ApplyResult::Conflict))
+    }
+
+    /// Clean three-way merge of concurrent text edits that share a parent object.
+    /// `None` means fall through to conflict copies (dirty merge, binary, git, or
+    /// no shared base). A clean result is one new object and a merged vector,
+    /// with no bump and no conflict copy, so both peers converge.
+    fn try_auto_merge(
+        &mut self,
+        remote: &RemoteEntry,
+        local: &EntryRecord,
+        mounts: &mut HashMap<MountId, MountApply>,
+    ) -> Result<Option<TryApply>, EngineError> {
+        if local.vector.compare(&remote.vector) != VectorOrdering::Concurrent {
+            return Ok(None);
+        }
+        if is_git_metadata(&remote.key.path) {
+            return Ok(None);
+        }
+        let (
+            EntryContent::File {
+                object: local_object,
+                ..
+            },
+            EntryContent::File {
+                object: remote_object,
+                ..
+            },
+        ) = (&local.content, &remote.content)
+        else {
+            return Ok(None);
+        };
+        let Some(base_id) = local.parent_object else {
+            return Ok(None);
+        };
+        if remote.parent_object != Some(base_id) {
+            return Ok(None);
+        }
+        if !self.store.contains(&base_id)
+            || !self.store.contains(local_object)
+            || !self.store.contains(remote_object)
+        {
+            return Ok(None);
+        }
+        let base = self.store.read(&base_id)?;
+        let left = self.store.read(local_object)?;
+        let right = self.store.read(remote_object)?;
+        let MergeOutcome::Clean(merged) = merge_text(&base, &left, &right) else {
+            return Ok(None);
+        };
+
+        let remote_rec = remote.clone().into_record(local.sequence, None);
+        let (winner_remote, _) = conflict_outcome(local, &remote_rec);
+        let winner = if winner_remote { &remote_rec } else { local };
+        let executable = match &winner.content {
+            EntryContent::File { executable, .. } => *executable,
+            _ => false,
+        };
+        let merged_id = self.store.put_bytes(&merged)?;
+        let ctx = mounts
+            .get(&remote.key.mount)
+            .ok_or(EngineError::MountNotLocal)?;
+        let root = ctx
+            .config
+            .local_path
+            .clone()
+            .ok_or(EngineError::MountNotLocal)?;
+        let path_stat = match self.materialize_remote_file(
+            remote,
+            Some(local),
+            &root,
+            merged_id,
+            executable,
+        )? {
+            MaterializeStep::Done(stat) => stat,
+            MaterializeStep::Rescan => return Ok(Some(TryApply::Rescan)),
+        };
+        let now = self.clock.now_ms();
+        let size = merged.len() as u64;
+        let content = EntryContent::File {
+            object: merged_id,
+            size,
+            executable,
+        };
+        let merged_vector = local.vector.merged(&remote.vector);
+        let path_key = remote.key.clone();
+        let modified_by = winner.modified_by;
+        let modified_at = winner.modified_at_unix_ms;
+        self.db.transaction(|repo| {
+            repo.record_object(merged_id, size, now)?;
+            let sequence = repo.next_sequence()?;
+            let record = EntryRecord {
+                key: path_key,
+                content,
+                vector: merged_vector,
+                parent_object: Some(base_id),
+                sequence,
+                modified_by,
+                modified_at_unix_ms: modified_at,
+                stat: path_stat,
+            };
+            repo.put_entry(&record)?;
+            Ok::<(), EngineError>(())
+        })?;
+        note_live(mounts, remote);
+        Ok(Some(TryApply::Done(ApplyResult::Written)))
     }
 
     fn materialize_remote_file(

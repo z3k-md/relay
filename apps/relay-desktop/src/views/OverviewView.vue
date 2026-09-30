@@ -4,19 +4,17 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import Modal from "../components/Modal.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { api, copyText } from "../lib/api";
-import { formatBytes, updateActive } from "../lib/updateProgress";
-import type { DeleteHold, Overview, RunnerState, TransferLive, UpdateAvailable } from "../lib/types";
+import { formatBytes } from "../lib/updateProgress";
+import type { DeleteHold, Overview, RunnerState, TransferLive } from "../lib/types";
 
 const props = defineProps<{
   overview: Overview;
   transfers: TransferLive[];
-  update: UpdateAvailable | null;
 }>();
 
 const emit = defineEmits<{
   pause: [];
   resume: [];
-  installUpdate: [];
 }>();
 
 const copied = ref(false);
@@ -149,26 +147,6 @@ function runnerDetail(state: RunnerState): string | null {
           @click="emit('pause')"
         >
           Pause
-        </button>
-      </div>
-    </div>
-
-    <div
-      v-if="update && !updateActive"
-      class="mb-4 rounded-lg border border-teal-300/70 bg-teal-50 px-3 py-2 dark:border-teal-900 dark:bg-teal-950/50"
-    >
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <p class="font-medium">Relay {{ update.version }} is available</p>
-          <p v-if="update.notes" class="line-clamp-2 text-[var(--color-muted)]">{{ update.notes }}</p>
-        </div>
-        <button
-          type="button"
-          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)] disabled:opacity-50"
-          :disabled="updateActive"
-          @click="emit('installUpdate')"
-        >
-          Install update
         </button>
       </div>
     </div>

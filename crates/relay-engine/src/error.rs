@@ -84,6 +84,15 @@ pub enum EngineError {
     #[error("relay home is open read-only")]
     ReadOnly,
 
+    #[error("peer {0} is revoked")]
+    PeerRevoked(String),
+
+    #[error("recovery key was not accepted")]
+    RecoveryRejected,
+
+    #[error("this home has no encryption key")]
+    NoBoxKey,
+
     #[error("index changed concurrently at {path}")]
     ConcurrentModification { path: LogicalPath },
 

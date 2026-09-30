@@ -14,6 +14,7 @@ mod error;
 mod io;
 mod pairing;
 mod session;
+mod stun;
 mod tls;
 
 use std::collections::HashMap;
@@ -31,6 +32,7 @@ use relay_store::ObjectStore;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
+pub use addr::advertised_addresses;
 pub use error::NetError;
 use session::{
     CLOSE_SHUTDOWN, Inner, apply_set_peers, close_code, drive_connection, spawn_dialers,
@@ -61,6 +63,9 @@ pub struct NetConfig {
     pub peers: Vec<PeerConfig>,
     /// [`ObjectStore`] root, used to serve and receive objects.
     pub store_root: PathBuf,
+    /// When set, query a public STUN server on the listen socket before Quinn
+    /// takes it, and remember the reflexive address for NAT hole punching.
+    pub enable_stun: bool,
 }
 
 /// Notifications delivered on the network thread via the callback passed to [`start`].
@@ -166,6 +171,8 @@ impl NetSender {
 pub struct NetHandle {
     cmd_tx: UnboundedSender<NetCommand>,
     local_addr: SocketAddr,
+    /// Public address learned from STUN, if `enable_stun` succeeded.
+    reflexive: Option<SocketAddr>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -184,6 +191,11 @@ impl NetHandle {
     /// Actual bound address (useful when the caller passed port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Reflexive UDP address from STUN, when discovery ran and a server answered.
+    pub fn reflexive(&self) -> Option<SocketAddr> {
+        self.reflexive
     }
 
     /// Close connections and join the runtime thread.
@@ -223,8 +235,15 @@ pub fn start(
         addr: config.listen,
         source,
     })?;
-    let _ = socket.set_nonblocking(true);
     let local_addr = socket.local_addr()?;
+    // STUN has to run before the socket is nonblocking and owned by Quinn.
+    // The mapped port matches this socket, so a peer dialing it punches the NAT.
+    let reflexive = if config.enable_stun {
+        stun::discover_public(&socket, Duration::from_millis(400))
+    } else {
+        None
+    };
+    let _ = socket.set_nonblocking(true);
 
     let store = ObjectStore::open(&config.store_root)?;
     let tls = TlsMaterials::from_identity(&config.identity)?;
@@ -300,6 +319,7 @@ pub fn start(
     Ok(NetHandle {
         cmd_tx,
         local_addr,
+        reflexive,
         thread: Some(thread),
     })
 }

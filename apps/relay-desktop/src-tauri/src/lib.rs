@@ -2,15 +2,19 @@ mod commands;
 mod error;
 mod runner;
 mod settings;
+#[cfg(not(target_os = "android"))]
 mod sidecar;
+#[cfg(not(target_os = "android"))]
 mod tray;
+#[cfg(not(target_os = "android"))]
 mod updates;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::{Manager, WindowEvent};
-use tauri_plugin_autostart::MacosLauncher;
+use tauri::Manager;
+#[cfg(not(target_os = "android"))]
+use tauri::WindowEvent;
 
 use crate::runner::Runner;
 
@@ -19,26 +23,36 @@ pub struct AppState {
     pub runner: Arc<Runner>,
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
-    builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-        tray::show_main_window(app);
-    }));
+    #[cfg(not(target_os = "android"))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::show_main_window(app);
+        }));
+    }
     builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec!["--hidden"]),
-        ))
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
                 .build(),
-        )
+        );
+    #[cfg(not(target_os = "android"))]
+    {
+        builder = builder
+            .plugin(tauri_plugin_process::init())
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                Some(vec!["--hidden"]),
+            ));
+    }
+    builder = builder
         .invoke_handler(tauri::generate_handler![
             commands::get_overview,
             commands::init_device,
@@ -65,6 +79,7 @@ pub fn run() {
             commands::pause_sync,
             commands::resume_sync,
             commands::check_for_updates,
+            commands::pending_update,
             commands::install_update,
             commands::restart_app,
             commands::get_settings,
@@ -74,7 +89,7 @@ pub fn run() {
             commands::install_cli,
         ])
         .setup(|app| {
-            let home = relay_engine::default_home();
+            let home = app_home(app)?;
             let _ = std::fs::create_dir_all(home.join("logs"));
 
             if let Err(err) = settings::apply_first_run_defaults(app.handle()) {
@@ -90,26 +105,33 @@ pub fn run() {
                 runner: Arc::clone(&runner),
             });
 
-            if let Err(err) = tray::setup(app.handle()) {
-                log::warn!("tray setup failed: {err:#}");
-            }
-            commands::apply_autostart(app.handle(), settings::load(app.handle()).start_at_login);
-            commands::maybe_install_cli(app.handle());
+            #[cfg(not(target_os = "android"))]
+            {
+                if let Err(err) = tray::setup(app.handle()) {
+                    log::warn!("tray setup failed: {err:#}");
+                }
+                commands::apply_autostart(
+                    app.handle(),
+                    settings::load(app.handle()).start_at_login,
+                );
+                commands::maybe_install_cli(app.handle());
 
-            if let Some(window) = app.get_webview_window("main") {
-                let window_hide = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = window_hide.hide();
+                if let Some(window) = app.get_webview_window("main") {
+                    let window_hide = window.clone();
+                    window.on_window_event(move |event| {
+                        if let WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = window_hide.hide();
+                        }
+                    });
+                    if std::env::args().any(|a| a == "--hidden") {
+                        let _ = window.hide();
                     }
-                });
-                if std::env::args().any(|a| a == "--hidden") {
-                    let _ = window.hide();
                 }
             }
 
             runner.start(app.handle());
+            #[cfg(not(target_os = "android"))]
             updates::spawn_periodic_checks(app.handle());
             Ok(())
         });
@@ -121,13 +143,32 @@ pub fn run() {
             std::process::exit(1);
         }
     };
-    app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
+    app.run(|app, event| match event {
+        tauri::RunEvent::ExitRequested { .. } => {
             // Cmd-Q / dock Quit / app.exit all land here. Tray Quit also calls
             // stop_join first; a second call is a no-op once the thread is gone.
             if let Some(state) = app.try_state::<AppState>() {
                 state.runner.stop_join();
             }
         }
+        // Dock click and a notification click both ask the app to reopen.
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => tray::show_main_window(app),
+        _ => {}
     });
+}
+
+fn app_home(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(target_os = "android")]
+    {
+        Ok(app.path().app_data_dir()?)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(relay_engine::default_home())
+    }
 }

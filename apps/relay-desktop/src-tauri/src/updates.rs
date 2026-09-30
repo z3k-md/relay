@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -5,6 +6,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 use tauri::Emitter;
 use tauri::Manager;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::AppState;
@@ -15,6 +17,18 @@ const PLACEHOLDER_PUBKEY: &str = "REPLACE_WITH_TAURI_UPDATER_PUBKEY";
 const PLACEHOLDER_ENDPOINT: &str = "OWNER/REPO";
 const RESTART_DELAY: Duration = Duration::from_secs(5);
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
+const STARTUP_DELAY: Duration = Duration::from_secs(3);
+const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+struct UpdateWatch {
+    pending: Option<UpdateAvailable>,
+    notified_version: Option<String>,
+}
+
+static WATCH: Mutex<UpdateWatch> = Mutex::new(UpdateWatch {
+    pending: None,
+    notified_version: None,
+});
 
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
@@ -165,6 +179,7 @@ pub async fn check_and_maybe_install(
     };
 
     let Some(update) = update else {
+        clear_available(app);
         return Ok(finish_interactive(
             app,
             interactive,
@@ -190,19 +205,29 @@ pub async fn check_and_maybe_install(
     let version = update.version.clone();
     let auto = settings::load(app).auto_update;
 
+    if !interactive {
+        notify_available(app, &version, auto);
+        if !auto {
+            publish_available(app, &version, &notes);
+        }
+    }
+
     if interactive || auto {
-        let info = install_downloaded(app, update, op_id, interactive).await?;
+        // Background installs use the same progress and restart countdown as
+        // the button. op_id 0 is reserved for quiet checks.
+        let install_op = if interactive { op_id } else { next_op() };
+        if !interactive {
+            emit_progress(app, &UpdateProgress::Checking { op_id: install_op });
+        }
+        let info = install_downloaded(app, update, install_op, true).await?;
+        if !interactive && info.error {
+            publish_available(app, &version, &notes);
+        }
         if info.restart_at_ms.is_some() {
             guard.hold_until_restart();
         }
         return Ok(info);
     }
-
-    let payload = UpdateAvailable {
-        version: version.clone(),
-        notes: notes.clone(),
-    };
-    let _ = app.emit_update(&payload);
 
     Ok(finish_interactive(
         app,
@@ -481,29 +506,84 @@ fn idle_message(op_id: u64, message: impl Into<String>) -> UpdateInfo {
     }
 }
 
-trait EmitUpdate {
-    fn emit_update(&self, payload: &UpdateAvailable) -> tauri::Result<()>;
-}
-
-impl EmitUpdate for AppHandle {
-    fn emit_update(&self, payload: &UpdateAvailable) -> tauri::Result<()> {
-        self.emit("relay://update-available", payload)
-    }
+pub fn pending_update() -> Option<UpdateAvailable> {
+    watch().pending.clone()
 }
 
 pub fn spawn_periodic_checks(app: &AppHandle) {
     let app = app.clone();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("relay-updater".to_owned())
         .spawn(move || {
-            std::thread::sleep(Duration::from_secs(20));
+            std::thread::sleep(STARTUP_DELAY);
             loop {
                 let handle = app.clone();
-                let _ = tauri::async_runtime::block_on(async move {
-                    check_and_maybe_install(&handle, false).await
+                let (tx, rx) = std::sync::mpsc::channel();
+                // Run the check on Tauri's runtime. block_on from this thread
+                // never completes: the runtime is already driving itself.
+                tauri::async_runtime::spawn(async move {
+                    let result = check_and_maybe_install(&handle, false).await;
+                    let _ = tx.send(result);
                 });
-                std::thread::sleep(Duration::from_secs(30 * 60));
+                match rx.recv() {
+                    Ok(Ok(info)) if info.error => log::warn!("update check: {}", info.message),
+                    Ok(Ok(info)) if info.available => {
+                        log::info!("update check: {}", info.message)
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => log::warn!("update check failed: {err}"),
+                    Err(_) => log::warn!("update check task ended before it finished"),
+                }
+                std::thread::sleep(CHECK_INTERVAL);
             }
-        })
-        .ok();
+        });
+    if spawned.is_err() {
+        log::warn!("could not start update checks");
+    }
+}
+
+fn watch() -> std::sync::MutexGuard<'static, UpdateWatch> {
+    WATCH.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn publish_available(app: &AppHandle, version: &str, notes: &str) {
+    let payload = UpdateAvailable {
+        version: version.to_owned(),
+        notes: notes.to_owned(),
+    };
+    watch().pending = Some(payload.clone());
+    let _ = app.emit("relay://update-available", &payload);
+}
+
+fn clear_available(app: &AppHandle) {
+    let mut watch = watch();
+    if watch.pending.is_none() && watch.notified_version.is_none() {
+        return;
+    }
+    watch.pending = None;
+    watch.notified_version = None;
+    drop(watch);
+    let _ = app.emit("relay://update-available", &None::<UpdateAvailable>);
+}
+
+fn notify_available(app: &AppHandle, version: &str, installing: bool) {
+    if watch().notified_version.as_deref() == Some(version) {
+        return;
+    }
+    let body = if installing {
+        format!("Relay {version} is downloading. It will restart when ready.")
+    } else {
+        format!("Relay {version} is available.")
+    };
+    if let Err(err) = app
+        .notification()
+        .builder()
+        .title("Relay update")
+        .body(body)
+        .show()
+    {
+        log::warn!("update notification: {err}");
+        return;
+    }
+    watch().notified_version = Some(version.to_owned());
 }

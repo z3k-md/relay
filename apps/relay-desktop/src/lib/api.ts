@@ -18,6 +18,7 @@ import type {
   RunnerState,
   Settings,
   SpaceView,
+  UpdateAvailable,
   UpdateInfo,
 } from "./types";
 
@@ -92,6 +93,7 @@ export const api = {
   pauseSync: () => call<RunnerState>("pause_sync"),
   resumeSync: () => call<RunnerState>("resume_sync"),
   checkForUpdates: () => call<UpdateInfo>("check_for_updates"),
+  pendingUpdate: () => call<UpdateAvailable | null>("pending_update"),
   installUpdate: () => call<UpdateInfo>("install_update"),
   restartApp: () => call<void>("restart_app"),
   getSettings: () => call<Settings>("get_settings"),

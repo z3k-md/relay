@@ -11,6 +11,7 @@ mod replica;
 mod reports;
 mod resolve;
 mod scan;
+mod secrets;
 mod sync;
 mod watch;
 
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use relay_core::{DeviceId, EntryKey, MOUNT_MARKER, validate_name};
+use relay_crypto::BoxKeyPair;
 use relay_db::Database;
 use relay_fs::{MaterializeOptions, MountMarker, materialize_file, resolve_os_path, to_os_path};
 use relay_policy::MountRules;
@@ -109,6 +111,9 @@ pub struct Engine {
     device: Device,
     clock: Arc<dyn Clock>,
     config: EngineConfig,
+    /// X25519 key that unwraps space keys. `None` only for a read-only open of
+    /// a home that has not generated one yet.
+    box_key: Option<BoxKeyPair>,
     /// Exclusive lock on `<home>/relay.lock`. `None` for a read-only engine.
     lock: Option<File>,
 }
@@ -133,6 +138,7 @@ impl Engine {
         let now = clock.now_ms();
         db.transaction(|repo| repo.init_local_device(&device, now))
             .map_err(EngineError::from_db)?;
+        let box_key = BoxKeyPair::load_or_generate(&home.join(IDENTITY_DIR))?;
         let store = ObjectStore::open(home.join(STORE_DIR))?;
         Ok(Engine {
             home: home.to_path_buf(),
@@ -141,6 +147,7 @@ impl Engine {
             device,
             clock,
             config: EngineConfig::default(),
+            box_key: Some(box_key),
             lock: Some(lock),
         })
     }
@@ -180,6 +187,7 @@ impl Engine {
             .ok_or(EngineError::NotInitialized)?;
         let identity = require_matching_identity(home, local.device.id)?;
         let _ = identity;
+        let box_key = BoxKeyPair::load_or_generate(&home.join(IDENTITY_DIR))?;
         let store = ObjectStore::open(home.join(STORE_DIR))?;
         Ok(Engine {
             home: home.to_path_buf(),
@@ -188,6 +196,7 @@ impl Engine {
             device: local.device,
             clock: Arc::new(SystemClock),
             config: EngineConfig::default(),
+            box_key: Some(box_key),
             lock: Some(lock),
         })
     }
@@ -206,6 +215,7 @@ impl Engine {
             .ok_or(EngineError::NotInitialized)?;
         let identity = require_matching_identity(home, local.device.id)?;
         let _ = identity;
+        let box_key = BoxKeyPair::load(&home.join(IDENTITY_DIR)).ok();
         let store = ObjectStore::open(home.join(STORE_DIR))?;
         Ok(Engine {
             home: home.to_path_buf(),
@@ -214,6 +224,7 @@ impl Engine {
             device: local.device,
             clock: Arc::new(SystemClock),
             config: EngineConfig::default(),
+            box_key,
             lock: None,
         })
     }
@@ -288,6 +299,7 @@ impl Engine {
         self.db
             .transaction(|repo| repo.create_space(&space, now))
             .map_err(EngineError::from_db)?;
+        self.ensure_space_key(space.id)?;
         Ok(space)
     }
 

@@ -7,6 +7,7 @@ const KEY_START_AT_LOGIN: &str = "start_at_login";
 const KEY_AUTO_UPDATE: &str = "auto_update";
 const KEY_PAUSED: &str = "paused";
 const KEY_DEFAULTS_APPLIED: &str = "defaults_applied";
+#[cfg(not(target_os = "android"))]
 const KEY_CLI_INSTALL_ATTEMPTED: &str = "cli_install_attempted";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,10 +20,15 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            start_at_login: true,
-            auto_update: true,
+            start_at_login: desktop_lifecycle(),
+            auto_update: desktop_lifecycle(),
         }
     }
+}
+
+/// Login autostart and the desktop updater exist on macOS, Windows, and Linux.
+fn desktop_lifecycle() -> bool {
+    !cfg!(target_os = "android")
 }
 
 fn store(app: &AppHandle) -> anyhow::Result<std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>> {
@@ -46,8 +52,8 @@ fn set_bool(app: &AppHandle, key: &str, value: bool) -> anyhow::Result<()> {
 
 pub fn load(app: &AppHandle) -> Settings {
     Settings {
-        start_at_login: get_bool(app, KEY_START_AT_LOGIN, true),
-        auto_update: get_bool(app, KEY_AUTO_UPDATE, true),
+        start_at_login: get_bool(app, KEY_START_AT_LOGIN, desktop_lifecycle()),
+        auto_update: get_bool(app, KEY_AUTO_UPDATE, desktop_lifecycle()),
     }
 }
 
@@ -74,10 +80,12 @@ pub fn migrate_paused_to_db(app: &AppHandle, home: &std::path::Path) -> anyhow::
     clear_paused(app)
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn cli_install_attempted(app: &AppHandle) -> bool {
     get_bool(app, KEY_CLI_INSTALL_ATTEMPTED, false)
 }
 
+#[cfg(not(target_os = "android"))]
 pub fn set_cli_install_attempted(app: &AppHandle) -> anyhow::Result<()> {
     set_bool(app, KEY_CLI_INSTALL_ATTEMPTED, true)
 }
@@ -86,8 +94,8 @@ pub fn apply_first_run_defaults(app: &AppHandle) -> anyhow::Result<Settings> {
     if get_bool(app, KEY_DEFAULTS_APPLIED, false) {
         return Ok(load(app));
     }
-    set_bool(app, KEY_START_AT_LOGIN, true)?;
-    set_bool(app, KEY_AUTO_UPDATE, true)?;
+    set_bool(app, KEY_START_AT_LOGIN, desktop_lifecycle())?;
+    set_bool(app, KEY_AUTO_UPDATE, desktop_lifecycle())?;
     set_bool(app, KEY_DEFAULTS_APPLIED, true)?;
     Ok(Settings::default())
 }

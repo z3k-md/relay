@@ -16,9 +16,7 @@
       "identifier": "opener:allow-open-path",
       "allow": [{ "path": "**" }]
     },
-    "updater:default",
-    "process:default",
-    "autostart:default",
+    "notification:default",
     "store:default",
     "log:default"
   ]

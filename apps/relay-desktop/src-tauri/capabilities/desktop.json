@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-only",
+  "description": "Plugins that ship on macOS, Windows, and Linux only.",
+  "platforms": ["macOS", "windows", "linux"],
+  "windows": ["main"],
+  "permissions": ["updater:default", "process:default", "autostart:default"]
+}

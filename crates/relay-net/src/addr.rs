@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use relay_core::{format_ip_port, is_advertisable_ip};
 
-pub(crate) fn advertised_addresses(port: u16) -> Vec<String> {
+pub fn advertised_addresses(port: u16) -> Vec<String> {
     match if_addrs::get_if_addrs() {
         Ok(ifaces) => {
             let mut out = Vec::new();

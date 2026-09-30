@@ -8,12 +8,15 @@ use relay_engine::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::error::{anyhow_chain, error_chain};
 use crate::runner::RunnerState;
+#[cfg(not(target_os = "android"))]
 use crate::sidecar::{self, CliInstallResult, CliStatus, ShellKind};
+#[cfg(not(target_os = "android"))]
 use crate::updates::{self, UpdateInfo};
 use crate::{AppState, settings};
 use relay_ipc::Client;
@@ -27,6 +30,8 @@ pub struct Overview {
     pub suggested_name: String,
     pub runner: RunnerState,
     pub version: String,
+    /// Android builds hide desktop-only settings (updater, autostart, CLI).
+    pub mobile: bool,
     pub peer_count: u32,
     pub connected_peers: u32,
     pub space_count: u32,
@@ -195,6 +200,7 @@ pub fn get_overview(app: AppHandle) -> Result<Overview, String> {
                 suggested_name,
                 runner,
                 version: version_string(),
+                mobile: cfg!(target_os = "android"),
                 peer_count: peers.len() as u32,
                 connected_peers: connected,
                 space_count: spaces.len() as u32,
@@ -208,6 +214,7 @@ pub fn get_overview(app: AppHandle) -> Result<Overview, String> {
             suggested_name,
             runner: RunnerState::NotInitialized,
             version: version_string(),
+            mobile: cfg!(target_os = "android"),
             peer_count: 0,
             connected_peers: 0,
             space_count: 0,
@@ -709,20 +716,89 @@ pub fn resume_sync(app: AppHandle) -> Result<RunnerState, String> {
     Ok(state.runner.state())
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
     updates::check_and_maybe_install(&app, true).await
 }
 
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub fn pending_update() -> Option<updates::UpdateAvailable> {
+    updates::pending_update()
+}
+
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<UpdateInfo, String> {
     updates::install(&app).await
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub fn restart_app(app: AppHandle) {
     updates::restart_now(&app);
 }
+
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    op_id: u64,
+    configured: bool,
+    available: bool,
+    version: Option<String>,
+    notes: Option<String>,
+    message: String,
+    installing: bool,
+    restart_at_ms: Option<u64>,
+    error: bool,
+}
+
+#[cfg(target_os = "android")]
+fn android_updates_unavailable(op_id: u64) -> UpdateInfo {
+    UpdateInfo {
+        op_id,
+        configured: false,
+        available: false,
+        version: None,
+        notes: None,
+        message: "Updates are not available on Android.".to_owned(),
+        installing: false,
+        restart_at_ms: None,
+        error: false,
+    }
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn check_for_updates() -> Result<UpdateInfo, String> {
+    Ok(android_updates_unavailable(0))
+}
+
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAvailable {
+    version: String,
+    notes: String,
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn pending_update() -> Option<UpdateAvailable> {
+    None
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn install_update() -> Result<UpdateInfo, String> {
+    Err("Updates are not available on Android.".to_owned())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn restart_app() {}
 
 #[tauri::command]
 pub fn get_settings(app: AppHandle) -> Result<settings::Settings, String> {
@@ -758,11 +834,40 @@ pub fn open_logs_folder(app: AppHandle) -> Result<(), String> {
         .map_err(|err| anyhow_chain(err.into()))
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub fn cli_status() -> Result<CliStatus, String> {
     Ok(sidecar::cli_status())
 }
 
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliStatus {
+    sidecar_path: Option<String>,
+    install_path: Option<String>,
+    on_path: bool,
+    hint: Option<String>,
+    detected_shell: Option<String>,
+    shell_hints: Vec<String>,
+    path_configured: bool,
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn cli_status() -> Result<CliStatus, String> {
+    Ok(CliStatus {
+        sidecar_path: None,
+        install_path: None,
+        on_path: false,
+        hint: Some("The command-line tool is not available on Android.".to_owned()),
+        detected_shell: None,
+        shell_hints: Vec::new(),
+        path_configured: false,
+    })
+}
+
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 pub fn install_cli(app: AppHandle, shell: Option<String>) -> Result<CliInstallResult, String> {
     let shell = match shell.as_deref() {
@@ -776,25 +881,53 @@ pub fn install_cli(app: AppHandle, shell: Option<String>) -> Result<CliInstallRe
     Ok(result)
 }
 
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliInstallResult {
+    path: String,
+    on_path: bool,
+    hint: Option<String>,
+    message: String,
+    detected_shell: Option<String>,
+    path_configured: bool,
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn install_cli() -> Result<CliInstallResult, String> {
+    Err("The command-line tool is not available on Android.".to_owned())
+}
+
 pub fn apply_autostart(app: &AppHandle, enable: bool) {
-    let manager = app.autolaunch();
-    let result = if enable {
-        manager.enable()
-    } else {
-        manager.disable()
-    };
-    if let Err(err) = result {
-        log::warn!("autostart: {err}");
+    #[cfg(not(target_os = "android"))]
+    {
+        let manager = app.autolaunch();
+        let result = if enable {
+            manager.enable()
+        } else {
+            manager.disable()
+        };
+        if let Err(err) = result {
+            log::warn!("autostart: {err}");
+        }
     }
+    #[cfg(target_os = "android")]
+    let _ = (app, enable);
 }
 
 pub fn maybe_install_cli(app: &AppHandle) {
-    if settings::cli_install_attempted(app) {
-        return;
+    #[cfg(not(target_os = "android"))]
+    {
+        if settings::cli_install_attempted(app) {
+            return;
+        }
+        let _ = settings::set_cli_install_attempted(app);
+        // Symlink only — do not rewrite shell rc files during automatic install.
+        if let Err(err) = sidecar::install_cli(None, false) {
+            log::info!("automatic CLI install skipped: {err:#}");
+        }
     }
-    let _ = settings::set_cli_install_attempted(app);
-    // Symlink only — do not rewrite shell rc files during automatic install.
-    if let Err(err) = sidecar::install_cli(None, false) {
-        log::info!("automatic CLI install skipped: {err:#}");
-    }
+    #[cfg(target_os = "android")]
+    let _ = app;
 }

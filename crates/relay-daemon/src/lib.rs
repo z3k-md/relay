@@ -34,6 +34,11 @@ pub struct DaemonOptions {
     pub watch: WatchOptions,
     pub verbose: bool,
     pub host: HostKind,
+    /// Query STUN on the listen socket so peers can hole-punch to the reflexive address.
+    pub enable_stun: bool,
+    /// Advertise only `127.0.0.1:<port>`. The sim lab sets this so peers dial
+    /// loopback instead of another interface on the same machine.
+    pub loopback_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +114,7 @@ fn run_loop(
         host.set_state(HostState::Starting, None);
         host.seed_mounts(&engine);
         let identity = Arc::new(engine.load_identity()?);
-        let peers = engine.peers()?;
+        let peers: Vec<_> = engine.peers()?.into_iter().filter(|p| !p.revoked).collect();
 
         let (tx, rx) = mpsc::channel::<SyncInput>();
         host.set_sync_tx(Some(tx.clone()));
@@ -211,6 +216,7 @@ fn run_loop(
                     })
                     .collect(),
                 store_root: engine.store().root().to_path_buf(),
+                enable_stun: opts.enable_stun,
             },
             Box::new(sink),
         )
@@ -219,6 +225,19 @@ fn run_loop(
         })?;
 
         let listen = net.local_addr();
+        let mut nat_addrs = if opts.loopback_only {
+            vec![format!("127.0.0.1:{}", listen.port())]
+        } else {
+            relay_net::advertised_addresses(listen.port())
+        };
+        if !opts.loopback_only
+            && let Some(reflexive) = net.reflexive()
+        {
+            nat_addrs.insert(0, relay_core::format_socket_addr(reflexive));
+        }
+        let _ = tx.send(SyncInput::NatHint {
+            addresses: nat_addrs,
+        });
         host.set_net(Some(net.sender()));
         host.set_listen(Some(listen.to_string()));
         host.set_state(HostState::Running, None);
@@ -260,6 +279,7 @@ fn run_loop(
                         {
                             let configs: Vec<PeerConfig> = peers
                                 .iter()
+                                .filter(|p| !p.revoked)
                                 .map(|p| PeerConfig {
                                     id: p.id,
                                     name: p.name.clone(),

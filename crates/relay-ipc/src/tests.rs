@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::protocol::{
-    ActivityItem, Hello, HostKind, HostState, PROTOCOL_VERSION, Request, Response, RpcErrorBody,
-    Status, TransferDirection, TransferLive, decode_line, encode_line,
+    ActivityItem, Hello, HostKind, HostState, Idle, PROTOCOL_VERSION, Request, Response,
+    RpcErrorBody, Status, TransferDirection, TransferLive, decode_line, encode_line,
 };
 use crate::{Client, Handler, Server};
 
@@ -52,6 +52,7 @@ impl Handler for TestHandler {
                 peers: Vec::new(),
                 mounts: Vec::new(),
                 transfers: Vec::new(),
+                idle: Idle::default(),
             })
             .unwrap()),
             "activity" => Ok(serde_json::to_value(&self.items).unwrap()),
@@ -156,6 +157,7 @@ fn status_includes_transfers() {
         peers: Vec::new(),
         mounts: Vec::new(),
         transfers: vec![live.clone()],
+        idle: Idle::default(),
     };
     let value = serde_json::to_value(&status).unwrap();
     let rows = value
@@ -175,6 +177,10 @@ fn status_includes_transfers() {
         peers: Vec::new(),
         mounts: Vec::new(),
         transfers: Vec::new(),
+        idle: Idle {
+            quiet: true,
+            replica_behind: None,
+        },
     };
     let value = serde_json::to_value(&empty).unwrap();
     assert!(value.get("transfers").is_none());
@@ -185,6 +191,39 @@ fn status_includes_transfers() {
     }))
     .unwrap();
     assert!(back.transfers.is_empty());
+    assert!(!back.idle.ready());
+}
+
+#[test]
+fn idle_is_ready_only_when_quiet_and_the_mailbox_is_caught_up() {
+    assert!(
+        Idle {
+            quiet: true,
+            replica_behind: None,
+        }
+        .ready()
+    );
+    assert!(
+        Idle {
+            quiet: true,
+            replica_behind: Some(0),
+        }
+        .ready()
+    );
+    assert!(
+        !Idle {
+            quiet: true,
+            replica_behind: Some(2),
+        }
+        .ready()
+    );
+    assert!(
+        !Idle {
+            quiet: false,
+            replica_behind: Some(0),
+        }
+        .ready()
+    );
 }
 
 fn wait_client(home: &std::path::Path) -> Option<Client> {
