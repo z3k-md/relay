@@ -657,6 +657,64 @@ fn offline_pause_and_resume_toggle_flag() {
     assert!(!engine.paused().unwrap());
 }
 
+#[test]
+fn pair_help_mentions_share_and_addr() {
+    relay()
+        .args(["pair", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--share"))
+        .stdout(predicate::str::contains("--addr"))
+        .stdout(predicate::str::contains("code"));
+}
+
+#[test]
+fn pair_rejects_invalid_code() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+
+    relay()
+        .args(["--home", &home_s, "pair", "123"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid pairing code"))
+        .stderr(predicate::str::contains("expected 10 digits"));
+
+    relay()
+        .args(["--home", &home_s, "pair", "not-a-code"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid pairing code"));
+}
+
+#[test]
+fn pair_rejects_conflicting_flags() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+
+    relay()
+        .args(["--home", &home_s, "pair", "--addr", "127.0.0.1:47321"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--addr is only valid when joining",
+        ));
+
+    relay()
+        .args(["--home", &home_s, "pair", "12-3456-7890", "--share", "S"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--share is only valid"));
+}
+
 fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {

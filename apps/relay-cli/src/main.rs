@@ -4,18 +4,22 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use relay_core::{DeviceId, EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
+use relay_core::{
+    DeviceId, EntryContent, EntryRecord, LogicalPath, PairingCode, Sequence, VersionVector,
+};
 use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{
     ConflictClass, ConflictInfo, DeleteHoldDecision, Engine, EngineError, Resolution, ScanOptions,
     ScanReport, WatchEvent, WatchOptions, default_home, group_git_conflicts, resolve_conflict,
     resolve_git_conflicts,
 };
-use relay_ipc::{ActivityItem, Client, Status as DaemonStatus};
+use relay_ipc::{ActivityItem, Client, PairStatus, Status as DaemonStatus};
 
 mod output;
 mod service;
@@ -60,7 +64,21 @@ enum Command {
     Id,
     /// Show device, mount and peer status
     Status,
-    /// Peer pairing
+    /// Pair with another device using a short code
+    Pair {
+        /// Code shown on the other device (omit to generate one)
+        code: Option<String>,
+        /// Spaces to share with the new peer (when generating a code)
+        #[arg(long)]
+        share: Vec<String>,
+        /// Address to dial when joining (Tailscale/VPN; skip on the same LAN)
+        #[arg(long)]
+        addr: Option<String>,
+        /// UDP listen address when this command starts a temporary host
+        #[arg(long, default_value = DEFAULT_LISTEN)]
+        listen: SocketAddr,
+    },
+    /// Add or remove peers by device id (advanced)
     Peer {
         #[command(subcommand)]
         cmd: PeerCmd,
@@ -340,6 +358,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Resume => cmd_resume(&home, json),
         Command::Rescan { target, no_wait } => cmd_rescan(&home, target.as_deref(), no_wait, json),
         Command::Activity { n, follow } => cmd_activity(&home, n, follow, json),
+        Command::Pair {
+            code,
+            share,
+            addr,
+            listen,
+        } => cmd_pair(&home, code, share, addr, listen, json),
         Command::Peer { cmd } => cmd_peer(&home, cmd, json),
         Command::Share { space, peer } => {
             let mut engine = Engine::open_for_config(&home)?;
@@ -643,9 +667,7 @@ fn cmd_run(
     let peers = engine.peers()?;
     let mut names: HashMap<String, String> = peer_names(&peers);
     if peers.is_empty() && !json {
-        output::out_line(
-            "no peers yet; add one with `relay peer add <name> <device-id> --addr host:port`",
-        );
+        output::out_line("no peers yet; pair another device with `relay pair`");
     }
     drop(engine);
 
@@ -710,6 +732,252 @@ fn cmd_run(
         }
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_pair(
+    home: &Path,
+    code: Option<String>,
+    share: Vec<String>,
+    addr: Option<String>,
+    listen: SocketAddr,
+    json: bool,
+) -> Result<ExitCode> {
+    if code.is_some() && !share.is_empty() {
+        bail!("--share is only valid when starting a session (omit the code)");
+    }
+    if code.is_none() && addr.is_some() {
+        bail!("--addr is only valid when joining (pass the pairing code)");
+    }
+    let joining = match code.as_deref() {
+        Some(raw) => Some(PairingCode::parse(raw)?),
+        None => None,
+    };
+    let _ready = Engine::open_read_only(home)?;
+
+    let existing = Client::connect(home)?;
+    let mut host = if existing.is_some() {
+        None
+    } else {
+        Some(start_pair_host(home, listen)?)
+    };
+    let mut client = wait_pair_client(home, host.as_mut())?;
+    let result = if let Some(code) = joining {
+        pair_join_cli(home, &code, addr.as_deref(), json)
+    } else {
+        pair_start_cli(&mut client, home, &share, json)
+    };
+    drop(host);
+    result
+}
+
+struct PairHost {
+    home: PathBuf,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl PairHost {
+    fn take_error(&mut self) -> Option<anyhow::Error> {
+        if !self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            return None;
+        }
+        match self.thread.take()?.join() {
+            Ok(Err(err)) => Some(err),
+            Ok(Ok(())) => Some(anyhow::anyhow!("temporary host stopped unexpectedly")),
+            Err(_) => Some(anyhow::anyhow!("temporary host thread panicked")),
+        }
+    }
+}
+
+impl Drop for PairHost {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = Client::connect(&self.home);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_pair_host(home: &Path, listen: SocketAddr) -> Result<PairHost> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let home_owned = home.to_path_buf();
+    let thread = thread::Builder::new()
+        .name("relay-pair-host".into())
+        .spawn(move || {
+            relay_daemon::run(
+                &home_owned,
+                DaemonOptions {
+                    listen,
+                    watch: WatchOptions::default(),
+                    verbose: false,
+                    host: HostKind::Cli,
+                },
+                &flag,
+                &mut |_| {},
+            )
+        })
+        .context("starting a temporary Relay host")?;
+    Ok(PairHost {
+        home: home.to_path_buf(),
+        stop,
+        thread: Some(thread),
+    })
+}
+
+fn wait_pair_client(home: &Path, mut host: Option<&mut PairHost>) -> Result<Client> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = None::<String>;
+    while Instant::now() < deadline {
+        if let Some(host) = host.as_mut()
+            && let Some(err) = host.take_error()
+        {
+            return Err(err.context("starting a temporary Relay host"));
+        }
+        match Client::connect(home) {
+            Ok(Some(mut client)) => {
+                if client.hello().is_ok() {
+                    match client.status() {
+                        Ok(status) if status.state == relay_ipc::HostState::Paused => {
+                            bail!("Relay is paused; run `relay resume` before pairing");
+                        }
+                        Ok(status) if status.state == relay_ipc::HostState::Running => {
+                            return Ok(client);
+                        }
+                        Ok(status) => {
+                            last = Some(format!("host is {}", status.state.as_str()));
+                        }
+                        Err(_) => return Ok(client),
+                    }
+                }
+            }
+            Ok(None) => last = Some("waiting for the host".into()),
+            Err(err) => last = Some(err.to_string()),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!(
+        "Relay host did not become ready ({})",
+        last.unwrap_or_else(|| "timeout".into())
+    )
+}
+
+fn install_pair_cancel() -> Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::clone(&flag);
+    ctrlc::set_handler(move || {
+        cancel.store(true, Ordering::SeqCst);
+    })
+    .context("installing Ctrl-C handler")?;
+    Ok(flag)
+}
+
+fn pair_start_cli(
+    client: &mut Client,
+    home: &Path,
+    share: &[String],
+    json: bool,
+) -> Result<ExitCode> {
+    let started = client.pair_start(share)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&started)?);
+    } else {
+        println!("Pairing code:  {}", started.code);
+        println!();
+        println!("On the other device, run:");
+        println!("  relay pair {}", started.code);
+        println!();
+        println!("If the machines cannot see each other on the LAN (Tailscale or another VPN):");
+        println!("  relay pair {} --addr HOST:47321", started.code);
+        println!();
+        println!("Waiting up to 10 minutes. Ctrl-C cancels this code.");
+    }
+    let cancel = install_pair_cancel()?;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = client.pair_cancel();
+            bail!("pairing cancelled");
+        }
+        match client.pair_status() {
+            Ok(PairStatus::Paired { peer_name, peer_id }) => {
+                print_paired(&peer_name, &peer_id, json)?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(PairStatus::Failed { reason }) => bail!("{reason}"),
+            Ok(PairStatus::Expired) => bail!("pairing code expired"),
+            Ok(PairStatus::Idle) => bail!("pairing cancelled"),
+            Ok(PairStatus::Waiting) => {}
+            Err(err) => {
+                if let Ok(Some(next)) = Client::connect(home) {
+                    *client = next;
+                } else {
+                    return Err(err.into());
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn pair_join_cli(
+    home: &Path,
+    code: &PairingCode,
+    addr: Option<&str>,
+    json: bool,
+) -> Result<ExitCode> {
+    let cancel = install_pair_cancel()?;
+    let home_owned = home.to_path_buf();
+    let digits = code.format();
+    let addr_owned = addr.map(ToOwned::to_owned);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = (|| {
+            let mut client = wait_pair_client(&home_owned, None)?;
+            client
+                .pair_join(&digits, addr_owned.as_deref())
+                .map_err(anyhow::Error::from)
+        })();
+        let _ = tx.send(result);
+    });
+    if !json {
+        match addr {
+            Some(addr) => println!("Joining via {addr}…"),
+            None => println!("Looking for the other device on the LAN…"),
+        }
+    }
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            if let Ok(Some(mut client)) = Client::connect(home) {
+                let _ = client.pair_cancel();
+            }
+            bail!("pairing cancelled");
+        }
+        match rx.try_recv() {
+            Ok(Ok(joined)) => {
+                print_paired(&joined.peer_name, &joined.peer_id, json)?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(100)),
+            Err(mpsc::TryRecvError::Disconnected) => bail!("pairing ended unexpectedly"),
+        }
+    }
+}
+
+fn print_paired(peer_name: &str, peer_id: &str, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "peer_name": peer_name,
+                "peer_id": peer_id,
+            }))?
+        );
+    } else {
+        println!("Paired with {peer_name} ({peer_id})");
+    }
+    Ok(())
 }
 
 fn peer_names(peers: &[relay_engine::PeerInfo]) -> HashMap<String, String> {
