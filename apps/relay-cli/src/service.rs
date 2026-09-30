@@ -169,8 +169,7 @@ pub fn xml_escape(s: &str) -> String {
 }
 
 pub fn launch_agent_plist(binary: &str, home: &str, listen: &str, log: &str) -> String {
-    let launchd_log = Path::new(home).join("logs").join("launchd.log");
-    let launchd_log = launchd_log.to_string_lossy();
+    let launchd_log = format!("{}/logs/launchd.log", home.trim_end_matches('/'));
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
