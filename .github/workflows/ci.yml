@@ -58,10 +58,14 @@ jobs:
             TMP,{{ DEV_DRIVE }}/tmp
             TEMP,{{ DEV_DRIVE }}/tmp
 
-      - name: Create temp dir on Dev Drive
+      # rust-lld (shipped with the toolchain) links the ~20 test binaries much
+      # faster than MSVC link.exe.
+      - name: Create temp dir on Dev Drive and use rust-lld
         if: runner.os == 'Windows'
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=rust-lld.exe" >> $env:GITHUB_ENV
 
       - name: Install pinned Rust toolchain
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
