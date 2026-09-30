@@ -416,12 +416,15 @@ Duplicates in the same batch (and objects already in the store) report
 `already_present` and drop the tmp. Staged names are not visible to
 `contains` or other callers. `commit()` then:
 
-1. One `F_FULLFSYNC` barrier on any file or directory in the store. This
-   flushes the volume, so every staged tmp's bytes are durable.
+1. One `F_FULLFSYNC` on a staged tmp file. This flushes the drive cache,
+   so every staged tmp's bytes are durable. It runs on a regular file (as
+   `sync_all` did before) and a failure fails the commit.
 2. Rename each tmp onto its content-addressed path (same "destination
    already exists → verify → success" handling as a single put).
 3. Plain `fsync` of each touched object directory.
-4. A final `F_FULLFSYNC` barrier so those directory entries are durable.
+4. A final `F_FULLFSYNC` on the store root so those directory entries are
+   durable. Best effort, like the directory fsync before: a lost rename
+   only means the object is stored again later.
 
 The name must not appear before step 1. `put`/`put_file` treat an existing
 destination as already present, so a renamed-but-not-durable file after a

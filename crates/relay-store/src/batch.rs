@@ -83,8 +83,6 @@ impl PutBatch {
 mod apple {
     use std::collections::HashSet;
     use std::fs::{self, File};
-    use std::io;
-    use std::os::fd::AsRawFd;
     use std::path::Path;
 
     use relay_core::{ObjectId, StatHint};
@@ -154,7 +152,7 @@ mod apple {
             });
         }
 
-        plain_fsync(tmp.as_file()).map_err(|e| io_err(tmp.path(), e))?;
+        rustix::fs::fsync(tmp.as_file()).map_err(|e| io_err(tmp.path(), e.into()))?;
         let tmp = tmp.into_temp_path();
 
         batch.apple.ids.insert(id);
@@ -178,10 +176,10 @@ mod apple {
             return Ok(());
         }
 
-        // Data in every staged tmp has been plain-fsync'd. This volume-wide
-        // barrier must land *before* any rename: `contains` treats a dest
-        // path as durable, so the name must not appear until the bytes are.
-        full_fsync_barrier(&batch.store)?;
+        // Data in every staged tmp has been plain-fsync'd. This drive-cache
+        // flush must land *before* any rename: `contains` treats a dest path
+        // as durable, so the name must not appear until the bytes are.
+        full_fsync_file(&batch.apple.staged[0].tmp)?;
 
         let staged = std::mem::take(&mut batch.apple.staged);
         batch.apple.ids.clear();
@@ -197,10 +195,14 @@ mod apple {
         }
 
         for dir in dirs {
-            fsync_dir_plain(&dir);
+            if let Ok(file) = File::open(&dir) {
+                let _ = rustix::fs::fsync(&file);
+            }
         }
 
-        full_fsync_barrier(&batch.store)?;
+        if let Ok(root) = File::open(batch.store.root()) {
+            let _ = rustix::fs::fcntl_fullfsync(&root);
+        }
         Ok(())
     }
 
@@ -232,36 +234,13 @@ mod apple {
         }
     }
 
-    fn plain_fsync(file: &File) -> io::Result<()> {
-        // SAFETY: `file` owns a valid open descriptor for the duration of the call.
-        let rc = unsafe { libc::fsync(file.as_raw_fd()) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    fn full_fsync(file: &File) -> io::Result<()> {
-        // SAFETY: `file` owns a valid open descriptor for the duration of the call.
-        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
-        if rc == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn full_fsync_barrier(store: &ObjectStore) -> Result<(), StoreError> {
-        let dir = store.root();
-        let file = File::open(dir).map_err(|e| io_err(dir, e))?;
-        full_fsync(&file).map_err(|e| io_err(dir, e))
-    }
-
-    fn fsync_dir_plain(dir: &std::path::Path) {
-        if let Ok(file) = File::open(dir) {
-            let _ = plain_fsync(&file);
-        }
+    fn full_fsync_file(path: &Path) -> Result<(), StoreError> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| io_err(path, e))?;
+        rustix::fs::fcntl_fullfsync(&file).map_err(|e| io_err(path, e.into()))
     }
 }
 
