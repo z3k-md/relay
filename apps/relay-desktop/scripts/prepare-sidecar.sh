@@ -33,6 +33,10 @@ TARGET="${1:-$(host_triple)}"
 if [[ "$TARGET" == "universal-apple-darwin" ]]; then
   cargo build --release -p relay-cli --target aarch64-apple-darwin --manifest-path "$WORKSPACE/Cargo.toml"
   cargo build --release -p relay-cli --target x86_64-apple-darwin --manifest-path "$WORKSPACE/Cargo.toml"
+  # tauri builds each arch separately and each build checks for its own
+  # externalBin before the universal bundle uses the lipo'd one.
+  copy_bin aarch64-apple-darwin "$WORKSPACE/target/aarch64-apple-darwin/release/relay"
+  copy_bin x86_64-apple-darwin "$WORKSPACE/target/x86_64-apple-darwin/release/relay"
   lipo -create \
     "$WORKSPACE/target/aarch64-apple-darwin/release/relay" \
     "$WORKSPACE/target/x86_64-apple-darwin/release/relay" \
