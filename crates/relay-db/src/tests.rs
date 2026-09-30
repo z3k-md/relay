@@ -108,6 +108,45 @@ impl Harness {
 }
 
 #[test]
+fn data_version_changes_only_when_another_connection_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.db");
+    let mut writer = Database::open(&path).unwrap();
+    writer
+        .transaction(|repo| repo.init_local_device(&device(1, "desktop"), 1_000))
+        .unwrap();
+    let before_own = writer.data_version().unwrap();
+    writer
+        .transaction(|repo| repo.create_space(&space("Personal"), 1_000))
+        .unwrap();
+    assert_eq!(
+        writer.data_version().unwrap(),
+        before_own,
+        "own commits must not change PRAGMA data_version on the writing connection"
+    );
+
+    let mut other = Database::open(&path).unwrap();
+    let before_external = writer.data_version().unwrap();
+    other
+        .transaction(|repo| repo.create_space(&space("Extra"), 2_000))
+        .unwrap();
+    assert_ne!(
+        writer.data_version().unwrap(),
+        before_external,
+        "a commit on another connection must change data_version"
+    );
+    let other_before = other.data_version().unwrap();
+    other
+        .transaction(|repo| repo.create_space(&space("Third"), 3_000))
+        .unwrap();
+    assert_eq!(
+        other.data_version().unwrap(),
+        other_before,
+        "the committing connection must not see its own write as a data_version change"
+    );
+}
+
+#[test]
 fn migrations_are_idempotent_on_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nested").join("relay.sqlite");

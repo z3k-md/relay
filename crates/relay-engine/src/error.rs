@@ -69,6 +69,9 @@ pub enum EngineError {
     #[error("another relay process is using {}", .home.display())]
     Busy { home: PathBuf },
 
+    #[error("Relay is syncing {} right now", .home.display())]
+    Running { home: PathBuf },
+
     #[error("relay home is open read-only")]
     ReadOnly,
 

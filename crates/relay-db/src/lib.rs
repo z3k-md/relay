@@ -56,6 +56,18 @@ impl Database {
         Repo { conn: &self.conn }
     }
 
+    /// SQLite `PRAGMA data_version` for this connection.
+    ///
+    /// The value changes only when a *different* connection commits. Writes
+    /// on this same connection leave it unchanged, so a watcher can detect
+    /// external writers without treating its own commits as reloads.
+    pub fn data_version(&self) -> Result<u32, DbError> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        u32::try_from(version).map_err(|_| DbError::IntegerOverflow)
+    }
+
     /// Run `f` in one IMMEDIATE transaction; commit on Ok, roll back on Err.
     pub fn transaction<T, E: From<DbError>>(
         &mut self,

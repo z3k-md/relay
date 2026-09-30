@@ -16,6 +16,7 @@ use crate::reports::{ScanOptions, ScanReport};
 use crate::sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
 
 const STOP_POLL: Duration = Duration::from_millis(100);
+const RELOAD_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchOptions {
@@ -24,6 +25,11 @@ pub struct WatchOptions {
     pub full_scan_interval: Duration,
     pub use_watcher: bool,
     pub max_dirty_paths: usize,
+    /// When set, [`Engine::run`] polls SQLite `PRAGMA data_version` about once
+    /// a second and returns [`RunExit::ExternalChange`] if another connection
+    /// committed. Default `false` so `relay watch` and existing tests are
+    /// unchanged.
+    pub reload_on_external_change: bool,
 }
 
 impl Default for WatchOptions {
@@ -34,8 +40,18 @@ impl Default for WatchOptions {
             full_scan_interval: Duration::from_secs(600),
             use_watcher: true,
             max_dirty_paths: 10_000,
+            reload_on_external_change: false,
         }
     }
+}
+
+/// Why [`Engine::run`] returned successfully.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunExit {
+    /// `stop` was set (or the input channel ended after a stop).
+    Stopped,
+    /// Another connection committed to the database (`PRAGMA data_version`).
+    ExternalChange,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -120,7 +136,9 @@ impl Engine {
         on_event: &mut dyn FnMut(&WatchEvent),
     ) -> Result<(), EngineError> {
         let (_tx, rx) = mpsc::channel();
-        self.run(opts, rx, |_| {}, stop, on_event)
+        match self.run(opts, rx, |_| {}, stop, on_event)? {
+            RunExit::Stopped | RunExit::ExternalChange => Ok(()),
+        }
     }
 
     /// Combined filesystem + peer sync loop.
@@ -140,8 +158,19 @@ impl Engine {
         mut output: impl FnMut(SyncOutput),
         stop: &AtomicBool,
         on_event: &mut dyn FnMut(&WatchEvent),
-    ) -> Result<(), EngineError> {
+    ) -> Result<RunExit, EngineError> {
         self.ensure_writable()?;
+        // Hold the run lock, then drop the writer lock so another process can
+        // `Engine::open` and commit (peers, mounts, shares). SQLite WAL serializes
+        // the actual writes; `data_version` on this connection sees theirs.
+        let _run_lock = crate::acquire_run_lock(&self.home)?;
+        self.release_writer_lock()?;
+        let baseline = if opts.reload_on_external_change {
+            Some(self.db.data_version()?)
+        } else {
+            None
+        };
+        let mut last_reload_check = Instant::now();
         let mut syncer = Syncer::new();
         let (tx, rx) = mpsc::channel::<LoopMsg>();
         {
@@ -278,11 +307,23 @@ impl Engine {
                     emit_sync(syncer.push_local_changes(self, &mut output), on_event);
                 }
             }
+
+            if let Some(baseline) = baseline
+                && now.saturating_duration_since(last_reload_check) >= RELOAD_POLL
+            {
+                last_reload_check = now;
+                if self.db.data_version()? != baseline {
+                    drop(watcher);
+                    self.try_reacquire_writer_lock()?;
+                    return Ok(RunExit::ExternalChange);
+                }
+            }
         }
 
         drop(watcher);
         on_event(&WatchEvent::Stopped);
-        Ok(())
+        self.try_reacquire_writer_lock()?;
+        Ok(RunExit::Stopped)
     }
 
     fn run_watch_scan(

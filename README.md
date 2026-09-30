@@ -147,8 +147,9 @@ relay share Mods pc
 ```
 
 Prefer a folder such as `~/Code` (see [Notes](#notes) if you need Documents,
-Desktop or Downloads). Config-changing commands restart the background
-service themselves; you never need to Ctrl-C anything.
+Desktop or Downloads). A running Relay picks up configuration changes
+(`peer`, `share`, `space`, `mount`) within about a second; you never need to
+Ctrl-C or restart the service first.
 
 **2. On the PC, join and attach a folder**
 
@@ -254,12 +255,13 @@ found missing or corrupt objects.
 `**/build/**`, `**/.venv/**` and `**/__pycache__/**`. A `.relayignore` file at
 the mount root adds more exclude globs, one per line. Rules are per device.
 
+A running Relay (`relay run` or the background service) picks up
 `peer add` / `peer remove`, `share` / `unshare`, `space create` / `space join`
-and `mount add` stop the background service, apply the change, and start it
-again. For `scan`, `restore` and `gc`, stop the service first if it is
-running (`relay service stop`). Read-only commands (`status`, `ls`,
-`history`, `conflicts`, `verify`) work while it runs. `relay run` is still
-available if you want a foreground process instead of the service.
+and `mount add` within about a second. For `scan`, `restore` and `gc`, prefer
+stopping the service first (`relay service stop`) so a one-shot write does not
+interleave with the live loop. Read-only commands (`status`, `ls`, `history`,
+`conflicts`, `verify`) work while it runs. `relay run` is still available if
+you want a foreground process instead of the service.
 
 ## Notes
 
@@ -348,6 +350,7 @@ crates/
   relay-proto    peer wire protocol (protobuf via prost)
   relay-net      QUIC transport: pinned mutual TLS, control and object streams
   relay-engine   scan, watch, sync state machine, remote apply, conflicts, history
+  relay-daemon   reusable sync runner: network + engine loop with live config reload
 apps/
   relay-cli      the `relay` binary
 scripts/         install.sh, install.ps1, build-windows.sh, deploy.sh
@@ -362,7 +365,7 @@ The phase plan is in [`docs/DESIGN.md`](docs/DESIGN.md) section 51. Next:
 
 1. **Phase 3**: Git-aware conflict grouping, receive-side mass-delete guard,
    conflict resolution commands.
-2. **Phase 4**: local IPC so the CLI talks to a running daemon without
-   restarting it (today, config-changing commands restart the service).
+2. **Phase 4**: local IPC so the CLI talks to a running daemon (config
+   changes are already picked up by a live reload within about a second).
 3. **Phase 5+**: LAN discovery and pairing codes, more than two devices,
    relaying, encryption at rest.

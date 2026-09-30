@@ -1018,3 +1018,37 @@ fn scan_records_success_and_mount_errors() {
         "{status:?}"
     );
 }
+
+#[test]
+fn own_writes_do_not_change_data_version_other_connection_does() {
+    let home = new_home();
+    let mount = new_home();
+    fs::write(mount.path().join("a.txt"), b"hello").unwrap();
+    let mut engine = ready(home.path(), mount.path());
+    let before = engine.data_version().unwrap();
+    let report = scan(&mut engine);
+    assert!(report.created > 0, "{report:?}");
+    assert_eq!(
+        engine.data_version().unwrap(),
+        before,
+        "scans write through Engine.db's single rusqlite connection; own commits must not bump data_version"
+    );
+
+    let mut other = relay_db::Database::open(&home.path().join("relay.db")).unwrap();
+    other
+        .transaction(|repo| {
+            repo.create_space(
+                &relay_core::Space {
+                    id: relay_core::SpaceId::new(),
+                    name: "Extra".to_owned(),
+                },
+                1,
+            )
+        })
+        .unwrap();
+    assert_ne!(
+        engine.data_version().unwrap(),
+        before,
+        "a commit on a different rusqlite connection must change data_version"
+    );
+}

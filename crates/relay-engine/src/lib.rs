@@ -38,13 +38,14 @@ pub use reports::{
     PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport, Status, VerifyReport, Warning,
 };
 pub use sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
-pub use watch::{WatchEvent, WatchOptions};
+pub use watch::{RunExit, WatchEvent, WatchOptions};
 
 const DB_FILE: &str = "relay.db";
 const STORE_DIR: &str = "store";
 const LOGS_DIR: &str = "logs";
 const IDENTITY_DIR: &str = "identity";
 const LOCK_FILE: &str = "relay.lock";
+const RUN_LOCK_FILE: &str = "relay.run.lock";
 const TMP_CLEAN_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Engine knobs that are not part of the persisted device identity.
@@ -126,13 +127,33 @@ impl Engine {
         })
     }
 
+    /// Open the home for writing. Fails with [`EngineError::Running`] while a
+    /// sync loop ([`Engine::run`]) owns the home: scans, restores and GC write
+    /// entries the loop is also writing, and two writers could hand out the
+    /// same version counter for different content.
     pub fn open(home: &Path) -> Result<Engine, EngineError> {
+        Self::open_inner(home, true)
+    }
+
+    /// Open the home to change configuration (peers, shares, spaces, mounts)
+    /// even while a sync loop runs. The loop notices the commit and reloads.
+    /// Do not use this handle to scan, restore or collect garbage.
+    pub fn open_for_config(home: &Path) -> Result<Engine, EngineError> {
+        Self::open_inner(home, false)
+    }
+
+    fn open_inner(home: &Path, exclusive: bool) -> Result<Engine, EngineError> {
         let db_path = home.join(DB_FILE);
         if !db_path.is_file() {
             return Err(EngineError::NotInitialized);
         }
         ensure_layout(home)?;
         let lock = acquire_lock(home)?;
+        if exclusive && run_lock_held(home)? {
+            return Err(EngineError::Running {
+                home: home.to_path_buf(),
+            });
+        }
         let db = Database::open(&db_path)?;
         let local = db
             .repo()
@@ -212,6 +233,14 @@ impl Engine {
 
     pub fn store(&self) -> &ObjectStore {
         &self.store
+    }
+
+    /// SQLite `PRAGMA data_version` on the engine's write connection.
+    ///
+    /// Increments only when another connection commits. Every engine write
+    /// (scans, sync apply, config) goes through [`Database`]'s single `conn`.
+    pub fn data_version(&self) -> Result<u32, EngineError> {
+        Ok(self.db.data_version()?)
     }
 
     pub fn create_space(&mut self, name: &str) -> Result<Space, EngineError> {
@@ -765,6 +794,59 @@ fn acquire_lock(home: &Path) -> Result<File, EngineError> {
             home: home.to_path_buf(),
         }),
         Err(fs::TryLockError::Error(err)) => Err(EngineError::Io(err)),
+    }
+}
+
+/// Exclusive lock held for the duration of [`Engine::run`] / [`Engine::watch`].
+///
+/// The writer lock (`relay.lock`) is released while the loop runs so another
+/// process can `Engine::open` and commit config. This lock keeps two run
+/// loops from overlapping.
+pub(crate) fn acquire_run_lock(home: &Path) -> Result<File, EngineError> {
+    let path = home.join(RUN_LOCK_FILE);
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(EngineError::Busy {
+            home: home.to_path_buf(),
+        }),
+        Err(fs::TryLockError::Error(err)) => Err(EngineError::Io(err)),
+    }
+}
+
+fn run_lock_held(home: &Path) -> Result<bool, EngineError> {
+    match acquire_run_lock(home) {
+        Ok(file) => {
+            drop(file);
+            Ok(false)
+        }
+        Err(EngineError::Busy { .. }) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+impl Engine {
+    pub(crate) fn release_writer_lock(&self) -> Result<(), EngineError> {
+        if let Some(file) = &self.lock {
+            file.unlock()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_reacquire_writer_lock(&self) -> Result<(), EngineError> {
+        let Some(file) = &self.lock else {
+            return Ok(());
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(()),
+            Err(fs::TryLockError::WouldBlock) => Ok(()),
+            Err(fs::TryLockError::Error(err)) => Err(EngineError::Io(err)),
+        }
     }
 }
 

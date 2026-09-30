@@ -2,18 +2,17 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use relay_core::{DeviceId, EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
+use relay_daemon::{DaemonEvent, DaemonOptions};
 use relay_engine::{
-    Engine, EngineError, ScanOptions, ScanReport, SyncInput, SyncOutput, WatchEvent, WatchOptions,
-    default_home,
+    Engine, EngineError, ScanOptions, ScanReport, WatchEvent, WatchOptions, default_home,
 };
-use relay_net::{NetCommand, NetConfig, NetEvent, PeerConfig};
 
 mod output;
 mod service;
@@ -261,15 +260,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let engine = Engine::open_read_only(&home)?;
             cmd_status(&engine, json).map(|()| ExitCode::SUCCESS)
         }
-        Command::Peer { cmd } => {
-            if matches!(cmd, PeerCmd::List) {
-                cmd_peer(&home, cmd, json)
-            } else {
-                service::paused(&home, json, || cmd_peer(&home, cmd, json))
-            }
-        }
-        Command::Share { space, peer } => service::paused(&home, json, || {
-            let mut engine = Engine::open(&home)?;
+        Command::Peer { cmd } => cmd_peer(&home, cmd, json),
+        Command::Share { space, peer } => {
+            let mut engine = Engine::open_for_config(&home)?;
             engine.share(&space, &peer)?;
             if json {
                 println!(
@@ -282,9 +275,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("shared {space} with {peer}");
             }
             Ok(ExitCode::SUCCESS)
-        }),
-        Command::Unshare { space, peer } => service::paused(&home, json, || {
-            let mut engine = Engine::open(&home)?;
+        }
+        Command::Unshare { space, peer } => {
+            let mut engine = Engine::open_for_config(&home)?;
             engine.unshare(&space, &peer)?;
             if json {
                 println!(
@@ -297,14 +290,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("unshared {space} from {peer}");
             }
             Ok(ExitCode::SUCCESS)
-        }),
+        }
         Command::Conflicts { space } => {
             let engine = Engine::open_read_only(&home)?;
             cmd_conflicts(&engine, space.as_deref(), json).map(|()| ExitCode::SUCCESS)
         }
         Command::Space { cmd } => match cmd {
-            SpaceCmd::Create { name } => service::paused(&home, json, || {
-                let mut engine = Engine::open(&home)?;
+            SpaceCmd::Create { name } => {
+                let mut engine = Engine::open_for_config(&home)?;
                 let space = engine.create_space(&name)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&space)?);
@@ -312,7 +305,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("created space {}", space.name);
                 }
                 Ok(ExitCode::SUCCESS)
-            }),
+            }
             SpaceCmd::List => {
                 let engine = Engine::open_read_only(&home)?;
                 let spaces = engine.spaces()?;
@@ -350,8 +343,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 Ok(ExitCode::SUCCESS)
             }
-            SpaceCmd::Join { name_or_id, from } => service::paused(&home, json, || {
-                let mut engine = Engine::open(&home)?;
+            SpaceCmd::Join { name_or_id, from } => {
+                let mut engine = Engine::open_for_config(&home)?;
                 let space = engine.join_space(&name_or_id, &from)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&space)?);
@@ -362,7 +355,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     );
                 }
                 Ok(ExitCode::SUCCESS)
-            }),
+            }
         },
         Command::Mount { cmd } => match cmd {
             MountCmd::Add {
@@ -372,11 +365,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 mut excludes,
                 includes,
                 dev_excludes,
-            } => service::paused(&home, json, || {
+            } => {
                 if dev_excludes {
                     excludes.extend(DEV_EXCLUDES.iter().map(|s| (*s).to_owned()));
                 }
-                let mut engine = Engine::open(&home)?;
+                let mut engine = Engine::open_for_config(&home)?;
                 let config = engine.add_mount(&space, &mount, &path, &includes, &excludes)?;
                 if json {
                     println!(
@@ -392,7 +385,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("added mount {space}/{mount} at {shown}");
                 }
                 Ok(ExitCode::SUCCESS)
-            }),
+            }
             MountCmd::List { space } => {
                 let engine = Engine::open_read_only(&home)?;
                 let mounts = engine.mounts(space.as_deref())?;
@@ -554,18 +547,15 @@ fn cmd_run(
     verbose: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let mut engine = Engine::open(home)?;
-    let identity = Arc::new(engine.load_identity()?);
+    let engine = Engine::open_read_only(home)?;
     let peers = engine.peers()?;
-    let names: HashMap<String, String> = peers
-        .iter()
-        .map(|p| (p.id.to_string(), p.name.clone()))
-        .collect();
+    let mut names: HashMap<String, String> = peer_names(&peers);
     if peers.is_empty() && !json {
         output::out_line(
             "no peers yet; add one with `relay peer add <name> <device-id> --addr host:port`",
         );
     }
+    drop(engine);
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -574,88 +564,64 @@ fn cmd_run(
     })
     .context("installing Ctrl-C handler")?;
 
-    let (tx, rx) = mpsc::channel::<SyncInput>();
-    let listen_failed = Arc::clone(&stop);
-    let sink = move |event: NetEvent| {
-        let input = match event {
-            NetEvent::PeerConnected { peer, name, .. } => SyncInput::PeerConnected { peer, name },
-            NetEvent::PeerDisconnected { peer, reason } => {
-                tracing::info!(%peer, %reason, "peer disconnected");
-                SyncInput::PeerDisconnected { peer }
-            }
-            NetEvent::Frame { peer, body } => SyncInput::Frame { peer, body },
-            NetEvent::ObjectFetched { peer, object } => SyncInput::ObjectFetched { peer, object },
-            NetEvent::ObjectFetchFailed {
-                peer,
-                object,
-                reason,
-                not_found,
-            } => SyncInput::ObjectFetchFailed {
-                peer,
-                object,
-                not_found,
-                reason,
-            },
-            NetEvent::ListenFailed { error } => {
-                output::err_line(&format!("error: network listener stopped: {error}"));
-                listen_failed.store(true, Ordering::SeqCst);
-                return;
-            }
-        };
-        let _ = tx.send(input);
-    };
-    let net = relay_net::start(
-        NetConfig {
-            identity,
-            device_name: engine.device().name.clone(),
+    relay_daemon::run(
+        home,
+        DaemonOptions {
             listen,
-            peers: peers
-                .iter()
-                .map(|p| PeerConfig {
-                    id: p.id,
-                    name: p.name.clone(),
-                    addresses: p.addresses.clone(),
-                })
-                .collect(),
-            store_root: engine.store().root().to_path_buf(),
+            watch: opts,
+            verbose,
         },
-        Box::new(sink),
+        &stop,
+        &mut |event| match event {
+            DaemonEvent::Started {
+                device_name,
+                device_id,
+                listen,
+            } => {
+                names = load_peer_names(home);
+                if !json {
+                    output::out_line(&format!(
+                        "{} listening on {listen} as {device_name} ({device_id})",
+                        utc_hms()
+                    ));
+                }
+            }
+            DaemonEvent::Watch(watch) => print_watch_event(watch, json, verbose, &names),
+            DaemonEvent::Reloading => {
+                if !json {
+                    output::out_line(&format!("{} configuration changed; reloading", utc_hms()));
+                }
+            }
+            DaemonEvent::Warning(message) => {
+                if !json {
+                    output::out_line(&format!("{} warning: {message}", utc_hms()));
+                }
+            }
+        },
     )
     .map_err(|err| {
-        let err = anyhow::Error::from(err).context(format!("starting the network on {listen}"));
         if service::is_addr_in_use(&err) {
             err.context(service::listen_in_use_hint())
         } else {
             err
         }
     })?;
-    if !json {
-        output::out_line(&format!(
-            "{} listening on {} as {} ({})",
-            utc_hms(),
-            net.local_addr(),
-            engine.device().name,
-            engine.device().id
-        ));
-    }
-
-    let result = engine.run(
-        opts,
-        rx,
-        |output| {
-            net.send(match output {
-                SyncOutput::Send { peer, body } => NetCommand::Send { peer, body },
-                SyncOutput::FetchObject { peer, object } => {
-                    NetCommand::FetchObject { peer, object }
-                }
-            })
-        },
-        &stop,
-        &mut |event| print_watch_event(event, json, verbose, &names),
-    );
-    net.shutdown();
-    result?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn peer_names(peers: &[relay_engine::PeerInfo]) -> HashMap<String, String> {
+    peers
+        .iter()
+        .map(|p| (p.id.to_string(), p.name.clone()))
+        .collect()
+}
+
+fn load_peer_names(home: &Path) -> HashMap<String, String> {
+    Engine::open_read_only(home)
+        .ok()
+        .and_then(|engine| engine.peers().ok())
+        .map(|peers| peer_names(&peers))
+        .unwrap_or_default()
 }
 
 fn peer_label<'a>(names: &'a HashMap<String, String>, peer: &'a str) -> &'a str {
@@ -752,7 +718,7 @@ fn print_watch_event(
             ));
             for name in spaces {
                 output::out_line(&format!(
-                    "  to accept: stop relay, then `relay space join {name} --from {label}`"
+                    "  to accept: `relay space join {name} --from {label}`"
                 ));
             }
         }
@@ -857,7 +823,7 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
             addresses,
         } => {
             let id: DeviceId = device_id.parse()?;
-            let mut engine = Engine::open(home)?;
+            let mut engine = Engine::open_for_config(home)?;
             let peer = engine.add_peer(&name, id, &addresses)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&peer)?);
@@ -884,7 +850,7 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
             }
         }
         PeerCmd::Remove { name } => {
-            let mut engine = Engine::open(home)?;
+            let mut engine = Engine::open_for_config(home)?;
             engine.remove_peer(&name)?;
             if json {
                 println!(
@@ -1375,6 +1341,11 @@ fn print_engine_error(err: &EngineError) {
         }
         EngineError::Busy { .. } => {
             eprintln!("hint: stop `relay watch` or wait for the other command to finish");
+        }
+        EngineError::Running { .. } => {
+            eprintln!(
+                "hint: stop it first: `relay service stop`, quit the Relay desktop app, or Ctrl-C `relay run`"
+            );
         }
         _ => {}
     }

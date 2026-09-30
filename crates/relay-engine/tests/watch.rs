@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use relay_core::{EntryContent, MOUNT_MARKER, ObjectId, TEMP_PREFIX};
-use relay_engine::{Engine, ScanOptions, WatchEvent, WatchOptions};
+use relay_engine::{Engine, RunExit, ScanOptions, WatchEvent, WatchOptions};
 use tempfile::TempDir;
 
 const CONVERGE: Duration = Duration::from_secs(10);
@@ -125,7 +125,7 @@ fn watch_opts(debounce_ms: u64, interval: Duration, use_watcher: bool) -> WatchO
         max_batch_delay: Duration::from_millis(500),
         full_scan_interval: interval,
         use_watcher,
-        max_dirty_paths: 10_000,
+        ..WatchOptions::default()
     }
 }
 
@@ -459,4 +459,58 @@ fn watch_relayignore_deselects_instead_of_delete() {
         "changing .relayignore did not trigger a full scan"
     );
     stop_watch(session);
+}
+
+#[test]
+fn run_returns_external_change_when_another_engine_commits() {
+    let (home, _mount) = ready_dirs();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let home_path = home.path().to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut engine = Engine::open(&home_path).unwrap();
+        let (_sync_tx, sync_rx) = mpsc::channel();
+        engine.run(
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                max_batch_delay: Duration::from_millis(500),
+                full_scan_interval: Duration::from_secs(600),
+                use_watcher: false,
+                reload_on_external_change: true,
+                ..WatchOptions::default()
+            },
+            sync_rx,
+            |_| {},
+            &stop_thread,
+            &mut |event| {
+                let _ = tx.send(event.clone());
+            },
+        )
+    });
+
+    assert!(
+        wait_until(CONVERGE, || {
+            rx.try_iter()
+                .any(|e| matches!(e, WatchEvent::Started { .. }))
+        }),
+        "run did not start"
+    );
+
+    assert!(
+        matches!(
+            Engine::open(home.path()),
+            Err(relay_engine::EngineError::Running { .. })
+        ),
+        "entry-writing opens must be refused while the loop runs"
+    );
+    {
+        let mut other =
+            Engine::open_for_config(home.path()).expect("writer lock released during run");
+        other.create_space("Extra").unwrap();
+    }
+
+    let exit = handle.join().expect("run thread panicked").expect("run");
+    assert_eq!(exit, RunExit::ExternalChange);
+    stop.store(true, Ordering::SeqCst);
 }

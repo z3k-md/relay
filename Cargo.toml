@@ -10,6 +10,7 @@ members = [
     "crates/relay-proto",
     "crates/relay-crypto",
     "crates/relay-net",
+    "crates/relay-daemon",
     "apps/relay-cli",
 ]
 
@@ -30,6 +31,7 @@ relay-engine = { path = "crates/relay-engine" }
 relay-proto = { path = "crates/relay-proto" }
 relay-crypto = { path = "crates/relay-crypto" }
 relay-net = { path = "crates/relay-net" }
+relay-daemon = { path = "crates/relay-daemon" }
 
 anyhow = "1"
 blake3 = "1"

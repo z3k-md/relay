@@ -120,45 +120,6 @@ pub fn run(home: &Path, cmd: ServiceCmd, json: bool) -> Result<ExitCode> {
     }
 }
 
-pub fn paused<T>(home: &Path, json: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let mut stopped = false;
-    if supported() {
-        match status_info(home) {
-            Ok(status) if status.installed && status.running => {
-                if !json {
-                    eprintln!("stopping the background service...");
-                }
-                match stop(home) {
-                    Ok(()) => stopped = true,
-                    Err(err) => {
-                        eprintln!("warning: could not stop the background service: {err:#}");
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(err) => {
-                eprintln!("warning: could not query the background service: {err:#}");
-            }
-        }
-    }
-
-    let result = f();
-
-    if stopped {
-        match start(home) {
-            Ok(()) => {
-                if !json {
-                    eprintln!("restarted the background service");
-                }
-            }
-            Err(err) => {
-                eprintln!("warning: could not restart the background service: {err:#}");
-            }
-        }
-    }
-    result
-}
-
 pub fn format_status_line(status: &ServiceStatus) -> String {
     if status.running {
         match status.pid {
