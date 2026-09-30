@@ -203,7 +203,7 @@ async fn run_initiator(inner: &Inner, conn: Connection, joiner: DeviceId) -> Res
         }
     };
     let expected_b = confirm_mac(&key, PAIR_CONFIRM_B, &transcript);
-    if confirm_b.mac.as_slice() != expected_b.as_bytes() {
+    if !mac_matches(&confirm_b.mac, &expected_b) {
         conn.close(close_code(CLOSE_UNTRUSTED), b"confirm mismatch");
         return Err("pairing confirmation failed".into());
     }
@@ -421,7 +421,7 @@ async fn run_joiner(inner: &Inner, conn: Connection, code: &PairingCode) -> Resu
         }
     };
     let expected_a = confirm_mac(&key, PAIR_CONFIRM_A, &transcript);
-    if confirm_a.mac.as_slice() != expected_a.as_bytes() {
+    if !mac_matches(&confirm_a.mac, &expected_a) {
         conn.close(close_code(CLOSE_UNTRUSTED), b"confirm mismatch");
         return Err("pairing confirmation failed".into());
     }
@@ -478,6 +478,10 @@ fn confirm_mac(key: &[u8], label: &[u8], transcript: &[u8]) -> blake3::Hash {
     data.extend_from_slice(label);
     data.extend_from_slice(transcript);
     blake3::keyed_hash(&keyed, &data)
+}
+
+fn mac_matches(received: &[u8], expected: &blake3::Hash) -> bool {
+    <[u8; 32]>::try_from(received).is_ok_and(|bytes| blake3::Hash::from_bytes(bytes) == *expected)
 }
 
 fn sanitize_name(name: &str, id: DeviceId) -> String {
