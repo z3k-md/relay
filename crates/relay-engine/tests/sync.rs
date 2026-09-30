@@ -683,7 +683,10 @@ fn hostile_symlink_escape_is_skipped() {
 #[test]
 fn large_batch_converges() {
     let mut h = Harness::pair();
-    let files: Vec<(String, Vec<u8>)> = (0..2500)
+    // Two full index batches plus a partial one, without thousands of fsyncs.
+    h.sa = Syncer::with_index_batch_entries(100);
+    h.sb = Syncer::with_index_batch_entries(100);
+    let files: Vec<(String, Vec<u8>)> = (0..250)
         .map(|i| (format!("f{i:04}.txt"), format!("{i}").into_bytes()))
         .collect();
     let refs: Vec<(&str, &[u8])> = files

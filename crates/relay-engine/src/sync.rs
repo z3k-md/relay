@@ -125,14 +125,34 @@ enum Fetch {
     Failed { not_found: bool },
 }
 
-#[derive(Default)]
 pub struct Syncer {
     connected: HashMap<DeviceId, Connected>,
+    index_batch_entries: usize,
+}
+
+impl Default for Syncer {
+    fn default() -> Self {
+        Self {
+            connected: HashMap::new(),
+            index_batch_entries: INDEX_BATCH_ENTRIES,
+        }
+    }
 }
 
 impl Syncer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Send index batches of at most `n` entries instead of
+    /// `INDEX_BATCH_ENTRIES`, so tests can cover multi-batch exchanges with
+    /// few files.
+    pub fn with_index_batch_entries(n: usize) -> Self {
+        assert!(n > 0, "index batches need at least one entry");
+        Self {
+            index_batch_entries: n,
+            ..Self::default()
+        }
     }
 
     pub fn handle(
@@ -426,16 +446,16 @@ impl Syncer {
             .map(|s| s.name)
             .unwrap_or_else(|| space.to_string());
 
+        let limit = self.index_batch_entries;
         loop {
-            let changes =
-                engine
-                    .db
-                    .repo()
-                    .changes_since_in_space(space, after, INDEX_BATCH_ENTRIES)?;
+            let changes = engine
+                .db
+                .repo()
+                .changes_since_in_space(space, after, limit)?;
             if changes.is_empty() && !force_empty && after.0 >= latest.0 {
                 break;
             }
-            let through = if changes.len() < INDEX_BATCH_ENTRIES {
+            let through = if changes.len() < limit {
                 latest
             } else {
                 changes.last().map(|e| e.sequence).unwrap_or(after)
