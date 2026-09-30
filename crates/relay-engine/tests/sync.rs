@@ -8,7 +8,8 @@ use std::sync::Arc;
 use relay_core::conflict::conflict_path;
 use relay_core::{DeviceId, LogicalPath, ObjectId};
 use relay_engine::{
-    Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent, SyncInput, SyncOutput, Syncer,
+    DeleteHoldDecision, Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent, SyncInput,
+    SyncOutput, Syncer,
 };
 use relay_proto::{IndexBatch, entry_to_wire, frame, space_id_bytes};
 use tempfile::TempDir;
@@ -83,6 +84,7 @@ struct Harness {
     strict: bool,
     /// Objects whose fetches fail (as a transient error) while present here.
     broken_objects: HashSet<ObjectId>,
+    events: Vec<SyncEvent>,
 }
 
 impl Harness {
@@ -110,6 +112,7 @@ impl Harness {
             sb: Syncer::new(),
             strict: true,
             broken_objects: HashSet::new(),
+            events: Vec::new(),
         }
     }
 
@@ -197,22 +200,62 @@ impl Harness {
         self.pump(VecDeque::new(), Some(true));
     }
 
+    fn reconnect(&mut self) {
+        self.disconnect();
+        self.sa = Syncer::new();
+        self.sb = Syncer::new();
+        self.connect();
+        self.push_both();
+    }
+
+    fn received(&self, from_a: bool) -> u64 {
+        let (engine, name) = if from_a {
+            (&self.a, "bravo")
+        } else {
+            (&self.b, "alpha")
+        };
+        engine
+            .status()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.spaces.iter().find(|s| s.space == "Personal"))
+            .map(|s| s.received_seq.0)
+            .unwrap_or(0)
+    }
+
     fn pump(&mut self, mut q: VecDeque<(bool, SyncInput)>, push: Option<bool>) {
         let mut outputs: VecDeque<(bool, SyncOutput)> = VecDeque::new();
         let mut steps = 0;
         if push == Some(true) {
-            collect_push(&mut self.sa, &mut self.a, true, &mut outputs, self.strict);
-            collect_push(&mut self.sb, &mut self.b, false, &mut outputs, self.strict);
+            collect_push(
+                &mut self.sa,
+                &mut self.a,
+                true,
+                &mut outputs,
+                self.strict,
+                &mut self.events,
+            );
+            collect_push(
+                &mut self.sb,
+                &mut self.b,
+                false,
+                &mut outputs,
+                self.strict,
+                &mut self.events,
+            );
         }
         loop {
             steps += 1;
             assert!(steps < 50_000, "sync pump did not go quiet");
             if let Some((to_a, input)) = q.pop_front() {
-                let outs = if to_a {
+                let (outs, ev) = if to_a {
                     take_handle(&mut self.sa, &mut self.a, input, self.strict)
                 } else {
                     take_handle(&mut self.sb, &mut self.b, input, self.strict)
                 };
+                self.events.extend(ev);
                 for o in outs {
                     outputs.push_back((to_a, o));
                 }
@@ -300,11 +343,11 @@ fn take_handle(
     engine: &mut Engine,
     input: SyncInput,
     strict: bool,
-) -> Vec<SyncOutput> {
+) -> (Vec<SyncOutput>, Vec<SyncEvent>) {
     let mut outs = Vec::new();
     let events = syncer.handle(engine, input, &mut |o| outs.push(o)).unwrap();
     assert_no_warnings(&events, strict);
-    outs
+    (outs, events)
 }
 
 fn collect_push(
@@ -313,12 +356,14 @@ fn collect_push(
     _from_a: bool,
     outputs: &mut VecDeque<(bool, SyncOutput)>,
     strict: bool,
+    collected: &mut Vec<SyncEvent>,
 ) {
     let mut outs = Vec::new();
     let events = syncer
         .push_local_changes(engine, &mut |o| outs.push(o))
         .unwrap();
     assert_no_warnings(&events, strict);
+    collected.extend(events);
     for o in outs {
         outputs.push_back((_from_a, o));
     }
@@ -894,4 +939,210 @@ fn git_metadata_conflicts_share_one_device_winner() {
         index_triples(&h.b, "Personal", "code")
     );
     assert_eq!(live_files(h.mount_a.path()), live_files(h.mount_b.path()));
+}
+
+fn forty_files() -> Vec<(String, Vec<u8>)> {
+    (0..40)
+        .map(|i| (format!("f{i:02}.txt"), format!("body-{i}").into_bytes()))
+        .collect()
+}
+
+fn file_pairs(files: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+    files
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect()
+}
+
+fn delete_first_n(root: &Path, n: usize) {
+    for i in 0..n {
+        fs::remove_file(root.join(format!("f{i:02}.txt"))).unwrap();
+    }
+}
+
+fn scan_allow_mass(engine: &mut Engine) {
+    engine
+        .scan(
+            "Personal",
+            "code",
+            ScanOptions {
+                allow_mass_delete: true,
+                ..ScanOptions::default()
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn peer_mass_delete_is_held() {
+    let files = forty_files();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.setup_shared_space(&pairs);
+    assert_eq!(live_files(h.mount_a.path()).len(), 40);
+    assert_eq!(live_files(h.mount_b.path()).len(), 40);
+    let received_before = h.received(false);
+
+    delete_first_n(h.mount_a.path(), 30);
+    scan_allow_mass(&mut h.a);
+    h.events.clear();
+    h.push_both();
+
+    assert_eq!(live_files(h.mount_b.path()).len(), 40);
+    let holds = h.b.delete_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].deletions, 30);
+    assert_eq!(holds[0].live, 40);
+    assert!(holds[0].decision.is_none());
+    assert!(
+        h.events.iter().any(|e| matches!(
+            e,
+            SyncEvent::DeletesHeld {
+                deletions: 30,
+                live: 40,
+                ..
+            }
+        )),
+        "expected DeletesHeld, got {:?}",
+        h.events
+    );
+    assert_eq!(h.received(false), received_before);
+}
+
+#[test]
+fn peer_small_delete_is_applied() {
+    let files = forty_files();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.setup_shared_space(&pairs);
+    delete_first_n(h.mount_a.path(), 3);
+    scan_allow_mass(&mut h.a);
+    h.events.clear();
+    h.push_both();
+
+    assert_eq!(live_files(h.mount_b.path()).len(), 37);
+    assert!(h.b.delete_holds().unwrap().is_empty());
+    assert!(
+        !h.events
+            .iter()
+            .any(|e| matches!(e, SyncEvent::DeletesHeld { .. }))
+    );
+}
+
+#[test]
+fn peer_mass_delete_trips_across_batches() {
+    let files = forty_files();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.sa = Syncer::with_index_batch_entries(10);
+    h.setup_shared_space(&pairs);
+    delete_first_n(h.mount_a.path(), 30);
+    scan_allow_mass(&mut h.a);
+    h.events.clear();
+    h.push_both();
+
+    let holds = h.b.delete_holds().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].deletions, 30);
+    assert_eq!(holds[0].live, 40);
+    assert!(
+        h.events
+            .iter()
+            .any(|e| matches!(e, SyncEvent::DeletesHeld { .. })),
+        "expected DeletesHeld, got {:?}",
+        h.events
+    );
+    let remaining = live_files(h.mount_b.path()).len();
+    assert!(
+        remaining > 10,
+        "later batches must be held, remaining={remaining}"
+    );
+}
+
+#[test]
+fn apply_held_mass_delete_then_clears_hold() {
+    let files = forty_files();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.setup_shared_space(&pairs);
+    delete_first_n(h.mount_a.path(), 30);
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert_eq!(h.b.delete_holds().unwrap().len(), 1);
+    assert_eq!(live_files(h.mount_b.path()).len(), 40);
+
+    let n =
+        h.b.decide_delete_hold("Personal", None, None, DeleteHoldDecision::Apply)
+            .unwrap();
+    assert_eq!(n, 1);
+    h.reconnect();
+    h.push_both();
+
+    assert_eq!(live_files(h.mount_b.path()).len(), 10);
+    assert!(h.b.delete_holds().unwrap().is_empty());
+}
+
+#[test]
+fn restore_held_mass_delete_converges() {
+    let files = forty_files();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.setup_shared_space(&pairs);
+    delete_first_n(h.mount_a.path(), 30);
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert_eq!(live_files(h.mount_b.path()).len(), 40);
+
+    let n =
+        h.b.decide_delete_hold("Personal", None, None, DeleteHoldDecision::Restore)
+            .unwrap();
+    assert_eq!(n, 1);
+    h.reconnect();
+    h.push_both();
+    h.push_both();
+
+    assert_eq!(live_files(h.mount_b.path()).len(), 40);
+    assert_eq!(live_files(h.mount_a.path()).len(), 40);
+    assert_eq!(live_files(h.mount_a.path()), live_files(h.mount_b.path()));
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+    assert!(h.b.delete_holds().unwrap().is_empty());
+}
+
+#[test]
+fn hold_on_one_space_does_not_block_another() {
+    let files = forty_files();
+    let pairs = file_pairs(&files);
+    let mut h = Harness::pair();
+    h.setup_shared_space(&pairs);
+
+    let work_a = tempfile::TempDir::new().unwrap();
+    let work_b = tempfile::TempDir::new().unwrap();
+    h.a.create_space("Work").unwrap();
+    h.a.add_mount("Work", "docs", work_a.path(), &[], &[])
+        .unwrap();
+    write_tree(work_a.path(), &[("note.txt", b"v1")]);
+    h.a.scan("Work", "docs", ScanOptions::default()).unwrap();
+    h.a.share("Work", "bravo").unwrap();
+    h.disconnect();
+    h.connect();
+    h.b.join_space("Work", "alpha").unwrap();
+    h.b.add_mount("Work", "docs", work_b.path(), &[], &[])
+        .unwrap();
+    h.disconnect();
+    h.connect();
+    h.push_both();
+    assert_eq!(fs::read(work_b.path().join("note.txt")).unwrap(), b"v1");
+
+    delete_first_n(h.mount_a.path(), 30);
+    scan_allow_mass(&mut h.a);
+    fs::write(work_a.path().join("note.txt"), b"v2").unwrap();
+    h.a.scan("Work", "docs", ScanOptions::default()).unwrap();
+    h.push_both();
+
+    assert_eq!(h.b.delete_holds().unwrap().len(), 1);
+    assert_eq!(live_files(h.mount_b.path()).len(), 40);
+    assert_eq!(fs::read(work_b.path().join("note.txt")).unwrap(), b"v2");
 }
