@@ -7,11 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use relay_core::{DeviceId, EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
 use relay_daemon::{DaemonEvent, DaemonOptions};
 use relay_engine::{
-    Engine, EngineError, ScanOptions, ScanReport, WatchEvent, WatchOptions, default_home,
+    ConflictClass, ConflictInfo, Engine, EngineError, Resolution, ScanOptions, ScanReport,
+    WatchEvent, WatchOptions, default_home, group_git_conflicts, resolve_conflict,
+    resolve_git_conflicts,
 };
 
 mod output;
@@ -66,10 +68,12 @@ enum Command {
     Share { space: String, peer: String },
     /// Stop sharing a space with a peer
     Unshare { space: String, peer: String },
-    /// List live conflict copies
+    /// List live conflict copies, or resolve them
     Conflicts {
         #[arg(long)]
         space: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<ConflictsCmd>,
     },
     /// Space commands
     Space {
@@ -148,6 +152,31 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConflictsCmd {
+    /// Keep the current file or replace it with the conflict copy
+    Resolve {
+        /// SPACE/MOUNT/conflict-copy-path
+        target: String,
+        #[arg(long, value_enum)]
+        keep: KeepChoice,
+    },
+    /// Delete Git metadata conflict copies under a repository (branches stay)
+    ResolveGit {
+        /// SPACE/MOUNT/path-to-.git
+        target: String,
+        /// Also delete conflicting refs (branches)
+        #[arg(long)]
+        branches: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum KeepChoice {
+    Current,
+    Copy,
 }
 
 #[derive(Subcommand, Debug)]
@@ -291,10 +320,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Conflicts { space } => {
-            let engine = Engine::open_read_only(&home)?;
-            cmd_conflicts(&engine, space.as_deref(), json).map(|()| ExitCode::SUCCESS)
-        }
+        Command::Conflicts { space, cmd } => match cmd {
+            None => {
+                let engine = Engine::open_read_only(&home)?;
+                cmd_conflicts(&engine, space.as_deref(), json).map(|()| ExitCode::SUCCESS)
+            }
+            Some(ConflictsCmd::Resolve { target, keep }) => {
+                cmd_conflicts_resolve(&home, &target, keep, json).map(|()| ExitCode::SUCCESS)
+            }
+            Some(ConflictsCmd::ResolveGit { target, branches }) => {
+                cmd_conflicts_resolve_git(&home, &target, branches, json)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+        },
         Command::Space { cmd } => match cmd {
             SpaceCmd::Create { name } => {
                 let mut engine = Engine::open_for_config(&home)?;
@@ -866,19 +904,190 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
 }
 
 fn cmd_conflicts(engine: &Engine, space: Option<&str>, json: bool) -> Result<()> {
-    let entries = engine.conflicts(space)?;
+    let infos = engine.conflict_infos(space)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
+        let rows: Vec<_> = infos.iter().map(conflict_json).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    if entries.is_empty() {
+    if infos.is_empty() {
         println!("no conflicts");
         return Ok(());
     }
-    for entry in entries {
-        println!("{}", entry.key.path);
+    let names = device_names(engine)?;
+    let git_groups = group_git_conflicts(&infos);
+    for info in &infos {
+        if matches!(info.class, ConflictClass::File { .. }) {
+            println!("{}", info.record.key.path);
+        }
+    }
+    for ((space_name, mount_name, git_dir), copies) in git_groups {
+        print_git_conflict_summary(&space_name, &mount_name, &git_dir, &copies, &names);
     }
     Ok(())
+}
+
+fn cmd_conflicts_resolve(home: &Path, target: &str, keep: KeepChoice, json: bool) -> Result<()> {
+    let parsed = parse_target(target)?;
+    let mount = parsed
+        .mount
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("conflicts resolve requires SPACE/MOUNT/PATH"))?;
+    let path = parsed
+        .path
+        .ok_or_else(|| anyhow::anyhow!("conflicts resolve requires SPACE/MOUNT/PATH"))?;
+    let resolution = match keep {
+        KeepChoice::Current => Resolution::KeepCurrent,
+        KeepChoice::Copy => Resolution::UseCopy,
+    };
+    let report = resolve_conflict(home, &parsed.space, mount, &path, resolution)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        match report.resolution {
+            Resolution::KeepCurrent => {
+                println!(
+                    "kept current {}/{}/{}; deleted {}",
+                    report.space, report.mount, report.original, report.copy
+                );
+            }
+            Resolution::UseCopy => {
+                println!(
+                    "replaced {}/{}/{} with {}; deleted the copy",
+                    report.space, report.mount, report.original, report.copy
+                );
+            }
+        }
+        println!(
+            "previous versions remain in `relay history {}/{}/{}`",
+            report.space, report.mount, report.original
+        );
+        if report.scanned {
+            println!("index updated");
+        } else {
+            println!("a running sync loop will pick up the change");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_conflicts_resolve_git(home: &Path, target: &str, branches: bool, json: bool) -> Result<()> {
+    let parsed = parse_target(target)?;
+    let mount = parsed
+        .mount
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("conflicts resolve-git requires SPACE/MOUNT/PATH"))?;
+    let path = parsed
+        .path
+        .ok_or_else(|| anyhow::anyhow!("conflicts resolve-git requires SPACE/MOUNT/PATH"))?;
+    let report = resolve_git_conflicts(home, &parsed.space, mount, &path, branches)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "cleaned {}/{}/{}: deleted {} copies, kept {} branches",
+            report.space,
+            report.mount,
+            report.git_dir,
+            report.deleted.len(),
+            report.kept.len()
+        );
+        if !branches && !report.kept.is_empty() {
+            println!(
+                "hint: conflicting branches remain for merging in Git; add --branches to delete them"
+            );
+        }
+        println!(
+            "previous versions remain in `relay history {}/{}/<path>`",
+            report.space, report.mount
+        );
+        if report.scanned {
+            println!("index updated");
+        } else {
+            println!("a running sync loop will pick up the change");
+        }
+    }
+    Ok(())
+}
+
+fn device_names(engine: &Engine) -> Result<HashMap<DeviceId, String>> {
+    let mut names = HashMap::new();
+    names.insert(engine.device().id, engine.device().name.clone());
+    for peer in engine.peers()? {
+        names.insert(peer.id, peer.name);
+    }
+    Ok(names)
+}
+
+fn print_git_conflict_summary(
+    space: &str,
+    mount: &str,
+    git_dir: &LogicalPath,
+    copies: &[&ConflictInfo],
+    names: &HashMap<DeviceId, String>,
+) {
+    let mut branches = Vec::new();
+    let mut metadata = 0usize;
+    let mut from: Vec<String> = Vec::new();
+    for copy in copies {
+        let label = names
+            .get(&copy.record.modified_by)
+            .cloned()
+            .unwrap_or_else(|| copy.record.modified_by.short());
+        if !from.contains(&label) {
+            from.push(label);
+        }
+        match &copy.class {
+            ConflictClass::Git { is_ref: true, .. } => {
+                let shown = copy
+                    .record
+                    .key
+                    .path
+                    .as_str()
+                    .strip_prefix(git_dir.as_str())
+                    .and_then(|s| s.strip_prefix('/'))
+                    .unwrap_or(copy.record.key.path.as_str());
+                branches.push(shown.to_owned());
+            }
+            _ => metadata += 1,
+        }
+    }
+    let branch_bit = match branches.len() {
+        0 => "0 branches".to_owned(),
+        1 => format!("1 branch ({})", branches[0]),
+        n => format!("{n} branches ({})", branches.join(", ")),
+    };
+    let meta_bit = if metadata == 1 {
+        "1 metadata copy".to_owned()
+    } else {
+        format!("{metadata} metadata copies")
+    };
+    let from_bit = if from.is_empty() {
+        String::new()
+    } else {
+        format!(" (from {})", from.join(", "))
+    };
+    println!("{space}/{mount}: {git_dir} — {branch_bit}, {meta_bit}{from_bit}");
+    println!("  hint: relay conflicts resolve-git {space}/{mount}/{git_dir}");
+    println!("        (add --branches to also delete conflicting branches)");
+}
+
+#[derive(serde::Serialize)]
+struct ConflictJson {
+    #[serde(flatten)]
+    record: EntryRecord,
+    classification: ConflictClass,
+    space: String,
+    mount: String,
+}
+
+fn conflict_json(info: &ConflictInfo) -> ConflictJson {
+    ConflictJson {
+        record: info.record.clone(),
+        classification: info.class.clone(),
+        space: info.space.clone(),
+        mount: info.mount.clone(),
+    }
 }
 
 fn cmd_status(engine: &Engine, json: bool) -> Result<()> {

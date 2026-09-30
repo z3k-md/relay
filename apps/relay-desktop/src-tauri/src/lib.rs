@@ -53,6 +53,8 @@ pub fn run() {
             commands::list_offers,
             commands::join_space,
             commands::list_conflicts,
+            commands::resolve_conflict,
+            commands::resolve_git_conflicts,
             commands::get_activity,
             commands::pause_sync,
             commands::resume_sync,

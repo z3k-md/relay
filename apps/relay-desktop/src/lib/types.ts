@@ -48,6 +48,10 @@ export interface OfferView {
   mounts: { name: string }[];
 }
 
+export type ConflictClass =
+  | { kind: "file"; original: string }
+  | { kind: "git"; gitDir: string; isRef: boolean };
+
 export interface ConflictView {
   path: string;
   space: string;
@@ -55,6 +59,25 @@ export interface ConflictView {
   deviceId: string;
   deviceShort: string;
   deviceName: string | null;
+  class: ConflictClass;
+}
+
+export interface ResolveReport {
+  space: string;
+  mount: string;
+  copy: string;
+  original: string;
+  resolution: string;
+  scanned: boolean;
+}
+
+export interface GitResolveReport {
+  space: string;
+  mount: string;
+  gitDir: string;
+  deleted: string[];
+  kept: string[];
+  scanned: boolean;
 }
 
 export interface ActivityItem {

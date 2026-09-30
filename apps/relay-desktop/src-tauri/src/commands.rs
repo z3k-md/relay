@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use relay_core::DeviceId;
-use relay_engine::{Engine, EngineError};
+use relay_engine::{
+    ConflictClass, Engine, EngineError, Resolution, resolve_conflict as engine_resolve_conflict,
+    resolve_git_conflicts as engine_resolve_git,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt;
@@ -73,6 +76,13 @@ pub struct OfferView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ConflictClassView {
+    File { original: String },
+    Git { git_dir: String, is_ref: bool },
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConflictView {
     pub path: String,
@@ -81,6 +91,29 @@ pub struct ConflictView {
     pub device_id: String,
     pub device_short: String,
     pub device_name: Option<String>,
+    pub class: ConflictClassView,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveReportView {
+    pub space: String,
+    pub mount: String,
+    pub copy: String,
+    pub original: String,
+    pub resolution: String,
+    pub scanned: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitResolveReportView {
+    pub space: String,
+    pub mount: String,
+    pub git_dir: String,
+    pub deleted: Vec<String>,
+    pub kept: Vec<String>,
+    pub scanned: bool,
 }
 
 pub fn version_string() -> String {
@@ -397,26 +430,93 @@ pub fn list_conflicts(app: AppHandle) -> Result<Vec<ConflictView>, String> {
         .collect();
     names.insert(local.id.to_string(), local.name.clone());
 
-    let conflicts = engine.conflicts(None).map_err(|err| error_chain(&err))?;
+    let conflicts = engine
+        .conflict_infos(None)
+        .map_err(|err| error_chain(&err))?;
     Ok(conflicts
         .into_iter()
-        .map(|entry| {
+        .map(|info| {
             let (space, mount) = listed
                 .iter()
-                .find(|(_, cfg)| cfg.mount.id == entry.key.mount)
+                .find(|(_, cfg)| cfg.mount.id == info.record.key.mount)
                 .map(|(s, cfg)| (s.name.clone(), cfg.mount.name.clone()))
-                .unwrap_or_else(|| ("?".to_owned(), "?".to_owned()));
-            let device_id = entry.modified_by.to_string();
+                .unwrap_or_else(|| (info.space.clone(), info.mount.clone()));
+            let device_id = info.record.modified_by.to_string();
             ConflictView {
-                path: entry.key.path.to_string(),
+                path: info.record.key.path.to_string(),
                 space,
                 mount,
-                device_short: entry.modified_by.short(),
+                device_short: info.record.modified_by.short(),
                 device_name: names.get(&device_id).cloned(),
                 device_id,
+                class: match info.class {
+                    ConflictClass::File { original } => ConflictClassView::File {
+                        original: original.to_string(),
+                    },
+                    ConflictClass::Git { git_dir, is_ref } => ConflictClassView::Git {
+                        git_dir: git_dir.to_string(),
+                        is_ref,
+                    },
+                },
             }
         })
         .collect())
+}
+
+#[tauri::command]
+pub fn resolve_conflict(
+    app: AppHandle,
+    space: String,
+    mount: String,
+    copy_path: String,
+    keep: String,
+) -> Result<ResolveReportView, String> {
+    let state = app.state::<AppState>();
+    let path = copy_path
+        .parse()
+        .map_err(|err: relay_core::CoreError| error_chain(&err))?;
+    let resolution = match keep.as_str() {
+        "current" => Resolution::KeepCurrent,
+        "copy" => Resolution::UseCopy,
+        other => return Err(format!("keep must be current or copy, not {other:?}")),
+    };
+    let report = engine_resolve_conflict(&state.home, &space, &mount, &path, resolution)
+        .map_err(|err| error_chain(&err))?;
+    Ok(ResolveReportView {
+        space: report.space,
+        mount: report.mount,
+        copy: report.copy.to_string(),
+        original: report.original.to_string(),
+        resolution: match report.resolution {
+            Resolution::KeepCurrent => "current".into(),
+            Resolution::UseCopy => "copy".into(),
+        },
+        scanned: report.scanned,
+    })
+}
+
+#[tauri::command]
+pub fn resolve_git_conflicts(
+    app: AppHandle,
+    space: String,
+    mount: String,
+    git_dir: String,
+    include_branches: bool,
+) -> Result<GitResolveReportView, String> {
+    let state = app.state::<AppState>();
+    let path = git_dir
+        .parse()
+        .map_err(|err: relay_core::CoreError| error_chain(&err))?;
+    let report = engine_resolve_git(&state.home, &space, &mount, &path, include_branches)
+        .map_err(|err| error_chain(&err))?;
+    Ok(GitResolveReportView {
+        space: report.space,
+        mount: report.mount,
+        git_dir: report.git_dir.to_string(),
+        deleted: report.deleted.iter().map(ToString::to_string).collect(),
+        kept: report.kept.iter().map(ToString::to_string).collect(),
+        scanned: report.scanned,
+    })
 }
 
 #[tauri::command]

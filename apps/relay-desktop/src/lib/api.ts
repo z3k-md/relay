@@ -4,10 +4,12 @@ import type {
   CliInstallResult,
   CliStatus,
   ConflictView,
+  GitResolveReport,
   MountView,
   OfferView,
   Overview,
   PeerView,
+  ResolveReport,
   RunnerState,
   Settings,
   SpaceView,
@@ -49,6 +51,25 @@ export const api = {
   joinSpace: (space: string, fromPeer: string) =>
     call<SpaceView>("join_space", { space, fromPeer }),
   listConflicts: () => call<ConflictView[]>("list_conflicts"),
+  resolveConflict: (
+    space: string,
+    mount: string,
+    copyPath: string,
+    keep: "current" | "copy",
+  ) =>
+    call<ResolveReport>("resolve_conflict", { space, mount, copyPath, keep }),
+  resolveGitConflicts: (
+    space: string,
+    mount: string,
+    gitDir: string,
+    includeBranches: boolean,
+  ) =>
+    call<GitResolveReport>("resolve_git_conflicts", {
+      space,
+      mount,
+      gitDir,
+      includeBranches,
+    }),
   getActivity: () => call<ActivityItem[]>("get_activity"),
   pauseSync: () => call<RunnerState>("pause_sync"),
   resumeSync: () => call<RunnerState>("resume_sync"),
