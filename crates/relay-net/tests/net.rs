@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rand::RngCore;
-use relay_core::{DeviceId, ObjectId};
+use relay_core::{DeviceId, ObjectId, PairingCode};
 use relay_crypto::DeviceIdentity;
 use relay_net::{NetCommand, NetConfig, NetEvent, NetHandle, PeerConfig, start};
 use relay_proto::{Ack, frame};
@@ -393,6 +393,155 @@ fn reconnects_after_peer_restart() {
 
     wait_connected(&mut alice.events, bob_id, "bob");
     wait_connected(&mut bob.events, alice_id, "alice");
+}
+
+fn wait_paired(events: &mut Events, peer: DeviceId) -> (String, Vec<String>, bool) {
+    events.wait_match(TIMEOUT, |ev| match ev {
+        NetEvent::Paired {
+            peer: p,
+            name,
+            addresses,
+            initiator,
+        } if *p == peer => Some((name.clone(), addresses.clone(), *initiator)),
+        _ => None,
+    })
+}
+
+fn wait_pair_failed(events: &mut Events) -> String {
+    events.wait_match(TIMEOUT, |ev| match ev {
+        NetEvent::PairFailed { reason } => Some(reason.clone()),
+        _ => None,
+    })
+}
+
+fn pair_code_with_same_nameplate(code: &PairingCode) -> String {
+    let mut digits = code.digits().to_owned();
+    let last = digits.pop().unwrap();
+    digits.push(if last == '0' { '1' } else { '0' });
+    digits
+}
+
+#[test]
+fn pairing_correct_code_exchanges_ids_and_addresses() {
+    let mut alice = spawn("alice", vec![]);
+    let mut bob = spawn("bob", vec![]);
+    let alice_id = alice.id;
+    let bob_id = bob.id;
+    let alice_addr = alice.handle.local_addr().to_string();
+    let code = PairingCode::generate();
+
+    alice.handle.send(NetCommand::PairStart {
+        code: code.digits().to_owned(),
+        expires_at: SystemTime::now() + Duration::from_secs(60),
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    bob.handle.send(NetCommand::PairJoin {
+        code: code.digits().to_owned(),
+        addr: Some(alice_addr),
+    });
+
+    let (bob_name, bob_addrs, alice_init) = wait_paired(&mut alice.events, bob_id);
+    let (alice_name, alice_addrs, bob_init) = wait_paired(&mut bob.events, alice_id);
+    assert!(alice_init);
+    assert!(!bob_init);
+    assert_eq!(bob_name, "bob");
+    assert_eq!(alice_name, "alice");
+    assert!(
+        bob_addrs
+            .iter()
+            .any(|a| a.contains(&bob.handle.local_addr().port().to_string())
+                || a.contains("127.0.0.1")),
+        "bob addrs: {bob_addrs:?}"
+    );
+    assert!(
+        alice_addrs
+            .iter()
+            .any(|a| a.contains("127.0.0.1")
+                || a.contains(&alice.handle.local_addr().ip().to_string())),
+        "alice addrs: {alice_addrs:?}"
+    );
+}
+
+#[test]
+fn pairing_wrong_code_aborts_session() {
+    let mut alice = spawn("alice", vec![]);
+    let mut bob = spawn("bob", vec![]);
+    let alice_addr = alice.handle.local_addr().to_string();
+    let code = PairingCode::generate();
+    let wrong = pair_code_with_same_nameplate(&code);
+
+    alice.handle.send(NetCommand::PairStart {
+        code: code.digits().to_owned(),
+        expires_at: SystemTime::now() + Duration::from_secs(60),
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    bob.handle.send(NetCommand::PairJoin {
+        code: wrong,
+        addr: Some(alice_addr.clone()),
+    });
+
+    let reason = wait_pair_failed(&mut bob.events);
+    assert!(
+        reason.contains("confirm") || reason.contains("pairing"),
+        "{reason}"
+    );
+    let _ = wait_pair_failed(&mut alice.events);
+
+    bob.handle.send(NetCommand::PairJoin {
+        code: code.digits().to_owned(),
+        addr: Some(alice_addr),
+    });
+    let again = wait_pair_failed(&mut bob.events);
+    assert!(
+        !again.is_empty(),
+        "correct retry after a failed attempt must fail: {again}"
+    );
+    alice.events.collect_for(Duration::from_millis(400));
+    assert!(
+        !alice
+            .events
+            .got
+            .iter()
+            .any(|e| matches!(e, NetEvent::Paired { .. })),
+        "initiator must not pair after a failed attempt: {:#?}",
+        alice.events.got
+    );
+}
+
+#[test]
+fn pairing_expired_session_is_rejected() {
+    let mut alice = spawn("alice", vec![]);
+    let mut bob = spawn("bob", vec![]);
+    let alice_addr = alice.handle.local_addr().to_string();
+    let code = PairingCode::generate();
+
+    alice.handle.send(NetCommand::PairStart {
+        code: code.digits().to_owned(),
+        expires_at: SystemTime::now() - Duration::from_secs(1),
+    });
+    let _ = wait_pair_failed(&mut alice.events);
+
+    bob.handle.send(NetCommand::PairJoin {
+        code: code.digits().to_owned(),
+        addr: Some(alice_addr),
+    });
+    let reason = wait_pair_failed(&mut bob.events);
+    assert!(!reason.is_empty(), "{reason}");
+}
+
+#[test]
+fn pairing_alpn_without_session_is_closed() {
+    let alice = spawn("alice", vec![]);
+    let mut bob = spawn("bob", vec![]);
+    let alice_addr = alice.handle.local_addr().to_string();
+    let code = PairingCode::generate();
+
+    bob.handle.send(NetCommand::PairJoin {
+        code: code.digits().to_owned(),
+        addr: Some(alice_addr),
+    });
+    let reason = wait_pair_failed(&mut bob.events);
+    assert!(!reason.is_empty(), "{reason}");
 }
 
 #[test]

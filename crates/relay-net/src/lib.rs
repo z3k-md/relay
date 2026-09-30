@@ -8,8 +8,11 @@
 //! Bind failures are returned from [`start`]. If the accept loop dies later,
 //! [`NetEvent::ListenFailed`] is emitted.
 
+mod addr;
+mod discovery;
 mod error;
 mod io;
+mod pairing;
 mod session;
 mod tls;
 
@@ -19,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use relay_core::{DeviceId, ObjectId};
 use relay_crypto::DeviceIdentity;
@@ -88,6 +91,20 @@ pub enum NetEvent {
     ListenFailed {
         error: String,
     },
+    Paired {
+        peer: DeviceId,
+        name: String,
+        addresses: Vec<String>,
+        initiator: bool,
+    },
+    PairFailed {
+        reason: String,
+    },
+    /// Merged address list for an already-trusted peer (LAN discovery).
+    PeerAddresses {
+        peer: DeviceId,
+        addresses: Vec<String>,
+    },
 }
 
 /// Commands sent from the engine (or tests) into the network thread.
@@ -104,6 +121,17 @@ pub enum NetCommand {
     },
     /// Replace the trusted set live; disconnect removed peers.
     SetPeers(Vec<PeerConfig>),
+    /// Begin listening for one pairing attempt (initiator).
+    PairStart {
+        code: String,
+        expires_at: SystemTime,
+    },
+    /// Dial the initiator (joiner). Without `addr`, use the mDNS nameplate.
+    PairJoin {
+        code: String,
+        addr: Option<String>,
+    },
+    PairCancel,
     Shutdown,
 }
 
@@ -170,7 +198,7 @@ pub fn start(
     let trusted = Arc::new(RwLock::new(
         config.peers.into_iter().map(|p| (p.id, p)).collect(),
     ));
-    let server = make_server_config(&tls, trusted.clone())?;
+    let server = make_server_config(&tls)?;
 
     let inner = Arc::new(Inner {
         our_id: config.identity.device_id(),
@@ -184,6 +212,10 @@ pub fn start(
         shutting_down: AtomicBool::new(false),
         tls,
         identity: config.identity,
+        listen_port: local_addr.port(),
+        pairing: Mutex::new(None),
+        pairing_ads: Mutex::new(HashMap::new()),
+        discovery: Mutex::new(None),
     });
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -246,6 +278,9 @@ async fn run(
 ) {
     let mut dialers = HashMap::new();
     spawn_dialers(&inner, &endpoint, &mut dialers);
+    if let Some(discovery) = discovery::start(&inner, inner.listen_port) {
+        *inner.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(discovery);
+    }
 
     loop {
         tokio::select! {
@@ -260,6 +295,13 @@ async fn run(
                         apply_set_peers(&inner, peers);
                         spawn_dialers(&inner, &endpoint, &mut dialers);
                     }
+                    Some(NetCommand::PairStart { code, expires_at }) => {
+                        pairing::start_session(&inner, code, expires_at);
+                    }
+                    Some(NetCommand::PairJoin { code, addr }) => {
+                        tokio::spawn(pairing::join(inner.clone(), endpoint.clone(), code, addr));
+                    }
+                    Some(NetCommand::PairCancel) => pairing::cancel_session(&inner),
                 }
             }
             incoming = endpoint.accept() => {
@@ -276,7 +318,7 @@ async fn run(
                         let inner = inner.clone();
                         tokio::spawn(async move {
                             match incoming.await {
-                                Ok(conn) => drive_connection(inner, conn, false).await,
+                                Ok(conn) => handle_incoming(inner, conn).await,
                                 Err(e) => {
                                     tracing::warn!(error = %e, "incoming handshake failed");
                                 }
@@ -292,11 +334,28 @@ async fn run(
         .shutting_down
         .store(true, std::sync::atomic::Ordering::Relaxed);
     inner.shutdown.notify_waiters();
+    if let Some(discovery) = inner
+        .discovery
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        discovery.shutdown();
+    }
     for (_, handle) in dialers.drain() {
         handle.abort();
     }
     endpoint.close(close_code(CLOSE_SHUTDOWN), b"shutdown");
     let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+}
+
+async fn handle_incoming(inner: Arc<Inner>, conn: quinn::Connection) {
+    let alpn = pairing::negotiated_alpn(&conn);
+    if alpn.as_deref() == Some(relay_proto::PAIR_ALPN) {
+        pairing::accept_incoming(inner, conn).await;
+        return;
+    }
+    drive_connection(inner, conn, false).await;
 }
 
 fn handle_send(inner: &Inner, peer: DeviceId, body: relay_proto::frame::Body) {

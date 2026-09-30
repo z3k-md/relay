@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::discovery::{Discovery, PairingAd};
+use crate::pairing::PairSession;
+
 use quinn::{Connection, RecvStream, SendStream, VarInt};
 use relay_core::{DeviceId, ObjectId};
 use relay_crypto::{DeviceIdentity, device_id_from_certificate};
@@ -50,6 +53,10 @@ pub(crate) struct Inner {
     /// Held so the identity outlives the runtime thread.
     #[allow(dead_code)]
     pub identity: Arc<DeviceIdentity>,
+    pub listen_port: u16,
+    pub pairing: Mutex<Option<PairSession>>,
+    pub pairing_ads: Mutex<HashMap<String, PairingAd>>,
+    pub discovery: Mutex<Option<Discovery>>,
 }
 
 type EstablishedSession = (
@@ -202,6 +209,13 @@ impl Inner {
         }
     }
 
+    pub(crate) fn refresh_pair_txt(&self, nameplate: Option<&str>) {
+        let discovery = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(discovery) = discovery.as_ref() {
+            discovery.set_pair_nameplate(nameplate, self, self.listen_port);
+        }
+    }
+
     pub(crate) fn close_peer(&self, id: DeviceId, reason: &str) {
         let conn = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -234,7 +248,7 @@ async fn wait_until_free(inner: &Inner, peer: DeviceId) {
     }
 }
 
-fn peer_device_id(conn: &Connection) -> Result<DeviceId, String> {
+pub(crate) fn peer_device_id(conn: &Connection) -> Result<DeviceId, String> {
     let ident = conn
         .peer_identity()
         .ok_or_else(|| "no peer identity after handshake".to_owned())?;
@@ -257,6 +271,9 @@ pub(crate) async fn drive_connection(inner: Arc<Inner>, conn: Connection, we_dia
         }
     };
 
+    // Trust is enforced here, after ALPN is known. The TLS verifier accepts
+    // any Relay device cert so pairing can complete; sync data must never
+    // flow to an untrusted peer. Checked before any stream is accepted.
     if !inner.is_trusted(&peer_id) {
         tracing::warn!(peer = %peer_id, "peer is not in the trusted set after handshake");
         conn.close(close_code(CLOSE_UNTRUSTED), b"untrusted peer");

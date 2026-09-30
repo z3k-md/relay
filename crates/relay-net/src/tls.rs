@@ -90,13 +90,12 @@ fn reject_untrusted(id: DeviceId, reason: &str) -> TlsError {
     TlsError::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)
 }
 
-/// Mandatory client-auth verifier: accept only the current trusted peer set.
+/// Accept any well-formed Relay device certificate. Trust is enforced after
+/// the handshake, once ALPN is visible (`relay/1` vs `relay-pair/1`).
 #[derive(Debug)]
-struct TrustedClientVerifier {
-    trusted: Arc<RwLock<HashMap<DeviceId, PeerConfig>>>,
-}
+struct AnyRelayClientVerifier;
 
-impl ClientCertVerifier for TrustedClientVerifier {
+impl ClientCertVerifier for AnyRelayClientVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
     }
@@ -107,14 +106,7 @@ impl ClientCertVerifier for TrustedClientVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
-        let id = device_id_or_bad_encoding(end_entity.as_ref(), "client")?;
-        let trusted = self.trusted.read().unwrap_or_else(|e| e.into_inner());
-        if !trusted.contains_key(&id) {
-            return Err(reject_untrusted(
-                id,
-                "client certificate is not in the trusted set",
-            ));
-        }
+        device_id_or_bad_encoding(end_entity.as_ref(), "client")?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -201,22 +193,61 @@ impl ServerCertVerifier for PinnedServerVerifier {
     }
 }
 
+/// Pairing dialer: accept any well-formed Relay device certificate.
+#[derive(Debug)]
+struct AnyRelayServerVerifier;
+
+impl ServerCertVerifier for AnyRelayServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        device_id_or_bad_encoding(end_entity.as_ref(), "server")?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        reject_tls12()
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        supported_schemes()
+    }
+}
+
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
 pub(crate) fn make_server_config(
     materials: &TlsMaterials,
-    trusted: Arc<RwLock<HashMap<DeviceId, PeerConfig>>>,
 ) -> Result<quinn::ServerConfig, NetError> {
-    let verifier = Arc::new(TrustedClientVerifier { trusted });
+    let verifier = Arc::new(AnyRelayClientVerifier);
     let mut rustls_cfg = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| NetError::Tls(e.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_single_cert(materials.cert_chain(), materials.key())
         .map_err(|e| NetError::Tls(e.to_string()))?;
-    rustls_cfg.alpn_protocols = vec![relay_proto::ALPN.to_vec()];
+    rustls_cfg.alpn_protocols = vec![relay_proto::ALPN.to_vec(), relay_proto::PAIR_ALPN.to_vec()];
 
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
@@ -243,6 +274,27 @@ pub(crate) fn make_client_config(
         .with_client_auth_cert(materials.cert_chain(), materials.key())
         .map_err(|e| NetError::Tls(e.to_string()))?;
     rustls_cfg.alpn_protocols = vec![relay_proto::ALPN.to_vec()];
+
+    let mut client = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+            .map_err(|e| NetError::Tls(e.to_string()))?,
+    ));
+    client.transport_config(transport_config());
+    Ok(client)
+}
+
+pub(crate) fn make_pairing_client_config(
+    materials: &TlsMaterials,
+) -> Result<quinn::ClientConfig, NetError> {
+    let verifier = Arc::new(AnyRelayServerVerifier);
+    let mut rustls_cfg = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| NetError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(materials.cert_chain(), materials.key())
+        .map_err(|e| NetError::Tls(e.to_string()))?;
+    rustls_cfg.alpn_protocols = vec![relay_proto::PAIR_ALPN.to_vec()];
 
     let mut client = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
