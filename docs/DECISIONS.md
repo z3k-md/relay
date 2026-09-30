@@ -471,10 +471,8 @@ out of scope.
   `$TMPDIR/relay-<16 hex chars of blake3(canonicalized home)>.sock`. After
   bind, the file mode is set to `0600`. A stale socket file is removed only
   by the process that already holds the host lock. Windows: a namespaced
-  named pipe `relay-<same 16 hex>`. `interprocess` 2.x does not expose a
-  safe per-user DACL builder under this workspace's `unsafe_code = forbid`,
-  so the pipe inherits the default local-user ACL; that is the documented
-  limit, not a second trust domain.
+  named pipe `relay-<same 16 hex>` with the default pipe security (see
+  Security).
 - **Endpoint naming.** The 16-hex token is the first 8 bytes of
   BLAKE3(canonicalized home path). Clients and the server derive the same
   name from `--home`.
@@ -503,9 +501,15 @@ out of scope.
   for IPC resume, a flag clear from another process (polled about once a
   second), or `stop`. Desktop Pause/Resume write the same flag; the old
   Tauri `settings.json` `paused` key is migrated once and then abandoned.
-- **Security.** Same OS user as the host. Unix socket `0600`; Windows named
-  pipe uses the default current-user ACL. No tokens, no cross-user access.
+- **Security.** Same OS user as the host, no tokens. Unix: socket `0600`.
+  Windows: `interprocess` 2.x has no safe DACL builder and the workspace
+  forbids `unsafe`, so the pipe keeps the default DACL: full control for
+  the creator, SYSTEM and Administrators, read-only for Everyone. A
+  read-only handle cannot send a request and every client gets its own
+  pipe instance, so other users cannot issue commands or read responses.
+  While no host runs, another local user could create the pipe name first
+  and answer the CLI; acceptable for a single-user machine.
 - **Known limits.** One host per home. The desktop app hosts IPC itself; it
   does not yet attach as a client of a `relay service` runner. Windows pipe
-  ACLs cannot be tightened further without `unsafe`. Subscribe is
+  security is the default (see Security). Subscribe is
   firehose-from-now; a client that needs history calls `activity` first.

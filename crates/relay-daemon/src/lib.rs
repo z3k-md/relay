@@ -73,6 +73,10 @@ pub fn run(
     ipc_stop.store(true, Ordering::SeqCst);
     let _ = Client::connect(home);
     let _ = ipc_thread.join();
+    // Subscriber threads block on their channel; dropping the senders ends them.
+    if let Ok(mut subs) = host.subscribers.lock() {
+        subs.clear();
+    }
     result
 }
 
