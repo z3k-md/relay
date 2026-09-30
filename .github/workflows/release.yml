@@ -104,6 +104,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: apps/relay-desktop/package.json
+
       - name: Bump version and push
         id: bump
         env:
@@ -119,7 +124,7 @@ jobs:
 
           conf="apps/relay-desktop/src-tauri/tauri.conf.json"
           read_ver() {
-            node -e "const j=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); if (typeof j.version !== 'string' || !j.version) { console.error('missing top-level version'); process.exit(1); } console.log(j.version);" "$1"
+            bun -e "const j=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); if (typeof j.version !== 'string' || !j.version) { console.error('missing top-level version'); process.exit(1); } console.log(j.version);" "$1"
           }
           current=$(read_ver "$conf")
 
@@ -240,12 +245,10 @@ jobs:
         with:
           ref: ${{ needs.create.outputs.sha }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/relay-desktop/package-lock.json
+          bun-version-file: apps/relay-desktop/package.json
 
       - name: Add Rust targets
         run: rustup target add ${{ matrix.rust_targets }}
@@ -261,7 +264,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: apps/relay-desktop
-        run: npm ci
+        run: bun install --frozen-lockfile
 
       - name: Build CLI sidecar
         run: bash apps/relay-desktop/scripts/prepare-sidecar.sh "${{ matrix.sidecar_target }}"

@@ -295,7 +295,7 @@ so terminal workflows keep working.
 Releases are produced by GitHub Actions only when the release workflow is
 dispatched (`.github/workflows/release.yml`). A normal push does not
 publish a version. The workflow bumps `[workspace.package] version` (patch
-by default), the Tauri and npm `"version"` fields, commits, and builds.
+by default), the Tauri and package.json `"version"` fields, commits, and builds.
 macOS is a universal (`aarch64` + `x86_64`)
 ad-hoc-signed `.dmg` (no notarization yet). Windows is a per-user NSIS
 installer (no admin). Linux desktop builds are not shipped; headless

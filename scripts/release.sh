@@ -157,7 +157,7 @@ next_version() {
 set_json_version() {
     file=$1
     ver=$2
-    node -e '
+    bun -e '
         const fs = require("fs");
         const file = process.argv[1];
         const ver = process.argv[2];

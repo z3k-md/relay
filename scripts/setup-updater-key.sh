@@ -6,7 +6,7 @@
 #   ./scripts/setup-updater-key.sh --no-password
 #   ./scripts/setup-updater-key.sh --release-repo owner/name
 #
-# The CLI has no --no-password flag (`npx @tauri-apps/cli signer generate
+# The CLI has no --no-password flag (`bunx @tauri-apps/cli signer generate
 # --help`): we pass --ci -p "" ourselves. Env overrides for tests:
 #   RELAY_TAURI_CONF  path to tauri.conf.json
 #   RELAY_UPDATER_KEY path to the private key file
@@ -113,8 +113,7 @@ if [ -e "$KEY" ] || [ -e "${KEY}.pub" ]; then
     die "refusing to overwrite existing key at $KEY (delete it yourself if you really want a new one)"
 fi
 
-command -v npx >/dev/null 2>&1 || die "npx not found; install Node.js 22+"
-command -v node >/dev/null 2>&1 || die "node not found; install Node.js 22+"
+command -v bun >/dev/null 2>&1 || die "bun not found; install Bun"
 
 if [ "$NO_PASSWORD" = 1 ]; then
     PASSWORD=""
@@ -133,9 +132,9 @@ fi
 mkdir -p "$(dirname "$KEY")"
 
 echo "==> Generating updater key at $KEY"
-# Current flags (npx @tauri-apps/cli signer generate --help):
+# Current flags (bunx @tauri-apps/cli signer generate --help):
 #   -w path, -p password, --ci (skip prompts), -f force (we never pass -f).
-npx --yes @tauri-apps/cli signer generate -w "$KEY" --ci -p "$PASSWORD"
+bunx @tauri-apps/cli signer generate -w "$KEY" --ci -p "$PASSWORD"
 
 if [ ! -f "${KEY}.pub" ]; then
     die "expected public key at ${KEY}.pub"
@@ -147,7 +146,7 @@ if [ -z "$ENDPOINT_REPO" ]; then
 fi
 
 echo "==> Writing public key into $CONF"
-node -e '
+bun -e '
     const fs = require("fs");
     const confPath = process.argv[1];
     const pubPath = process.argv[2];

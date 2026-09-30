@@ -5,9 +5,9 @@
   "version": "0.1.6",
   "identifier": "dev.relay.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "bun run frontend",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "bun run frontend:build",
     "frontendDist": "../dist"
   },
   "app": {

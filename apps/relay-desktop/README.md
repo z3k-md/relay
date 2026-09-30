@@ -9,26 +9,16 @@ Closing the window hides Relay in the tray. Quit from the tray menu to stop sync
 From this directory:
 
 ```bash
-# once per machine / after changing the CLI
-bash scripts/prepare-sidecar.sh
-
-npm install
-npm run tauri dev
+bun install          # once
+bun run dev          # this checkout, hot reload, same home as the installed app
 ```
 
-`prepare-sidecar.sh` builds `relay-cli` in release mode and copies it to `src-tauri/binaries/relay-<target-triple>` so Tauri can bundle it as `binaries/relay`. Pass a target triple to cross-build; `universal-apple-darwin` builds both Apple architectures and `lipo`s them.
-
-The frontend type-check + Vite build (no Rust) is:
-
-```bash
-npm run build
-```
+Quit the installed Relay from the tray first. `dev` rebuilds the `relay` CLI sidecar, then starts the app. Cargo skips that rebuild when the CLI has not changed.
 
 ## Package
 
 ```bash
-bash scripts/prepare-sidecar.sh
-npm run tauri build
+bun run build
 ```
 
 macOS produces `.app` / `.dmg` (ad-hoc signed). Windows produces a per-user NSIS installer (no admin). The app binary is `relay-desktop` so it does not collide with the bundled `relay.exe` sidecar on Windows.
@@ -50,9 +40,9 @@ The Android app is the same Vue UI and in-process engine. It does not ship the t
 One-time setup: Android SDK, NDK 29 (`ndk;29.0.13846066`, the version Tauri CLI 2.12 asks for), and JDK 17+. From this directory, with `ANDROID_HOME` and `NDK_HOME` set:
 
 ```bash
-npm install
-npm run tauri android init
-npm run tauri android build -- --apk --target aarch64
+bun install
+bun run tauri android init
+bun run tauri android build -- --apk --target aarch64
 ```
 
 `android init` writes `src-tauri/gen/android`. The debug APK is under `src-tauri/gen/android/app/build/outputs/apk/`. iOS is not set up.

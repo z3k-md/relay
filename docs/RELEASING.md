@@ -22,7 +22,7 @@ Until the GitHub repo exists, URLs below use the placeholder **OWNER/REPO**.
    Releases (the updater downloads `latest.json` and the installers; that URL
    must be publicly reachable). Note its `owner/name`.
 
-2. **Generate the updater signing key** on a trusted machine (Node 22+):
+2. **Generate the updater signing key** on a trusted machine (Bun):
 
    ```bash
    ./scripts/setup-updater-key.sh

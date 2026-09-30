@@ -90,20 +90,18 @@ jobs:
         if: matrix.lint
         run: cargo clippy --workspace --exclude relay-desktop --all-targets --locked -- -D warnings
 
-      - name: Setup Node.js
+      - name: Setup Bun
         if: matrix.lint
-        uses: actions/setup-node@v5
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/relay-desktop/package-lock.json
+          bun-version-file: apps/relay-desktop/package.json
 
       - name: Typecheck and build desktop frontend
         if: matrix.lint
         working-directory: apps/relay-desktop
         run: |
-          npm ci
-          npm run build
+          bun install --frozen-lockfile
+          bun run frontend:build
 
       - name: Placeholder frontend and sidecar for tauri-build
         if: matrix.desktop
