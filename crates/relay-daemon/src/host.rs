@@ -277,12 +277,6 @@ impl Handler for Host {
             "pause" => {
                 set_paused_flag(&self.home, true)?;
                 self.set_state(HostState::Paused, None);
-                self.push_activity(ActivityItem {
-                    at_ms: now_ms(),
-                    kind: "paused".into(),
-                    summary: "paused".into(),
-                    detail: None,
-                });
                 serde_json::to_value(self.snapshot()).map_err(internal)
             }
             "resume" => {

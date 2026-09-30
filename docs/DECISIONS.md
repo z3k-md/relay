@@ -455,9 +455,6 @@ period (D6).
 durable immediately) and `commit()` is a no-op. Linux and Windows behavior
 is unchanged.
 
-  History and objects are kept (no GC yet), so a later change can restore
-  those too.
-
 ## D24. Local IPC and the host lock
 
 A running host (`relay run`, `relay service`, or the desktop app) exposes a
