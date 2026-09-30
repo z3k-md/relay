@@ -112,20 +112,24 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          # A separate release repo does not contain our commits, so the tag
-          # there points at its default branch instead of github.sha.
-          target_args=()
-          if [ "$DEST" = "$GITHUB_REPOSITORY" ]; then
-            target_args=(--target "$GITHUB_SHA")
-          fi
-          if ! gh release view "$TAG" --repo "$DEST" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$DEST" --draft \
-              --title "Relay v${VERSION}" \
-              --notes "Desktop app and CLI for Relay v${VERSION} (${GITHUB_SHA::7})." \
-              "${target_args[@]}"
-          fi
           id=$(gh api "repos/${DEST}/releases" --paginate \
             --jq ".[] | select(.tag_name == \"${TAG}\") | .id" | head -n1)
+          if [ -z "$id" ]; then
+            # The release list lags behind a create, so take the id from the
+            # create response instead of looking it up again.
+            args=(
+              -f tag_name="$TAG"
+              -f name="Relay v${VERSION}"
+              -f body="Desktop app and CLI for Relay v${VERSION} (${GITHUB_SHA::7})."
+              -F draft=true
+            )
+            # A separate release repo does not contain our commits, so the tag
+            # there points at its default branch instead of github.sha.
+            if [ "$DEST" = "$GITHUB_REPOSITORY" ]; then
+              args+=(-f target_commitish="$GITHUB_SHA")
+            fi
+            id=$(gh api -X POST "repos/${DEST}/releases" "${args[@]}" --jq .id)
+          fi
           if [ -z "$id" ]; then
             echo "error: could not find release ${TAG} in ${DEST}" >&2
             exit 1
