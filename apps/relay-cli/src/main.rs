@@ -224,7 +224,7 @@ enum DeletesCmd {
         #[arg(long)]
         peer: Option<String>,
     },
-    /// Keep the files here and send them back to the peer
+    /// Keep the files here (including any already deleted this catch-up) and send them back
     Restore {
         space: String,
         #[arg(long)]

@@ -361,16 +361,18 @@ when unsure, so the receiver holds a peer mass delete until the user decides.
   live side (D18) and are not counted. A per-connection,
   per-(space, mount) counter tracks deletions already applied in the current
   catch-up and resets when a `caught_up` batch for that space has been
-  applied. Baseline live is the current live count (the same `count_live`
-  the scan guard uses) plus deletions applied so far. The guard trips when
-  `is_large_fraction_delete(session + batch, baseline)` is true — the same
-  function and thresholds as the scan-side check (at least 25 entries and
-  more than half the mount).
+  applied. The same map also records the paths whose local entry actually
+  became a tombstone from those applies. Baseline live is the current live
+  count (the same `count_live` the scan guard uses) plus deletions applied
+  so far. The guard trips when `is_large_fraction_delete(session + batch,
+  baseline)` is true — the same function and thresholds as the scan-side
+  check (at least 25 entries and more than half the mount).
 - **Hold.** If there is no stored decision for (peer, space, mount), persist a
   hold and the held paths (this batch and any already queued for that peer
-  and space). Emit `DeletesHeld` once per hold per connection. Do not apply
-  the batch, advance `received`, or ack; that (peer, space) queue waits. Other
-  spaces and peers keep syncing. A reconnect re-requests from the unchanged
+  and space), plus the already-applied session paths marked as applied.
+  Emit `DeletesHeld` once per hold per connection. Do not apply the batch,
+  advance `received`, or ack; that (peer, space) queue waits. Other spaces
+  and peers keep syncing. A reconnect re-requests from the unchanged
   watermark.
 - **Decisions.** Written through `Engine::open_for_config` (`relay deletes
   apply|restore`, or the desktop buttons). A running loop reloads on the
@@ -388,13 +390,23 @@ when unsure, so the receiver holds a peer mass delete until the user decides.
     tombstone; D18 rule 1 (exactly one side is a tombstone → the live side
     wins, no copy) keeps the file here and brings it back on the peer. Paths
     that changed locally are skipped (the next scan records the change, which
-    also beats the tombstone). The held path list is emptied after the first
+    also beats the tombstone). The first restore batch also resurrects each
+    applied path when the local entry is a tombstone last modified by that
+    peer, nothing is on disk now, and the most recent earlier history version
+    is a regular file whose object is still in the store: the file is written
+    back and a new local version is recorded whose vector dominates the
+    tombstone, so the peer applies it as a re-create. Symlinks and other
+    non-file kinds are skipped; a path that fails a precondition is skipped;
+    other per-path failures become `SyncWarning` and do not abort the batch.
+    The held path list (including applied paths) is emptied after the first
     re-assert.
 - **Limit.** Tombstones arrive in index batches (D16) and the guard only sees
   the batches so far, so a delete spread over several batches trips once the
   running total passes the threshold; the deletes before that are applied.
-  History and objects are kept (no GC yet), so a later change can restore
-  those too.
+  Those applied paths are tracked on the connection and persisted with the
+  hold, so `restore` brings them back too. Counters and path lists are per
+  connection, so deletes applied before a reconnect that preceded the hold
+  are not tracked.
 
 ## D23. Batched object durability on macOS
 

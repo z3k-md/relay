@@ -169,7 +169,7 @@ function runnerDetail(state: RunnerState): string | null {
           class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
           @click="confirm = { hold, decision: 'restore' }"
         >
-          Restore files on {{ hold.peerName }}
+          Restore files here and on {{ hold.peerName }}
         </button>
       </div>
     </div>
@@ -177,7 +177,7 @@ function runnerDetail(state: RunnerState): string | null {
 
     <Modal
       :open="!!confirm"
-      :title="confirm?.decision === 'apply' ? 'Delete these files?' : 'Restore files on the peer?'"
+      :title="confirm?.decision === 'apply' ? 'Delete these files?' : 'Restore these files?'"
       @close="confirm = null"
     >
       <p v-if="confirm?.decision === 'apply'">
@@ -185,7 +185,8 @@ function runnerDetail(state: RunnerState): string | null {
         {{ confirm.hold.space }}/{{ confirm.hold.mount }} on this computer too?
       </p>
       <p v-else-if="confirm">
-        Keep the files here and send them back to {{ confirm.hold.peerName }}?
+        Keep the files here — including any already deleted this catch-up — and
+        send them back to {{ confirm.hold.peerName }}?
       </p>
       <div class="mt-4 flex justify-end gap-2">
         <button type="button" class="rounded-md px-2.5 py-1" @click="confirm = null">Cancel</button>
