@@ -1,0 +1,104 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  ActivityItem,
+  CliInstallResult,
+  CliStatus,
+  ConflictView,
+  MountView,
+  OfferView,
+  Overview,
+  PeerView,
+  RunnerState,
+  Settings,
+  SpaceView,
+  UpdateInfo,
+} from "./types";
+
+function asError(err: unknown): Error {
+  if (typeof err === "string") {
+    return new Error(err);
+  }
+  if (err instanceof Error) {
+    return err;
+  }
+  return new Error(String(err));
+}
+
+async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (err) {
+    throw asError(err);
+  }
+}
+
+export const api = {
+  getOverview: () => call<Overview>("get_overview"),
+  initDevice: (name: string) => call<Overview>("init_device", { name }),
+  listPeers: () => call<PeerView[]>("list_peers"),
+  addPeer: (name: string, deviceId: string, address: string) =>
+    call<PeerView>("add_peer", { name, deviceId, address }),
+  removePeer: (name: string) => call<void>("remove_peer", { name }),
+  listSpaces: () => call<SpaceView[]>("list_spaces"),
+  createSpace: (name: string) => call<SpaceView>("create_space", { name }),
+  addMount: (space: string, mount: string, path: string) =>
+    call<MountView>("add_mount", { space, mount, path }),
+  share: (space: string, peer: string) => call<void>("share", { space, peer }),
+  unshare: (space: string, peer: string) => call<void>("unshare", { space, peer }),
+  listOffers: () => call<OfferView[]>("list_offers"),
+  joinSpace: (space: string, fromPeer: string) =>
+    call<SpaceView>("join_space", { space, fromPeer }),
+  listConflicts: () => call<ConflictView[]>("list_conflicts"),
+  getActivity: () => call<ActivityItem[]>("get_activity"),
+  pauseSync: () => call<RunnerState>("pause_sync"),
+  resumeSync: () => call<RunnerState>("resume_sync"),
+  checkForUpdates: () => call<UpdateInfo>("check_for_updates"),
+  installUpdate: () => call<UpdateInfo>("install_update"),
+  getSettings: () => call<Settings>("get_settings"),
+  setSettings: (patch: Partial<Settings>) =>
+    call<Settings>("set_settings", { patch }),
+  openLogsFolder: () => call<void>("open_logs_folder"),
+  cliStatus: () => call<CliStatus>("cli_status"),
+  installCli: () => call<CliInstallResult>("install_cli"),
+};
+
+export function runnerLabel(state: RunnerState): string {
+  switch (state.kind) {
+    case "notInitialized":
+      return "Not initialized";
+    case "starting":
+      return "Starting";
+    case "running":
+      return "Running";
+    case "paused":
+      return "Paused";
+    case "error":
+      return "Error";
+    case "externalService":
+      return "Background service";
+  }
+}
+
+export function formatTime(tsMs: number): string {
+  const d = new Date(tsMs);
+  return d.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+export async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+}

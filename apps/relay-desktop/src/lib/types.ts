@@ -1,0 +1,105 @@
+export type RunnerState =
+  | { kind: "notInitialized" }
+  | { kind: "starting" }
+  | { kind: "running" }
+  | { kind: "paused" }
+  | { kind: "error"; message: string }
+  | { kind: "externalService"; message: string };
+
+export interface Overview {
+  initialized: boolean;
+  deviceName: string | null;
+  deviceId: string | null;
+  suggestedName: string;
+  runner: RunnerState;
+  version: string;
+  peerCount: number;
+  connectedPeers: number;
+  spaceCount: number;
+  mountCount: number;
+}
+
+export interface PeerView {
+  name: string;
+  id: string;
+  shortId: string;
+  address: string;
+  connected: boolean;
+}
+
+export interface MountView {
+  name: string;
+  path: string | null;
+  attached: boolean;
+  state: string;
+}
+
+export interface SpaceView {
+  name: string;
+  id: string;
+  mounts: MountView[];
+  sharedWith: string[];
+}
+
+export interface OfferView {
+  peer: string;
+  peerId: string;
+  name: string;
+  mounts: { name: string }[];
+}
+
+export interface ConflictView {
+  path: string;
+  space: string;
+  mount: string;
+  deviceId: string;
+  deviceShort: string;
+  deviceName: string | null;
+}
+
+export interface ActivityItem {
+  tsMs: number;
+  kind: string;
+  message: string;
+}
+
+export interface Settings {
+  startAtLogin: boolean;
+  autoUpdate: boolean;
+}
+
+export interface UpdateInfo {
+  configured: boolean;
+  available: boolean;
+  version: string | null;
+  notes: string | null;
+  message: string;
+  installing: boolean;
+}
+
+export interface UpdateAvailable {
+  version: string;
+  notes: string;
+}
+
+export interface CliStatus {
+  sidecarPath: string | null;
+  installPath: string | null;
+  onPath: boolean;
+  hint: string | null;
+}
+
+export interface CliInstallResult {
+  path: string;
+  onPath: boolean;
+  hint: string | null;
+  message: string;
+}
+
+export type Page =
+  | "overview"
+  | "peers"
+  | "spaces"
+  | "conflicts"
+  | "activity"
+  | "settings";

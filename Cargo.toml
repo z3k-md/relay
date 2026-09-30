@@ -12,6 +12,23 @@ members = [
     "crates/relay-net",
     "crates/relay-daemon",
     "apps/relay-cli",
+    "apps/relay-desktop/src-tauri",
+]
+# Plain `cargo build` / `cargo test` skip the desktop app: it needs the
+# webview system libraries, a built frontend and a sidecar binary (see
+# apps/relay-desktop/README.md). CI builds everything with --workspace.
+default-members = [
+    "crates/relay-core",
+    "crates/relay-policy",
+    "crates/relay-fs",
+    "crates/relay-store",
+    "crates/relay-db",
+    "crates/relay-engine",
+    "crates/relay-proto",
+    "crates/relay-crypto",
+    "crates/relay-net",
+    "crates/relay-daemon",
+    "apps/relay-cli",
 ]
 
 [workspace.package]

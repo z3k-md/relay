@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Segoe UI", "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
+  --color-ink: #18181b;
+  --color-muted: #71717a;
+  --color-line: #e4e4e7;
+  --color-panel: #ffffff;
+  --color-canvas: #f4f4f5;
+  --color-accent: #0f766e;
+  --color-accent-fg: #f0fdfa;
+  --color-danger: #b91c1c;
+  --color-ok: #15803d;
+  --color-warn: #b45309;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-ink: #f4f4f5;
+    --color-muted: #a1a1aa;
+    --color-line: #3f3f46;
+    --color-panel: #18181b;
+    --color-canvas: #09090b;
+    --color-accent: #2dd4bf;
+    --color-accent-fg: #042f2e;
+    --color-danger: #fca5a5;
+    --color-ok: #86efac;
+    --color-warn: #fcd34d;
+  }
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--color-ink);
+  background: var(--color-canvas);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
