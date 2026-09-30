@@ -33,3 +33,5 @@ cargo install --path apps/relay-cli --locked --force
 echo
 echo "Installed: $(command -v relay || echo "$HOME/.cargo/bin/relay")"
 relay --version 2>/dev/null || true
+echo
+echo "To upgrade this Mac and a Windows PC together: ./scripts/deploy.sh --help"

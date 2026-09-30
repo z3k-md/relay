@@ -15,16 +15,83 @@ else, so the repository is the same on both machines.
 
 ## Status
 
-**Phase 2: two-device sync.** `relay run` watches your folders and syncs them
-with paired devices over QUIC (TLS 1.3, each device pinned by its public key).
+**Phase 2: two-device sync.** Relay watches your folders and syncs them with
+paired devices over QUIC (TLS 1.3, each device pinned by its public key).
 Edits, creates and deletes flow both ways within about a second; concurrent
 edits keep both versions; per-file history and restore work on every device.
+`relay service install` runs it in the background so you do not have to keep
+a terminal open.
 
-Not yet: a background service (you keep `relay run` open in a terminal),
-device discovery (you type the other machine's address), Git-aware conflict
-handling, and relaying through a third device. See [Roadmap](#roadmap).
+Not yet: device discovery (you type the other machine's address), Git-aware
+conflict handling, and relaying through a third device. See [Roadmap](#roadmap).
 
 ## Install
+
+### Dev loop: upgrade both machines with one command
+
+If you develop on a Mac and test on a Windows PC you can reach over SSH, one
+command builds this checkout, installs it on both machines, and restarts the
+background service.
+
+**One-time setup**
+
+On the Mac: Rust (skip if `cargo` already works) and the Windows cross
+compiler.
+
+```bash
+./scripts/install.sh --install-rust
+brew install mingw-w64
+```
+
+On the PC: enable the OpenSSH Server optional feature, then put the Mac's
+public key on the PC so `ssh you@pc-host` works without a password.
+
+For a normal Windows user, `ssh-copy-id you@pc-host` is enough. For an
+**administrator** account, Windows OpenSSH reads
+
+`C:\ProgramData\ssh\administrators_authorized_keys`
+
+not the user's `authorized_keys`. Append the Mac's `~/.ssh/id_*.pub` line to
+that file (as Administrator) and lock the ACL down:
+
+```powershell
+icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
+```
+
+Admin SSH sessions are elevated, which `relay service install` needs on
+Windows (copy, PATH, scheduled task, firewall rule).
+
+**First run** (from the repo on the Mac):
+
+```bash
+./scripts/deploy.sh --pc you@pc-host --pair
+```
+
+That remembers `you@pc-host` in `.relay-deploy` (gitignored). `--pair` reads
+each device's id, takes the two addresses from the SSH session, and runs
+`relay peer add` both ways.
+
+**Everyday**
+
+```bash
+git pull && ./scripts/deploy.sh
+```
+
+**Check both sides**
+
+```bash
+relay --version              # e.g. relay 0.1.0 (abc1234)
+relay service status
+relay service logs -f        # Ctrl-C only stops the tail, not the service
+
+ssh you@pc-host relay --version
+ssh you@pc-host relay service status
+ssh you@pc-host relay service logs -f
+```
+
+`RELAY_PC=you@pc-host` also selects the PC. `--mac-only` / `--pc-only` deploy
+just one side; `--mac-name` / `--pc-name` override the `relay init` names
+(default `mac` and `pc`). See `./scripts/deploy.sh --help`.
 
 ### macOS (build from source)
 
@@ -49,15 +116,16 @@ rustup target add x86_64-pc-windows-gnu
 ./scripts/build-windows.sh            # -> dist/relay-windows-x86_64.zip
 ```
 
-Copy the zip to the PC, extract it, and in PowerShell inside that folder:
+Copy the zip to the PC, extract it, and in an **elevated** PowerShell inside
+that folder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Open a new terminal afterwards so `relay` is on your PATH. The first time
-`relay run` starts, Windows asks whether to allow it through the firewall:
-allow **Private networks**.
+That initializes the device if needed and runs `relay service install` (copy
+to `%LOCALAPPDATA%\Programs\Relay`, user PATH, startup task, firewall rule).
+Open a new terminal afterwards so `relay` is on your PATH.
 
 ## Sync your Mac and your Windows PC
 
@@ -66,52 +134,30 @@ same LAN, or both on [Tailscale](https://tailscale.com) (then use the
 `100.x.y.z` addresses). Find a machine's LAN address with
 `ipconfig getifaddr en0` on macOS or `ipconfig` on Windows.
 
-**1. Create an identity on each machine**
+If you used `./scripts/deploy.sh --pc you@pc-host --pair`, both devices
+already have an identity, the background service is running, and each side
+has the other as a peer. Skip to creating a space.
 
-```bash
-# Mac
-relay init --name mac
-```
-
-```powershell
-# PC
-relay init --name pc
-```
-
-Each prints a 64-character device id. `relay id` shows it again.
-
-**2. Pair them.** Each side adds the other. Addresses are optional on one
-side, but giving both lets either machine reconnect first.
-
-```bash
-# Mac: the PC's id and address
-relay peer add pc <PC-DEVICE-ID> --addr 192.168.1.20:47321
-```
-
-```powershell
-# PC: the Mac's id and address
-relay peer add mac <MAC-DEVICE-ID> --addr 192.168.1.10:47321
-```
-
-**3. On the Mac, create a space, add the folder and share it**
+**1. On the Mac, create a space, add the folder and share it**
 
 ```bash
 relay space create Mods
 relay mount add Mods game ~/Code/game-mods
 relay share Mods pc
-relay run
 ```
 
-**4. On the PC, join and attach a folder**
+Prefer a folder such as `~/Code` (see [Notes](#notes) if you need Documents,
+Desktop or Downloads). Config-changing commands restart the background
+service themselves; you never need to Ctrl-C anything.
 
-Start `relay run` once so the PC receives the Mac's offer, then stop it with
-Ctrl-C (the join commands need the database to themselves):
+**2. On the PC, join and attach a folder**
+
+Over SSH or locally:
 
 ```powershell
-relay run          # prints: mac offers: Mods ... then Ctrl-C
+relay space offers
 relay space join Mods --from mac
 relay mount add Mods game "C:\Games\MyGame\Mods"
-relay run
 ```
 
 Point the PC's mount at an **empty folder, or one you don't mind merging**.
@@ -119,8 +165,27 @@ If it already holds different versions of the same files, both versions are
 kept as conflict copies (see below). For a Git repository, starting from an
 empty folder on the second machine is simplest.
 
-Leave `relay run` open on both machines. Edit on the Mac, and the change is on
-the PC a moment later; it works the other way too.
+Edit on the Mac, and the change is on the PC a moment later; it works the
+other way too.
+
+**Without SSH** (zip installer, pair by hand)
+
+Build `dist/relay-windows-x86_64.zip` with `./scripts/build-windows.sh`, copy
+it to the PC, extract it, and run `install.ps1` from an elevated PowerShell.
+Then on each machine, `relay init` if `relay id` fails, and:
+
+```bash
+# Mac
+relay peer add pc <PC-DEVICE-ID> --addr 192.168.1.20:47321
+```
+
+```powershell
+# PC
+relay peer add mac <MAC-DEVICE-ID> --addr 192.168.1.10:47321
+```
+
+`relay id` prints `<64-hex-device-id> <name>`. Addresses are optional on one
+side, but giving both lets either machine reconnect first.
 
 **Check on it**
 
@@ -159,7 +224,10 @@ you get conflict copies inside `.git` that you resolve by hand.
 | --- | --- |
 | `relay init [--name NAME]` | Create this device's key, id and local database |
 | `relay id` | Print this device's id and name |
-| `relay run [--listen ADDR] [--verbose]` | Watch mounts and sync with peers until Ctrl-C. Default listen `0.0.0.0:47321` |
+| `relay run [--listen ADDR] [--verbose] [--log-file PATH]` | Watch mounts and sync with peers in the foreground until Ctrl-C. Default listen `0.0.0.0:47321` |
+| `relay service install [--listen ADDR]` | Install or upgrade the background service and start it (macOS LaunchAgent; Windows scheduled task). Requires `relay init` first. Windows must be elevated. |
+| `relay service uninstall` / `start` / `stop` / `restart` / `status` | Remove or control the background service |
+| `relay service logs [-n N] [-f]` | Show the service log (`<relay home>/logs/relay.log`) |
 | `relay status` | Device, mounts, entry counts, peers and sync progress |
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Pair with another device |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
@@ -186,10 +254,26 @@ found missing or corrupt objects.
 `**/build/**`, `**/.venv/**` and `**/__pycache__/**`. A `.relayignore` file at
 the mount root adds more exclude globs, one per line. Rules are per device.
 
-Only one process can write to a Relay home at a time. Stop `relay run` before
-`peer add`, `share`, `space join`, `mount add`, `scan`, `restore` or `gc`.
-Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) work
-while it runs.
+`peer add` / `peer remove`, `share` / `unshare`, `space create` / `space join`
+and `mount add` stop the background service, apply the change, and start it
+again. For `scan`, `restore` and `gc`, stop the service first if it is
+running (`relay service stop`). Read-only commands (`status`, `ls`,
+`history`, `conflicts`, `verify`) work while it runs. `relay run` is still
+available if you want a foreground process instead of the service.
+
+## Notes
+
+A macOS background agent cannot read `~/Documents`, `~/Desktop`,
+`~/Downloads` or iCloud Drive folders unless the binary has Full Disk Access
+(System Settings > Privacy & Security > Full Disk Access; add
+`~/.cargo/bin/relay`). Prefer folders such as `~/Code`.
+
+On Windows the task runs as your user without a login session. The Public
+network profile blocks it:
+
+```powershell
+Set-NetConnectionProfile -NetworkCategory Private
+```
 
 ## Safety behavior
 
@@ -232,7 +316,8 @@ Relay's rule is to preserve data when unsure.
 
 Override with `--home` or `RELAY_HOME`. Inside: `identity/device.key` (this
 device's private key; keep it private), `relay.db` (SQLite index),
-`store/objects/` (content-addressed file contents) and `store/tmp/`.
+`store/objects/` (content-addressed file contents), `store/tmp/` and
+`logs/relay.log`.
 
 Each mount root gets a small `.relay-mount` marker file identifying it.
 
@@ -265,7 +350,7 @@ crates/
   relay-engine   scan, watch, sync state machine, remote apply, conflicts, history
 apps/
   relay-cli      the `relay` binary
-scripts/         install.sh, install.ps1, build-windows.sh
+scripts/         install.sh, install.ps1, build-windows.sh, deploy.sh
 docs/
   DESIGN.md      original specification
   DECISIONS.md   amendments adopted during implementation
@@ -277,7 +362,7 @@ The phase plan is in [`docs/DESIGN.md`](docs/DESIGN.md) section 51. Next:
 
 1. **Phase 3**: Git-aware conflict grouping, receive-side mass-delete guard,
    conflict resolution commands.
-2. **Phase 4**: `relayd` background service (launchd / Windows service), the
-   CLI talking to it over local IPC so commands work while it runs.
+2. **Phase 4**: local IPC so the CLI talks to a running daemon without
+   restarting it (today, config-changing commands restart the service).
 3. **Phase 5+**: LAN discovery and pairing codes, more than two devices,
    relaying, encryption at rest.

@@ -4,3 +4,4 @@ uploads/
 *.db-wal
 *.db-shm
 /dist
+/.relay-deploy
