@@ -537,61 +537,15 @@ impl Engine {
                 )));
             }
         };
-
-        let dest = match resolve_os_path(&local_path, path)? {
-            Some(existing) => existing,
-            None => to_os_path(&local_path, path)?,
-        };
         let current = self.db.repo().entry(&key)?;
-        let expected_existing = restore_expected_stat(&self.store, &dest, current.as_ref())?;
-
-        let mut reader = self.store.open_object(&object)?;
-        let stat = match materialize_file(
-            &mut reader,
-            &dest,
-            object,
-            executable,
-            expected_existing.as_ref(),
-            MaterializeOptions {
-                mount_root: &local_path,
-                mtime_ns: None,
-            },
-        ) {
-            Ok(stat) => stat,
-            Err(relay_fs::FsError::DestinationChanged(path)) => {
-                return Err(EngineError::DestinationChanged(path));
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let stat = scan::recorded_stat(stat, scan::wall_clock_now_ns(), self.config.racy_window);
-
-        let now = self.clock.now_ms();
-        let device = self.device.id;
-        let content = EntryContent::File {
+        self.restore_file_version(
+            &key,
+            &local_path,
             object,
             size,
             executable,
-        };
-        self.db
-            .transaction(|repo| {
-                repo.record_object(object, size, now)?;
-                let sequence = repo.next_sequence()?;
-                let record = EntryRecord::local_write(
-                    current.as_ref(),
-                    key.clone(),
-                    content.clone(),
-                    stat,
-                    device,
-                    now,
-                    sequence,
-                );
-                repo.put_entry(&record)?;
-                Ok(record)
-            })
-            .map_err(|err| match err {
-                EngineError::Db(inner) => EngineError::from_db(inner),
-                other => other,
-            })
+            current.as_ref(),
+        )
     }
 
     pub fn verify_objects(&self) -> Result<VerifyReport, EngineError> {
@@ -745,6 +699,163 @@ impl Engine {
             })
     }
 
+    /// Write a historical file version to disk and record a new local version
+    /// whose vector dominates `current` (the tombstone, for a recreate).
+    fn restore_file_version(
+        &mut self,
+        key: &EntryKey,
+        local_path: &Path,
+        object: ObjectId,
+        size: u64,
+        executable: bool,
+        current: Option<&EntryRecord>,
+    ) -> Result<EntryRecord, EngineError> {
+        let dest = match resolve_os_path(local_path, &key.path)? {
+            Some(existing) => existing,
+            None => to_os_path(local_path, &key.path)?,
+        };
+        let expected_existing = restore_expected_stat(&self.store, &dest, current)?;
+
+        let mut reader = self.store.open_object(&object)?;
+        let stat = match materialize_file(
+            &mut reader,
+            &dest,
+            object,
+            executable,
+            expected_existing.as_ref(),
+            MaterializeOptions {
+                mount_root: local_path,
+                mtime_ns: None,
+            },
+        ) {
+            Ok(stat) => stat,
+            Err(relay_fs::FsError::DestinationChanged(path)) => {
+                return Err(EngineError::DestinationChanged(path));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let stat = scan::recorded_stat(stat, scan::wall_clock_now_ns(), self.config.racy_window);
+
+        let now = self.clock.now_ms();
+        let device = self.device.id;
+        let content = EntryContent::File {
+            object,
+            size,
+            executable,
+        };
+        self.db
+            .transaction(|repo| {
+                repo.record_object(object, size, now)?;
+                let sequence = repo.next_sequence()?;
+                let record = EntryRecord::local_write(
+                    current,
+                    key.clone(),
+                    content.clone(),
+                    stat,
+                    device,
+                    now,
+                    sequence,
+                );
+                repo.put_entry(&record)?;
+                Ok(record)
+            })
+            .map_err(|err| match err {
+                EngineError::Db(inner) => EngineError::from_db(inner),
+                other => other,
+            })
+    }
+
+    /// Recreate files deleted by this peer's already-applied tombstones.
+    ///
+    /// Skips a path when a precondition fails. Other per-path errors are
+    /// returned as warnings so the caller can emit `SyncWarning`.
+    pub(crate) fn resurrect_applied_deletes(
+        &mut self,
+        peer: DeviceId,
+        keys: &[EntryKey],
+    ) -> Result<Vec<(String, String)>, EngineError> {
+        self.ensure_writable()?;
+        let mut warnings = Vec::new();
+        for key in keys {
+            match self.try_resurrect_applied(peer, key) {
+                Ok(()) => {}
+                Err(ResurrectSkip::Precondition) => {}
+                Err(ResurrectSkip::Warn(reason)) => {
+                    warnings.push((key.path.to_string(), reason));
+                }
+                Err(ResurrectSkip::Fatal(err)) => return Err(err),
+            }
+        }
+        Ok(warnings)
+    }
+
+    fn try_resurrect_applied(
+        &mut self,
+        peer: DeviceId,
+        key: &EntryKey,
+    ) -> Result<(), ResurrectSkip> {
+        let Some(current) = self.db.repo().entry(key).map_err(EngineError::from_db)? else {
+            return Err(ResurrectSkip::Precondition);
+        };
+        if !current.is_deleted() || current.modified_by != peer {
+            return Err(ResurrectSkip::Precondition);
+        }
+        let Some(config) = self
+            .db
+            .repo()
+            .mount_config(key.mount)
+            .map_err(EngineError::from_db)?
+        else {
+            return Err(ResurrectSkip::Precondition);
+        };
+        let Some(root) = config.local_path.as_ref() else {
+            return Err(ResurrectSkip::Precondition);
+        };
+        relay_fs::MountMarker::verify(root, config.mount.id).map_err(EngineError::from)?;
+
+        let dest = match resolve_os_path(root, &key.path).map_err(EngineError::from)? {
+            Some(existing) => existing,
+            None => to_os_path(root, &key.path).map_err(EngineError::from)?,
+        };
+        match fs::symlink_metadata(&dest) {
+            Ok(_) => return Err(ResurrectSkip::Precondition),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(ResurrectSkip::Warn(format!(
+                    "could not restore applied delete: {err}"
+                )));
+            }
+        }
+
+        let history = self.db.repo().history(key).map_err(EngineError::from_db)?;
+        let Some(prior) = history
+            .iter()
+            .rev()
+            .find(|h| h.sequence != current.sequence)
+        else {
+            return Err(ResurrectSkip::Precondition);
+        };
+        let (object, size, executable) = match &prior.content {
+            EntryContent::File {
+                object,
+                size,
+                executable,
+            } => (*object, *size, *executable),
+            _ => return Err(ResurrectSkip::Precondition),
+        };
+        if !self.store.contains(&object) {
+            return Err(ResurrectSkip::Warn(format!(
+                "could not restore applied delete: object {object} is missing"
+            )));
+        }
+
+        self.restore_file_version(key, root, object, size, executable, Some(&current))
+            .map_err(|err| {
+                ResurrectSkip::Warn(format!("could not restore applied delete: {err}"))
+            })?;
+        Ok(())
+    }
+
     pub(crate) fn persist_delete_hold(
         &mut self,
         peer: DeviceId,
@@ -752,13 +863,15 @@ impl Engine {
         mount: relay_core::MountId,
         deletions: usize,
         live: usize,
-        paths: &[relay_core::LogicalPath],
+        paths: (&[relay_core::LogicalPath], &[relay_core::LogicalPath]),
     ) -> Result<(), EngineError> {
         let now = self.clock.now_ms();
+        let (held, applied) = paths;
         self.db
             .transaction(|repo| {
                 repo.upsert_delete_hold(peer, space, mount, deletions, live, now)?;
-                repo.replace_delete_hold_paths(peer, space, mount, paths)?;
+                repo.replace_delete_hold_paths(peer, space, mount, held)?;
+                repo.insert_delete_hold_applied_paths(peer, space, mount, applied)?;
                 Ok(())
             })
             .map_err(EngineError::from_db)
@@ -1015,6 +1128,18 @@ impl Engine {
             Err(fs::TryLockError::WouldBlock) => Ok(()),
             Err(fs::TryLockError::Error(err)) => Err(EngineError::Io(err)),
         }
+    }
+}
+
+enum ResurrectSkip {
+    Precondition,
+    Warn(String),
+    Fatal(EngineError),
+}
+
+impl From<EngineError> for ResurrectSkip {
+    fn from(err: EngineError) -> Self {
+        Self::Fatal(err)
     }
 }
 

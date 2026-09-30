@@ -116,6 +116,8 @@ struct Connected {
     resync_at: HashMap<SpaceId, Instant>,
     /// Live-local tombstones already applied for this catch-up, per mount.
     session_deletes: HashMap<(SpaceId, MountId), usize>,
+    /// Paths whose local entry became a tombstone from those applies.
+    session_deleted_paths: HashMap<(SpaceId, MountId), Vec<relay_core::LogicalPath>>,
     /// `DeletesHeld` already emitted for this connection.
     held_emitted: HashSet<(SpaceId, MountId)>,
 }
@@ -307,6 +309,7 @@ impl Syncer {
                 holes: HashMap::new(),
                 resync_at: HashMap::new(),
                 session_deletes: HashMap::new(),
+                session_deleted_paths: HashMap::new(),
                 held_emitted: HashSet::new(),
             },
         );
@@ -695,8 +698,15 @@ impl Syncer {
             for (mount, paths) in &batch_deletes {
                 *conn.session_deletes.entry((space, *mount)).or_default() += paths.len();
             }
+            for (mount, paths) in applied_tombstone_paths(engine, space, &batch_deletes)? {
+                conn.session_deleted_paths
+                    .entry((space, mount))
+                    .or_default()
+                    .extend(paths);
+            }
             if caught_up {
                 conn.session_deletes.retain(|(s, _), _| *s != space);
+                conn.session_deleted_paths.retain(|(s, _), _| *s != space);
             }
         }
         if caught_up {
@@ -848,7 +858,22 @@ impl Syncer {
                 let mut paths = queued_deletes.get(&mount).cloned().unwrap_or_default();
                 paths.sort();
                 paths.dedup();
-                engine.persist_delete_hold(peer, space, mount, deletions, live, &paths)?;
+                let mut applied = self
+                    .connected
+                    .get(&peer)
+                    .and_then(|c| c.session_deleted_paths.get(&(space, mount)))
+                    .cloned()
+                    .unwrap_or_default();
+                applied.sort();
+                applied.dedup();
+                engine.persist_delete_hold(
+                    peer,
+                    space,
+                    mount,
+                    deletions,
+                    live,
+                    (&paths, &applied),
+                )?;
                 let already = self
                     .connected
                     .get(&peer)
@@ -873,7 +898,11 @@ impl Syncer {
                 .db
                 .repo()
                 .list_delete_hold_paths(peer, space, mount)?;
-            let had_held_paths = !paths.is_empty();
+            let applied = engine
+                .db
+                .repo()
+                .list_delete_hold_applied_paths(peer, space, mount)?;
+            let had_held_paths = !paths.is_empty() || !applied.is_empty();
             if let Some(batch) = batch_deletes.get(&mount) {
                 paths.extend(batch.iter().cloned());
             }
@@ -885,6 +914,15 @@ impl Syncer {
                 .collect();
             if !keys.is_empty() {
                 engine.reassert_live(&keys)?;
+            }
+            if had_held_paths && !applied.is_empty() {
+                let applied_keys: Vec<EntryKey> = applied
+                    .into_iter()
+                    .map(|path| EntryKey { space, mount, path })
+                    .collect();
+                for (path, reason) in engine.resurrect_applied_deletes(peer, &applied_keys)? {
+                    events.push(SyncEvent::SyncWarning { peer, path, reason });
+                }
             }
             if had_held_paths {
                 engine.clear_delete_hold_paths(peer, space, mount)?;
@@ -919,6 +957,30 @@ fn live_tombstones(
         out.entry(entry.key.mount)
             .or_default()
             .push(entry.key.path.clone());
+    }
+    Ok(out)
+}
+
+fn applied_tombstone_paths(
+    engine: &Engine,
+    space: SpaceId,
+    batch_deletes: &HashMap<MountId, Vec<relay_core::LogicalPath>>,
+) -> Result<HashMap<MountId, Vec<relay_core::LogicalPath>>, EngineError> {
+    let mut out: HashMap<MountId, Vec<relay_core::LogicalPath>> = HashMap::new();
+    for (mount, paths) in batch_deletes {
+        for path in paths {
+            let key = EntryKey {
+                space,
+                mount: *mount,
+                path: path.clone(),
+            };
+            let Some(local) = engine.db.repo().entry(&key)? else {
+                continue;
+            };
+            if local.is_deleted() {
+                out.entry(*mount).or_default().push(path.clone());
+            }
+        }
     }
     Ok(out)
 }
