@@ -4,17 +4,18 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use relay_core::{DeviceId, EntryContent, EntryRecord, LogicalPath, Sequence, VersionVector};
-use relay_daemon::{DaemonEvent, DaemonOptions};
+use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{
     ConflictClass, ConflictInfo, DeleteHoldDecision, Engine, EngineError, Resolution, ScanOptions,
     ScanReport, WatchEvent, WatchOptions, default_home, group_git_conflicts, resolve_conflict,
     resolve_git_conflicts,
 };
+use relay_ipc::{ActivityItem, Client, Status as DaemonStatus};
 
 mod output;
 mod service;
@@ -99,6 +100,24 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Pause syncing (persisted; a running host stops watching and networking)
+    Pause,
+    /// Resume syncing after pause
+    Resume,
+    /// Ask a running host to rescan, or scan directly if none is running
+    Rescan {
+        target: Option<String>,
+        /// Return as soon as the scan is queued
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Recent host activity
+    Activity {
+        #[arg(short = 'n', default_value_t = 20)]
+        n: usize,
+        #[arg(long)]
+        follow: bool,
+    },
     /// List indexed entries
     Ls {
         target: String,
@@ -139,6 +158,9 @@ enum Command {
         /// Append run output to this file instead of the terminal
         #[arg(long)]
         log_file: Option<PathBuf>,
+        /// Which host kind this process reports over IPC (used by `relay service`)
+        #[arg(long, hide = true, default_value = "cli")]
+        host: HostKind,
     },
     /// Manage the background Relay service (macOS LaunchAgent / Windows Scheduled Task)
     Service {
@@ -314,6 +336,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let engine = Engine::open_read_only(&home)?;
             cmd_status(&engine, json).map(|()| ExitCode::SUCCESS)
         }
+        Command::Pause => cmd_pause(&home, json),
+        Command::Resume => cmd_resume(&home, json),
+        Command::Rescan { target, no_wait } => cmd_rescan(&home, target.as_deref(), no_wait, json),
+        Command::Activity { n, follow } => cmd_activity(&home, n, follow, json),
         Command::Peer { cmd } => cmd_peer(&home, cmd, json),
         Command::Share { space, peer } => {
             let mut engine = Engine::open_for_config(&home)?;
@@ -562,6 +588,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             poll,
             verbose,
             log_file: _,
+            host,
         } => {
             let opts = WatchOptions {
                 debounce: Duration::from_millis(debounce_ms),
@@ -569,7 +596,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 use_watcher: !poll,
                 ..WatchOptions::default()
             };
-            cmd_run(&home, listen, opts, verbose, json)
+            cmd_run(&home, listen, opts, verbose, json, host)
         }
         Command::Service { cmd } => service::run(&home, cmd, json),
     }
@@ -610,6 +637,7 @@ fn cmd_run(
     opts: WatchOptions,
     verbose: bool,
     json: bool,
+    host: HostKind,
 ) -> Result<ExitCode> {
     let engine = Engine::open_read_only(home)?;
     let peers = engine.peers()?;
@@ -634,6 +662,7 @@ fn cmd_run(
             listen,
             watch: opts,
             verbose,
+            host,
         },
         &stop,
         &mut |event| match event {
@@ -659,6 +688,16 @@ fn cmd_run(
             DaemonEvent::Warning(message) => {
                 if !json {
                     output::out_line(&format!("{} warning: {message}", utc_hms()));
+                }
+            }
+            DaemonEvent::Paused => {
+                if !json {
+                    output::out_line(&format!("{} paused", utc_hms()));
+                }
+            }
+            DaemonEvent::Resumed => {
+                if !json {
+                    output::out_line(&format!("{} resumed", utc_hms()));
                 }
             }
         },
@@ -1132,6 +1171,7 @@ fn conflict_json(info: &ConflictInfo) -> ConflictJson {
 fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     let status = engine.status()?;
     let holds = engine.delete_holds()?;
+    let daemon = query_daemon(engine.home());
     let service = if service::supported() {
         match service::status_info(engine.home()) {
             Ok(info) => Some(info),
@@ -1146,6 +1186,21 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     if json {
         let mut value = serde_json::to_value(&status)?;
         value["delete_holds"] = serde_json::to_value(&holds)?;
+        value["daemon"] = match &daemon {
+            Some((hello, live)) => serde_json::json!({
+                "host": hello.host,
+                "pid": hello.pid,
+                "started_at_ms": hello.started_at_ms,
+                "protocol": hello.protocol,
+                "relay_version": hello.relay_version,
+                "state": live.state,
+                "message": live.message,
+                "listen": live.listen,
+                "peers": live.peers,
+                "mounts": live.mounts,
+            }),
+            None => serde_json::Value::Null,
+        };
         if let Some(info) = service {
             value["service"] = serde_json::to_value(info)?;
         }
@@ -1235,7 +1290,249 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     if let Some(info) = service {
         println!("{}", service::format_status_line(&info));
     }
+    print_daemon_human(daemon.as_ref());
     Ok(())
+}
+
+fn query_daemon(home: &Path) -> Option<(relay_ipc::Hello, DaemonStatus)> {
+    let mut client = Client::connect(home).ok().flatten()?;
+    let hello = client.hello().ok()?;
+    let status = client.status().ok()?;
+    Some((hello, status))
+}
+
+fn print_daemon_human(daemon: Option<&(relay_ipc::Hello, DaemonStatus)>) {
+    let Some((hello, live)) = daemon else {
+        println!("daemon: not running");
+        return;
+    };
+    let state = live.state.as_str();
+    println!("daemon: {state} ({} pid {})", hello.host, hello.pid);
+    if let Some(listen) = &live.listen {
+        println!("  listen {listen}");
+    }
+    if let Some(message) = &live.message {
+        println!("  {message}");
+    }
+    if live.peers.is_empty() {
+        println!("  peers: none connected");
+    } else {
+        for peer in &live.peers {
+            println!("  peer {} {}", peer.name, peer.id);
+        }
+    }
+    for mount in &live.mounts {
+        let path = mount
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let scan = mount
+            .last_scan_summary
+            .clone()
+            .or_else(|| mount.last_error.clone())
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "  {}/{}  {}  {}  {scan}",
+            mount.space,
+            mount.mount,
+            path,
+            mount.watching.as_str()
+        );
+    }
+}
+
+fn cmd_pause(home: &Path, json: bool) -> Result<ExitCode> {
+    if let Some(mut client) = Client::connect(home)? {
+        let status = client.pause()?;
+        return print_pause_result(json, true, Some(&status));
+    }
+    let mut engine = Engine::open_for_config(home)?;
+    engine.set_paused(true)?;
+    print_pause_result(json, true, None)
+}
+
+fn cmd_resume(home: &Path, json: bool) -> Result<ExitCode> {
+    if let Some(mut client) = Client::connect(home)? {
+        let status = client.resume()?;
+        return print_pause_result(json, false, Some(&status));
+    }
+    let mut engine = Engine::open_for_config(home)?;
+    engine.set_paused(false)?;
+    print_pause_result(json, false, None)
+}
+
+fn print_pause_result(json: bool, paused: bool, live: Option<&DaemonStatus>) -> Result<ExitCode> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "paused": paused,
+                "state": live.map(|s| s.state),
+                "daemon": live.is_some(),
+            }))?
+        );
+    } else {
+        match (paused, live) {
+            (true, Some(_)) => println!("paused"),
+            (false, Some(_)) => println!("resumed"),
+            (true, None) => {
+                println!("paused (will take effect the next time Relay starts)")
+            }
+            (false, None) => {
+                println!("resume requested (will take effect the next time Relay starts)")
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_rescan(home: &Path, target: Option<&str>, no_wait: bool, json: bool) -> Result<ExitCode> {
+    let (space, mount) = parse_rescan_target(target)?;
+    if Client::connect(home)?.is_some() {
+        if no_wait {
+            let mut client =
+                Client::connect(home)?.ok_or_else(|| anyhow::anyhow!("Relay is not running"))?;
+            let queued = client.rescan(space.as_deref(), mount.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&queued)?);
+            } else {
+                println!("queued {}", queued.queued.join(", "));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        let sub_client =
+            Client::connect(home)?.ok_or_else(|| anyhow::anyhow!("Relay is not running"))?;
+        let mut cmd_client =
+            Client::connect(home)?.ok_or_else(|| anyhow::anyhow!("Relay is not running"))?;
+        let mut pending = wait_rescan_start(sub_client)?;
+        let queued = cmd_client.rescan(space.as_deref(), mount.as_deref())?;
+        if !json {
+            println!("queued {}", queued.queued.join(", "));
+        }
+        pending.extend(queued.queued);
+        return wait_rescan_finish(pending, json);
+    }
+    let mut engine = Engine::open(home)?;
+    cmd_scan(&mut engine, target, false, false, json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn parse_rescan_target(target: Option<&str>) -> Result<(Option<String>, Option<String>)> {
+    let Some(raw) = target else {
+        return Ok((None, None));
+    };
+    let parsed = parse_target(raw)?;
+    if parsed.path.is_some() {
+        bail!("rescan target is SPACE or SPACE/MOUNT");
+    }
+    Ok((Some(parsed.space), parsed.mount))
+}
+
+struct RescanWait {
+    pending: std::collections::HashSet<String>,
+    rx: std::sync::mpsc::Receiver<ActivityItem>,
+}
+
+fn wait_rescan_start(client: Client) -> Result<RescanWait> {
+    let mut sub = client.subscribe()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(Some(item)) = sub.next_item() {
+            if tx.send(item).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(RescanWait {
+        pending: std::collections::HashSet::new(),
+        rx,
+    })
+}
+
+impl RescanWait {
+    fn extend(&mut self, queued: Vec<String>) {
+        self.pending.extend(queued);
+    }
+}
+
+fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while !wait.pending.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let left: Vec<String> = wait.pending.into_iter().collect();
+            bail!("timed out waiting for rescan of {}", left.join(", "));
+        }
+        match wait.rx.recv_timeout(remaining.min(Duration::from_secs(1))) {
+            Ok(item) => {
+                if item.kind != "scan" && item.kind != "scan_failed" {
+                    continue;
+                }
+                let key = item
+                    .detail
+                    .clone()
+                    .or_else(|| item.summary.split(':').next().map(|s| s.trim().to_owned()));
+                let Some(key) = key else {
+                    continue;
+                };
+                if wait.pending.remove(&key) {
+                    if json {
+                        println!("{}", serde_json::to_string(&item)?);
+                    } else {
+                        println!("{}", item.summary);
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("host closed the activity stream before rescan finished");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_activity(home: &Path, n: usize, follow: bool, json: bool) -> Result<ExitCode> {
+    let Some(mut client) = Client::connect(home)? else {
+        bail!("Relay is not running");
+    };
+    let items = client.activity(Some(n as u32))?;
+    for item in &items {
+        print_activity_item(item, json);
+    }
+    if !follow {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let _ = ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+    });
+    let mut sub = client.subscribe()?;
+    while !stop.load(Ordering::Relaxed) {
+        match sub.next_item()? {
+            Some(item) => print_activity_item(&item, json),
+            None => break,
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_activity_item(item: &ActivityItem, json: bool) {
+    if json {
+        match serde_json::to_string(item) {
+            Ok(line) => println!("{line}"),
+            Err(err) => eprintln!("error: {err}"),
+        }
+    } else {
+        println!(
+            "{}  {}  {}",
+            format_utc_ms(item.at_ms as i64),
+            item.kind,
+            item.summary
+        );
+    }
 }
 
 fn cmd_deletes(home: &Path, cmd: Option<DeletesCmd>, json: bool) -> Result<ExitCode> {
@@ -1696,9 +1993,7 @@ fn print_engine_error(err: &EngineError) {
             eprintln!("hint: stop `relay watch` or wait for the other command to finish");
         }
         EngineError::Running { .. } => {
-            eprintln!(
-                "hint: stop it first: `relay service stop`, quit the Relay desktop app, or Ctrl-C `relay run`"
-            );
+            eprintln!("hint: use `relay rescan` to scan while Relay is running");
         }
         _ => {}
     }

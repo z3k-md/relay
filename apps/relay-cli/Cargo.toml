@@ -17,6 +17,7 @@ ctrlc.workspace = true
 relay-core.workspace = true
 relay-daemon.workspace = true
 relay-engine.workspace = true
+relay-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

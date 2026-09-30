@@ -609,6 +609,54 @@ fn service_status_errors_off_macos_windows() {
         .stderr(predicate::str::contains("supported on macOS and Windows"));
 }
 
+#[test]
+fn status_json_daemon_null_without_host() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+
+    let out = relay()
+        .args(["--home", &home_s, "--json", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(parsed["daemon"].is_null(), "{parsed}");
+}
+
+#[test]
+fn offline_pause_and_resume_toggle_flag() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+
+    relay()
+        .args(["--home", &home_s, "pause"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("paused"));
+
+    let engine = relay_engine::Engine::open_read_only(home.path()).unwrap();
+    assert!(engine.paused().unwrap());
+
+    relay()
+        .args(["--home", &home_s, "resume"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resume"));
+
+    let engine = relay_engine::Engine::open_read_only(home.path()).unwrap();
+    assert!(!engine.paused().unwrap());
+}
+
 fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {

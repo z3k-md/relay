@@ -187,6 +187,8 @@ pub fn launch_agent_plist(binary: &str, home: &str, listen: &str, log: &str) -> 
 		<string>{listen}</string>
 		<string>--log-file</string>
 		<string>{log}</string>
+		<string>--host</string>
+		<string>service</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -240,7 +242,7 @@ pub fn ps_quote(s: &str) -> String {
 }
 
 pub fn windows_task_argument_string(home: &str, listen: &str, log: &str) -> String {
-    format!("--home \"{home}\" run --listen {listen} --log-file \"{log}\"")
+    format!("--home \"{home}\" run --listen {listen} --log-file \"{log}\" --host service")
 }
 
 pub fn windows_install_exe_path(localappdata: &str) -> PathBuf {
@@ -1004,6 +1006,8 @@ mod tests {
                 "0.0.0.0:47321",
                 "--log-file",
                 "/Users/a&amp;b/Relay/logs/relay.log",
+                "--host",
+                "service",
             ]
         );
     }
@@ -1062,7 +1066,7 @@ gui/501/dev.relay.agent = {
                 "0.0.0.0:47321",
                 r"C:\Users\me\AppData\Roaming\Relay\logs\relay.log",
             ),
-            r#"--home "C:\Users\me\AppData\Roaming\Relay" run --listen 0.0.0.0:47321 --log-file "C:\Users\me\AppData\Roaming\Relay\logs\relay.log""#
+            r#"--home "C:\Users\me\AppData\Roaming\Relay" run --listen 0.0.0.0:47321 --log-file "C:\Users\me\AppData\Roaming\Relay\logs\relay.log" --host service"#
         );
     }
 
@@ -1072,7 +1076,7 @@ gui/501/dev.relay.agent = {
             r"C:\src\relay.exe",
             r"C:\Users\me\AppData\Local\Programs\Relay\relay.exe",
             47321,
-            r#"--home "D:\data" run --listen 0.0.0.0:47321 --log-file "D:\data\logs\relay.log""#,
+            r#"--home "D:\data" run --listen 0.0.0.0:47321 --log-file "D:\data\logs\relay.log" --host service"#,
         );
         assert!(script.starts_with("$ErrorActionPreference = 'Stop'\n"));
         assert!(script.contains("$src = 'C:\\src\\relay.exe'"));
