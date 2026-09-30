@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use relay_daemon::{DaemonEvent, DaemonOptions};
+use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{Engine, WatchEvent, WatchOptions};
 use tempfile::TempDir;
 
@@ -39,6 +39,7 @@ fn start_daemon(home: &Path) -> DaemonSession {
             listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             watch: watch_opts(),
             verbose: false,
+            host: HostKind::Cli,
         };
         relay_daemon::run(&home_path, opts, &stop_thread, &mut |event| {
             let _ = tx.send(event.clone());
@@ -215,6 +216,130 @@ fn does_not_reload_on_own_writes() {
             .any(|e| matches!(e, DaemonEvent::Watch(WatchEvent::Scanned { .. })))
             || live_has(home.path(), "Personal", "code", "later.txt"),
         "expected the daemon to keep indexing without reloading"
+    );
+
+    stop_daemon(session);
+}
+
+fn wait_ipc(home: &Path) -> relay_ipc::Client {
+    let deadline = Instant::now() + CONVERGE;
+    while Instant::now() < deadline {
+        if let Ok(Some(client)) = relay_ipc::Client::connect(home) {
+            return client;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("IPC client did not connect");
+}
+
+#[test]
+fn ipc_hello_status_rescan_pause_and_host_lock() {
+    let home = TempDir::new().unwrap();
+    let mount = TempDir::new().unwrap();
+    fs::write(mount.path().join("seed.txt"), b"seed").unwrap();
+
+    {
+        let mut engine = Engine::init(home.path(), "testdev").unwrap();
+        engine.create_space("Personal").unwrap();
+        engine
+            .add_mount("Personal", "code", mount.path(), &[], &[])
+            .unwrap();
+    }
+
+    let session = start_daemon(home.path());
+    assert!(wait_started(&session).is_some(), "daemon did not start");
+
+    let mut client = wait_ipc(home.path());
+    let hello = client.hello().expect("hello");
+    assert_eq!(hello.host, HostKind::Cli);
+    assert_eq!(hello.pid, std::process::id());
+    assert_eq!(hello.protocol, relay_ipc::PROTOCOL_VERSION);
+
+    let status = client.status().expect("status");
+    assert_eq!(status.state, relay_ipc::HostState::Running);
+    assert!(
+        status
+            .mounts
+            .iter()
+            .any(|m| m.space == "Personal" && m.mount == "code"),
+        "status mounts: {:?}",
+        status.mounts
+    );
+
+    assert!(
+        wait_until(CONVERGE, || live_has(
+            home.path(),
+            "Personal",
+            "code",
+            "seed.txt"
+        )),
+        "seed was not indexed"
+    );
+
+    fs::write(mount.path().join("via-rescan.txt"), b"rescanned").unwrap();
+    let queued = client.rescan(None, None).expect("rescan");
+    assert!(
+        queued.queued.iter().any(|n| n == "Personal/code"),
+        "queued: {:?}",
+        queued.queued
+    );
+    assert!(
+        wait_until(CONVERGE, || live_has(
+            home.path(),
+            "Personal",
+            "code",
+            "via-rescan.txt"
+        )),
+        "rescan did not index the new file"
+    );
+
+    client.pause().expect("pause");
+    assert!(
+        wait_until(CONVERGE, || Engine::open(home.path()).is_ok()),
+        "engine locks were not released after pause"
+    );
+
+    let mut client = wait_ipc(home.path());
+    client.resume().expect("resume");
+    assert!(
+        wait_until(CONVERGE, || matches!(
+            relay_ipc::Client::connect(home.path())
+                .ok()
+                .flatten()
+                .and_then(|mut c| c.status().ok())
+                .map(|s| s.state),
+            Some(relay_ipc::HostState::Running)
+        )),
+        "did not resume"
+    );
+
+    let home_path = home.path().to_path_buf();
+    let second = thread::spawn(move || {
+        let stop = Arc::new(AtomicBool::new(false));
+        relay_daemon::run(
+            &home_path,
+            DaemonOptions {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                watch: watch_opts(),
+                verbose: false,
+                host: HostKind::Cli,
+            },
+            &stop,
+            &mut |_| {},
+        )
+    });
+    let err = second
+        .join()
+        .expect("second host thread")
+        .expect_err("second host");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("another Relay host is already running"),
+        "{message}"
+    );
+    assert!(
+        message.contains("cli") || message.contains("pid"),
+        "{message}"
     );
 
     stop_daemon(session);

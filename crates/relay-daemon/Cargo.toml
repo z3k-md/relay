@@ -10,7 +10,9 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 relay-engine.workspace = true
+relay-ipc.workspace = true
 relay-net.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
