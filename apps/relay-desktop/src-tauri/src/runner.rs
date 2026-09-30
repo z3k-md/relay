@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use relay_engine::{WatchEvent, WatchOptions};
+use relay_engine::{
+    TransferDirection, TransferLive, WatchEvent, WatchOptions, bookends, index_row, summary_line,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -49,6 +51,9 @@ struct Inner {
     events: VecDeque<ActivityItem>,
     connected: HashSet<String>,
     thread: Option<JoinHandle<()>>,
+    transfers: Vec<TransferLive>,
+    scans: Vec<TransferLive>,
+    published: Vec<TransferLive>,
 }
 
 pub struct Runner {
@@ -67,6 +72,9 @@ impl Runner {
                 events: VecDeque::new(),
                 connected: HashSet::new(),
                 thread: None,
+                transfers: Vec::new(),
+                scans: Vec::new(),
+                published: Vec::new(),
             }),
         }
     }
@@ -205,6 +213,77 @@ impl Runner {
         tray::refresh(app);
     }
 
+    fn apply_progress(&self, app: &AppHandle, event: &WatchEvent) {
+        let update = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            let changed = match event {
+                WatchEvent::Transfers(rows) => {
+                    inner.transfers = rows.clone();
+                    true
+                }
+                WatchEvent::ScanProgress {
+                    space,
+                    mount,
+                    files_seen,
+                    bytes_hashed,
+                } => {
+                    if let Some(row) = inner
+                        .scans
+                        .iter_mut()
+                        .find(|row| row.space == *space && row.mount.as_deref() == Some(mount))
+                    {
+                        row.files_done = *files_seen;
+                        row.bytes_done = *bytes_hashed;
+                    } else {
+                        let mut row = index_row(space, mount, *files_seen, *bytes_hashed);
+                        row.started_at_ms = now_ms().max(0) as u64;
+                        inner.scans.push(row);
+                    }
+                    true
+                }
+                WatchEvent::Scanned { space, mount, .. }
+                | WatchEvent::ScanFailed { space, mount, .. } => {
+                    let before = inner.scans.len();
+                    inner.scans.retain(|row| {
+                        !(row.space == *space && row.mount.as_deref() == Some(mount))
+                    });
+                    before != inner.scans.len()
+                }
+                _ => false,
+            };
+            if !changed {
+                return;
+            }
+            let mut next = inner.transfers.clone();
+            next.extend(inner.scans.iter().cloned());
+            let lines = bookends(&inner.published, &next, now_ms().max(0) as u64);
+            inner.published = next.clone();
+            (next, lines)
+        };
+        for line in update.1 {
+            self.push_event(
+                app,
+                ActivityItem {
+                    ts_ms: now_ms(),
+                    kind: line.kind,
+                    message: line.summary,
+                },
+            );
+        }
+        let _ = app.emit("relay://transfers", &ui_transfers(&update.0));
+        tray::refresh(app);
+    }
+
+    pub fn transfer_summary(&self) -> Option<String> {
+        let inner = self.inner.lock().ok()?;
+        if matches!(inner.state, RunnerState::Paused) {
+            return None;
+        }
+        summary_line(&inner.published)
+    }
+
     fn apply_watch_peer(&self, event: &WatchEvent) {
         if let Ok(mut inner) = self.inner.lock() {
             match event {
@@ -282,6 +361,7 @@ fn handle_daemon_event(app: &AppHandle, event: &DaemonEvent) {
     let (kind, message) = describe_event(event);
     if let DaemonEvent::Watch(watch) = event {
         runner.apply_watch_peer(watch);
+        runner.apply_progress(app, watch);
     }
     match event {
         DaemonEvent::Started { .. } => runner.set_state(app, RunnerState::Running),
@@ -289,6 +369,12 @@ fn handle_daemon_event(app: &AppHandle, event: &DaemonEvent) {
         DaemonEvent::Resumed => runner.set_state(app, RunnerState::Starting),
         DaemonEvent::Reloading => {}
         _ => {}
+    }
+    if matches!(
+        event,
+        DaemonEvent::Watch(WatchEvent::Transfers(_) | WatchEvent::ScanProgress { .. })
+    ) {
+        return;
     }
     runner.push_event(
         app,
@@ -408,6 +494,23 @@ fn describe_watch(event: &WatchEvent) -> (String, String) {
             format!("{peer} wants to delete {deletions} of {live} files in {space}/{mount}"),
         ),
         WatchEvent::Stopped => ("stop".to_owned(), "Sync loop stopped".to_owned()),
+        WatchEvent::Transfers(rows) => (
+            "transfers".to_owned(),
+            if rows.is_empty() {
+                "Transfers idle".to_owned()
+            } else {
+                format!("{} transfer(s) in flight", rows.len())
+            },
+        ),
+        WatchEvent::ScanProgress {
+            space,
+            mount,
+            files_seen,
+            bytes_hashed,
+        } => (
+            "scanProgress".to_owned(),
+            format!("{space}/{mount}: indexed {files_seen} files, {bytes_hashed} bytes"),
+        ),
     }
 }
 
@@ -479,12 +582,57 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-pub fn status_line(state: &RunnerState, connected: usize) -> String {
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiTransfer {
+    peer_id: String,
+    peer_name: String,
+    space: String,
+    mount: Option<String>,
+    direction: String,
+    files_done: u64,
+    files_total: Option<u64>,
+    bytes_done: u64,
+    bytes_total: Option<u64>,
+    bytes_per_sec: u64,
+    started_at_ms: u64,
+    retries: u64,
+    current_path: Option<String>,
+}
+
+fn ui_transfers(rows: &[TransferLive]) -> Vec<UiTransfer> {
+    rows.iter()
+        .map(|row| UiTransfer {
+            peer_id: row.peer_id.clone(),
+            peer_name: row.peer_name.clone(),
+            space: row.space.clone(),
+            mount: row.mount.clone(),
+            direction: match row.direction {
+                TransferDirection::Receive => "receive",
+                TransferDirection::Send => "send",
+                TransferDirection::Index => "index",
+            }
+            .to_owned(),
+            files_done: row.files_done,
+            files_total: row.files_total,
+            bytes_done: row.bytes_done,
+            bytes_total: row.bytes_total,
+            started_at_ms: row.started_at_ms,
+            bytes_per_sec: row.bytes_per_sec,
+            retries: row.retries,
+            current_path: row.current_path.clone(),
+        })
+        .collect()
+}
+
+pub fn status_line(state: &RunnerState, connected: usize, summary: Option<&str>) -> String {
     match state {
         RunnerState::NotInitialized => "Relay — Not initialized".to_owned(),
         RunnerState::Starting => "Relay — Starting…".to_owned(),
         RunnerState::Running => {
-            if connected == 1 {
+            if let Some(summary) = summary {
+                format!("Relay — {summary}")
+            } else if connected == 1 {
                 "Relay — Running, 1 peer online".to_owned()
             } else {
                 format!("Relay — Running, {connected} peers online")

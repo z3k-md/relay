@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::discovery::{Discovery, PairingAd};
 use crate::pairing::PairSession;
@@ -31,6 +31,7 @@ pub(crate) const CLOSE_SHUTDOWN: u32 = 4;
 pub(crate) const CLOSE_UNTRUSTED: u32 = 5;
 
 const MAX_CONCURRENT_FETCHES: usize = 8;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const CHUNK: usize = 64 * 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -523,8 +524,9 @@ async fn incoming_objects(conn: Connection, inner: Arc<Inner>, peer: DeviceId) {
             Ok((send, recv)) => {
                 let store = inner.store.clone();
                 let conn = conn.clone();
+                let progress = Arc::clone(&inner);
                 tokio::spawn(async move {
-                    if let Err(e) = serve_object(send, recv, &store, &conn).await {
+                    if let Err(e) = serve_object(send, recv, &store, &conn, &progress, peer).await {
                         tracing::debug!(peer = %peer, error = %e, "object serve failed");
                     }
                 });
@@ -550,6 +552,8 @@ async fn serve_object(
     mut recv: RecvStream,
     store: &ObjectStore,
     conn: &Connection,
+    inner: &Inner,
+    peer: DeviceId,
 ) -> Result<(), ServeErr> {
     let req = match read_message::<ObjectRequest>(&mut recv).await {
         Ok(req) => req,
@@ -621,6 +625,8 @@ async fn serve_object(
                 message: e.to_string(),
             })?;
             let mut buf = vec![0u8; CHUNK];
+            let mut sent = 0u64;
+            let mut last_progress = Instant::now();
             loop {
                 let n = file.read(&mut buf).await.map_err(|e| ServeErr {
                     message: e.to_string(),
@@ -631,6 +637,17 @@ async fn serve_object(
                 send.write_all(&buf[..n]).await.map_err(|e| ServeErr {
                     message: e.to_string(),
                 })?;
+                sent += n as u64;
+                let now = Instant::now();
+                if now.saturating_duration_since(last_progress) >= PROGRESS_INTERVAL {
+                    last_progress = now;
+                    inner.emit(NetEvent::ObjectProgress {
+                        peer,
+                        object: id,
+                        incoming: false,
+                        bytes: sent,
+                    });
+                }
             }
             let _ = send.finish();
         }
@@ -708,7 +725,7 @@ async fn fetch_object(
         }
     }
 
-    let result = do_fetch(&inner, &conn, object, &sem).await;
+    let result = do_fetch(&inner, &conn, peer, object, &sem).await;
     in_flight
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -728,6 +745,7 @@ async fn fetch_object(
 async fn do_fetch(
     inner: &Inner,
     conn: &Connection,
+    peer: DeviceId,
     object: ObjectId,
     sem: &Semaphore,
 ) -> Result<(), FetchFail> {
@@ -762,7 +780,21 @@ async fn do_fetch(
         });
     }
 
-    receive_object(&inner.store, &mut recv, object, header.size).await
+    let mut last_progress = Instant::now();
+    let store = inner.store.clone();
+    receive_object(&store, &mut recv, object, header.size, &mut |have| {
+        let now = Instant::now();
+        if now.saturating_duration_since(last_progress) >= PROGRESS_INTERVAL {
+            last_progress = now;
+            inner.emit(NetEvent::ObjectProgress {
+                peer,
+                object,
+                incoming: true,
+                bytes: have,
+            });
+        }
+    })
+    .await
 }
 
 async fn receive_object(
@@ -770,9 +802,10 @@ async fn receive_object(
     recv: &mut RecvStream,
     expected: ObjectId,
     size: u64,
+    on_progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<(), FetchFail> {
     let tmp = store.tmp_path().map_err(FetchFail::err)?;
-    let outcome = write_and_import(store, recv, expected, size, &tmp).await;
+    let outcome = write_and_import(store, recv, expected, size, &tmp, on_progress).await;
     if outcome.is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
@@ -785,6 +818,7 @@ async fn write_and_import(
     expected: ObjectId,
     size: u64,
     tmp: &std::path::Path,
+    on_progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<(), FetchFail> {
     let mut file = tokio::fs::File::create(tmp).await.map_err(FetchFail::err)?;
     let mut hasher = blake3::Hasher::new();
@@ -802,6 +836,7 @@ async fn write_and_import(
                     .map_err(FetchFail::err)?;
                 hasher.update(&buf[..n]);
                 remaining -= n as u64;
+                on_progress(size - remaining);
             }
             Ok(None) => return Err(FetchFail::err("truncated object stream")),
             Err(e) => return Err(FetchFail::err(e)),

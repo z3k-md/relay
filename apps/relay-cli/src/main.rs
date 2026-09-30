@@ -87,6 +87,21 @@ enum Command {
     Share { space: String, peer: String },
     /// Stop sharing a space with a peer
     Unshare { space: String, peer: String },
+    /// Durable mailbox for offline catch-up
+    Replica {
+        #[command(subcommand)]
+        cmd: ReplicaCmd,
+    },
+    /// Device groups for replication policies
+    Group {
+        #[command(subcommand)]
+        cmd: GroupCmd,
+    },
+    /// Replication policies (which subtrees sync to which devices)
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCmd,
+    },
     /// List live conflict copies, or resolve them
     Conflicts {
         #[arg(long)]
@@ -200,6 +215,24 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum ReplicaCmd {
+    /// Set the durable mailbox directory
+    Set { path: PathBuf },
+    /// Clear the mailbox path (peer-only sync)
+    Clear,
+    /// Show the configured mailbox path and push watermarks
+    Status,
+    /// Garbage-collect acked mailbox entries and objects
+    Gc {
+        /// Keep the latest live object per path (mirror mode)
+        #[arg(long)]
+        mirror: bool,
+        #[arg(long, default_value_t = 3600)]
+        grace_secs: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ConflictsCmd {
     /// Keep the current file or replace it with the conflict copy
     Resolve {
@@ -251,6 +284,36 @@ enum PeerCmd {
     List,
     Remove {
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupCmd {
+    Create { name: String },
+    Add { name: String, peer: String },
+    Remove { name: String, peer: String },
+    Delete { name: String },
+    List,
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCmd {
+    Add {
+        space: String,
+        name: String,
+        #[arg(long = "selector", required = true)]
+        selectors: Vec<String>,
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+    },
+    Remove {
+        space: String,
+        name: String,
+    },
+    List {
+        space: Option<String>,
     },
 }
 
@@ -395,6 +458,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Replica { cmd } => cmd_replica(&home, cmd, json),
+        Command::Group { cmd } => cmd_group(&home, cmd, json),
+        Command::Policy { cmd } => cmd_policy(&home, cmd, json),
         Command::Conflicts { space, cmd } => match cmd {
             None => {
                 let engine = Engine::open_read_only(&home)?;
@@ -1141,6 +1207,8 @@ fn print_watch_event(
                 utc_hms()
             ));
         }
+        WatchEvent::Transfers(_) => {}
+        WatchEvent::ScanProgress { .. } => {}
     }
 }
 
@@ -1243,6 +1311,209 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
                 );
             } else {
                 println!("removed peer {name}");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_replica(home: &Path, cmd: ReplicaCmd, json: bool) -> Result<ExitCode> {
+    match cmd {
+        ReplicaCmd::Set { path } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.set_replica_path(&path)?;
+            let status = engine.replica_status()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "replica path {}",
+                    status
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
+        }
+        ReplicaCmd::Clear => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.clear_replica_path()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"cleared": true}))?
+                );
+            } else {
+                println!("replica path cleared");
+            }
+        }
+        ReplicaCmd::Status => {
+            let engine = Engine::open_read_only(home)?;
+            let status = engine.replica_status()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                match &status.path {
+                    Some(path) => println!("replica path {}", path.display()),
+                    None => println!("replica path not set"),
+                }
+                for row in &status.pushed {
+                    println!("  {} pushed_seq {}", row.space, row.pushed_seq);
+                }
+            }
+        }
+        ReplicaCmd::Gc { mirror, grace_secs } => {
+            let mut engine = Engine::open_for_config(home)?;
+            let report = engine.replica_gc(mirror, Duration::from_secs(grace_secs))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "removed {} entries, {} objects ({} bytes)",
+                    report.entries_removed, report.objects_removed, report.bytes_freed
+                );
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_group(home: &Path, cmd: GroupCmd, json: bool) -> Result<ExitCode> {
+    match cmd {
+        GroupCmd::Create { name } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.group_create(&name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"created": name}))?
+                );
+            } else {
+                println!("created group {name}");
+            }
+        }
+        GroupCmd::Add { name, peer } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.group_add(&name, &peer)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"group": name, "added": peer})
+                    )?
+                );
+            } else {
+                println!("added {peer} to group {name}");
+            }
+        }
+        GroupCmd::Remove { name, peer } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.group_remove_member(&name, &peer)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"group": name, "removed": peer})
+                    )?
+                );
+            } else {
+                println!("removed {peer} from group {name}");
+            }
+        }
+        GroupCmd::Delete { name } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.group_delete(&name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"deleted": name}))?
+                );
+            } else {
+                println!("deleted group {name}");
+            }
+        }
+        GroupCmd::List => {
+            let engine = Engine::open_read_only(home)?;
+            let groups = engine.groups()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&groups)?);
+            } else if groups.is_empty() {
+                println!("no groups");
+            } else {
+                for group in groups {
+                    let members = if group.members.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        group.members.join(", ")
+                    };
+                    println!("{}  {members}", group.name);
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_policy(home: &Path, cmd: PolicyCmd, json: bool) -> Result<ExitCode> {
+    match cmd {
+        PolicyCmd::Add {
+            space,
+            name,
+            selectors,
+            peers,
+            groups,
+        } => {
+            let mut engine = Engine::open_for_config(home)?;
+            let policy = engine.policy_add(&space, &name, &selectors, &peers, &groups)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&policy)?);
+            } else {
+                println!(
+                    "added policy {name} on {space} ({} selector(s), {} target(s))",
+                    policy.selectors.len(),
+                    policy.targets.len()
+                );
+            }
+        }
+        PolicyCmd::Remove { space, name } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.policy_remove(&space, &name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"removed": name, "space": space})
+                    )?
+                );
+            } else {
+                println!("removed policy {name} from {space}");
+            }
+        }
+        PolicyCmd::List { space } => {
+            let engine = Engine::open_read_only(home)?;
+            let policies = engine.policies(space.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&policies)?);
+            } else if policies.is_empty() {
+                println!("no policies");
+            } else {
+                for policy in policies {
+                    let selectors = policy.selectors.join(", ");
+                    let mut targets = policy.peer_names.clone();
+                    for g in &policy.group_names {
+                        targets.push(format!("group:{g}"));
+                    }
+                    let targets = if targets.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        targets.join(", ")
+                    };
+                    println!(
+                        "{}/{}  selectors=[{selectors}]  targets=[{targets}]",
+                        policy.space, policy.name
+                    );
+                }
             }
         }
     }
@@ -1466,6 +1737,7 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
                 "listen": live.listen,
                 "peers": live.peers,
                 "mounts": live.mounts,
+                "transfers": live.transfers,
             }),
             None => serde_json::Value::Null,
         };
@@ -1608,6 +1880,78 @@ fn print_daemon_human(daemon: Option<&(relay_ipc::Hello, DaemonStatus)>) {
             mount.watching.as_str()
         );
     }
+    if !live.transfers.is_empty() {
+        println!("sync:");
+        for row in &live.transfers {
+            println!("  {}", format_transfer(row));
+        }
+    }
+}
+
+fn format_transfer(row: &relay_ipc::TransferLive) -> String {
+    let rate = if row.bytes_per_sec > 0 {
+        format!("  {}", format_byte_rate(row.bytes_per_sec))
+    } else {
+        String::new()
+    };
+    match row.direction {
+        relay_ipc::TransferDirection::Receive => {
+            let bytes = match row.bytes_total {
+                Some(total) => format!(
+                    "{} of {}",
+                    format_byte_count(row.bytes_done),
+                    format_byte_count(total)
+                ),
+                None => format_byte_count(row.bytes_done),
+            };
+            let files = match row.files_total {
+                Some(total) => format!("{} of {total} files", row.files_done),
+                None => format!("{} files", row.files_done),
+            };
+            let retry = if row.retries > 0 {
+                format!("  {} files waiting to retry", row.retries)
+            } else {
+                String::new()
+            };
+            format!(
+                "receiving from {}  {}  {files}  {bytes}{rate}{retry}",
+                row.peer_name, row.space
+            )
+        }
+        relay_ipc::TransferDirection::Send => format!(
+            "sending to {}  {}  {}{rate}",
+            row.peer_name,
+            row.space,
+            format_byte_count(row.bytes_done)
+        ),
+        relay_ipc::TransferDirection::Index => {
+            let mount = row.mount.as_deref().unwrap_or(&row.space);
+            format!(
+                "indexing {mount}  {} files  {}",
+                row.files_done,
+                format_byte_count(row.bytes_done)
+            )
+        }
+    }
+}
+
+fn format_byte_count(n: u64) -> String {
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let kb = n as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{kb:.1} KB");
+    }
+    let mb = kb / 1024.0;
+    if mb < 1024.0 {
+        return format!("{mb:.1} MB");
+    }
+    format!("{:.1} GB", mb / 1024.0)
+}
+
+fn format_byte_rate(n: u64) -> String {
+    format!("{}/s", format_byte_count(n))
 }
 
 fn cmd_pause(home: &Path, json: bool) -> Result<ExitCode> {

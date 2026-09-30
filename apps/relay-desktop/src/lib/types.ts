@@ -110,6 +110,22 @@ export interface GitResolveReport {
   scanned: boolean;
 }
 
+export interface TransferLive {
+  peerId: string;
+  peerName: string;
+  space: string;
+  mount: string | null;
+  direction: "receive" | "send" | "index";
+  filesDone: number;
+  filesTotal: number | null;
+  bytesDone: number;
+  bytesTotal: number | null;
+  bytesPerSec: number;
+  startedAtMs: number;
+  retries: number;
+  currentPath: string | null;
+}
+
 export interface ActivityItem {
   tsMs: number;
   kind: string;

@@ -14,7 +14,7 @@ pub use protocol::{
     ActivityItem, AddMountParams, AddMountResult, Hello, HostKind, HostState, MountLive,
     PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
     PeerLive, Request, RescanParams, RescanResult, RpcError, RpcErrorBody, ShareParams, Status,
-    Watching, decode_line, encode_line,
+    TransferDirection, TransferLive, Watching, decode_line, encode_line,
 };
 pub use server::{Handler, Server};
 

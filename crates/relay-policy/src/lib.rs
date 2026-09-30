@@ -213,6 +213,21 @@ fn default_case_insensitive() -> bool {
     cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
+/// Validate a replication-policy selector glob (case-sensitive).
+///
+/// Same semantics as mount rules: `*` does not cross `/`; `**` matches any
+/// number of path components, including zero.
+pub fn validate_selector(pattern: &str) -> Result<(), PolicyError> {
+    compile_glob(pattern, false).map(|_| ())
+}
+
+/// Whether a case-sensitive selector glob matches `path` (`/`-separated).
+pub fn selector_matches(pattern: &str, path: &str) -> Result<bool, PolicyError> {
+    Ok(compile_glob(pattern, false)?
+        .compile_matcher()
+        .is_match(path))
+}
+
 fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<Glob, PolicyError> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
@@ -525,5 +540,16 @@ mod tests {
                 assert!(!message.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn replication_selector_matches_case_sensitive() {
+        assert!(selector_matches("code/personal/**", "code/personal/a.txt").unwrap());
+        assert!(!selector_matches("code/personal/**", "code/work/b.txt").unwrap());
+        assert!(!selector_matches("code/Personal/**", "code/personal/a.txt").unwrap());
+        assert!(selector_matches("code/*/x.txt", "code/personal/x.txt").unwrap());
+        assert!(!selector_matches("code/*/x.txt", "code/personal/nested/x.txt").unwrap());
+        assert!(validate_selector("code/work/**").is_ok());
+        assert!(validate_selector("[").is_err());
     }
 }

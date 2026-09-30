@@ -21,6 +21,7 @@ import type {
   Overview,
   Page,
   RunnerState,
+  TransferLive,
   UpdateAvailable,
 } from "./lib/types";
 
@@ -35,6 +36,7 @@ const pages: { id: Page; label: string }[] = [
 
 const page = ref<Page>("overview");
 const overview = ref<Overview | null>(null);
+const transfers = ref<TransferLive[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
 const update = ref<UpdateAvailable | null>(null);
@@ -114,6 +116,11 @@ onMounted(async () => {
     await listen<ActivityItem>("relay://activity", (event) => {
       activityRef.value?.prepend(event.payload);
       if (overviewKinds.has(event.payload.kind)) void refresh();
+    }),
+  );
+  unlistens.push(
+    await listen<TransferLive[]>("relay://transfers", (event) => {
+      transfers.value = event.payload;
     }),
   );
   unlistens.push(
@@ -200,6 +207,7 @@ onUnmounted(() => {
           <OverviewView
             v-if="page === 'overview'"
             :overview="overview"
+            :transfers="transfers"
             :update="update"
             @pause="pause"
             @resume="resume"

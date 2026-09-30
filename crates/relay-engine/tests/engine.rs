@@ -1084,8 +1084,42 @@ fn read_only_open_upgrades_an_older_schema() {
     drop(init_engine(home.path()));
     {
         let conn = rusqlite::Connection::open(home.path().join("relay.db")).unwrap();
-        conn.execute_batch("DROP TABLE local_settings; PRAGMA user_version = 6;")
-            .unwrap();
+        // Roll schema back to v7 so open_read_only must migrate through 0008–0010.
+        conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS replica_push;
+            DROP TABLE IF EXISTS peer_policy_snapshots;
+            DROP TABLE IF EXISTS replication_policy_groups;
+            DROP TABLE IF EXISTS replication_policy_peers;
+            DROP TABLE IF EXISTS replication_policies;
+            DROP TABLE IF EXISTS device_group_members;
+            DROP TABLE IF EXISTS device_groups;
+            CREATE TABLE spaces_v8 (
+                id BLOB PRIMARY KEY CHECK (length(id) = 16),
+                name TEXT NOT NULL UNIQUE,
+                created_at_ms INTEGER
+            );
+            INSERT INTO spaces_v8 SELECT id, name, created_at_ms FROM spaces;
+            DROP TABLE spaces;
+            ALTER TABLE spaces_v8 RENAME TO spaces;
+
+            DROP TABLE IF EXISTS dismissed_peers;
+            CREATE TABLE peer_offers_v7 (
+                device_ref INTEGER NOT NULL REFERENCES devices(ref),
+                space_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                mounts_json TEXT NOT NULL,
+                received_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (device_ref, space_id)
+            );
+            INSERT INTO peer_offers_v7
+                SELECT device_ref, space_id, name, mounts_json, received_at_ms FROM peer_offers;
+            DROP TABLE peer_offers;
+            ALTER TABLE peer_offers_v7 RENAME TO peer_offers;
+            PRAGMA user_version = 7;
+            ",
+        )
+        .unwrap();
     }
 
     let engine = Engine::open_read_only(home.path()).unwrap();
@@ -1096,5 +1130,5 @@ fn read_only_open_upgrades_an_older_schema() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 10);
 }

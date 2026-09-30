@@ -27,8 +27,8 @@
 
 use relay_core::entry::EntryKey;
 use relay_core::{
-    DeviceId, EntryContent, EntryRecord, LogicalPath, MountId, ObjectId, Sequence, SpaceId,
-    VersionVector,
+    DeviceId, EntryContent, EntryRecord, LogicalPath, MountId, ObjectId, PolicyId, Sequence,
+    SpaceId, VersionVector,
 };
 
 /// Bumped on incompatible changes. Peers with different versions refuse to
@@ -102,8 +102,9 @@ pub struct Hello {
 }
 
 /// Spaces the sender shares with the receiver. Sent after `Hello` and again
-/// whenever the set changes. Receiving an offer never joins anything; the user
-/// has to run `relay space join`.
+/// whenever the set changes. Receiving an offer never joins a space. Members
+/// listed on an offer for a space this device has already joined are trusted
+/// (see D26); membership alone does not join anything.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SpaceOffers {
     #[prost(message, repeated, tag = "1")]
@@ -118,6 +119,39 @@ pub struct SpaceOffer {
     pub name: String,
     #[prost(message, repeated, tag = "3")]
     pub mounts: Vec<MountOffer>,
+    /// Other devices this space is also shared with (excluding the recipient).
+    #[prost(message, repeated, tag = "4")]
+    pub members: Vec<MemberOffer>,
+    /// Local policy epoch for this space (D27). Peers replay from sequence 0
+    /// when the epoch they stored for us changes.
+    #[prost(uint64, tag = "5")]
+    pub policy_epoch: u64,
+    /// Local policies for this space with groups already expanded to device ids.
+    #[prost(message, repeated, tag = "6")]
+    pub policies: Vec<PolicyOffer>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PolicyOffer {
+    #[prost(bytes = "vec", tag = "1")]
+    pub id: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(string, repeated, tag = "3")]
+    pub selectors: Vec<String>,
+    /// Device ids; groups are expanded before the offer is built.
+    #[prost(bytes = "vec", repeated, tag = "4")]
+    pub targets: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct MemberOffer {
+    #[prost(bytes = "vec", tag = "1")]
+    pub device_id: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(string, repeated, tag = "3")]
+    pub addresses: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -157,6 +191,19 @@ pub struct IndexBatch {
     /// changes.
     #[prost(uint64, tag = "5")]
     pub after_sequence: u64,
+    /// Entry count for the whole catch-up that started at `plan_after`, not
+    /// just this batch. Absent when the sender has no backlog, or on older
+    /// peers. Directories and deletes are included.
+    #[prost(uint64, optional, tag = "6")]
+    pub plan_files: Option<u64>,
+    /// Sum of file sizes for that same catch-up. Directories and deletes
+    /// contribute nothing. Absent alongside `plan_files`.
+    #[prost(uint64, optional, tag = "7")]
+    pub plan_bytes: Option<u64>,
+    /// Sender sequence the catch-up plan starts after. Stamped on every batch
+    /// of that plan so the receiver can tell a continuation from a new range.
+    #[prost(uint64, optional, tag = "8")]
+    pub plan_after: Option<u64>,
 }
 
 /// "I have durably applied your changes to this space through
@@ -401,11 +448,19 @@ pub fn mount_id_from_bytes(bytes: &[u8]) -> Result<MountId, ProtoError> {
     uuid_from_bytes("mount_id", bytes).map(MountId::from_uuid)
 }
 
+pub fn policy_id_from_bytes(bytes: &[u8]) -> Result<PolicyId, ProtoError> {
+    uuid_from_bytes("policy_id", bytes).map(PolicyId::from_uuid)
+}
+
 pub fn space_id_bytes(id: &SpaceId) -> Vec<u8> {
     id.as_uuid().as_bytes().to_vec()
 }
 
 pub fn mount_id_bytes(id: &MountId) -> Vec<u8> {
+    id.as_uuid().as_bytes().to_vec()
+}
+
+pub fn policy_id_bytes(id: &PolicyId) -> Vec<u8> {
     id.as_uuid().as_bytes().to_vec()
 }
 
@@ -557,6 +612,9 @@ mod tests {
             through_sequence: 42,
             caught_up: true,
             after_sequence: 0,
+            plan_files: Some(1),
+            plan_bytes: Some(11),
+            plan_after: Some(0),
         }));
         let bytes = encode_frame(&frame).unwrap();
         let len = frame_len(bytes[..4].try_into().unwrap()).unwrap();
@@ -573,6 +631,9 @@ mod tests {
         assert_eq!(remote.modified_by, record.modified_by);
         assert_eq!(remote.sequence, record.sequence);
         assert_eq!(remote.mtime_ns, record.stat.map(|s| s.mtime_ns));
+        assert_eq!(batch.plan_files, Some(1));
+        assert_eq!(batch.plan_bytes, Some(11));
+        assert_eq!(batch.plan_after, Some(0));
     }
 
     #[test]

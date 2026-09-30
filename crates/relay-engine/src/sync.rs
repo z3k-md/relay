@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 
 use relay_core::version::VectorOrdering;
 use relay_core::{DeviceId, EntryContent, EntryKey, MountId, ObjectId, Sequence, SpaceId};
-use relay_db::PeerOfferRow;
+use relay_db::{OfferedMember, PeerOfferRow};
 use relay_proto::{
-    Ack, INDEX_BATCH_ENTRIES, IndexBatch, IndexRequest, RemoteEntry, entry_from_wire,
-    entry_to_wire, frame, space_id_bytes, space_id_from_bytes,
+    Ack, INDEX_BATCH_ENTRIES, IndexBatch, IndexRequest, RemoteEntry, device_id_from_bytes,
+    entry_from_wire, entry_to_wire, frame, space_id_bytes, space_id_from_bytes,
 };
 use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
 use crate::peers::offered_mounts_from_wire;
+use crate::progress::{IncomingFile, ProgressBook, TransferLive};
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_ATTEMPTS: u32 = 3;
@@ -57,6 +58,13 @@ pub enum SyncInput {
         object: ObjectId,
         not_found: bool,
         reason: String,
+    },
+    /// Absolute bytes of `object` received (`incoming`) or served so far.
+    ObjectProgress {
+        peer: DeviceId,
+        object: ObjectId,
+        incoming: bool,
+        bytes: u64,
     },
     Rescan {
         mounts: Vec<(SpaceId, MountId)>,
@@ -133,6 +141,7 @@ pub enum SyncEvent {
         deletions: usize,
         live: usize,
     },
+    Transfers(Vec<TransferLive>),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -143,7 +152,6 @@ pub struct OfferedSpaceEvent {
 }
 
 struct Connected {
-    #[allow(dead_code)]
     name: String,
     send_cursor: HashMap<SpaceId, Sequence>,
     incoming: HashMap<SpaceId, VecDeque<PendingBatch>>,
@@ -181,6 +189,7 @@ enum Fetch {
 pub struct Syncer {
     connected: HashMap<DeviceId, Connected>,
     index_batch_entries: usize,
+    progress: ProgressBook,
 }
 
 impl Default for Syncer {
@@ -188,6 +197,7 @@ impl Default for Syncer {
         Self {
             connected: HashMap::new(),
             index_batch_entries: INDEX_BATCH_ENTRIES,
+            progress: ProgressBook::default(),
         }
     }
 }
@@ -221,7 +231,9 @@ impl Syncer {
             }
             SyncInput::PeerDisconnected { peer } => {
                 self.connected.remove(&peer);
+                self.progress.drop_peer(peer);
                 events.push(SyncEvent::PeerDisconnected { peer });
+                self.flush_progress(&mut events, true);
             }
             SyncInput::Frame { peer, body } => {
                 self.on_frame(engine, peer, body, out, &mut events)?;
@@ -245,13 +257,45 @@ impl Syncer {
                     &mut events,
                 )?;
             }
+            SyncInput::ObjectProgress {
+                peer,
+                object,
+                incoming,
+                bytes,
+            } => {
+                if incoming {
+                    self.progress
+                        .note_download(peer, object, bytes, Instant::now());
+                } else {
+                    self.progress
+                        .note_upload(peer, object, bytes, Instant::now());
+                }
+            }
             SyncInput::Rescan { .. }
             | SyncInput::AddPeer { .. }
             | SyncInput::PeerAddresses { .. }
             | SyncInput::AddMount { .. }
             | SyncInput::Share { .. } => {}
         }
+        self.flush_progress(&mut events, false);
         Ok(events)
+    }
+
+    fn flush_progress(&mut self, events: &mut Vec<SyncEvent>, force: bool) {
+        if let Some(rows) = self.progress.emit_if_changed(Instant::now(), force) {
+            events.push(SyncEvent::Transfers(rows));
+        }
+    }
+
+    /// Rows currently open. Empty once a receive has applied through its plan
+    /// and a send has been acknowledged through its plan.
+    pub fn live_transfers(&self) -> Vec<TransferLive> {
+        self.progress.snapshot()
+    }
+
+    /// Throttled snapshot for the watch loop, between sync inputs.
+    pub fn poll_transfers(&mut self, now: Instant) -> Option<Vec<TransferLive>> {
+        self.progress.emit_if_changed(now, false)
     }
 
     /// Re-send current space offers to a connected peer after a live share or
@@ -306,6 +350,7 @@ impl Syncer {
                 self.send_batches(engine, peer, space, false, out, &mut events)?;
             }
         }
+        self.flush_progress(&mut events, false);
         Ok(events)
     }
 
@@ -358,6 +403,7 @@ impl Syncer {
                 }
             }
         }
+        self.flush_progress(&mut events, false);
         Ok(events)
     }
 
@@ -430,14 +476,19 @@ impl Syncer {
             return Ok(());
         }
         match body {
-            frame::Body::SpaceOffers(offers) => self.on_offers(engine, peer, offers, events)?,
+            frame::Body::SpaceOffers(offers) => {
+                self.on_offers(engine, peer, offers, out, events)?
+            }
             frame::Body::IndexRequest(req) => {
                 self.on_index_request(engine, peer, req, out, events)?
             }
             frame::Body::IndexBatch(batch) => {
                 self.on_index_batch(engine, peer, batch, out, events)?
             }
-            frame::Body::Ack(ack) => self.on_ack(engine, peer, ack)?,
+            frame::Body::Ack(ack) => {
+                self.on_ack(engine, peer, ack)?;
+                self.flush_progress(events, true);
+            }
             frame::Body::Hello(_)
             | frame::Body::Ping(_)
             | frame::Body::Pong(_)
@@ -451,10 +502,14 @@ impl Syncer {
         engine: &mut Engine,
         peer: DeviceId,
         offers: relay_proto::SpaceOffers,
+        out: &mut dyn FnMut(SyncOutput),
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
         let mut rows = Vec::new();
         let mut listed = Vec::new();
+        let mut set_peers = false;
+        let mut follow_up: Vec<(DeviceId, SpaceId)> = Vec::new();
+        let mut policy_replays: Vec<SpaceId> = Vec::new();
         for offer in offers.spaces {
             let Ok(space_id) = space_id_from_bytes(&offer.space_id) else {
                 events.push(SyncEvent::SyncWarning {
@@ -475,19 +530,86 @@ impl Syncer {
                     continue;
                 }
             };
+            let mut members = Vec::new();
+            for member in &offer.members {
+                match device_id_from_bytes(&member.device_id) {
+                    Ok(id) => members.push(OfferedMember {
+                        id,
+                        name: member.name.clone(),
+                        addresses: member.addresses.clone(),
+                    }),
+                    Err(_) => {
+                        events.push(SyncEvent::SyncWarning {
+                            peer,
+                            path: offer.name.clone(),
+                            reason: "invalid member device id in offer".into(),
+                        });
+                    }
+                }
+            }
             let already = engine.db.repo().space(space_id)?.is_some();
             listed.push(OfferedSpaceEvent {
                 name: offer.name.clone(),
                 id: space_id,
                 already_joined: already,
             });
+            if already {
+                let adopted = engine.adopt_offered_members(space_id, &members)?;
+                if adopted.peers_changed {
+                    set_peers = true;
+                }
+                for id in adopted.newly_shared {
+                    if self.connected.contains_key(&id) {
+                        follow_up.push((id, space_id));
+                    }
+                }
+                if let Some(replay) =
+                    self.apply_policy_offer(engine, peer, space_id, &offer, out, events)?
+                {
+                    policy_replays.push(replay);
+                }
+            }
             rows.push(PeerOfferRow {
                 space_id,
                 name: offer.name,
                 mounts,
+                members,
             });
         }
         engine.persist_offers(peer, &rows)?;
+        if set_peers {
+            out(SyncOutput::SetPeers);
+        }
+        for (member, space) in follow_up {
+            self.refresh_offers(engine, member, out)?;
+            let needs_index = self
+                .connected
+                .get(&member)
+                .is_some_and(|c| !c.send_cursor.contains_key(&space));
+            if needs_index {
+                let after = engine.db.repo().sync_progress(member, space)?.received_seq;
+                out(SyncOutput::Send {
+                    peer: member,
+                    body: frame::Body::IndexRequest(IndexRequest {
+                        space_id: space_id_bytes(&space),
+                        after_sequence: after.0,
+                    }),
+                });
+            }
+        }
+        for space in policy_replays {
+            if let Some(conn) = self.connected.get_mut(&peer) {
+                conn.send_cursor.insert(space, Sequence::ZERO);
+            }
+            self.send_batches(engine, peer, space, true, out, events)?;
+            out(SyncOutput::Send {
+                peer,
+                body: frame::Body::IndexRequest(IndexRequest {
+                    space_id: space_id_bytes(&space),
+                    after_sequence: 0,
+                }),
+            });
+        }
         let hint: Vec<_> = listed
             .iter()
             .filter(|s| !s.already_joined)
@@ -497,6 +619,33 @@ impl Syncer {
             events.push(SyncEvent::OffersReceived { peer, spaces: hint });
         }
         Ok(())
+    }
+
+    /// Store a peer's policy snapshot when the epoch changes. Returns the space
+    /// id when both sides should replay from sequence 0.
+    fn apply_policy_offer(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        space: SpaceId,
+        offer: &relay_proto::SpaceOffer,
+        _out: &mut dyn FnMut(SyncOutput),
+        _events: &mut Vec<SyncEvent>,
+    ) -> Result<Option<SpaceId>, EngineError> {
+        let previous = engine.db.repo().peer_policy_snapshot(peer, space)?;
+        if previous
+            .as_ref()
+            .is_some_and(|s| s.epoch == offer.policy_epoch)
+        {
+            return Ok(None);
+        }
+        let first_empty =
+            previous.is_none() && offer.policy_epoch == 0 && offer.policies.is_empty();
+        engine.store_peer_policy_snapshot(peer, space, offer.policy_epoch, &offer.policies)?;
+        if first_empty {
+            return Ok(None);
+        }
+        Ok(Some(space))
     }
 
     fn on_index_request(
@@ -542,12 +691,41 @@ impl Syncer {
             .map(|s| s.name)
             .unwrap_or_else(|| space.to_string());
 
+        let plan_after = after.0;
+        let plan = if after.0 < latest.0 {
+            engine.db.repo().catchup_plan(space, after)?
+        } else {
+            relay_db::CatchupPlan { files: 0, bytes: 0 }
+        };
+        if plan.files > 0 {
+            let peer_name = self
+                .connected
+                .get(&peer)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let now_ms = u64::try_from(engine.clock.now_ms()).unwrap_or(0);
+            self.progress.begin_send(
+                peer,
+                &peer_name,
+                space,
+                &space_name,
+                plan.files,
+                plan.bytes,
+                plan_after,
+                latest.0,
+                now_ms,
+            );
+            self.flush_progress(events, true);
+        }
+        let stamped = (plan.files > 0).then_some((plan.files, plan.bytes, plan_after));
+
         let limit = self.index_batch_entries;
         loop {
             let changes = engine
                 .db
                 .repo()
                 .changes_since_in_space(space, after, limit)?;
+            let query_len = changes.len();
             if changes.is_empty() && !force_empty && after.0 >= latest.0 {
                 break;
             }
@@ -557,19 +735,47 @@ impl Syncer {
                 changes.last().map(|e| e.sequence).unwrap_or(after)
             };
             let caught_up = through.0 >= latest.0;
-            let n = changes.len();
+
+            let mounts = engine.db.repo().list_mounts(Some(space))?;
+            let mount_names: HashMap<MountId, String> = mounts
+                .into_iter()
+                .map(|cfg| (cfg.mount.id, cfg.mount.name))
+                .collect();
+            let mut wire_entries = Vec::new();
+            let mut objects = Vec::new();
+            for entry in &changes {
+                let include = match mount_names.get(&entry.key.mount) {
+                    Some(mount_name) => {
+                        engine.wants(space, peer, mount_name, entry.key.path.as_str())?
+                    }
+                    None => true,
+                };
+                if !include {
+                    continue;
+                }
+                if let EntryContent::File { object, size, .. } = &entry.content {
+                    objects.push((*object, *size));
+                }
+                wire_entries.push(entry_to_wire(entry));
+            }
+            let n = wire_entries.len();
             let batch = IndexBatch {
                 space_id: space_id_bytes(&space),
-                entries: changes.iter().map(entry_to_wire).collect(),
+                entries: wire_entries,
                 through_sequence: through.0,
                 caught_up,
                 after_sequence: after.0,
+                plan_files: stamped.map(|(f, _, _)| f),
+                plan_bytes: stamped.map(|(_, b, _)| b),
+                plan_after: stamped.map(|(_, _, a)| a),
             };
             out(SyncOutput::Send {
                 peer,
                 body: frame::Body::IndexBatch(batch),
             });
             if n > 0 {
+                self.progress
+                    .note_sent(peer, space, through.0, n as u64, &objects);
                 events.push(SyncEvent::SentChanges {
                     peer,
                     space: space_name.clone(),
@@ -584,7 +790,9 @@ impl Syncer {
                 break;
             }
             // Only force one empty batch on the initial IndexRequest.
-            if force_empty && n == 0 {
+            // Use the pre-filter query length so a fully-filtered batch does
+            // not stall the cursor.
+            if force_empty && query_len == 0 {
                 break;
             }
         }
@@ -619,6 +827,25 @@ impl Syncer {
             }
         }
 
+        let mounts = engine.db.repo().list_mounts(Some(space))?;
+        let mount_names: HashMap<MountId, String> = mounts
+            .into_iter()
+            .map(|cfg| (cfg.mount.id, cfg.mount.name))
+            .collect();
+        let local = engine.device().id;
+        let mut kept = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match mount_names.get(&entry.key.mount) {
+                Some(name) => {
+                    if engine.wants(space, local, name, entry.key.path.as_str())? {
+                        kept.push(entry);
+                    }
+                }
+                None => kept.push(entry),
+            }
+        }
+        let entries = kept;
+
         let mut pending = HashSet::new();
         for entry in &entries {
             if let Some(obj) = entry.content.object()
@@ -630,6 +857,46 @@ impl Syncer {
         for obj in &pending {
             out(SyncOutput::FetchObject { peer, object: *obj });
         }
+
+        let incoming_files: Vec<IncomingFile> = entries
+            .iter()
+            .filter_map(|entry| match &entry.content {
+                EntryContent::File { object, size, .. } => Some(IncomingFile {
+                    sequence: entry.sequence.0,
+                    path: entry.key.path.as_str().to_owned(),
+                    object: *object,
+                    size: *size,
+                    local: !pending.contains(object),
+                }),
+                _ => None,
+            })
+            .collect();
+        let has_entries = !entries.is_empty();
+        let peer_name = self
+            .connected
+            .get(&peer)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let space_name = engine
+            .db
+            .repo()
+            .space(space)?
+            .map(|s| s.name)
+            .unwrap_or_else(|| space.to_string());
+        let now_ms = u64::try_from(engine.clock.now_ms()).unwrap_or(0);
+        self.progress.observe_incoming(
+            peer,
+            &peer_name,
+            space,
+            &space_name,
+            batch.plan_files,
+            batch.plan_bytes,
+            batch.plan_after,
+            &incoming_files,
+            has_entries,
+            now_ms,
+        );
+        self.flush_progress(events, true);
 
         let pending_batch = PendingBatch {
             after_sequence: batch.after_sequence,
@@ -679,8 +946,20 @@ impl Syncer {
                         continue;
                     }
                     head.failed_objects.insert(object);
+                    let retries = head.failed_objects.len() as u64;
+                    let _ = head;
+                    self.progress.set_retries(peer, space, retries);
+                } else {
+                    let _ = head;
+                    self.progress.note_fetched(peer, object, Instant::now());
+                    self.flush_progress(events, true);
                 }
-                head.pending_objects.remove(&object);
+                if let Some(conn) = self.connected.get_mut(&peer)
+                    && let Some(queue) = conn.incoming.get_mut(&space)
+                    && let Some(head) = queue.front_mut()
+                {
+                    head.pending_objects.remove(&object);
+                }
                 self.process_head(engine, peer, space, out, events)?;
             }
         }
@@ -698,7 +977,9 @@ impl Syncer {
             .transaction(|repo| {
                 repo.set_acked_seq(peer, space, Sequence(ack.through_sequence), now)
             })
-            .map_err(EngineError::from_db)
+            .map_err(EngineError::from_db)?;
+        self.progress.note_ack(peer, space, ack.through_sequence);
+        Ok(())
     }
 
     fn process_head(
@@ -727,6 +1008,16 @@ impl Syncer {
 
         let entries = head.entries.clone();
         let failed = head.failed_objects.clone();
+        let applied: Vec<u64> = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .content
+                    .object()
+                    .is_none_or(|object| !failed.contains(&object))
+            })
+            .map(|entry| entry.sequence.0)
+            .collect();
         let batch_after = head.after_sequence;
         let batch_through = head.through_sequence;
         let caught_up = head.caught_up;
@@ -742,7 +1033,7 @@ impl Syncer {
             MassDeleteAction::Proceed => {}
         }
 
-        let outcome = engine.apply_remote_batch(peer, space, entries, &failed)?;
+        let outcome = engine.apply_remote_batch(peer, space, entries.clone(), &failed)?;
         for w in &outcome.warnings {
             events.push(SyncEvent::SyncWarning {
                 peer,
@@ -860,6 +1151,14 @@ impl Syncer {
         {
             queue.pop_front();
         }
+        let queue_empty = self
+            .connected
+            .get(&peer)
+            .and_then(|conn| conn.incoming.get(&space))
+            .is_none_or(|queue| queue.is_empty());
+        self.progress
+            .note_applied(peer, space, &applied, caught_up, queue_empty);
+        self.flush_progress(events, true);
         self.process_head(engine, peer, space, out, events)
     }
 

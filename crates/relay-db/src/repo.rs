@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use relay_core::{
-    Device, DeviceId, EntryContent, EntryKey, EntryRecord, Mount, MountId, ObjectId, Sequence,
-    Space, SpaceId, StatHint, VersionVector,
+    Device, DeviceId, EntryContent, EntryKey, EntryRecord, Mount, MountId, ObjectId, PolicyId,
+    Sequence, Space, SpaceId, StatHint, VersionVector,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -11,7 +11,7 @@ use crate::DbError;
 use crate::convert::{
     decode_content, decode_stat, device_id_bytes, encode_content, encode_stat, i64_from_u64,
     is_unique_violation, map_write_err, mount_bytes, mount_from_bytes, object_id_from_blob,
-    opt_object_id, space_bytes, space_from_bytes, u64_from_i64,
+    opt_object_id, policy_bytes, policy_from_bytes, space_bytes, space_from_bytes, u64_from_i64,
 };
 
 const ENTRY_SELECT: &str = "e.id, e.mount_id, e.path, e.kind, e.deleted, e.object_id, e.size,
@@ -51,11 +51,19 @@ pub struct OfferedMount {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OfferedMember {
+    pub id: DeviceId,
+    pub name: String,
+    pub addresses: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerOfferRow {
     pub space_id: SpaceId,
     pub name: String,
     pub mounts: Vec<OfferedMount>,
+    pub members: Vec<OfferedMember>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +72,7 @@ pub struct StoredOffer {
     pub space_id: SpaceId,
     pub name: String,
     pub mounts: Vec<OfferedMount>,
+    pub members: Vec<OfferedMember>,
     pub received_at_ms: i64,
 }
 
@@ -72,6 +81,45 @@ pub struct SyncProgress {
     pub received_seq: Sequence,
     pub acked_seq: Sequence,
     pub last_sync_ms: Option<i64>,
+}
+
+/// How much of a space is still unseen by a peer that has applied through `after`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatchupPlan {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceGroupRecord {
+    pub name: String,
+    pub members: Vec<DeviceId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRecord {
+    pub id: PolicyId,
+    pub space_id: SpaceId,
+    pub name: String,
+    pub selectors: Vec<String>,
+    /// Direct device targets (not expanded from groups).
+    pub peer_targets: Vec<DeviceId>,
+    pub group_targets: Vec<String>,
+}
+
+/// One policy as stored in a peer's snapshot (targets already expanded).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotPolicy {
+    pub id: PolicyId,
+    pub name: String,
+    pub selectors: Vec<String>,
+    pub targets: Vec<DeviceId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerPolicySnapshot {
+    pub epoch: u64,
+    pub policies: Vec<SnapshotPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +234,12 @@ impl Repo<'_> {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    pub fn clear_local_setting(&self, key: &str) -> Result<(), DbError> {
+        self.conn
+            .execute("DELETE FROM local_settings WHERE key = ?1", params![key])?;
         Ok(())
     }
 
@@ -776,6 +830,31 @@ impl Repo<'_> {
         Ok(Sequence(max.map(u64_from_i64).transpose()?.unwrap_or(0)))
     }
 
+    /// Entries and file bytes in this space with `sequence > after`.
+    ///
+    /// `files` counts every entry, including directories and deletes. `bytes`
+    /// sums sizes of live files only.
+    pub fn catchup_plan(&self, space: SpaceId, after: Sequence) -> Result<CatchupPlan, DbError> {
+        let space = space_bytes(space);
+        let after = i64_from_u64(after.0)?;
+        let (files, bytes): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE
+                        WHEN e.kind = 'file' AND e.deleted = 0 THEN COALESCE(e.size, 0)
+                        ELSE 0
+                    END), 0)
+             FROM entries e
+             JOIN mounts m ON m.id = e.mount_id
+             WHERE m.space_id = ?1 AND e.sequence > ?2",
+            params![space.as_slice(), after],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(CatchupPlan {
+            files: u64_from_i64(files)?,
+            bytes: u64_from_i64(bytes)?,
+        })
+    }
+
     pub fn changes_since_in_space(
         &self,
         space: SpaceId,
@@ -820,6 +899,11 @@ impl Repo<'_> {
             Ok(_) => {}
             Err(err) => return Err(map_write_err(err, Some(&device.name))),
         }
+        let id_bytes = device_id_bytes(device.id);
+        self.conn.execute(
+            "DELETE FROM dismissed_peers WHERE device_id = ?1",
+            params![id_bytes.as_slice()],
+        )?;
         Ok(PeerRecord {
             device: device.clone(),
             addresses: addresses.to_vec(),
@@ -849,6 +933,11 @@ impl Repo<'_> {
             "UPDATE peers SET name = ?1, addresses = ?2 WHERE device_ref = ?3",
             params![name, addresses_json, device_ref],
         )?;
+        let id_bytes = device_id_bytes(id);
+        self.conn.execute(
+            "DELETE FROM dismissed_peers WHERE device_id = ?1",
+            params![id_bytes.as_slice()],
+        )?;
         Ok(PeerRecord {
             device: Device {
                 id,
@@ -866,6 +955,11 @@ impl Repo<'_> {
         let device_ref = self
             .device_ref(peer.device.id)?
             .ok_or_else(|| DbError::Corrupt("peer device is missing".into()))?;
+        let id_bytes = device_id_bytes(peer.device.id);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO dismissed_peers (device_id) VALUES (?1)",
+            params![id_bytes.as_slice()],
+        )?;
         self.conn.execute(
             "DELETE FROM space_shares WHERE device_ref = ?1",
             params![device_ref],
@@ -887,6 +981,16 @@ impl Repo<'_> {
             params![device_ref],
         )?;
         Ok(true)
+    }
+
+    pub fn is_dismissed(&self, id: DeviceId) -> Result<bool, DbError> {
+        let bytes = device_id_bytes(id);
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM dismissed_peers WHERE device_id = ?1",
+            params![bytes.as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn peer_by_name(&self, name: &str) -> Result<Option<PeerRecord>, DbError> {
@@ -973,6 +1077,393 @@ impl Repo<'_> {
         Ok(ids)
     }
 
+    pub fn policy_epoch(&self, space: SpaceId) -> Result<u64, DbError> {
+        let bytes = space_bytes(space);
+        let epoch: i64 = self
+            .conn
+            .query_row(
+                "SELECT policy_epoch FROM spaces WHERE id = ?1",
+                params![bytes.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DbError::NotFound)?;
+        u64_from_i64(epoch)
+    }
+
+    pub fn bump_policy_epoch(&self, space: SpaceId) -> Result<u64, DbError> {
+        let bytes = space_bytes(space);
+        let updated = self.conn.execute(
+            "UPDATE spaces SET policy_epoch = policy_epoch + 1 WHERE id = ?1",
+            params![bytes.as_slice()],
+        )?;
+        if updated == 0 {
+            return Err(DbError::NotFound);
+        }
+        self.policy_epoch(space)
+    }
+
+    pub fn create_device_group(&self, name: &str, now_ms: i64) -> Result<(), DbError> {
+        match self.conn.execute(
+            "INSERT INTO device_groups (name, created_at_ms) VALUES (?1, ?2)",
+            params![name, now_ms],
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(map_write_err(err, Some(name))),
+        }
+    }
+
+    pub fn delete_device_group(&self, name: &str) -> Result<(), DbError> {
+        // Detach from policies first so removal is correct even without CASCADE.
+        self.conn.execute(
+            "DELETE FROM replication_policy_groups WHERE group_name = ?1",
+            params![name],
+        )?;
+        self.conn.execute(
+            "DELETE FROM device_group_members WHERE group_name = ?1",
+            params![name],
+        )?;
+        let n = self
+            .conn
+            .execute("DELETE FROM device_groups WHERE name = ?1", params![name])?;
+        if n == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn add_group_member(&self, group: &str, device: DeviceId) -> Result<(), DbError> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM device_groups WHERE name = ?1",
+            params![group],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Err(DbError::NotFound);
+        }
+        let id = device_id_bytes(device);
+        match self.conn.execute(
+            "INSERT OR IGNORE INTO device_group_members (group_name, device_id) VALUES (?1, ?2)",
+            params![group, id.as_slice()],
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(map_write_err(err, Some(group))),
+        }
+    }
+
+    pub fn remove_group_member(&self, group: &str, device: DeviceId) -> Result<(), DbError> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM device_groups WHERE name = ?1",
+            params![group],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Err(DbError::NotFound);
+        }
+        let id = device_id_bytes(device);
+        self.conn.execute(
+            "DELETE FROM device_group_members WHERE group_name = ?1 AND device_id = ?2",
+            params![group, id.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_device_groups(&self) -> Result<Vec<DeviceGroupRecord>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT name FROM device_groups ORDER BY name")?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            out.push(DeviceGroupRecord {
+                members: self.group_members(&name)?,
+                name,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn group_members(&self, group: &str) -> Result<Vec<DeviceId>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT device_id FROM device_group_members WHERE group_name = ?1 ORDER BY device_id",
+        )?;
+        let rows = stmt.query_map(params![group], |row| row.get::<_, [u8; 32]>(0))?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(DeviceId::from_bytes(row?));
+        }
+        Ok(members)
+    }
+
+    /// Spaces that have a local policy referencing `group`.
+    pub fn spaces_referencing_group(&self, group: &str) -> Result<Vec<SpaceId>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT p.space_id
+             FROM replication_policies p
+             JOIN replication_policy_groups g ON g.policy_id = p.id
+             WHERE g.group_name = ?1",
+        )?;
+        let rows = stmt.query_map(params![group], |row| row.get::<_, [u8; 16]>(0))?;
+        let mut spaces = Vec::new();
+        for row in rows {
+            spaces.push(space_from_bytes(row?));
+        }
+        Ok(spaces)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_policy(
+        &self,
+        id: PolicyId,
+        space: SpaceId,
+        name: &str,
+        selectors: &[String],
+        peers: &[DeviceId],
+        groups: &[String],
+        now_ms: i64,
+    ) -> Result<(), DbError> {
+        let id_bytes = policy_bytes(id);
+        let space_bytes = space_bytes(space);
+        let selectors_json = serde_json::to_string(selectors)?;
+        match self.conn.execute(
+            "INSERT INTO replication_policies (id, space_id, name, selectors_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id_bytes.as_slice(),
+                space_bytes.as_slice(),
+                name,
+                selectors_json,
+                now_ms
+            ],
+        ) {
+            Ok(_) => {}
+            Err(err) => return Err(map_write_err(err, Some(name))),
+        }
+        for peer in peers {
+            let peer_bytes = device_id_bytes(*peer);
+            self.conn.execute(
+                "INSERT INTO replication_policy_peers (policy_id, device_id) VALUES (?1, ?2)",
+                params![id_bytes.as_slice(), peer_bytes.as_slice()],
+            )?;
+        }
+        for group in groups {
+            let exists: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM device_groups WHERE name = ?1",
+                params![group.as_str()],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                return Err(DbError::NotFound);
+            }
+            self.conn.execute(
+                "INSERT INTO replication_policy_groups (policy_id, group_name) VALUES (?1, ?2)",
+                params![id_bytes.as_slice(), group.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_policy(&self, space: SpaceId, name: &str) -> Result<(), DbError> {
+        let Some(policy) = self.policy_by_name(space, name)? else {
+            return Err(DbError::NotFound);
+        };
+        let id = policy_bytes(policy.id);
+        self.conn.execute(
+            "DELETE FROM replication_policy_peers WHERE policy_id = ?1",
+            params![id.as_slice()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM replication_policy_groups WHERE policy_id = ?1",
+            params![id.as_slice()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM replication_policies WHERE id = ?1",
+            params![id.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    pub fn policy_by_name(
+        &self,
+        space: SpaceId,
+        name: &str,
+    ) -> Result<Option<PolicyRecord>, DbError> {
+        let space_bytes = space_bytes(space);
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, space_id, name, selectors_json FROM replication_policies
+                 WHERE space_id = ?1 AND name = ?2",
+                params![space_bytes.as_slice(), name],
+                |row| {
+                    Ok((
+                        row.get::<_, [u8; 16]>(0)?,
+                        row.get::<_, [u8; 16]>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            Some((id, space_id, name, selectors_json)) => Ok(Some(self.load_policy(
+                id,
+                space_id,
+                name,
+                selectors_json,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_policies(&self, space: SpaceId) -> Result<Vec<PolicyRecord>, DbError> {
+        let space_bytes = space_bytes(space);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, space_id, name, selectors_json FROM replication_policies
+             WHERE space_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![space_bytes.as_slice()], |row| {
+            Ok((
+                row.get::<_, [u8; 16]>(0)?,
+                row.get::<_, [u8; 16]>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, space_id, name, selectors_json) = row?;
+            out.push(self.load_policy(id, space_id, name, selectors_json)?);
+        }
+        Ok(out)
+    }
+
+    /// Expanded device targets for a local policy (direct peers ∪ group members).
+    pub fn expand_policy_targets(&self, policy: &PolicyRecord) -> Result<Vec<DeviceId>, DbError> {
+        let mut set = HashSet::new();
+        for peer in &policy.peer_targets {
+            set.insert(*peer);
+        }
+        for group in &policy.group_targets {
+            for member in self.group_members(group)? {
+                set.insert(member);
+            }
+        }
+        let mut targets: Vec<_> = set.into_iter().collect();
+        targets.sort();
+        Ok(targets)
+    }
+
+    pub fn put_peer_policy_snapshot(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        epoch: u64,
+        policies: &[SnapshotPolicy],
+    ) -> Result<(), DbError> {
+        let device_ref = self.device_ref(peer)?.ok_or(DbError::NotFound)?;
+        let space_bytes = space_bytes(space);
+        let epoch = i64_from_u64(epoch)?;
+        let policies_json = serde_json::to_string(policies)?;
+        self.conn.execute(
+            "INSERT INTO peer_policy_snapshots (device_ref, space_id, epoch, policies_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(device_ref, space_id) DO UPDATE SET
+                epoch = excluded.epoch,
+                policies_json = excluded.policies_json",
+            params![device_ref, space_bytes.as_slice(), epoch, policies_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn peer_policy_snapshot(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+    ) -> Result<Option<PeerPolicySnapshot>, DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(None);
+        };
+        let space_bytes = space_bytes(space);
+        self.conn
+            .query_row(
+                "SELECT epoch, policies_json FROM peer_policy_snapshots
+                 WHERE device_ref = ?1 AND space_id = ?2",
+                params![device_ref, space_bytes.as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(epoch, policies_json)| {
+                Ok(PeerPolicySnapshot {
+                    epoch: u64_from_i64(epoch)?,
+                    policies: serde_json::from_str(&policies_json)?,
+                })
+            })
+            .transpose()
+    }
+
+    /// All snapshot policies for a space from every peer, plus nothing about
+    /// local policies (caller unions those separately).
+    pub fn all_peer_policy_snapshots_for_space(
+        &self,
+        space: SpaceId,
+    ) -> Result<Vec<SnapshotPolicy>, DbError> {
+        let space_bytes = space_bytes(space);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT policies_json FROM peer_policy_snapshots WHERE space_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![space_bytes.as_slice()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let policies: Vec<SnapshotPolicy> = serde_json::from_str(&row?)?;
+            out.extend(policies);
+        }
+        Ok(out)
+    }
+
+    fn load_policy(
+        &self,
+        id: [u8; 16],
+        space_id: [u8; 16],
+        name: String,
+        selectors_json: String,
+    ) -> Result<PolicyRecord, DbError> {
+        let policy_id = policy_from_bytes(id);
+        let id_bytes = policy_bytes(policy_id);
+        let selectors: Vec<String> = serde_json::from_str(&selectors_json)?;
+        let mut peer_stmt = self.conn.prepare_cached(
+            "SELECT device_id FROM replication_policy_peers WHERE policy_id = ?1 ORDER BY device_id",
+        )?;
+        let peer_rows = peer_stmt.query_map(params![id_bytes.as_slice()], |row| {
+            row.get::<_, [u8; 32]>(0)
+        })?;
+        let mut peer_targets = Vec::new();
+        for row in peer_rows {
+            peer_targets.push(DeviceId::from_bytes(row?));
+        }
+        let mut group_stmt = self.conn.prepare_cached(
+            "SELECT group_name FROM replication_policy_groups WHERE policy_id = ?1 ORDER BY group_name",
+        )?;
+        let group_rows =
+            group_stmt.query_map(params![id_bytes.as_slice()], |row| row.get::<_, String>(0))?;
+        let mut group_targets = Vec::new();
+        for row in group_rows {
+            group_targets.push(row?);
+        }
+        Ok(PolicyRecord {
+            id: policy_id,
+            space_id: space_from_bytes(space_id),
+            name,
+            selectors,
+            peer_targets,
+            group_targets,
+        })
+    }
+
     pub fn replace_peer_offers(
         &self,
         peer: DeviceId,
@@ -987,14 +1478,16 @@ impl Repo<'_> {
         for offer in offers {
             let space = space_bytes(offer.space_id);
             let mounts_json = serde_json::to_string(&offer.mounts)?;
+            let members_json = serde_json::to_string(&offer.members)?;
             self.conn.execute(
-                "INSERT INTO peer_offers (device_ref, space_id, name, mounts_json, received_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO peer_offers (device_ref, space_id, name, mounts_json, members_json, received_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     device_ref,
                     space.as_slice(),
                     offer.name.as_str(),
                     mounts_json,
+                    members_json,
                     now_ms
                 ],
             )?;
@@ -1004,7 +1497,7 @@ impl Repo<'_> {
 
     pub fn list_offers(&self) -> Result<Vec<StoredOffer>, DbError> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT d.device_id, p.name, o.space_id, o.name, o.mounts_json, o.received_at_ms
+            "SELECT d.device_id, p.name, o.space_id, o.name, o.mounts_json, o.members_json, o.received_at_ms
              FROM peer_offers o
              JOIN devices d ON d.ref = o.device_ref
              JOIN peers p ON p.device_ref = o.device_ref
@@ -1017,13 +1510,15 @@ impl Repo<'_> {
                 row.get::<_, [u8; 16]>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         let mut offers = Vec::new();
         for row in rows {
-            let (id, peer_name, space_id, name, mounts_json, received_at_ms) = row?;
+            let (id, peer_name, space_id, name, mounts_json, members_json, received_at_ms) = row?;
             let mounts: Vec<OfferedMount> = serde_json::from_str(&mounts_json)?;
+            let members = parse_members_json(&members_json)?;
             offers.push(StoredOffer {
                 peer: Device {
                     id: DeviceId::from_bytes(id),
@@ -1032,6 +1527,7 @@ impl Repo<'_> {
                 space_id: space_from_bytes(space_id),
                 name,
                 mounts,
+                members,
                 received_at_ms,
             });
         }
@@ -1105,6 +1601,50 @@ impl Repo<'_> {
         now_ms: i64,
     ) -> Result<(), DbError> {
         self.upsert_progress(peer, space, None, Some(seq), Some(now_ms))
+    }
+
+    pub fn replica_pushed_seq(&self, space: SpaceId) -> Result<Sequence, DbError> {
+        let space = space_bytes(space);
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT pushed_seq FROM replica_push WHERE space_id = ?1",
+                params![space.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match seq {
+            None => Ok(Sequence::ZERO),
+            Some(v) => Ok(Sequence(u64_from_i64(v)?)),
+        }
+    }
+
+    pub fn set_replica_pushed_seq(&self, space: SpaceId, seq: Sequence) -> Result<(), DbError> {
+        let space = space_bytes(space);
+        let pushed = i64_from_u64(seq.0)?;
+        self.conn.execute(
+            "INSERT INTO replica_push (space_id, pushed_seq) VALUES (?1, ?2)
+             ON CONFLICT(space_id) DO UPDATE SET pushed_seq = excluded.pushed_seq",
+            params![space.as_slice(), pushed],
+        )?;
+        Ok(())
+    }
+
+    pub fn peers_sharing_space(&self, space: SpaceId) -> Result<Vec<DeviceId>, DbError> {
+        let space = space_bytes(space);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT d.device_id
+             FROM space_shares s
+             JOIN devices d ON d.ref = s.device_ref
+             WHERE s.space_id = ?1
+             ORDER BY d.device_id",
+        )?;
+        let rows = stmt.query_map(params![space.as_slice()], |row| row.get::<_, [u8; 32]>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(DeviceId::from_bytes(row?));
+        }
+        Ok(out)
     }
 
     pub fn reset_received_seq_for_space(&self, space: SpaceId) -> Result<(), DbError> {
@@ -1839,6 +2379,13 @@ fn parse_peer(
         addresses: serde_json::from_str(&addresses)?,
         added_at_ms,
     })
+}
+
+fn parse_members_json(raw: &str) -> Result<Vec<OfferedMember>, DbError> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_str(raw)?)
 }
 
 fn collect_mounts(

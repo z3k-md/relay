@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { onMounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
@@ -91,6 +92,15 @@ async function doShare() {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
     busy.value = false;
+  }
+}
+
+async function openFolder(path: string) {
+  error.value = null;
+  try {
+    await openPath(path);
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
   }
 }
 
@@ -230,12 +240,26 @@ defineExpose({ load });
             </div>
           </div>
           <ul v-if="space.mounts.length" class="mt-2 space-y-1">
-            <li v-for="mount in space.mounts" :key="mount.name" class="text-[13px]">
-              <span class="font-medium">{{ mount.name }}</span>
-              <span class="text-[var(--color-muted)]">
-                — {{ mount.path ?? "not attached on this device" }}
-                <span v-if="mount.state && mount.state !== 'OK'"> · {{ mount.state }}</span>
-              </span>
+            <li
+              v-for="mount in space.mounts"
+              :key="mount.name"
+              class="flex items-center justify-between gap-2 text-[13px]"
+            >
+              <div class="min-w-0">
+                <span class="font-medium">{{ mount.name }}</span>
+                <span class="text-[var(--color-muted)]">
+                  — {{ mount.path ?? "not attached on this device" }}
+                  <span v-if="mount.state && mount.state !== 'OK'"> · {{ mount.state }}</span>
+                </span>
+              </div>
+              <button
+                v-if="mount.path"
+                type="button"
+                class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+                @click="mount.path && openFolder(mount.path)"
+              >
+                Open folder
+              </button>
             </li>
           </ul>
           <p v-else class="mt-2 text-[12px] text-[var(--color-muted)]">No local folders yet.</p>

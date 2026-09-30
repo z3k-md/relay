@@ -15,18 +15,25 @@ else, so the repository is the same on both machines.
 
 ## Status
 
-**Phase 5: device pairing.** Relay watches your folders and syncs them with
-paired devices over QUIC (TLS 1.3, each device pinned by its public key).
-On the same LAN, `relay pair` on one machine and `relay pair CODE` on the
-other is enough; over Tailscale, add `--addr`. Edits, creates and deletes
-flow both ways within about a second; concurrent edits keep both versions;
-per-file history and restore work on every device. `relay service install`
-runs it in the background so you do not have to keep a terminal open. The
-[desktop app](apps/relay-desktop/README.md) does the same from the tray,
-starts at login and updates itself from GitHub Releases.
+**Multi-device sync.** Relay watches your folders and syncs them with paired
+devices over QUIC (TLS 1.3, each device pinned by its public key). On the
+same LAN, `relay pair` on one machine and `relay pair CODE` on the other is
+enough; over Tailscale, add `--addr`. A third device pairs with any member
+of a space and joins it; the other members are introduced, so you do not
+copy device ids by hand. Files also move through a machine that has the
+folder when the other two are not directly connected. Edits, creates and
+deletes flow both ways within about a second; concurrent edits keep both
+versions; per-file history and restore work on every device. `relay service
+install` runs it in the background so you do not have to keep a terminal
+open. The [desktop app](apps/relay-desktop/README.md) does the same from the
+tray, starts at login and updates itself from GitHub Releases.
 
-Not yet: more than two devices as a first-class topology, or relaying
-through a third device. See [Roadmap](#roadmap).
+Not yet: encryption at rest, automatic text merge, or NAT traversal. See
+[Roadmap](#roadmap). Optional replication policies can limit which subtrees
+sync to which devices (`relay policy` / `relay group`); omit them and a shared
+space syncs everything to every peer it is shared with. An optional durable
+mailbox directory lets a device catch up when the other is offline
+(shared-folder style; not a hosted service).
 
 ## Install
 
@@ -192,6 +199,12 @@ relay mount add Mods game ~/Code/game-mods
 relay share Mods pc
 ```
 
+Sharing a space with a peer tells the other members of that space about the
+peer (addresses included), so a third machine does not need a hand-copied
+device id once it has paired with anyone already in the space. Optional
+`relay policy` / `relay group` commands can limit which subtrees go to which
+devices; without them the whole shared space syncs.
+
 Prefer a folder such as `~/Code` (see [Notes](#notes) if you need Documents,
 Desktop or Downloads). A running Relay picks up configuration changes
 (`peer`, `share`, `space`, `mount`) within about a second; you never need to
@@ -280,6 +293,11 @@ noisy metadata copies; add `--branches` to delete the conflicting refs too.
 | `relay pair [--share SPACE]...` / `relay pair CODE [--addr HOST:PORT]` | Pair with another device (LAN code, or `--addr` over Tailscale) |
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id (advanced / manual) |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
+| `relay replica set PATH` / `replica clear` / `replica status` | Configure a durable mailbox directory for offline catch-up |
+| `relay replica gc [--mirror] [--grace-secs N]` | Garbage-collect acked mailbox entries and objects |
+| `relay group create NAME` / `group add NAME PEER` / `group remove NAME PEER` / `group delete NAME` / `group list` | Device groups for replication policies |
+| `relay policy add SPACE NAME --selector GLOB... [--peer NAME]... [--group NAME]...` | Limit which subtrees sync to which devices |
+| `relay policy remove SPACE NAME` / `policy list [SPACE]` | Remove a policy or list them |
 | `relay space create NAME` / `space list` | Manage Spaces (logical namespaces) |
 | `relay space offers` / `space join NAME --from PEER` | See and accept spaces other devices shared with you |
 | `relay mount add SPACE MOUNT PATH [--include P]... [--exclude P]... [--dev-excludes]` | Map a directory into a Space, or attach a joined mount to a local folder |
@@ -407,6 +425,7 @@ crates/
   relay-fs       scanning, watching, mount markers, safe path mapping, atomic writes
   relay-store    BLAKE3 content-addressed object store with mark-and-sweep GC
   relay-db       SQLite schema, migrations and the local index repository
+  relay-replica  durable non-materializing mailbox (filesystem directory)
   relay-crypto   device identity: Ed25519 key, self-signed certificate
   relay-proto    peer wire protocol (protobuf via prost)
   relay-net      QUIC transport: pinned mutual TLS, pairing, LAN discovery
@@ -423,11 +442,12 @@ docs/
 
 ## Roadmap
 
-The phase plan is in [`docs/DESIGN.md`](docs/DESIGN.md) section 51. Next:
+Phases 0–8 are in (including the desktop app, pairing, conflicts,
+history/restore, space membership, replication policies, and a durable
+shared-folder mailbox). Nested `.relayignore` is still root-only.
 
-1. **Phase 3**: Git-aware conflict grouping, resolve commands, and the
-   receive-side mass-delete guard are in.
-2. **Phase 4**: local IPC is in — the CLI talks to a running host for
-   status, pause/resume, rescan, and activity.
-3. **Phase 5**: pairing codes and LAN discovery are in. Next: more than
-   two devices as a first-class topology, relaying, encryption at rest.
+Still not started:
+
+- Encryption at rest
+- Automatic text merge
+- NAT traversal

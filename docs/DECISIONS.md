@@ -577,3 +577,136 @@ address. There is no internet rendezvous and no NAT traversal.
 - **Known limits.** No internet rendezvous, no hole punching, no pairing
   through a third device. Two devices that cannot reach each other's UDP
   port cannot pair. Peer revocation is still `relay peer remove`.
+
+## D26. Space membership
+
+A space shared with several peers is a membership set. Relaying files through
+a middle machine that has the folder attached is ordinary index exchange —
+not a separate protocol. There is still no NAT traversal, no encryption at
+rest, and no durable cloud replica for devices that never overlap online.
+
+- **Members on the offer.** `SpaceOffer` lists the other peers that space is
+  also shared with (name and addresses from the local peers table). Old peers
+  ignore the field.
+- **Adopt only after join.** Receiving an offer still never joins a space.
+  Members are trusted only for a space this device has already joined: add
+  them as peers if missing, merge addresses (existing first), and share the
+  space. `join_space` adopts the offer's members the same way after creating
+  the space. An offer for a space you have not joined does not introduce its
+  members.
+- **Dismissal.** `relay peer remove` records the device id in
+  `dismissed_peers`. Later offers skip that id until `peer add` or a pairing
+  upsert clears the dismissal.
+- **Live refresh.** Sharing a space (or pairing with shares) re-sends offers
+  to every connected member of that space so existing members learn the new
+  one without reconnecting.
+- **Hub forward.** Applied remote entries take a fresh local sequence and are
+  offered to other peers of the same space through normal `changes_since`.
+  The middle device must have the mount attached (D16): entries for a mount
+  with no local path are not stored and cannot be forwarded. Devices that are
+  not directly connected still need a path through a member that has the
+  folder; there is no introduction of devices for a space you have not joined.
+- **Known limits.** No NAT traversal, no encryption at rest, no durable
+  replica when devices never overlap. Nested `.relayignore` is still
+  root-only.
+
+## D27. Replication policies
+
+A shared space can sync different subtrees to different devices. There is
+still one logical file; policies only decide who receives which paths.
+Share remains required — a policy never grants sync by itself.
+
+- **Default.** With no effective policies, behavior is unchanged: every entry
+  in a shared space syncs to every peer it is shared with.
+- **Policy.** Belongs to one space, has a name, one or more selectors, and
+  targets. A target is a device id, a peer name (or this device's name)
+  resolved to an id, or a device group expanded to device ids at decision
+  time. Overlapping policies union their targets.
+- **Selector.** A glob matched against `mountName/relativePath`
+  (`/`-separated), always case-sensitive so both sides agree. Same glob
+  semantics as mount rules: `*` does not cross `/`; `**` matches any number
+  of components including zero. Invalid globs fail at create time.
+- **`wants(space, device, mount, path)`.** If the space has no effective
+  policies: true. Else true iff some policy selector matches and `device` is
+  in that policy's expanded targets. Effective policies are local policies
+  union policy snapshots received from peers. Local targets expand groups
+  live; snapshots already carry concrete device ids.
+- **Send / receive.** The sender drops entries the peer does not want
+  (`through_sequence` still advances; empty filtered batches are still sent).
+  The receiver drops entries this device does not want before object fetch;
+  those drops are not `skipped` and do not emit `SyncWarning`. Unknown mounts
+  are left to the existing unknown-mount path.
+- **Epoch and replay.** Each space has `policy_epoch` (default 0), bumped
+  when local policies or referenced group membership change. `SpaceOffer`
+  carries the epoch and the sender's local policies with groups expanded.
+  On a joined space, if the peer's epoch differs from the stored snapshot
+  (including the first non-empty/non-zero store), replace the snapshot, reset
+  the send cursor to 0, and request the peer's index from 0. First sight of
+  epoch 0 with empty policies is stored without replay. Unjoined spaces store
+  no policy snapshot.
+- **Removal.** Removing a policy bumps the epoch and does not delete files
+  already on disk or send tombstones. Shrinking a target set just omits those
+  paths on the next replay.
+- **Groups.** Named sets of device ids (peers or this device). Deleting a
+  group removes the group link from policies but keeps direct peer targets
+  and the policy itself.
+- **Out of scope.** No durability classes, no metadata-only mode, no GUI
+  policy editor. Nested `.relayignore` is still root-only. Still no durable
+  replica, encryption at rest, automatic text merge, or NAT traversal.
+
+## D28. Sync progress is a snapshot
+
+The activity log records that a transfer started and that it finished. Live
+progress is a separate snapshot (`WatchEvent::Transfers`, IPC `status.transfers`),
+pushed at most a few times a second and omitted when nothing is in flight.
+
+- **Receive denominator.** The sender stamps `plan_files`, `plan_bytes`, and
+  `plan_after` on each `IndexBatch` of a catch-up (optional protobuf fields;
+  older peers omit them and the receiver shows a rate without a percent).
+  `plan_files` counts every entry. `plan_bytes` sums live file sizes. Objects
+  already in the local store count toward bytes immediately. In-flight objects
+  advance per chunk, and completion replaces that partial count.
+- **Send row.** The sender does not know which objects the peer already has,
+  so outbound bytes are a running total and a rate, not a percent. The row
+  ends when the peer's ack reaches the sequence the plan was built against.
+- **Indexing.** A local scan is its own row (files visited, bytes hashed) and
+  is not mixed into the transfer byte total. The scan passes each visit and
+  hash to that row; it is not a separate estimate.
+- **Pause.** Pausing freezes the snapshot and hides the rate. No ETA.
+
+## D29. Durable mailbox
+
+When two devices never overlap online, a shared directory acts as a
+non-materializing mailbox so each can catch up later. No QUIC session is
+required for that catch-up. The mailbox stores the same content-addressed
+bytes as the local object store plus length-prefixed prost entry logs; it is
+not a filesystem and does not reconstruct working trees. Encryption of
+objects at rest is the next phase — this phase stores plaintext CAS bytes.
+
+- **Path.** Local setting `replica_path` (string). Empty or absent means
+  peer-only sync (today's behavior). `relay replica set PATH` / `clear` /
+  `status` / `gc`. One filesystem backend (`relay-replica`); no network or
+  hosted backend yet.
+- **Push.** After a scan commits or remote entries are applied, the watch
+  loop pushes this device's new index entries and any referenced objects the
+  mailbox does not already have. Watermark `replica_push.pushed_seq` advances
+  only after append and object puts succeed; idempotent append makes a crash
+  between append and watermark safe to retry.
+- **Pull.** On host start (after the initial scan) and about every 5 seconds,
+  pull each shared peer's log after `sync_progress.received_seq`. Missing
+  objects are fetched from the mailbox into the local store; a missing object
+  holds the cursor (same hole rule as a failed QUIC fetch). Contiguous
+  prefixes use the same `apply_remote_batch` path and received watermark as
+  QUIC. Policy `wants` still filters; filtered sequences advance the cursor
+  without apply and without `SyncWarning`. Unchanged logs are probed cheaply
+  (stat + cached signature); files are not rewritten on an empty pull.
+- **Ack / GC.** Readers record `put_ack` through the applied sequence.
+  Mailbox GC deletes an entry (and its objects) only when every other current
+  member of that space has acked past it and the entry is older than `grace`.
+  A member with no ack blocks GC. No acks means delete nothing. A device that
+  joins after GC needs a peer that is online, or mirror mode. Mirror
+  (`--mirror`) keeps the object of the latest live entry per path even after
+  ack; older versions follow the mailbox rule. A transient apply does not
+  advance the received cursor.
+- **Out of scope.** No hosted backend, no NAT, no encryption at rest, no
+  automatic text merge. Nested `.relayignore` is still root-only.

@@ -5,11 +5,15 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use relay_core::{PairingCode, SpaceId};
-use relay_engine::{Engine, ScanReport, SyncInput, WatchEvent};
+use relay_engine::{
+    Engine, ScanReport, SyncInput, TransferDirection, TransferLive as EngineTransfer, WatchEvent,
+    bookends, index_row,
+};
 use relay_ipc::{
     ActivityItem, AddMountParams, AddMountResult, Handler, Hello, HostKind, HostState, MountLive,
     PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
-    PeerLive, RescanParams, RpcErrorBody, ShareParams, Status, Watching,
+    PeerLive, RescanParams, RpcErrorBody, ShareParams, Status, TransferDirection as IpcDirection,
+    TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -28,6 +32,9 @@ pub(crate) struct Host {
     pub message: Mutex<Option<String>>,
     pub peers: Mutex<Vec<PeerLive>>,
     pub mounts: Mutex<Vec<MountLive>>,
+    pub transfers: Mutex<Vec<EngineTransfer>>,
+    pub scans: Mutex<Vec<EngineTransfer>>,
+    published: Mutex<Vec<EngineTransfer>>,
     pub activity: Mutex<VecDeque<ActivityItem>>,
     pub subscribers: Mutex<Vec<mpsc::Sender<ActivityItem>>>,
     pub sync_tx: Mutex<Option<mpsc::Sender<SyncInput>>>,
@@ -109,6 +116,9 @@ impl Host {
             message: Mutex::new(None),
             peers: Mutex::new(Vec::new()),
             mounts: Mutex::new(Vec::new()),
+            transfers: Mutex::new(Vec::new()),
+            scans: Mutex::new(Vec::new()),
+            published: Mutex::new(Vec::new()),
             activity: Mutex::new(VecDeque::new()),
             subscribers: Mutex::new(Vec::new()),
             sync_tx: Mutex::new(None),
@@ -510,6 +520,7 @@ impl Host {
                     m.last_scan_summary = Some(scan_summary(report));
                     m.last_error = None;
                 });
+                self.clear_scan(space, mount);
             }
             WatchEvent::ScanFailed {
                 space,
@@ -520,6 +531,21 @@ impl Host {
                     m.last_scan_ms = Some(now_ms() as i64);
                     m.last_error = Some(error.clone());
                 });
+                self.clear_scan(space, mount);
+            }
+            WatchEvent::Transfers(rows) => {
+                if let Ok(mut live) = self.transfers.lock() {
+                    *live = rows.clone();
+                }
+                self.publish_progress();
+            }
+            WatchEvent::ScanProgress {
+                space,
+                mount,
+                files_seen,
+                bytes_hashed,
+            } => {
+                self.note_scan(space, mount, *files_seen, *bytes_hashed);
             }
             WatchEvent::WatcherUnavailable { space, mount, .. } => {
                 self.update_mount(space, mount, |m| {
@@ -571,12 +597,85 @@ impl Host {
     }
 
     pub fn snapshot(&self) -> Status {
+        let state = self.state.lock().map(|g| *g).unwrap_or(HostState::Error);
+        let mut transfers = self.progress_rows();
+        if state == HostState::Paused {
+            for row in &mut transfers {
+                row.bytes_per_sec = 0;
+            }
+        }
         Status {
-            state: self.state.lock().map(|g| *g).unwrap_or(HostState::Error),
+            state,
             message: self.message.lock().ok().and_then(|g| g.clone()),
             listen: self.listen.lock().ok().and_then(|g| g.clone()),
             peers: self.peers.lock().map(|g| g.clone()).unwrap_or_default(),
             mounts: self.mounts.lock().map(|g| g.clone()).unwrap_or_default(),
+            transfers,
+        }
+    }
+
+    fn progress_rows(&self) -> Vec<TransferLive> {
+        let mut rows = self
+            .transfers
+            .lock()
+            .map(|g| g.iter().map(to_ipc_transfer).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Ok(scans) = self.scans.lock() {
+            rows.extend(scans.iter().map(to_ipc_transfer));
+        }
+        rows
+    }
+
+    fn note_scan(&self, space: &str, mount: &str, files_seen: u64, bytes_hashed: u64) {
+        if let Ok(mut scans) = self.scans.lock() {
+            if let Some(row) = scans
+                .iter_mut()
+                .find(|row| row.space == space && row.mount.as_deref() == Some(mount))
+            {
+                row.files_done = files_seen;
+                row.bytes_done = bytes_hashed;
+            } else {
+                let mut row = index_row(space, mount, files_seen, bytes_hashed);
+                row.started_at_ms = now_ms();
+                scans.push(row);
+            }
+        }
+        self.publish_progress();
+    }
+
+    fn clear_scan(&self, space: &str, mount: &str) {
+        let removed = self.scans.lock().is_ok_and(|mut scans| {
+            let before = scans.len();
+            scans.retain(|row| !(row.space == space && row.mount.as_deref() == Some(mount)));
+            scans.len() != before
+        });
+        if removed {
+            self.publish_progress();
+        }
+    }
+
+    fn engine_progress(&self) -> Vec<EngineTransfer> {
+        let mut rows = self.transfers.lock().map(|g| g.clone()).unwrap_or_default();
+        if let Ok(scans) = self.scans.lock() {
+            rows.extend(scans.iter().cloned());
+        }
+        rows
+    }
+
+    fn publish_progress(&self) {
+        let next = self.engine_progress();
+        let prev = self.published.lock().map(|g| g.clone()).unwrap_or_default();
+        let now = now_ms();
+        for item in bookends(&prev, &next, now) {
+            self.push_activity(ActivityItem {
+                at_ms: now,
+                kind: item.kind,
+                summary: item.summary,
+                detail: None,
+            });
+        }
+        if let Ok(mut published) = self.published.lock() {
+            *published = next;
         }
     }
 
@@ -713,6 +812,28 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn to_ipc_transfer(row: &EngineTransfer) -> TransferLive {
+    TransferLive {
+        peer_id: row.peer_id.clone(),
+        peer_name: row.peer_name.clone(),
+        space: row.space.clone(),
+        mount: row.mount.clone(),
+        direction: match row.direction {
+            TransferDirection::Receive => IpcDirection::Receive,
+            TransferDirection::Send => IpcDirection::Send,
+            TransferDirection::Index => IpcDirection::Index,
+        },
+        files_done: row.files_done,
+        files_total: row.files_total,
+        bytes_done: row.bytes_done,
+        bytes_total: row.bytes_total,
+        bytes_per_sec: row.bytes_per_sec,
+        started_at_ms: row.started_at_ms,
+        retries: row.retries,
+        current_path: row.current_path.clone(),
+    }
+}
+
 fn scan_summary(report: &ScanReport) -> String {
     format!(
         "{} created, {} modified, {} deleted",
@@ -721,6 +842,12 @@ fn scan_summary(report: &ScanReport) -> String {
 }
 
 fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
+    if matches!(
+        event,
+        WatchEvent::Transfers(_) | WatchEvent::ScanProgress { .. }
+    ) {
+        return None;
+    }
     let (kind, summary, detail) = match event {
         WatchEvent::Started { mounts } => (
             "started",
@@ -813,6 +940,8 @@ fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
             Some(format!("{space}/{mount}")),
         ),
         WatchEvent::Stopped => ("stopped", "sync loop stopped".to_owned(), None),
+        // Live progress is a snapshot, not an activity-log row (D28).
+        WatchEvent::Transfers(_) | WatchEvent::ScanProgress { .. } => return None,
     };
     Some(ActivityItem {
         at_ms: now_ms(),
@@ -820,4 +949,47 @@ fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
         summary,
         detail,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transfer(bytes_done: u64) -> EngineTransfer {
+        EngineTransfer {
+            peer_id: "peer".into(),
+            peer_name: "macbook".into(),
+            space: "Photos".into(),
+            mount: None,
+            direction: TransferDirection::Receive,
+            files_done: 0,
+            files_total: Some(2),
+            bytes_done,
+            bytes_total: Some(100),
+            bytes_per_sec: 10,
+            started_at_ms: 1_000,
+            retries: 0,
+            current_path: None,
+        }
+    }
+
+    #[test]
+    fn activity_records_one_start_and_one_finish_per_transfer() {
+        let home = std::env::temp_dir();
+        let host = Host::new(&home, HostKind::Cli, false);
+        let open = transfer(10);
+        host.apply_watch(&WatchEvent::Transfers(vec![open.clone()]));
+        let mut tick = open.clone();
+        tick.bytes_done = 40;
+        tick.bytes_per_sec = 30;
+        host.apply_watch(&WatchEvent::Transfers(vec![tick.clone()]));
+        host.apply_watch(&WatchEvent::Transfers(vec![tick]));
+        host.apply_watch(&WatchEvent::Transfers(Vec::new()));
+
+        let activity = host.activity.lock().expect("activity");
+        assert_eq!(activity.len(), 2, "{activity:?}");
+        assert!(activity[0].summary.contains("started receiving"));
+        assert!(activity[1].summary.contains("finished"));
+        assert!(host.snapshot().transfers.is_empty());
+    }
 }

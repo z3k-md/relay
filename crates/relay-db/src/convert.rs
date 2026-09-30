@@ -1,4 +1,4 @@
-use relay_core::{DeviceId, EntryContent, MountId, ObjectId, SpaceId, StatHint};
+use relay_core::{DeviceId, EntryContent, MountId, ObjectId, PolicyId, SpaceId, StatHint};
 use uuid::Uuid;
 
 use crate::DbError;
@@ -19,12 +19,20 @@ pub(crate) fn mount_bytes(id: MountId) -> [u8; 16] {
     *id.as_uuid().as_bytes()
 }
 
+pub(crate) fn policy_bytes(id: PolicyId) -> [u8; 16] {
+    *id.as_uuid().as_bytes()
+}
+
 pub(crate) fn space_from_bytes(bytes: [u8; 16]) -> SpaceId {
     SpaceId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 pub(crate) fn mount_from_bytes(bytes: [u8; 16]) -> MountId {
     MountId::from_uuid(Uuid::from_bytes(bytes))
+}
+
+pub(crate) fn policy_from_bytes(bytes: [u8; 16]) -> PolicyId {
+    PolicyId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 pub(crate) fn object_id_from_blob(bytes: &[u8]) -> Result<ObjectId, DbError> {

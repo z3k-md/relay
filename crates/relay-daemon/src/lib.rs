@@ -141,6 +141,17 @@ fn run_loop(
                     NetEvent::ObjectFetched { peer, object } => {
                         SyncInput::ObjectFetched { peer, object }
                     }
+                    NetEvent::ObjectProgress {
+                        peer,
+                        object,
+                        incoming,
+                        bytes,
+                    } => SyncInput::ObjectProgress {
+                        peer,
+                        object,
+                        incoming,
+                        bytes,
+                    },
                     NetEvent::ObjectFetchFailed {
                         peer,
                         object,

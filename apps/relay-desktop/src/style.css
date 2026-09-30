@@ -35,6 +35,52 @@ body,
   height: 100%;
 }
 
+html {
+  color-scheme: light;
+  --scrollbar-thumb: color-mix(in srgb, var(--color-muted) 80%, var(--color-line));
+  --scrollbar-thumb-hover: var(--color-muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  html {
+    color-scheme: dark;
+  }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+*::-webkit-scrollbar {
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover,
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--scrollbar-thumb-hover);
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 body {
   margin: 0;
   font-family: var(--font-sans);
@@ -49,6 +95,46 @@ button,
 input,
 select {
   font: inherit;
+}
+
+input[type="checkbox"] {
+  appearance: none;
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  flex: none;
+  display: inline-grid;
+  place-content: center;
+  border: 1px solid color-mix(in srgb, var(--color-muted) 72%, var(--color-line));
+  border-radius: 0.25rem;
+  background: transparent;
+  vertical-align: middle;
+}
+
+input[type="checkbox"]::before {
+  content: "";
+  width: 0.6rem;
+  height: 0.6rem;
+  transform: scale(0);
+  background: var(--color-accent-fg);
+  clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0, 43% 62%);
+}
+
+input[type="checkbox"]:hover {
+  border-color: var(--color-muted);
+}
+
+input[type="checkbox"]:checked {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+}
+
+input[type="checkbox"]:checked::before {
+  transform: scale(1);
+}
+
+input[type="checkbox"]:checked:hover {
+  border-color: var(--color-accent);
 }
 
 button,

@@ -6,13 +6,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use relay_core::conflict::conflict_path;
-use relay_core::{DeviceId, EntryContent, LogicalPath, MOUNT_MARKER, ObjectId};
+use relay_core::{DeviceId, EntryContent, LogicalPath, MOUNT_MARKER, ObjectId, SpaceId};
 use relay_engine::{
     DeleteHoldDecision, Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent, SyncInput,
-    SyncOutput, Syncer,
+    SyncOutput, Syncer, TransferDirection,
 };
 use relay_fs::MountMarker;
-use relay_proto::{IndexBatch, entry_to_wire, frame, space_id_bytes};
+use relay_proto::{IndexBatch, entry_to_wire, frame, mount_id_bytes, space_id_bytes};
 use tempfile::TempDir;
 
 fn init(home: &Path, name: &str, racy_window: std::time::Duration) -> Engine {
@@ -324,6 +324,131 @@ impl Harness {
         let _ = self.sa.push_local_changes(&mut self.a, &mut |_| {});
         self.push_both();
     }
+}
+
+#[test]
+fn catchup_plan_is_stamped_on_every_batch() {
+    let mut h = Harness::pair();
+    h.sa = Syncer::with_index_batch_entries(1);
+    h.setup_shared_space(&[]);
+    h.disconnect();
+    write_tree(
+        h.mount_a.path(),
+        &[("a.txt", b"aa"), ("b.txt", b"bbb"), ("c.txt", b"cccc")],
+    );
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+
+    let id_a = h.id_a();
+    let id_b = h.id_b();
+    let mut from_b = Vec::new();
+    h.sb.handle(
+        &mut h.b,
+        SyncInput::PeerConnected {
+            peer: id_a,
+            name: "alpha".into(),
+        },
+        &mut |output| from_b.push(output),
+    )
+    .unwrap();
+    h.sa.handle(
+        &mut h.a,
+        SyncInput::PeerConnected {
+            peer: id_b,
+            name: "bravo".into(),
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let mut batches = Vec::new();
+    for output in from_b {
+        let SyncOutput::Send { body, .. } = output else {
+            continue;
+        };
+        h.sa.handle(
+            &mut h.a,
+            SyncInput::Frame { peer: id_b, body },
+            &mut |output| batches.push(output),
+        )
+        .unwrap();
+    }
+    let plans: Vec<_> = batches
+        .iter()
+        .filter_map(|output| match output {
+            SyncOutput::Send {
+                body: frame::Body::IndexBatch(batch),
+                ..
+            } => Some((batch.plan_files, batch.plan_bytes, batch.plan_after)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        plans.len() >= 3,
+        "expected one batch per file, got {plans:?}"
+    );
+    assert!(plans.iter().all(|plan| *plan == plans[0]));
+    let (files, bytes, _) = plans[0];
+    assert!(files.is_some_and(|n| n >= 3));
+    assert_eq!(bytes, Some(2 + 3 + 4));
+}
+
+#[test]
+fn local_object_counts_and_both_rows_finish() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.disconnect();
+    write_tree(h.mount_a.path(), &[("a.txt", b"aa"), ("b.txt", b"bbb")]);
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.b.store().put_bytes(b"aa").unwrap();
+    h.events.clear();
+    h.connect();
+    h.pump(VecDeque::new(), Some(true));
+
+    let transfers: Vec<&Vec<_>> = h
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            SyncEvent::Transfers(rows) => Some(rows),
+            _ => None,
+        })
+        .collect();
+    let receive: Vec<_> = transfers
+        .iter()
+        .flat_map(|rows| rows.iter())
+        .filter(|row| row.direction == TransferDirection::Receive)
+        .collect();
+    assert!(
+        receive
+            .iter()
+            .any(|row| row.bytes_total == Some(5) && row.bytes_done == 2),
+        "local object should count before the other file arrives: {receive:?}"
+    );
+    assert!(
+        receive
+            .iter()
+            .any(|row| row.bytes_total == Some(5) && row.bytes_done == 5),
+        "receive row should reach the plan: {receive:?}"
+    );
+    let send: Vec<_> = transfers
+        .iter()
+        .flat_map(|rows| rows.iter())
+        .filter(|row| row.direction == TransferDirection::Send)
+        .collect();
+    assert!(
+        send.iter()
+            .any(|row| row.bytes_total.is_none() && row.bytes_done < 5),
+        "send row has no byte percent and stays under the plan: {send:?}"
+    );
+    assert!(
+        h.sa.live_transfers().is_empty() && h.sb.live_transfers().is_empty(),
+        "rows should close once the receive is applied and the send is acked"
+    );
+    assert_eq!(
+        index_triples(&h.b, "Personal", "code"),
+        index_triples(&h.a, "Personal", "code")
+    );
 }
 
 fn assert_no_warnings(events: &[SyncEvent], strict: bool) {
@@ -715,6 +840,9 @@ fn hostile_symlink_escape_is_skipped() {
         through_sequence: local.sequence.0 + 10,
         caught_up: true,
         after_sequence: 0,
+        plan_files: None,
+        plan_bytes: None,
+        plan_after: None,
     };
     h.drive(
         SyncInput::Frame {
@@ -1344,6 +1472,9 @@ fn mount_marker_is_not_indexed_or_replicated() {
         through_sequence: local.sequence.0 + 10,
         caught_up: true,
         after_sequence: 0,
+        plan_files: None,
+        plan_bytes: None,
+        plan_after: None,
     };
     h.drive(
         SyncInput::Frame {
@@ -1365,5 +1496,789 @@ fn mount_marker_is_not_indexed_or_replicated() {
             .unwrap()
             .iter()
             .any(|e| e.key.path.as_str() == MOUNT_MARKER)
+    );
+}
+
+/// Three engines with A–B and B–C links only. After each handle, push that
+/// engine's local changes (same as the watch loop) so applied remote entries
+/// are offered onward.
+struct Hub {
+    _homes: [TempDir; 3],
+    mounts: [TempDir; 3],
+    engines: [Engine; 3],
+    syncers: [Syncer; 3],
+    strict: bool,
+    events: Vec<SyncEvent>,
+}
+
+impl Hub {
+    fn new() -> Self {
+        let homes = [
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        ];
+        let mounts = [
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        ];
+        let engines = [
+            init(homes[0].path(), "alpha", std::time::Duration::ZERO),
+            init(homes[1].path(), "bravo", std::time::Duration::ZERO),
+            init(homes[2].path(), "charlie", std::time::Duration::ZERO),
+        ];
+        Self {
+            _homes: homes,
+            mounts,
+            engines,
+            syncers: [Syncer::new(), Syncer::new(), Syncer::new()],
+            strict: true,
+            events: Vec::new(),
+        }
+    }
+
+    fn id(&self, i: usize) -> DeviceId {
+        self.engines[i].device().id
+    }
+
+    fn name(i: usize) -> &'static str {
+        ["alpha", "bravo", "charlie"][i]
+    }
+
+    fn index_of(&self, id: DeviceId) -> usize {
+        (0..3)
+            .find(|&i| self.id(i) == id)
+            .expect("unknown device in hub pump")
+    }
+
+    fn connect_pair(&mut self, left: usize, right: usize) {
+        let mut q = VecDeque::new();
+        q.push_back((
+            left,
+            SyncInput::PeerConnected {
+                peer: self.id(right),
+                name: Self::name(right).into(),
+            },
+        ));
+        q.push_back((
+            right,
+            SyncInput::PeerConnected {
+                peer: self.id(left),
+                name: Self::name(left).into(),
+            },
+        ));
+        self.pump(q);
+    }
+
+    fn push_all(&mut self) {
+        let mut outputs = VecDeque::new();
+        for i in 0..3 {
+            let mut outs = Vec::new();
+            let events = self.syncers[i]
+                .push_local_changes(&mut self.engines[i], &mut |o| outs.push(o))
+                .unwrap();
+            assert_no_warnings(&events, self.strict);
+            self.events.extend(events);
+            for o in outs {
+                outputs.push_back((i, o));
+            }
+        }
+        self.drain(VecDeque::new(), outputs);
+    }
+
+    fn pump(&mut self, q: VecDeque<(usize, SyncInput)>) {
+        self.drain(q, VecDeque::new());
+    }
+
+    fn drain(
+        &mut self,
+        mut q: VecDeque<(usize, SyncInput)>,
+        mut outputs: VecDeque<(usize, SyncOutput)>,
+    ) {
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            assert!(steps < 50_000, "hub pump did not go quiet");
+            if let Some((to, input)) = q.pop_front() {
+                let mut outs = Vec::new();
+                let events = self.syncers[to]
+                    .handle(&mut self.engines[to], input, &mut |o| outs.push(o))
+                    .unwrap();
+                assert_no_warnings(&events, self.strict);
+                self.events.extend(events);
+                // Mirror the watch loop: after applying, offer local sequences onward.
+                let mut pushed = Vec::new();
+                let push_events = self.syncers[to]
+                    .push_local_changes(&mut self.engines[to], &mut |o| pushed.push(o))
+                    .unwrap();
+                assert_no_warnings(&push_events, self.strict);
+                self.events.extend(push_events);
+                for o in outs.into_iter().chain(pushed) {
+                    outputs.push_back((to, o));
+                }
+                continue;
+            }
+            let Some((from, output)) = outputs.pop_front() else {
+                break;
+            };
+            match output {
+                SyncOutput::Send { peer, body } => {
+                    let to = self.index_of(peer);
+                    assert_ne!(to, from, "send went to the sender");
+                    q.push_back((
+                        to,
+                        SyncInput::Frame {
+                            peer: self.id(from),
+                            body,
+                        },
+                    ));
+                }
+                SyncOutput::SetPeers => {}
+                SyncOutput::FetchObject { peer, object } => {
+                    let src = self.index_of(peer);
+                    let input = copy_object(&self.engines[src], &self.engines[from], peer, object);
+                    q.push_back((from, input));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hub_forwards_between_devices_that_are_not_directly_connected() {
+    let mut h = Hub::new();
+    // A↔B and B↔C only; never A↔C.
+    h.engines[0]
+        .add_peer("bravo", h.id(1), &["127.0.0.1:47321".into()])
+        .unwrap();
+    h.engines[1]
+        .add_peer("alpha", h.id(0), &["127.0.0.1:47321".into()])
+        .unwrap();
+    h.engines[1]
+        .add_peer("charlie", h.id(2), &["127.0.0.1:47321".into()])
+        .unwrap();
+    h.engines[2]
+        .add_peer("bravo", h.id(1), &["127.0.0.1:47321".into()])
+        .unwrap();
+
+    h.engines[0].create_space("Personal").unwrap();
+    h.engines[0]
+        .add_mount("Personal", "code", h.mounts[0].path(), &[], &[])
+        .unwrap();
+    write_tree(h.mounts[0].path(), &[("seed.txt", b"seed")]);
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.engines[0].share("Personal", "bravo").unwrap();
+
+    h.connect_pair(0, 1);
+    h.engines[1].join_space("Personal", "alpha").unwrap();
+    h.engines[1]
+        .add_mount("Personal", "code", h.mounts[1].path(), &[], &[])
+        .unwrap();
+    h.engines[1].share("Personal", "charlie").unwrap();
+
+    // Reconnect A–B so B's mount is in offers; then connect B–C.
+    h.syncers[0] = Syncer::new();
+    h.syncers[1] = Syncer::new();
+    h.connect_pair(0, 1);
+    h.push_all();
+
+    h.connect_pair(1, 2);
+    h.engines[2].join_space("Personal", "bravo").unwrap();
+    h.engines[2]
+        .add_mount("Personal", "code", h.mounts[2].path(), &[], &[])
+        .unwrap();
+    h.syncers[1] = Syncer::new();
+    h.syncers[2] = Syncer::new();
+    h.connect_pair(1, 2);
+    // Keep A–B connected too.
+    h.connect_pair(0, 1);
+    h.push_all();
+
+    assert_eq!(
+        live_files(h.mounts[0].path()),
+        live_files(h.mounts[2].path()),
+        "initial seed should reach C through B"
+    );
+
+    fs::write(h.mounts[0].path().join("from-a.txt"), b"a-side").unwrap();
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_all();
+    assert_eq!(
+        fs::read(h.mounts[2].path().join("from-a.txt")).unwrap(),
+        b"a-side"
+    );
+
+    fs::write(h.mounts[2].path().join("from-c.txt"), b"c-side").unwrap();
+    h.engines[2]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_all();
+    assert_eq!(
+        fs::read(h.mounts[0].path().join("from-c.txt")).unwrap(),
+        b"c-side"
+    );
+}
+
+#[test]
+fn joined_space_trusts_members_listed_on_the_offer() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("hello.txt", b"hi")]);
+
+    let home_c = TempDir::new().unwrap();
+    let c = init(home_c.path(), "charlie", std::time::Duration::ZERO);
+    let id_c = c.device().id;
+
+    h.b.add_peer("charlie", id_c, &["127.0.0.1:47322".into()])
+        .unwrap();
+    h.b.share("Personal", "charlie").unwrap();
+
+    let offers = h.b.space_offers_for_peer(h.id_a()).unwrap();
+    assert_eq!(offers.spaces.len(), 1);
+    assert_eq!(offers.spaces[0].members.len(), 1);
+    assert_eq!(
+        offers.spaces[0].members[0].device_id,
+        id_c.as_bytes().to_vec()
+    );
+    assert_eq!(offers.spaces[0].members[0].name, "charlie");
+
+    let peer_b = h.id_b();
+    let mut outs = Vec::new();
+    let events =
+        h.sa.handle(
+            &mut h.a,
+            SyncInput::Frame {
+                peer: peer_b,
+                body: frame::Body::SpaceOffers(offers),
+            },
+            &mut |o| outs.push(o),
+        )
+        .unwrap();
+    assert_no_warnings(&events, true);
+    assert!(
+        outs.iter().any(|o| matches!(o, SyncOutput::SetPeers)),
+        "adopting a member should emit SetPeers: {outs:?}"
+    );
+    assert!(
+        h.a.peers().unwrap().iter().any(|p| p.id == id_c),
+        "A should trust C after offer from a joined space"
+    );
+    assert!(
+        h.a.status()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.name == "charlie")
+            .is_some_and(|p| p.spaces.iter().any(|s| s.space == "Personal")),
+        "A should share Personal with C"
+    );
+
+    // Offer for a space A has not joined must not introduce members.
+    let foreign = relay_proto::SpaceOffers {
+        spaces: vec![relay_proto::SpaceOffer {
+            space_id: space_id_bytes(&SpaceId::new()),
+            name: "Strangers".into(),
+            mounts: vec![],
+            members: vec![relay_proto::MemberOffer {
+                device_id: DeviceId::from_bytes([9; 32]).as_bytes().to_vec(),
+                name: "nobody".into(),
+                addresses: vec!["127.0.0.1:9".into()],
+            }],
+            policy_epoch: 0,
+            policies: vec![],
+        }],
+    };
+    let before = h.a.peers().unwrap().len();
+    let mut outs = Vec::new();
+    let events =
+        h.sa.handle(
+            &mut h.a,
+            SyncInput::Frame {
+                peer: peer_b,
+                body: frame::Body::SpaceOffers(foreign),
+            },
+            &mut |o| outs.push(o),
+        )
+        .unwrap();
+    assert_no_warnings(&events, true);
+    assert!(!outs.iter().any(|o| matches!(o, SyncOutput::SetPeers)));
+    assert_eq!(h.a.peers().unwrap().len(), before);
+    assert!(
+        h.a.peers()
+            .unwrap()
+            .iter()
+            .all(|p| p.id != DeviceId::from_bytes([9; 32]))
+    );
+}
+
+#[test]
+fn join_adopts_offered_members() {
+    let mut h = Harness::pair();
+    h.pair_peers();
+    h.a.create_space("Personal").unwrap();
+    h.a.add_mount("Personal", "code", h.mount_a.path(), &[], &[])
+        .unwrap();
+    h.a.share("Personal", "bravo").unwrap();
+
+    let id_c = DeviceId::from_bytes([0xcc; 32]);
+    let space = h.a.spaces().unwrap().into_iter().next().unwrap();
+    let mount =
+        h.a.mounts(Some("Personal"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .1
+            .mount;
+    let offers = relay_proto::SpaceOffers {
+        spaces: vec![relay_proto::SpaceOffer {
+            space_id: space_id_bytes(&space.id),
+            name: space.name,
+            mounts: vec![relay_proto::MountOffer {
+                mount_id: mount_id_bytes(&mount.id),
+                name: mount.name,
+            }],
+            members: vec![relay_proto::MemberOffer {
+                device_id: id_c.as_bytes().to_vec(),
+                name: "charlie".into(),
+                addresses: vec!["127.0.0.1:47322".into()],
+            }],
+            policy_epoch: 0,
+            policies: vec![],
+        }],
+    };
+    // B has not joined yet, so members are stored but not adopted.
+    let peer_a = h.id_a();
+    h.sb.handle(
+        &mut h.b,
+        SyncInput::PeerConnected {
+            peer: peer_a,
+            name: "alpha".into(),
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    h.sb.handle(
+        &mut h.b,
+        SyncInput::Frame {
+            peer: peer_a,
+            body: frame::Body::SpaceOffers(offers),
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(
+        h.b.peers().unwrap().iter().all(|p| p.id != id_c),
+        "members on an unjoined offer must not be trusted yet"
+    );
+
+    h.b.join_space("Personal", "alpha").unwrap();
+    assert!(
+        h.b.peers().unwrap().iter().any(|p| p.id == id_c),
+        "join should adopt offered member charlie"
+    );
+    let shared =
+        h.b.status()
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.name == "charlie")
+            .expect("charlie peer")
+            .spaces
+            .iter()
+            .any(|s| s.space == "Personal");
+    assert!(shared, "join should share the space with adopted members");
+}
+
+#[test]
+fn joined_space_drops_out_of_offers_until_left() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let mount_a = TempDir::new().unwrap();
+    let mut a = init(home_a.path(), "alpha", std::time::Duration::ZERO);
+    let mut b = init(home_b.path(), "bravo", std::time::Duration::ZERO);
+    a.add_peer("bravo", b.device().id, &["127.0.0.1:47321".into()])
+        .unwrap();
+    b.add_peer("alpha", a.device().id, &["127.0.0.1:47321".into()])
+        .unwrap();
+    a.create_space("Personal").unwrap();
+    a.add_mount("Personal", "code", mount_a.path(), &[], &[])
+        .unwrap();
+    a.share("Personal", "bravo").unwrap();
+
+    let wire = a.space_offers_for_peer(b.device().id).unwrap();
+    let peer_a = a.device().id;
+    let mut sb = Syncer::new();
+    sb.handle(
+        &mut b,
+        SyncInput::PeerConnected {
+            peer: peer_a,
+            name: "alpha".into(),
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    sb.handle(
+        &mut b,
+        SyncInput::Frame {
+            peer: peer_a,
+            body: frame::Body::SpaceOffers(wire),
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert!(
+        b.offers().unwrap().iter().any(|o| o.name == "Personal"),
+        "an unjoined offer is joinable"
+    );
+    b.join_space("Personal", "alpha").unwrap();
+    assert!(
+        b.offers().unwrap().iter().all(|o| o.name != "Personal"),
+        "joining hides the offer"
+    );
+
+    // Leave: the offer row stays, so removing the local space lists it again.
+    drop(b);
+    let db = rusqlite::Connection::open(home_b.path().join("relay.db")).unwrap();
+    db.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         DELETE FROM space_shares;
+         DELETE FROM sync_progress;
+         DELETE FROM mounts;
+         DELETE FROM spaces;",
+    )
+    .unwrap();
+    drop(db);
+
+    let b = Engine::open_read_only(home_b.path()).unwrap();
+    assert!(
+        b.offers().unwrap().iter().any(|o| o.name == "Personal"),
+        "leaving brings the offer back"
+    );
+}
+
+#[test]
+fn removed_peer_is_not_reintroduced() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("hello.txt", b"hi")]);
+    let id_c = DeviceId::from_bytes([0xcc; 32]);
+    let members = [relay_db::OfferedMember {
+        id: id_c,
+        name: "charlie".into(),
+        addresses: vec!["127.0.0.1:47322".into()],
+    }];
+    let space = h.a.spaces().unwrap()[0].id;
+    h.a.adopt_offered_members(space, &members).unwrap();
+    assert!(h.a.peers().unwrap().iter().any(|p| p.id == id_c));
+
+    h.a.remove_peer("charlie").unwrap();
+    assert!(h.a.peers().unwrap().iter().all(|p| p.id != id_c));
+
+    let again = h.a.adopt_offered_members(space, &members).unwrap();
+    assert!(!again.peers_changed);
+    assert!(again.newly_shared.is_empty());
+    assert!(h.a.peers().unwrap().iter().all(|p| p.id != id_c));
+
+    // Explicit add clears dismissal.
+    h.a.add_peer("charlie", id_c, &["127.0.0.1:47322".into()])
+        .unwrap();
+    assert!(h.a.peers().unwrap().iter().any(|p| p.id == id_c));
+    h.a.remove_peer("charlie").unwrap();
+
+    // upsert_peer of the same id also clears dismissal.
+    h.a.upsert_peer("charlie", id_c, &["127.0.0.1:47322".into()])
+        .unwrap();
+    assert!(h.a.peers().unwrap().iter().any(|p| p.id == id_c));
+
+    // After remove, a later offer still skips until cleared again.
+    h.a.remove_peer("charlie").unwrap();
+    let mut outs = Vec::new();
+    let space_rec = h.a.spaces().unwrap().into_iter().next().unwrap();
+    let peer_b = h.id_b();
+    let offer = relay_proto::SpaceOffers {
+        spaces: vec![relay_proto::SpaceOffer {
+            space_id: space_id_bytes(&space_rec.id),
+            name: space_rec.name,
+            mounts: vec![],
+            members: vec![relay_proto::MemberOffer {
+                device_id: id_c.as_bytes().to_vec(),
+                name: "charlie".into(),
+                addresses: vec!["127.0.0.1:47322".into()],
+            }],
+            policy_epoch: 0,
+            policies: vec![],
+        }],
+    };
+    h.sa.handle(
+        &mut h.a,
+        SyncInput::Frame {
+            peer: peer_b,
+            body: frame::Body::SpaceOffers(offer),
+        },
+        &mut |o| outs.push(o),
+    )
+    .unwrap();
+    assert!(h.a.peers().unwrap().iter().all(|p| p.id != id_c));
+}
+
+fn hub_fully_mesh(h: &mut Hub) {
+    for i in 0..3 {
+        for j in 0..3 {
+            if i == j {
+                continue;
+            }
+            let name = Hub::name(j);
+            let id = h.id(j);
+            if h.engines[i].peers().unwrap().iter().all(|p| p.id != id) {
+                h.engines[i]
+                    .add_peer(name, id, &["127.0.0.1:47321".into()])
+                    .unwrap();
+            }
+        }
+    }
+}
+
+fn hub_reconnect_all(h: &mut Hub) {
+    for i in 0..3 {
+        h.syncers[i] = Syncer::new();
+    }
+    h.connect_pair(0, 1);
+    h.connect_pair(1, 2);
+    h.connect_pair(0, 2);
+    h.push_all();
+}
+
+#[test]
+fn replication_policies_partition_subtrees_across_three_devices() {
+    let mut h = Hub::new();
+    hub_fully_mesh(&mut h);
+
+    h.engines[0].create_space("Personal").unwrap();
+    h.engines[0]
+        .add_mount("Personal", "code", h.mounts[0].path(), &[], &[])
+        .unwrap();
+    // No policies yet: a seed file still syncs to every shared peer.
+    write_tree(h.mounts[0].path(), &[("seed.txt", b"seed")]);
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.engines[0].share("Personal", "bravo").unwrap();
+    h.engines[0].share("Personal", "charlie").unwrap();
+
+    h.connect_pair(0, 1);
+    h.engines[1].join_space("Personal", "alpha").unwrap();
+    h.engines[1]
+        .add_mount("Personal", "code", h.mounts[1].path(), &[], &[])
+        .unwrap();
+    h.engines[1].share("Personal", "charlie").unwrap();
+
+    h.connect_pair(0, 2);
+    h.engines[2].join_space("Personal", "alpha").unwrap();
+    h.engines[2]
+        .add_mount("Personal", "code", h.mounts[2].path(), &[], &[])
+        .unwrap();
+    hub_reconnect_all(&mut h);
+
+    assert!(h.mounts[1].path().join("seed.txt").is_file());
+    assert!(h.mounts[2].path().join("seed.txt").is_file());
+
+    h.engines[0]
+        .policy_add(
+            "Personal",
+            "personal",
+            &["code/personal/**".into()],
+            &["alpha".into(), "bravo".into()],
+            &[],
+        )
+        .unwrap();
+    h.engines[0]
+        .policy_add(
+            "Personal",
+            "work",
+            &["code/work/**".into()],
+            &["bravo".into(), "charlie".into()],
+            &[],
+        )
+        .unwrap();
+    hub_reconnect_all(&mut h);
+
+    write_tree(h.mounts[0].path(), &[("personal/a.txt", b"personal-a")]);
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    write_tree(h.mounts[2].path(), &[("work/b.txt", b"work-b")]);
+    h.engines[2]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_all();
+
+    assert_eq!(
+        fs::read(h.mounts[0].path().join("personal/a.txt")).unwrap(),
+        b"personal-a"
+    );
+    assert_eq!(
+        fs::read(h.mounts[1].path().join("personal/a.txt")).unwrap(),
+        b"personal-a"
+    );
+    assert!(
+        !h.mounts[2].path().join("personal/a.txt").exists(),
+        "C must not receive personal/"
+    );
+    assert!(
+        !h.mounts[0].path().join("work/b.txt").exists(),
+        "A must not receive work/"
+    );
+    assert_eq!(
+        fs::read(h.mounts[1].path().join("work/b.txt")).unwrap(),
+        b"work-b"
+    );
+    assert_eq!(
+        fs::read(h.mounts[2].path().join("work/b.txt")).unwrap(),
+        b"work-b"
+    );
+    assert!(
+        !h.mounts[0]
+            .path()
+            .join("personal")
+            .read_dir()
+            .into_iter()
+            .flatten()
+            .any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("relay-conflict")),
+        "no conflict copies on A"
+    );
+
+    fs::write(h.mounts[0].path().join("personal/a.txt"), b"edited").unwrap();
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_all();
+    assert_eq!(
+        fs::read(h.mounts[1].path().join("personal/a.txt")).unwrap(),
+        b"edited"
+    );
+    assert!(!h.mounts[2].path().join("personal/a.txt").exists());
+}
+
+#[test]
+fn removing_a_policy_preserves_existing_files() {
+    let mut h = Harness::pair();
+    h.pair_peers();
+    h.a.create_space("Personal").unwrap();
+    h.a.add_mount("Personal", "code", h.mount_a.path(), &[], &[])
+        .unwrap();
+    h.a.share("Personal", "bravo").unwrap();
+    h.connect();
+    h.b.join_space("Personal", "alpha").unwrap();
+    h.b.add_mount("Personal", "code", h.mount_b.path(), &[], &[])
+        .unwrap();
+    h.reconnect();
+
+    h.a.policy_add(
+        "Personal",
+        "all",
+        &["code/**".into()],
+        &["alpha".into(), "bravo".into()],
+        &[],
+    )
+    .unwrap();
+    h.reconnect();
+
+    write_tree(h.mount_a.path(), &[("keep.txt", b"keep-me")]);
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert_eq!(
+        fs::read(h.mount_b.path().join("keep.txt")).unwrap(),
+        b"keep-me"
+    );
+
+    h.a.policy_remove("Personal", "all").unwrap();
+    h.reconnect();
+    h.push_both();
+
+    assert_eq!(
+        fs::read(h.mount_a.path().join("keep.txt")).unwrap(),
+        b"keep-me"
+    );
+    assert_eq!(
+        fs::read(h.mount_b.path().join("keep.txt")).unwrap(),
+        b"keep-me"
+    );
+    let deleted =
+        h.b.entries("Personal", "code", true)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.key.path.as_str() == "keep.txt" && e.is_deleted());
+    assert!(!deleted, "removal must not tombstone keep.txt");
+}
+
+#[test]
+fn device_group_expansion_widens_targets_after_epoch_exchange() {
+    let mut h = Hub::new();
+    hub_fully_mesh(&mut h);
+
+    h.engines[0].create_space("Personal").unwrap();
+    h.engines[0]
+        .add_mount("Personal", "code", h.mounts[0].path(), &[], &[])
+        .unwrap();
+    h.engines[0].share("Personal", "bravo").unwrap();
+    h.engines[0].share("Personal", "charlie").unwrap();
+
+    h.connect_pair(0, 1);
+    h.engines[1].join_space("Personal", "alpha").unwrap();
+    h.engines[1]
+        .add_mount("Personal", "code", h.mounts[1].path(), &[], &[])
+        .unwrap();
+
+    h.connect_pair(0, 2);
+    h.engines[2].join_space("Personal", "alpha").unwrap();
+    h.engines[2]
+        .add_mount("Personal", "code", h.mounts[2].path(), &[], &[])
+        .unwrap();
+    hub_reconnect_all(&mut h);
+
+    h.engines[0].group_create("lan").unwrap();
+    h.engines[0].group_add("lan", "bravo").unwrap();
+    h.engines[0]
+        .policy_add(
+            "Personal",
+            "shared",
+            &["code/shared/**".into()],
+            &["alpha".into()],
+            &["lan".into()],
+        )
+        .unwrap();
+    hub_reconnect_all(&mut h);
+
+    write_tree(h.mounts[0].path(), &[("shared/one.txt", b"one")]);
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_all();
+    assert_eq!(
+        fs::read(h.mounts[1].path().join("shared/one.txt")).unwrap(),
+        b"one"
+    );
+    assert!(!h.mounts[2].path().join("shared/one.txt").exists());
+
+    h.engines[0].group_add("lan", "charlie").unwrap();
+    hub_reconnect_all(&mut h);
+    write_tree(h.mounts[0].path(), &[("shared/two.txt", b"two")]);
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_all();
+    assert_eq!(
+        fs::read(h.mounts[2].path().join("shared/two.txt")).unwrap(),
+        b"two"
     );
 }

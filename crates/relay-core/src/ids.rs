@@ -166,6 +166,7 @@ macro_rules! uuid_id {
 
 uuid_id!(SpaceId);
 uuid_id!(MountId);
+uuid_id!(PolicyId);
 
 /// Position in a device's local change log.
 ///

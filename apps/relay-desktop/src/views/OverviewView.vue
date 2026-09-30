@@ -4,11 +4,12 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import Modal from "../components/Modal.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { api, copyText } from "../lib/api";
-import { updateActive } from "../lib/updateProgress";
-import type { DeleteHold, Overview, RunnerState, UpdateAvailable } from "../lib/types";
+import { formatBytes, updateActive } from "../lib/updateProgress";
+import type { DeleteHold, Overview, RunnerState, TransferLive, UpdateAvailable } from "../lib/types";
 
 const props = defineProps<{
   overview: Overview;
+  transfers: TransferLive[];
   update: UpdateAvailable | null;
 }>();
 
@@ -84,6 +85,36 @@ async function copyId() {
   window.setTimeout(() => {
     copied.value = false;
   }, 1500);
+}
+
+function transferTitle(row: TransferLive): string {
+  if (row.direction === "index") {
+    return `Indexing ${row.mount ?? row.space}`;
+  }
+  const verb = row.direction === "receive" ? "Receiving from" : "Sending to";
+  return `${verb} ${row.peerName} · ${row.space}`;
+}
+
+function transferFiles(row: TransferLive): string {
+  if (row.filesTotal != null) return `${row.filesDone} of ${row.filesTotal} files`;
+  return `${row.filesDone} files`;
+}
+
+function transferBytes(row: TransferLive): string {
+  if (row.direction === "receive" && row.bytesTotal != null) {
+    return `${formatBytes(row.bytesDone)} of ${formatBytes(row.bytesTotal)}`;
+  }
+  if (row.direction === "index") return `${formatBytes(row.bytesDone)} hashed`;
+  return formatBytes(row.bytesDone);
+}
+
+function transferPercent(row: TransferLive): number | null {
+  if (row.direction !== "receive" || row.bytesTotal == null || row.bytesTotal <= 0) return null;
+  return Math.max(0, Math.min(100, (row.bytesDone / row.bytesTotal) * 100));
+}
+
+function showRate(row: TransferLive): boolean {
+  return props.overview.runner.kind !== "paused" && row.bytesPerSec > 0 && row.direction !== "index";
 }
 
 function runnerDetail(state: RunnerState): string | null {
@@ -176,6 +207,42 @@ function runnerDetail(state: RunnerState): string | null {
       </div>
     </div>
     <p v-if="holdError" class="mb-4 text-[var(--color-muted)]">{{ holdError }}</p>
+
+    <section
+      v-if="transfers.length"
+      class="mb-4 rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2"
+    >
+      <p class="mb-2 text-[12px] font-medium text-[var(--color-muted)]">
+        {{ overview.runner.kind === "paused" ? "Sync paused" : "Syncing" }}
+      </p>
+      <div v-for="row in transfers" :key="`${row.direction}-${row.peerId}-${row.space}-${row.mount}`" class="mb-3 last:mb-0">
+        <div class="flex items-baseline justify-between gap-3">
+          <p class="font-medium">{{ transferTitle(row) }}</p>
+          <p class="shrink-0 tabular-nums text-[12px] text-[var(--color-muted)]">
+            {{ transferBytes(row) }}
+            <template v-if="showRate(row)"> · {{ formatBytes(row.bytesPerSec) }}/s</template>
+          </p>
+        </div>
+        <p class="text-[12px] text-[var(--color-muted)]">
+          {{ transferFiles(row) }}
+          <template v-if="row.currentPath"> · {{ row.currentPath }}</template>
+          <template v-if="row.retries > 0"> · {{ row.retries }} files waiting to retry</template>
+        </p>
+        <div
+          v-if="transferPercent(row) != null"
+          class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-[var(--color-line)]"
+          role="progressbar"
+          :aria-valuemin="0"
+          :aria-valuemax="100"
+          :aria-valuenow="Math.round(transferPercent(row) ?? 0)"
+        >
+          <div
+            class="h-full rounded-full bg-[var(--color-accent)]"
+            :style="{ width: `${transferPercent(row)}%` }"
+          />
+        </div>
+      </div>
+    </section>
 
     <Modal
       :open="!!confirm"

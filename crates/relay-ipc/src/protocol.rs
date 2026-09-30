@@ -116,6 +116,38 @@ pub struct Status {
     pub listen: Option<String>,
     pub peers: Vec<PeerLive>,
     pub mounts: Vec<MountLive>,
+    /// Live indexing and peer transfers. Empty when nothing is in flight.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfers: Vec<TransferLive>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Receive,
+    Send,
+    Index,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferLive {
+    pub peer_id: String,
+    pub peer_name: String,
+    pub space: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
+    pub direction: TransferDirection,
+    pub files_done: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_total: Option<u64>,
+    pub bytes_done: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+    pub bytes_per_sec: u64,
+    pub started_at_ms: u64,
+    pub retries: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,6 +6,7 @@ members = [
     "crates/relay-fs",
     "crates/relay-store",
     "crates/relay-db",
+    "crates/relay-replica",
     "crates/relay-engine",
     "crates/relay-proto",
     "crates/relay-crypto",
@@ -24,6 +25,7 @@ default-members = [
     "crates/relay-fs",
     "crates/relay-store",
     "crates/relay-db",
+    "crates/relay-replica",
     "crates/relay-engine",
     "crates/relay-proto",
     "crates/relay-crypto",
@@ -46,6 +48,7 @@ relay-policy = { path = "crates/relay-policy" }
 relay-fs = { path = "crates/relay-fs" }
 relay-store = { path = "crates/relay-store" }
 relay-db = { path = "crates/relay-db" }
+relay-replica = { path = "crates/relay-replica" }
 relay-engine = { path = "crates/relay-engine" }
 relay-proto = { path = "crates/relay-proto" }
 relay-crypto = { path = "crates/relay-crypto" }

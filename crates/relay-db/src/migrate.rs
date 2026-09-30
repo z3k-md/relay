@@ -10,9 +10,12 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_delete_holds.sql"),
     include_str!("../migrations/0006_delete_hold_applied.sql"),
     include_str!("../migrations/0007_local_settings.sql"),
+    include_str!("../migrations/0008_space_members.sql"),
+    include_str!("../migrations/0009_replication_policies.sql"),
+    include_str!("../migrations/0010_replica_push.sql"),
 ];
 
-pub(crate) const SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCHEMA_VERSION: u32 = 10;
 
 pub(crate) fn user_version(conn: &Connection) -> Result<u32, DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

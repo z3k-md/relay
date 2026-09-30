@@ -109,6 +109,13 @@ pub enum NetEvent {
         peer: DeviceId,
         addresses: Vec<String>,
     },
+    /// Bytes of one object received (`incoming`) or served so far.
+    ObjectProgress {
+        peer: DeviceId,
+        object: ObjectId,
+        incoming: bool,
+        bytes: u64,
+    },
 }
 
 /// Commands sent from the engine (or tests) into the network thread.

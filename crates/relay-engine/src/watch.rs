@@ -12,11 +12,13 @@ use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::progress::TransferLive;
 use crate::reports::{ScanOptions, ScanReport};
 use crate::sync::{AddMountApplied, SyncEvent, SyncInput, SyncOutput, Syncer};
 
 const STOP_POLL: Duration = Duration::from_millis(100);
 const RELOAD_POLL: Duration = Duration::from_secs(1);
+const REPLICA_PULL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchOptions {
@@ -114,6 +116,14 @@ pub enum WatchEvent {
         deletions: usize,
         live: usize,
     },
+    /// Live transfer snapshot. Empty means nothing is in flight.
+    Transfers(Vec<TransferLive>),
+    ScanProgress {
+        space: String,
+        mount: String,
+        files_seen: u64,
+        bytes_hashed: u64,
+    },
     Stopped,
 }
 
@@ -180,6 +190,8 @@ impl Engine {
             None
         };
         let mut last_reload_check = Instant::now();
+        let mut last_replica_pull: Option<Instant>;
+        let mut replica_warned = false;
         let mut syncer = Syncer::new();
         let (tx, rx) = mpsc::channel::<LoopMsg>();
         {
@@ -266,7 +278,7 @@ impl Engine {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            let result = self.scan(&space, &mount, ScanOptions::default());
+            let result = self.scan_reporting(&space, &mount, None, on_event);
             let committed = result.as_ref().is_ok_and(scan_committed);
             if let Some(state) = states
                 .iter_mut()
@@ -276,8 +288,12 @@ impl Engine {
             }
             if committed {
                 emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+                emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
             }
         }
+
+        emit_replica(self.pull_replica_watch(), &mut replica_warned, on_event);
+        last_replica_pull = Some(Instant::now());
 
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(STOP_POLL) {
@@ -292,7 +308,15 @@ impl Engine {
                         addresses,
                         share,
                     } => {
-                        if let Err(err) = apply_add_peer(self, peer, &name, &addresses, &share) {
+                        if let Err(err) = apply_add_peer(
+                            self,
+                            &syncer,
+                            peer,
+                            &name,
+                            &addresses,
+                            &share,
+                            &mut output,
+                        ) {
                             on_event(&WatchEvent::SyncWarning {
                                 peer: peer.to_string(),
                                 path: String::new(),
@@ -339,6 +363,7 @@ impl Engine {
                     other => {
                         emit_sync(syncer.handle(self, other, &mut output), on_event);
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+                        emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
                     }
                 },
                 Err(RecvTimeoutError::Timeout) => {}
@@ -350,6 +375,9 @@ impl Engine {
 
             let now = Instant::now();
             emit_sync(syncer.tick(self, now, &mut output), on_event);
+            if let Some(rows) = syncer.poll_transfers(now) {
+                on_event(&WatchEvent::Transfers(rows));
+            }
             retry_watchers(
                 watcher.as_mut(),
                 &mut states,
@@ -371,7 +399,15 @@ impl Engine {
                 };
                 if committed {
                     emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+                    emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
                 }
+            }
+
+            if last_replica_pull
+                .is_none_or(|t| now.saturating_duration_since(t) >= REPLICA_PULL_INTERVAL)
+            {
+                last_replica_pull = Some(now);
+                emit_replica(self.pull_replica_watch(), &mut replica_warned, on_event);
             }
 
             if let Some(baseline) = baseline
@@ -392,6 +428,46 @@ impl Engine {
         Ok(RunExit::Stopped)
     }
 
+    fn scan_reporting(
+        &mut self,
+        space: &str,
+        mount: &str,
+        paths: Option<&[LogicalPath]>,
+        on_event: &mut dyn FnMut(&WatchEvent),
+    ) -> Result<ScanReport, EngineError> {
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        let mut last = Instant::now()
+            .checked_sub(Duration::from_millis(250))
+            .unwrap_or_else(Instant::now);
+        let space_name = space.to_owned();
+        let mount_name = mount.to_owned();
+        let mut on_tick = |tick: crate::scan::ScanTick| {
+            match tick {
+                crate::scan::ScanTick::Visited => files += 1,
+                crate::scan::ScanTick::Hashed(n) => bytes = bytes.saturating_add(n),
+            }
+            let now = Instant::now();
+            if now.saturating_duration_since(last) >= Duration::from_millis(250)
+                && (files > 0 || bytes > 0)
+            {
+                last = now;
+                on_event(&WatchEvent::ScanProgress {
+                    space: space_name.clone(),
+                    mount: mount_name.clone(),
+                    files_seen: files,
+                    bytes_hashed: bytes,
+                });
+            }
+        };
+        match paths {
+            Some(paths) => {
+                self.scan_paths_inner(space, mount, paths, ScanOptions::default(), &mut on_tick)
+            }
+            None => self.scan_mount(space, mount, ScanOptions::default(), &mut on_tick),
+        }
+    }
+
     fn run_watch_scan(
         &mut self,
         state: &mut MountWatch,
@@ -399,7 +475,7 @@ impl Engine {
         on_event: &mut dyn FnMut(&WatchEvent),
     ) -> bool {
         let paths = state.dirty.len();
-        let result = self.scan(&state.space, &state.mount, ScanOptions::default());
+        let result = self.scan_reporting(&state.space, &state.mount, None, on_event);
         let committed = result.as_ref().is_ok_and(scan_committed);
         finish_watch_scan(state, full, paths, result, on_event);
         committed
@@ -412,7 +488,7 @@ impl Engine {
         on_event: &mut dyn FnMut(&WatchEvent),
     ) -> bool {
         let n = paths.len();
-        let result = self.scan_paths(&state.space, &state.mount, paths, ScanOptions::default());
+        let result = self.scan_reporting(&state.space, &state.mount, Some(paths), on_event);
         let committed = result.as_ref().is_ok_and(scan_committed);
         finish_watch_scan(state, false, n, result, on_event);
         committed
@@ -421,15 +497,26 @@ impl Engine {
 
 fn apply_add_peer(
     engine: &mut Engine,
+    syncer: &Syncer,
     peer: relay_core::DeviceId,
     name: &str,
     addresses: &[String],
     share: &[SpaceId],
+    output: &mut dyn FnMut(SyncOutput),
 ) -> Result<(), EngineError> {
     engine.upsert_peer(name, peer, addresses)?;
+    let mut shared = Vec::new();
     for space in share {
-        if let Err(err) = engine.share_space_id(*space, peer) {
-            tracing::warn!(%peer, %space, error = %err, "could not share space with new peer");
+        match engine.share_space_id(*space, peer) {
+            Ok(()) => shared.push(*space),
+            Err(err) => {
+                tracing::warn!(%peer, %space, error = %err, "could not share space with new peer");
+            }
+        }
+    }
+    for space in shared {
+        if let Err(err) = syncer.refresh_offers_for_space(engine, space, output) {
+            tracing::warn!(%space, error = %err, "could not refresh offers after add peer");
         }
     }
     Ok(())
@@ -503,15 +590,15 @@ fn apply_share(
     output: &mut dyn FnMut(SyncOutput),
 ) -> Result<(), String> {
     engine.share(space, peer).map_err(|err| err.to_string())?;
-    let peer_id = engine
-        .peers()
+    let space_id = engine
+        .spaces()
         .map_err(|err| err.to_string())?
         .into_iter()
-        .find(|p| p.name == peer)
-        .map(|p| p.id)
-        .ok_or_else(|| format!("unknown peer {peer}"))?;
+        .find(|s| s.name == space)
+        .map(|s| s.id)
+        .ok_or_else(|| format!("unknown space {space}"))?;
     syncer
-        .refresh_offers(engine, peer_id, output)
+        .refresh_offers_for_space(engine, space_id, output)
         .map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -532,6 +619,23 @@ fn emit_sync(result: Result<Vec<SyncEvent>, EngineError>, on_event: &mut dyn FnM
             path: String::new(),
             reason: err.to_string(),
         }),
+    }
+}
+
+fn emit_replica<T>(
+    result: Result<T, EngineError>,
+    warned: &mut bool,
+    on_event: &mut dyn FnMut(&WatchEvent),
+) {
+    if let Err(err) = result
+        && !*warned
+    {
+        *warned = true;
+        on_event(&WatchEvent::SyncWarning {
+            peer: String::new(),
+            path: String::new(),
+            reason: format!("replica: {err}"),
+        });
     }
 }
 
@@ -579,6 +683,7 @@ fn watch_from_sync(event: &SyncEvent) -> WatchEvent {
             path: path.clone(),
             reason: reason.clone(),
         },
+        SyncEvent::Transfers(rows) => WatchEvent::Transfers(rows.clone()),
         SyncEvent::DeletesHeld {
             peer,
             space,

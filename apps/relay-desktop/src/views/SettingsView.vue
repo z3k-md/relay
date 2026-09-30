@@ -108,30 +108,24 @@ defineExpose({ load });
     <ErrorBanner :message="error" />
     <p v-if="loading" class="text-[var(--color-muted)]">Loading settings…</p>
     <div v-else class="space-y-4">
-      <label class="flex items-center justify-between gap-3 rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2">
-        <span>
-          <span class="block font-medium">Start at login</span>
-          <span class="text-[12px] text-[var(--color-muted)]">Launch Relay in the tray when you sign in.</span>
-        </span>
-        <input
-          type="checkbox"
-          class="h-4 w-4"
-          :checked="settings.startAtLogin"
-          @change="toggle('startAtLogin', ($event.target as HTMLInputElement).checked)"
-        />
-      </label>
-      <label class="flex items-center justify-between gap-3 rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2">
-        <span>
-          <span class="block font-medium">Automatically install updates</span>
-          <span class="text-[12px] text-[var(--color-muted)]">Download and restart when a new build is published.</span>
-        </span>
-        <input
-          type="checkbox"
-          class="h-4 w-4"
-          :checked="settings.autoUpdate"
-          @change="toggle('autoUpdate', ($event.target as HTMLInputElement).checked)"
-        />
-      </label>
+      <section class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)]">
+        <label class="flex items-center justify-between gap-3 px-3 py-2">
+          <span class="font-medium">Start at login</span>
+          <input
+            type="checkbox"
+            :checked="settings.startAtLogin"
+            @change="toggle('startAtLogin', ($event.target as HTMLInputElement).checked)"
+          />
+        </label>
+        <label class="flex items-center justify-between gap-3 px-3 py-2">
+          <span class="font-medium">Autoupdate</span>
+          <input
+            type="checkbox"
+            :checked="settings.autoUpdate"
+            @change="toggle('autoUpdate', ($event.target as HTMLInputElement).checked)"
+          />
+        </label>
+      </section>
 
       <section class="rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2">
         <div class="flex items-center justify-between gap-3">

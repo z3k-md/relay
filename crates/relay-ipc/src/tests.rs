@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{
     ActivityItem, Hello, HostKind, HostState, PROTOCOL_VERSION, Request, Response, RpcErrorBody,
-    Status, decode_line, encode_line,
+    Status, TransferDirection, TransferLive, decode_line, encode_line,
 };
 use crate::{Client, Handler, Server};
 
@@ -51,6 +51,7 @@ impl Handler for TestHandler {
                 listen: Some("127.0.0.1:0".into()),
                 peers: Vec::new(),
                 mounts: Vec::new(),
+                transfers: Vec::new(),
             })
             .unwrap()),
             "activity" => Ok(serde_json::to_value(&self.items).unwrap()),
@@ -129,6 +130,61 @@ fn client_server_over_local_socket() {
 
     stop.store(true, Ordering::SeqCst);
     let _ = accept.join();
+}
+
+#[test]
+fn status_includes_transfers() {
+    let live = TransferLive {
+        peer_id: "peer".into(),
+        peer_name: "macbook".into(),
+        space: "Photos".into(),
+        mount: None,
+        direction: TransferDirection::Receive,
+        files_done: 1,
+        files_total: Some(4),
+        bytes_done: 20,
+        bytes_total: Some(80),
+        bytes_per_sec: 10,
+        started_at_ms: 5,
+        retries: 0,
+        current_path: None,
+    };
+    let status = Status {
+        state: HostState::Running,
+        message: None,
+        listen: None,
+        peers: Vec::new(),
+        mounts: Vec::new(),
+        transfers: vec![live.clone()],
+    };
+    let value = serde_json::to_value(&status).unwrap();
+    let rows = value
+        .get("transfers")
+        .and_then(|v| v.as_array())
+        .expect("status json includes transfers");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["direction"], "receive");
+    assert_eq!(rows[0]["bytes_total"], 80);
+    let back: Status = serde_json::from_value(value).unwrap();
+    assert_eq!(back.transfers, vec![live]);
+
+    let empty = Status {
+        state: HostState::Running,
+        message: None,
+        listen: None,
+        peers: Vec::new(),
+        mounts: Vec::new(),
+        transfers: Vec::new(),
+    };
+    let value = serde_json::to_value(&empty).unwrap();
+    assert!(value.get("transfers").is_none());
+    let back: Status = serde_json::from_value(serde_json::json!({
+        "state": "running",
+        "peers": [],
+        "mounts": []
+    }))
+    .unwrap();
+    assert!(back.transfers.is_empty());
 }
 
 fn wait_client(home: &std::path::Path) -> Option<Client> {

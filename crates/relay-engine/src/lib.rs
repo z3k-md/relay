@@ -5,6 +5,9 @@ mod clock;
 mod error;
 mod order;
 mod peers;
+mod policies;
+mod progress;
+mod replica;
 mod reports;
 mod resolve;
 mod scan;
@@ -26,7 +29,13 @@ use relay_store::StoreError;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::EngineError;
 pub use peers::{
-    ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict, group_git_conflicts,
+    AdoptedMembers, ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict,
+    group_git_conflicts,
+};
+pub use policies::{GroupInfo, PolicyInfo};
+pub use progress::{
+    Bookend, TransferDirection, TransferLive, bookends, format_bytes, format_rate, index_row,
+    summary_line,
 };
 pub use relay_core::{
     Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount, MountId, ObjectId, Sequence,
@@ -36,6 +45,7 @@ pub use relay_crypto::DeviceIdentity;
 pub use relay_db::{HistoryRecord, MountConfig};
 pub use relay_fs::{FsError, ScanWarning};
 pub use relay_store::ObjectStore;
+pub use replica::{ReplicaPull, ReplicaPush, ReplicaSpacePush, ReplicaStatus};
 pub use reports::{
     DeleteHold, DeleteHoldDecision, GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT,
     MASS_DELETE_NUMERATOR, MountStatus, PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport,
@@ -480,7 +490,7 @@ impl Engine {
         mount: &str,
         opts: ScanOptions,
     ) -> Result<ScanReport, EngineError> {
-        self.scan_mount(space, mount, opts)
+        self.scan_mount(space, mount, opts, &mut |_| {})
     }
 
     /// Incremental scan of `paths` (and the scopes `scan_paths` derives).
@@ -491,7 +501,7 @@ impl Engine {
         paths: &[LogicalPath],
         opts: ScanOptions,
     ) -> Result<ScanReport, EngineError> {
-        self.scan_paths_inner(space, mount, paths, opts)
+        self.scan_paths_inner(space, mount, paths, opts, &mut |_| {})
     }
 
     #[allow(clippy::type_complexity)]

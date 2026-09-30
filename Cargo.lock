@@ -4032,6 +4032,7 @@ dependencies = [
  "relay-fs",
  "relay-policy",
  "relay-proto",
+ "relay-replica",
  "relay-store",
  "rusqlite",
  "serde",
@@ -4107,6 +4108,20 @@ version = "0.1.4"
 dependencies = [
  "prost",
  "relay-core",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "relay-replica"
+version = "0.1.4"
+dependencies = [
+ "hex",
+ "prost",
+ "relay-core",
+ "relay-proto",
+ "serde",
+ "tempfile",
  "thiserror 2.0.21",
  "uuid",
 ]

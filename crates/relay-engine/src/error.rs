@@ -27,6 +27,15 @@ pub enum EngineError {
     #[error("peer {0:?} already exists")]
     DuplicatePeer(String),
 
+    #[error("unknown device group {0:?}")]
+    UnknownGroup(String),
+
+    #[error("unknown replication policy {0:?}")]
+    UnknownPolicy(String),
+
+    #[error("policy needs at least one selector and one target")]
+    EmptyPolicy,
+
     #[error("space {name:?} already exists with a different id")]
     SpaceIdConflict { name: String },
 
@@ -107,6 +116,9 @@ pub enum EngineError {
 
     #[error(transparent)]
     Policy(#[from] PolicyError),
+
+    #[error("{0}")]
+    Replica(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),

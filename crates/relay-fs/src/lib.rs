@@ -18,7 +18,7 @@ pub use paths::{
 };
 pub use scan::{
     PartialScan, ScanResult, ScanScope, ScanWarning, ScannedEntry, ScopeKind, effective_rules,
-    scan_mount, scan_paths,
+    scan_mount, scan_mount_with, scan_paths,
 };
 pub use watch::{MountWatcher, WatchSignal};
 

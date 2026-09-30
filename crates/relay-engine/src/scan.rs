@@ -6,7 +6,9 @@ use relay_core::{
     EntryContent, EntryKey, EntryKind, EntryRecord, LocalChange, LogicalPath, MountId, Observation,
     Sequence, derive_local_change, is_bookkeeping_path, needs_rehash,
 };
-use relay_fs::{ScanScope, ScanWarning, ScopeKind, effective_rules, scan_mount, to_logical_path};
+use relay_fs::{
+    ScanScope, ScanWarning, ScopeKind, effective_rules, scan_mount_with, to_logical_path,
+};
 use relay_policy::MountRules;
 use relay_store::{PutBatch, StoreError};
 
@@ -15,6 +17,11 @@ use crate::error::EngineError;
 use crate::reports::{ScanOptions, ScanReport, Warning, is_large_fraction_delete, is_mass_delete};
 
 const SCAN_APPLY_ATTEMPTS: u32 = 3;
+
+pub(crate) enum ScanTick {
+    Visited,
+    Hashed(u64),
+}
 
 enum Protection {
     EntireMount,
@@ -54,8 +61,9 @@ impl Engine {
         space_name: &str,
         mount_name: &str,
         opts: ScanOptions,
+        on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanReport, EngineError> {
-        self.run_scan(space_name, mount_name, opts, true, None)
+        self.run_scan(space_name, mount_name, opts, true, None, on_tick)
     }
 
     pub(crate) fn scan_paths_inner(
@@ -64,8 +72,9 @@ impl Engine {
         mount: &str,
         paths: &[LogicalPath],
         opts: ScanOptions,
+        on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanReport, EngineError> {
-        self.run_scan(space, mount, opts, false, Some(paths))
+        self.run_scan(space, mount, opts, false, Some(paths), on_tick)
     }
 
     fn run_scan(
@@ -75,11 +84,12 @@ impl Engine {
         opts: ScanOptions,
         full: bool,
         paths: Option<&[LogicalPath]>,
+        on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanReport, EngineError> {
         self.ensure_writable()?;
         let (space, config) = self.lookup_mount(space_name, mount_name)?;
         let mount_id = config.mount.id;
-        let result = self.scan_attempts(&space, &config, opts, full, paths);
+        let result = self.scan_attempts(&space, &config, opts, full, paths, on_tick);
         if !opts.dry_run {
             self.record_scan_bookkeeping(mount_id, full, &result)?;
         }
@@ -93,13 +103,14 @@ impl Engine {
         opts: ScanOptions,
         full: bool,
         paths: Option<&[LogicalPath]>,
+        on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanReport, EngineError> {
         let mut last_conflict = None;
         for attempt in 0..SCAN_APPLY_ATTEMPTS {
             let plan = if full {
-                self.plan_scan_for(space, config, opts)?
+                self.plan_scan_for(space, config, opts, on_tick)?
             } else {
-                self.plan_scan_paths_for(space, config, paths.unwrap_or(&[]), opts)?
+                self.plan_scan_paths_for(space, config, paths.unwrap_or(&[]), opts, on_tick)?
             };
             if opts.dry_run {
                 return Ok(plan.report);
@@ -125,7 +136,7 @@ impl Engine {
         opts: ScanOptions,
     ) -> Result<ScanPlan, EngineError> {
         let (space, config) = self.lookup_mount(space_name, mount_name)?;
-        self.plan_scan_for(&space, &config, opts)
+        self.plan_scan_for(&space, &config, opts, &mut |_| {})
     }
 
     fn plan_scan_for(
@@ -133,10 +144,13 @@ impl Engine {
         space: &relay_core::Space,
         config: &relay_db::MountConfig,
         opts: ScanOptions,
+        on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanPlan, EngineError> {
         let local_path = verified_root(config)?;
         let user_rules = MountRules::new(&config.includes, &config.excludes)?;
-        let scanned = scan_mount(&local_path, &user_rules)?;
+        let scanned = scan_mount_with(&local_path, &user_rules, &mut || {
+            on_tick(ScanTick::Visited);
+        })?;
         let rules = match scanned.rules.clone() {
             Some(rules) => rules,
             None => effective_rules(&local_path, &user_rules, &mut Vec::new())?,
@@ -148,19 +162,23 @@ impl Engine {
             .filter(|r| !r.is_deleted())
             .map(|r| r.key.path.clone())
             .collect();
-        self.build_plan(BuildPlan {
-            space,
-            config,
-            opts,
-            local_path: &local_path,
-            entries: &scanned.entries,
-            warnings: &scanned.warnings,
-            rules: &rules,
-            previous,
-            deletion_scope,
-            live_for_guard: live_count,
-            empty_scan_rule: true,
-        })
+        self.build_plan(
+            BuildPlan {
+                space,
+                config,
+                opts,
+                local_path: &local_path,
+                entries: &scanned.entries,
+                warnings: &scanned.warnings,
+                rules: &rules,
+                previous,
+                deletion_scope,
+                live_for_guard: live_count,
+                empty_scan_rule: true,
+            },
+            false,
+            on_tick,
+        )
     }
 
     fn plan_scan_paths_for(
@@ -169,6 +187,7 @@ impl Engine {
         config: &relay_db::MountConfig,
         paths: &[LogicalPath],
         opts: ScanOptions,
+        on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanPlan, EngineError> {
         let local_path = verified_root(config)?;
         let user_rules = MountRules::new(&config.includes, &config.excludes)?;
@@ -176,22 +195,31 @@ impl Engine {
         let previous = self.db.repo().entries_for_mount(config.mount.id)?;
         let deletion_scope = scoped_previous_paths(self, config.mount.id, &scanned.scopes)?;
         let live_for_guard = self.db.repo().count_live(config.mount.id)?;
-        self.build_plan(BuildPlan {
-            space,
-            config,
-            opts,
-            local_path: &local_path,
-            entries: &scanned.entries,
-            warnings: &scanned.warnings,
-            rules: &scanned.rules,
-            previous,
-            deletion_scope,
-            live_for_guard,
-            empty_scan_rule: false,
-        })
+        self.build_plan(
+            BuildPlan {
+                space,
+                config,
+                opts,
+                local_path: &local_path,
+                entries: &scanned.entries,
+                warnings: &scanned.warnings,
+                rules: &scanned.rules,
+                previous,
+                deletion_scope,
+                live_for_guard,
+                empty_scan_rule: false,
+            },
+            true,
+            on_tick,
+        )
     }
 
-    fn build_plan(&self, input: BuildPlan<'_>) -> Result<ScanPlan, EngineError> {
+    fn build_plan(
+        &self,
+        input: BuildPlan<'_>,
+        count_visited: bool,
+        on_tick: &mut dyn FnMut(ScanTick),
+    ) -> Result<ScanPlan, EngineError> {
         let BuildPlan {
             space,
             config,
@@ -226,6 +254,9 @@ impl Engine {
         let mut batch = (!opts.dry_run).then(|| self.store.batch());
 
         for entry in entries {
+            if count_visited {
+                on_tick(ScanTick::Visited);
+            }
             scanned_paths.insert(entry.path.clone());
             let prev = prev_by_path.get(&entry.path);
             let mut observe = ObserveCtx {
@@ -238,6 +269,7 @@ impl Engine {
                 wall_now_ns,
                 racy_window: self.config.racy_window,
                 dry_run: opts.dry_run,
+                on_tick: &mut *on_tick,
             };
             let observation = match observation_for(&mut observe, entry, prev)? {
                 Some(obs) => obs,
@@ -537,6 +569,7 @@ struct ObserveCtx<'a> {
     wall_now_ns: i64,
     racy_window: Duration,
     dry_run: bool,
+    on_tick: &'a mut dyn FnMut(ScanTick),
 }
 
 fn observation_for(
@@ -555,6 +588,7 @@ fn observation_for(
                 match hashed {
                     Ok(outcome) => {
                         *ctx.bytes_hashed += outcome.size;
+                        (ctx.on_tick)(ScanTick::Hashed(outcome.size));
                         if !ctx.dry_run {
                             ctx.new_objects.push((outcome.id, outcome.size));
                         }

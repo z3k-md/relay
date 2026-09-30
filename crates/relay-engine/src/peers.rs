@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use relay_core::conflict::original_path;
 use relay_core::{
-    Device, DeviceId, EntryRecord, LogicalPath, Mount, Space, SpaceId, git_dir_of, validate_name,
+    Device, DeviceId, EntryRecord, LogicalPath, Mount, Space, SpaceId, git_dir_of,
+    merge_peer_addresses, validate_name,
 };
-use relay_db::{OfferedMount, PeerOfferRow, StoredOffer};
+use relay_db::{OfferedMember, OfferedMount, PeerOfferRow, StoredOffer};
 use serde::Serialize;
 
 use crate::Engine;
@@ -101,6 +102,14 @@ impl From<&StoredOffer> for OfferInfo {
             received_at_ms: offer.received_at_ms,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptedMembers {
+    /// True when a peer was added/updated (including address merges).
+    pub peers_changed: bool,
+    /// Peers newly shared for this space during adoption.
+    pub newly_shared: Vec<DeviceId>,
 }
 
 impl Engine {
@@ -275,12 +284,23 @@ impl Engine {
         Ok(())
     }
 
+    /// Offers this device can still join. A space that already exists locally
+    /// is omitted; the stored offer stays, so it shows again if that space is
+    /// removed.
     pub fn offers(&self) -> Result<Vec<OfferInfo>, EngineError> {
+        let joined: HashSet<_> = self
+            .db
+            .repo()
+            .list_spaces()?
+            .into_iter()
+            .map(|space| space.id)
+            .collect();
         Ok(self
             .db
             .repo()
             .list_offers()?
             .iter()
+            .filter(|offer| !joined.contains(&offer.space_id))
             .map(OfferInfo::from)
             .collect())
     }
@@ -335,7 +355,54 @@ impl Engine {
                 EngineError::Db(inner) => EngineError::from_db(inner),
                 other => other,
             })?;
+        let _ = self.adopt_offered_members(offer.space_id, &offer.members)?;
         Ok(space)
+    }
+
+    /// Trust members listed on an offer for a space this device has already
+    /// joined: upsert peers, merge addresses, and share the space. Dismissed
+    /// peers and the local device are skipped.
+    pub fn adopt_offered_members(
+        &mut self,
+        space: SpaceId,
+        members: &[OfferedMember],
+    ) -> Result<AdoptedMembers, EngineError> {
+        self.ensure_writable()?;
+        if self.db.repo().space(space)?.is_none() {
+            return Err(EngineError::UnknownSpace(space.to_string()));
+        }
+        let local = self.device.id;
+        let mut peers_changed = false;
+        let mut newly_shared = Vec::new();
+        for member in members {
+            if member.id == local {
+                continue;
+            }
+            if self.db.repo().is_dismissed(member.id)? {
+                continue;
+            }
+            let existing = self.db.repo().peer_by_id(member.id)?;
+            if let Some(peer) = existing {
+                let merged = merge_peer_addresses(&member.addresses, &peer.addresses);
+                if merged != peer.addresses {
+                    self.set_peer_addresses(member.id, &merged)?;
+                    peers_changed = true;
+                }
+            } else {
+                let addresses = merge_peer_addresses(&[], &member.addresses);
+                self.upsert_peer(&member.name, member.id, &addresses)?;
+                peers_changed = true;
+            }
+            if !self.db.repo().is_shared(space, member.id)? {
+                self.share_space_id(space, member.id)?;
+                newly_shared.push(member.id);
+                peers_changed = true;
+            }
+        }
+        Ok(AdoptedMembers {
+            peers_changed,
+            newly_shared,
+        })
     }
 
     pub fn conflicts(&self, space: Option<&str>) -> Result<Vec<EntryRecord>, EngineError> {
@@ -391,11 +458,12 @@ impl Engine {
             .collect())
     }
 
-    pub(crate) fn space_offers_for_peer(
+    pub fn space_offers_for_peer(
         &self,
         peer: DeviceId,
     ) -> Result<relay_proto::SpaceOffers, EngineError> {
         let mut spaces = Vec::new();
+        let all_peers = self.db.repo().list_peers()?;
         for space_id in self.db.repo().shared_space_ids(peer)? {
             let Some(space) = self.db.repo().space(space_id)? else {
                 continue;
@@ -410,10 +478,28 @@ impl Engine {
                     name: cfg.mount.name,
                 })
                 .collect();
+            let mut members = Vec::new();
+            for other in &all_peers {
+                if other.device.id == peer || other.device.id == self.device.id {
+                    continue;
+                }
+                if !self.db.repo().is_shared(space_id, other.device.id)? {
+                    continue;
+                }
+                members.push(relay_proto::MemberOffer {
+                    device_id: other.device.id.as_bytes().to_vec(),
+                    name: other.device.name.clone(),
+                    addresses: other.addresses.clone(),
+                });
+            }
+            let (policy_epoch, policies) = self.local_policy_offers(space_id)?;
             spaces.push(relay_proto::SpaceOffer {
                 space_id: relay_proto::space_id_bytes(&space.id),
                 name: space.name,
                 mounts,
+                members,
+                policy_epoch,
+                policies,
             });
         }
         Ok(relay_proto::SpaceOffers { spaces })

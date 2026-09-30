@@ -72,7 +72,12 @@ pub fn refresh(app: &AppHandle) {
     } else {
         (RunnerState::Starting, 0)
     };
-    let _ = tray.status.set_text(runner::status_line(&state, connected));
+    let summary = app
+        .try_state::<AppState>()
+        .and_then(|state| state.runner.transfer_summary());
+    let _ = tray
+        .status
+        .set_text(runner::status_line(&state, connected, summary.as_deref()));
     let pause_label = match &state {
         RunnerState::Paused => "Resume sync",
         _ => "Pause sync",
