@@ -9,9 +9,10 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_peers_and_sync.sql"),
     include_str!("../migrations/0005_delete_holds.sql"),
     include_str!("../migrations/0006_delete_hold_applied.sql"),
+    include_str!("../migrations/0007_local_settings.sql"),
 ];
 
-pub(crate) const SCHEMA_VERSION: u32 = 6;
+pub(crate) const SCHEMA_VERSION: u32 = 7;
 
 pub(crate) fn user_version(conn: &Connection) -> Result<u32, DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

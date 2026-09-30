@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use relay_core::{LogicalPath, MOUNT_MARKER};
+use relay_core::{LogicalPath, MOUNT_MARKER, MountId, SpaceId};
 use relay_fs::{MountWatcher, WatchSignal, to_logical_path};
 use serde::Serialize;
 
@@ -118,6 +118,8 @@ pub enum WatchEvent {
 }
 
 struct MountWatch {
+    space_id: SpaceId,
+    mount_id: MountId,
     space: String,
     mount: String,
     root: PathBuf,
@@ -197,6 +199,8 @@ impl Engine {
             .filter_map(|(space, config)| {
                 let root = config.local_path?;
                 Some(MountWatch {
+                    space_id: space.id,
+                    mount_id: config.mount.id,
                     space: space.name,
                     mount: config.mount.name,
                     root,
@@ -278,10 +282,15 @@ impl Engine {
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(STOP_POLL) {
                 Ok(LoopMsg::Fs(signal)) => apply_signal(&mut states, signal, Instant::now()),
-                Ok(LoopMsg::Sync(input)) => {
-                    emit_sync(syncer.handle(self, input, &mut output), on_event);
-                    emit_sync(syncer.push_local_changes(self, &mut output), on_event);
-                }
+                Ok(LoopMsg::Sync(input)) => match input {
+                    SyncInput::Rescan { mounts } => {
+                        mark_rescan(&mut states, &mounts, Instant::now());
+                    }
+                    other => {
+                        emit_sync(syncer.handle(self, other, &mut output), on_event);
+                        emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+                    }
+                },
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {}
             }
@@ -597,6 +606,20 @@ fn note_times(state: &mut MountWatch, now: Instant) {
         state.first_event = Some(now);
     }
     state.last_event = Some(now);
+}
+
+fn mark_rescan(states: &mut [MountWatch], mounts: &[(SpaceId, MountId)], now: Instant) {
+    for state in states {
+        if mounts
+            .iter()
+            .any(|(space, mount)| *space == state.space_id && *mount == state.mount_id)
+        {
+            state.failed = false;
+            state.full_pending = true;
+            note_times(state, now);
+            state.last_event = Some(now.checked_sub(Duration::from_secs(10)).unwrap_or(now));
+        }
+    }
 }
 
 fn flush_jobs(states: &mut [MountWatch], now: Instant, opts: &WatchOptions) -> Vec<FlushJob> {

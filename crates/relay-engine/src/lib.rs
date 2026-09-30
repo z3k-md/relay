@@ -29,8 +29,8 @@ pub use peers::{
     ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict, group_git_conflicts,
 };
 pub use relay_core::{
-    Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount, ObjectId, Sequence, Space,
-    VectorOrdering,
+    Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount, MountId, ObjectId, Sequence,
+    Space, SpaceId, VectorOrdering,
 };
 pub use relay_crypto::DeviceIdentity;
 pub use relay_db::{HistoryRecord, MountConfig};
@@ -254,6 +254,18 @@ impl Engine {
         Ok(self.db.data_version()?)
     }
 
+    pub fn paused(&self) -> Result<bool, EngineError> {
+        Ok(self.db.repo().local_setting("paused")?.as_deref() == Some("1"))
+    }
+
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), EngineError> {
+        self.ensure_writable()?;
+        let value = if paused { "1" } else { "0" };
+        self.db
+            .transaction(|repo| repo.set_local_setting("paused", value))
+            .map_err(EngineError::from_db)
+    }
+
     pub fn create_space(&mut self, name: &str) -> Result<Space, EngineError> {
         self.ensure_writable()?;
         validate_name(name)?;
@@ -431,6 +443,32 @@ impl Engine {
                 .space(config.mount.space)?
                 .ok_or_else(|| EngineError::UnknownSpace(config.mount.name.clone()))?;
             out.push((space, config));
+        }
+        Ok(out)
+    }
+
+    /// Resolve SPACE[/MOUNT] to local mount ids for a forced rescan.
+    pub fn resolve_rescan_targets(
+        &self,
+        space: Option<&str>,
+        mount: Option<&str>,
+    ) -> Result<Vec<(SpaceId, MountId, String)>, EngineError> {
+        let listed = self.mounts(space)?;
+        let mut out = Vec::new();
+        for (space_rec, config) in listed {
+            if let Some(name) = mount
+                && config.mount.name != name
+            {
+                continue;
+            }
+            if config.local_path.is_none() {
+                continue;
+            }
+            out.push((
+                space_rec.id,
+                config.mount.id,
+                format!("{}/{}", space_rec.name, config.mount.name),
+            ));
         }
         Ok(out)
     }

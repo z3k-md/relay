@@ -169,6 +169,26 @@ impl Repo<'_> {
         }
     }
 
+    pub fn local_setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT value FROM local_settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn set_local_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO local_settings(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn local_device(&self) -> Result<Option<LocalDevice>, DbError> {
         let row = self
             .conn

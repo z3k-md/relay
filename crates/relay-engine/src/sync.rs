@@ -47,6 +47,9 @@ pub enum SyncInput {
         not_found: bool,
         reason: String,
     },
+    Rescan {
+        mounts: Vec<(SpaceId, MountId)>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +210,7 @@ impl Syncer {
                     &mut events,
                 )?;
             }
+            SyncInput::Rescan { .. } => {}
         }
         Ok(events)
     }

@@ -364,6 +364,7 @@ fn v4_database_upgrades_to_delete_holds() {
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
     assert_eq!(mount.name, "docs");
     assert!(db.repo().list_delete_holds().unwrap().is_empty());
+    assert!(db.repo().local_setting("paused").unwrap().is_none());
 }
 
 #[test]
