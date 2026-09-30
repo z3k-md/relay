@@ -1,8 +1,9 @@
 # Releasing Relay
 
-Desktop builds and signed auto-updates are produced by GitHub Actions when a
-`v*` tag is pushed. The headless CLI (`relay service`) is still installed with
-`scripts/install.sh` / `scripts/deploy.sh` for SSH and servers.
+Desktop builds and signed auto-updates are produced only when a release is
+cut. A normal commit or push does not publish a new version. The headless
+CLI (`relay service`) is still installed with `scripts/install.sh` /
+`scripts/deploy.sh` for SSH and servers.
 
 Until the GitHub repo exists, URLs below use the placeholder **OWNER/REPO**.
 `scripts/release.sh` and `scripts/setup-updater-key.sh` replace that from
@@ -78,19 +79,39 @@ Until the GitHub repo exists, URLs below use the placeholder **OWNER/REPO**.
 ```bash
 git checkout main
 git pull
-./scripts/release.sh          # default: patch. also: minor | major | X.Y.Z
+./scripts/release.sh          # default: patch. also: minor | major | none | X.Y.Z
 # ./scripts/release.sh --dry-run
 ```
 
-The script requires a clean `main` that matches `origin/main`. It bumps
-`[workspace.package] version` in the root `Cargo.toml`, the `"version"`
-fields in `apps/relay-desktop/src-tauri/tauri.conf.json` and
-`apps/relay-desktop/package.json`, refreshes `Cargo.lock`, commits
-`Release vX.Y.Z`, pushes `main`, and dispatches the release workflow on
-`main` with `tag=vX.Y.Z` (`gh` must be logged in; otherwise it pushes the
-tag instead). Running on `main` matters for speed: Actions caches saved by
-a tag run are visible only to that tag, while `main`'s caches are shared by
-every later release. The tag is created when the release is published.
+The script requires a clean `main` that matches `origin/main`, and `gh`
+logged in. It does not edit the tree. It dispatches the release workflow
+on `main`. That workflow increments the patch number (the build number:
+`0.1.2` becomes `0.1.3`) in `[workspace.package] version`, in
+`apps/relay-desktop/src-tauri/tauri.conf.json`, in
+`apps/relay-desktop/package.json`, and in `Cargo.lock`, commits
+`Release vX.Y.Z`, and builds that commit. `minor`, `major`, and an exact
+`X.Y.Z` are the other choices. `none` rebuilds the version already on
+`main`.
+
+If the current version is not published yet (no release, or still a draft),
+a patch cut finishes that version instead of incrementing again. Pushing a
+`v*` tag does not start a build. Running on `main` matters for speed:
+Actions caches saved by a tag run are visible only to that tag, while
+`main`'s caches are shared by every later release. The tag is created when
+the release is published.
+
+An agent with Actions write access can cut the same release without the
+script:
+
+```bash
+gh workflow run release.yml --repo OWNER/REPO --ref main -f bump=patch
+# or:
+gh api -X POST repos/OWNER/REPO/actions/workflows/release.yml/dispatches \
+  -f ref=main -f inputs[bump]=patch
+```
+
+The call returns as soon as the run is queued. `ref` is the branch to
+release (use `main`).
 
 GitHub Actions (`.github/workflows/release.yml`) then builds: about
 15 minutes cold, a few minutes with a warm cache. It creates a draft
@@ -108,9 +129,9 @@ the new version up within about 30 minutes, or immediately from the tray
 **Check for updates**. Headless installs can download `relay-macos-universal`
 or `relay-windows-x86_64.exe` from the same Release.
 
-`workflow_dispatch` can rebuild the current `tauri.conf.json` version
-(`v__VERSION__`) or a specific tag. The job fails early if the tag without
-`v` does not match `tauri.conf.json`'s `"version"`.
+`bump=none`, or a re-run of the failed build jobs, rebuilds the current
+version. The job fails if the committed version and the tag it publishes
+disagree.
 
 ## SSH `deploy.sh` fast loop
 
@@ -131,9 +152,9 @@ the Release. Confirm `TAURI_SIGNING_PRIVATE_KEY` is the same key
 `setup-updater-key.sh` wrote, and that `tauri.conf.json` was committed
 before the tag.
 
-**Version not bumped.** The tag (`vX.Y.Z`) must equal the `"version"` in
-`tauri.conf.json` (and, after `release.sh`, the workspace Cargo version).
-A hand-pushed tag that skipped the script fails the release job immediately.
+**Version not bumped.** The published tag (`vX.Y.Z`) is the `"version"` in
+`tauri.conf.json`, which the workflow keeps equal to the workspace Cargo
+version and `package.json`. A hand-pushed tag does not start a release.
 
 **`latest.json` missing.** The updater endpoint 404s. Check that
 both build jobs and the `publish release` job succeeded (a failed

@@ -292,10 +292,11 @@ runner is hosted in-process (the same engine the CLI embeds). The `relay`
 CLI is also bundled as a sidecar (`bundle.externalBin`) and placed on PATH
 so terminal workflows keep working.
 
-Releases are produced by GitHub Actions when a `v*` tag is pushed
-(`.github/workflows/release.yml`). `scripts/release.sh` bumps
-`[workspace.package] version`, the Tauri and npm `"version"` fields,
-commits, tags, and pushes. macOS is a universal (`aarch64` + `x86_64`)
+Releases are produced by GitHub Actions only when the release workflow is
+dispatched (`.github/workflows/release.yml`). A normal push does not
+publish a version. The workflow bumps `[workspace.package] version` (patch
+by default), the Tauri and npm `"version"` fields, commits, and builds.
+macOS is a universal (`aarch64` + `x86_64`)
 ad-hoc-signed `.dmg` (no notarization yet). Windows is a per-user NSIS
 installer (no admin). Linux desktop builds are not shipped; headless
 `relay service` remains the path for SSH and servers (see

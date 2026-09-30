@@ -1,8 +1,9 @@
-# Build and publish Relay desktop + CLI. scripts/release.sh dispatches this on
-# main with the new tag (so the Rust cache is shared across releases); pushing
-# a v* tag by hand also works, just without saving a cache.
+# Build and publish Relay desktop + CLI. Ordinary pushes do not run this.
+# scripts/release.sh (or the workflow_dispatch API) starts it on main.
 #
-# 1. create:   a draft release (drafts are invisible to the updater)
+# 1. create:   bump the patch version unless this version is still unpublished,
+#              commit it, then open a draft release (drafts are invisible to
+#              the updater)
 # 2. build:    macOS universal + Windows bundles and CLI binaries into it
 # 3. finalize: check latest.json covers every platform, then publish
 #
@@ -17,15 +18,24 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
-      tag:
+      bump:
         description: >-
-          Git tag to publish (e.g. v0.1.0). Leave empty to use the version
-          in tauri.conf.json.
+          patch (default) increments the build number. minor and major
+          increment those components. none rebuilds the version already
+          on the branch.
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - none
+        default: patch
+      version:
+        description: >-
+          Exact X.Y.Z to publish. Overrides bump. Leave empty to use bump.
         required: false
         type: string
         default: ""
@@ -50,8 +60,9 @@ jobs:
     name: create draft release
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.meta.outputs.tag }}
-      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.bump.outputs.sha }}
       owner: ${{ steps.meta.outputs.owner }}
       repo: ${{ steps.meta.outputs.repo }}
       full: ${{ steps.meta.outputs.full }}
@@ -59,30 +70,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
 
-      - name: Resolve destination and check version
+      - name: Resolve destination
         id: meta
         env:
           RELEASE_REPO: ${{ vars.RELEASE_REPO }}
           HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          conf="apps/relay-desktop/src-tauri/tauri.conf.json"
-          conf_ver=$(node -e "const j=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); if (typeof j.version !== 'string' || !j.version) { console.error('missing top-level version'); process.exit(1); } console.log(j.version);" "$conf")
-
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            tag="${INPUT_TAG:-v${conf_ver}}"
-          else
-            tag="$REF_NAME"
-          fi
-          if [ "${tag#v}" != "$conf_ver" ]; then
-            echo "error: tag '${tag}' != tauri.conf.json version '${conf_ver}' (run scripts/release.sh)" >&2
-            exit 1
-          fi
-
           if [ -n "$RELEASE_REPO" ]; then
             case "$RELEASE_REPO" in
               */*) ;;
@@ -97,21 +95,99 @@ jobs:
             dest="$GITHUB_REPOSITORY"
           fi
           {
-            echo "tag=${tag}"
-            echo "version=${conf_ver}"
             echo "owner=${dest%%/*}"
             echo "repo=${dest#*/}"
             echo "full=${dest}"
           } >> "$GITHUB_OUTPUT"
-          echo "Publishing ${tag} to ${dest}"
+          echo "Release destination: ${dest}"
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Bump version and push
+        id: bump
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          DEST: ${{ steps.meta.outputs.full }}
+          BUMP: ${{ inputs.bump }}
+          EXACT: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$REF_NAME"
+          git reset --hard "origin/${REF_NAME}"
+
+          conf="apps/relay-desktop/src-tauri/tauri.conf.json"
+          read_ver() {
+            node -e "const j=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); if (typeof j.version !== 'string' || !j.version) { console.error('missing top-level version'); process.exit(1); } console.log(j.version);" "$1"
+          }
+          current=$(read_ver "$conf")
+
+          # A patch cut publishes the next build number only after the current
+          # one is already public. A failed cut leaves a draft (or no release)
+          # and the next run finishes that version instead of skipping it.
+          state="missing"
+          err=$(mktemp)
+          if json=$(gh release view "v${current}" --repo "$DEST" --json isDraft 2>"$err"); then
+            state=$(printf '%s' "$json" | jq -r .isDraft)
+          elif ! grep -Eqi 'not found|HTTP 404' "$err"; then
+            echo "error: could not read release v${current} in ${DEST}" >&2
+            cat "$err" >&2
+            exit 1
+          fi
+          rm -f "$err"
+
+          kind=""
+          if [ -n "$EXACT" ]; then
+            kind="$EXACT"
+          elif [ "$BUMP" = "none" ]; then
+            kind=""
+          elif [ "$BUMP" = "patch" ] && [ "$state" != "false" ]; then
+            echo "v${current} is not published yet; building it without a new increment"
+          else
+            kind="$BUMP"
+          fi
+
+          if [ -n "$kind" ]; then
+            ver=$(./scripts/release.sh --apply "$kind" | tail -n1)
+            git add Cargo.toml Cargo.lock \
+              apps/relay-desktop/src-tauri/tauri.conf.json \
+              apps/relay-desktop/package.json
+            if git diff --cached --quiet; then
+              echo "version already ${ver}; not committing"
+            else
+              export GIT_AUTHOR_NAME="github-actions[bot]"
+              export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+              export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+              export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+              git commit -m "Release v${ver}"
+              git push origin "HEAD:${REF_NAME}"
+            fi
+          else
+            ver="$current"
+          fi
+
+          conf_ver=$(read_ver "$conf")
+          if [ "$ver" != "$conf_ver" ]; then
+            echo "error: version '${ver}' != tauri.conf.json version '${conf_ver}'" >&2
+            exit 1
+          fi
+          sha=$(git rev-parse HEAD)
+          {
+            echo "tag=v${ver}"
+            echo "version=${ver}"
+            echo "sha=${sha}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing v${ver} (${sha}) to ${DEST}"
 
       - name: Create draft release
         id: release
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           DEST: ${{ steps.meta.outputs.full }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          SHA: ${{ steps.bump.outputs.sha }}
         run: |
           set -euo pipefail
           id=$(gh api "repos/${DEST}/releases" --paginate \
@@ -122,13 +198,13 @@ jobs:
             args=(
               -f tag_name="$TAG"
               -f name="Relay v${VERSION}"
-              -f body="Desktop app and CLI for Relay v${VERSION} (${GITHUB_SHA::7})."
+              -f body="Desktop app and CLI for Relay v${VERSION} (${SHA::7})."
               -F draft=true
             )
             # A separate release repo does not contain our commits, so the tag
-            # there points at its default branch instead of github.sha.
+            # there points at its default branch instead of this sha.
             if [ "$DEST" = "$GITHUB_REPOSITORY" ]; then
-              args+=(-f target_commitish="$GITHUB_SHA")
+              args+=(-f target_commitish="$SHA")
             fi
             id=$(gh api -X POST "repos/${DEST}/releases" "${args[@]}" --jq .id)
           fi
@@ -161,6 +237,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.create.outputs.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -176,8 +254,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.sidecar_target }}
-          # Caches saved from a tag run are only visible to that tag, so only
-          # main (scripts/release.sh dispatches there) saves.
+          # Dispatched on main so later releases reuse this cache. A cache
+          # saved from a tag is visible only to that tag.
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 

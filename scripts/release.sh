@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Bump Relay's shared version, commit, push, and start the release workflow
-# on main so GitHub Actions builds the desktop app and CLI.
+# Start a Relay release build. The workflow on main bumps the shared version,
+# commits it, and builds the desktop app and CLI. Ordinary pushes do not.
 #
 #   ./scripts/release.sh                 # patch (default)
 #   ./scripts/release.sh minor
 #   ./scripts/release.sh 1.2.3
+#   ./scripts/release.sh none            # rebuild the version already on main
 #   ./scripts/release.sh --dry-run
+#
+# The workflow calls `./scripts/release.sh --apply patch` to edit the version
+# files in its checkout. That mode does not commit or start a build.
 #
 # macOS ships bash 3.2: no associative arrays, no ${var,,}, no mapfile.
 set -euo pipefail
@@ -14,24 +18,28 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$ROOT"
 
 DRY_RUN=0
+APPLY=0
 BUMP="patch"
 
 usage() {
     cat <<'EOF'
-Bump the workspace version, commit, push to origin, and start the release
-workflow for vX.Y.Z on main (needs gh; falls back to pushing the tag).
+Start the release workflow on main (needs gh). The workflow bumps the
+version, commits `Release vX.Y.Z`, and builds that commit.
 
 Usage:
-  ./scripts/release.sh [--dry-run] [patch|minor|major|X.Y.Z]
+  ./scripts/release.sh [--dry-run] [patch|minor|major|none|X.Y.Z]
 
-  patch | minor | major   Semver bump of [workspace.package] version
-                          in the root Cargo.toml (default: patch).
-  X.Y.Z                   Set that version explicitly.
-  --dry-run               Print the plan; change nothing.
+  patch | minor | major   Semver bump (default: patch, the build number).
+  none                    Rebuild the version already on origin/main.
+  X.Y.Z                   Publish that version.
+  --dry-run               Print the plan; start nothing.
+  --apply KIND            Write the version files and print the new version.
+                          Does not commit, push, or start a build.
 
-Requires a clean tree on main, up to date with origin/main. Updates
-Cargo.toml, apps/relay-desktop/src-tauri/tauri.conf.json,
-apps/relay-desktop/package.json, and Cargo.lock.
+Requires a clean tree on main, up to date with origin/main, except --apply.
+The workflow updates Cargo.toml, Cargo.lock,
+apps/relay-desktop/src-tauri/tauri.conf.json, and
+apps/relay-desktop/package.json.
 EOF
 }
 
@@ -50,7 +58,11 @@ while [ $# -gt 0 ]; do
             DRY_RUN=1
             shift
             ;;
-        patch|minor|major)
+        --apply)
+            APPLY=1
+            shift
+            ;;
+        patch|minor|major|none)
             BUMP="$1"
             shift
             ;;
@@ -190,19 +202,38 @@ need_file apps/relay-desktop/package.json
 
 CURRENT=$(cargo_workspace_version)
 [ -n "$CURRENT" ] || die "could not read [workspace.package] version from Cargo.toml"
-NEXT=$(next_version "$CURRENT" "$BUMP")
+if [ "$BUMP" = "none" ]; then
+    NEXT="$CURRENT"
+else
+    NEXT=$(next_version "$CURRENT" "$BUMP")
+fi
+
+if [ "$APPLY" = 1 ]; then
+    [ "$DRY_RUN" = 0 ] || die "--apply and --dry-run together do nothing useful"
+    if [ "$NEXT" != "$CURRENT" ]; then
+        set_cargo_workspace_version "$NEXT"
+        set_json_version apps/relay-desktop/src-tauri/tauri.conf.json "$NEXT"
+        set_json_version apps/relay-desktop/package.json "$NEXT"
+        if ! cargo update --workspace --offline; then
+            echo "cargo update --offline failed; retrying without --offline" >&2
+            cargo update --workspace
+        fi
+    fi
+    printf '%s\n' "$NEXT"
+    exit 0
+fi
 
 REPO=$(github_owner_repo)
 ACTIONS_URL="https://github.com/${REPO}/actions"
 
 echo "Current version: $CURRENT"
 echo "Next version:    $NEXT"
-echo "Commit:          Release v${NEXT}"
+echo "Commit:          Release v${NEXT} (made by the workflow on origin/main)"
 echo "Tag:             v${NEXT}"
-echo "Files:           Cargo.toml, Cargo.lock,"
-echo "                 apps/relay-desktop/src-tauri/tauri.conf.json,"
-echo "                 apps/relay-desktop/package.json"
 echo "Actions:         $ACTIONS_URL"
+if [ "$BUMP" = "patch" ]; then
+    echo "If v${CURRENT} is not published yet, the workflow rebuilds it instead."
+fi
 
 if [ -n "$(git status --porcelain)" ]; then
     die "working tree is dirty; commit or stash first"
@@ -221,34 +252,30 @@ fi
 
 if [ "$DRY_RUN" = 1 ]; then
     echo
-    echo "Dry run: no files changed, nothing committed or pushed."
+    echo "Dry run: workflow not started."
     exit 0
 fi
 
-set_cargo_workspace_version "$NEXT"
-set_json_version apps/relay-desktop/src-tauri/tauri.conf.json "$NEXT"
-set_json_version apps/relay-desktop/package.json "$NEXT"
-
-if ! cargo update --workspace --offline; then
-    echo "cargo update --offline failed; retrying without --offline" >&2
-    cargo update --workspace
+if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+    case "$BUMP" in
+        patch|minor|major|none)
+            hint="gh workflow run release.yml --repo ${REPO} --ref main -f bump=${BUMP}"
+            ;;
+        *)
+            hint="gh workflow run release.yml --repo ${REPO} --ref main -f bump=patch -f version=${NEXT}"
+            ;;
+    esac
+    die "gh is missing or not logged in. Cut the release with: ${hint}"
 fi
 
-git add Cargo.toml Cargo.lock \
-    apps/relay-desktop/src-tauri/tauri.conf.json \
-    apps/relay-desktop/package.json
-git commit -m "Release v${NEXT}"
-git push origin main
-
-# Dispatching on main (instead of pushing a tag) lets the build reuse and
-# refresh main's Rust cache. The release job creates the tag when it publishes.
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    gh workflow run release.yml --repo "$REPO" --ref main -f tag="v${NEXT}"
-else
-    echo "gh is missing or not logged in; pushing tag v${NEXT} instead (slower, uncached build)" >&2
-    git tag "v${NEXT}"
-    git push origin "v${NEXT}"
-fi
+case "$BUMP" in
+    patch|minor|major|none)
+        gh workflow run release.yml --repo "$REPO" --ref main -f "bump=${BUMP}"
+        ;;
+    *)
+        gh workflow run release.yml --repo "$REPO" --ref main -f bump=patch -f "version=${NEXT}"
+        ;;
+esac
 
 echo
 echo "Started the v${NEXT} release. Watch the build at:"
