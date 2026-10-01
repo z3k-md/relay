@@ -10,9 +10,9 @@ use relay_engine::{
     bookends, index_row,
 };
 use relay_ipc::{
-    ActivityItem, AddMountParams, AddMountResult, Handler, Hello, HostKind, HostState, Idle,
-    MountLive, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult,
-    PairStatus, PeerLive, RescanParams, RpcErrorBody, ShareParams, Status,
+    ActivityItem, AddMountParams, AddMountResult, FetchParams, Handler, Hello, HostKind, HostState,
+    Idle, MountLive, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams,
+    PairStartResult, PairStatus, PeerLive, RescanParams, RpcErrorBody, ShareParams, Status,
     TransferDirection as IpcDirection, TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
@@ -262,6 +262,28 @@ impl Host {
             name: config.mount.name,
             path: config.local_path,
         })
+    }
+
+    fn fetch(&self, params: FetchParams) -> Result<(), RpcErrorBody> {
+        if let Some(tx) = self.sync_tx() {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            tx.send(SyncInput::Fetch {
+                space: params.space,
+                mount: params.mount,
+                path: params.path,
+                reply: reply_tx,
+            })
+            .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
+            return reply_rx
+                .recv_timeout(Duration::from_secs(60))
+                .map_err(|_| RpcErrorBody::new("unavailable", "timed out waiting for fetch"))?
+                .map_err(|message| RpcErrorBody::new("failed", message));
+        }
+        let mut engine = Engine::open_for_config(&self.home)
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
+        engine
+            .fetch_path(&params.space, &params.mount, &params.path)
+            .map_err(|err| RpcErrorBody::new("failed", err.to_string()))
     }
 
     fn share(&self, params: ShareParams) -> Result<(), RpcErrorBody> {
@@ -713,6 +735,12 @@ impl Handler for Host {
                 set_paused_flag(&self.home, false)?;
                 self.wake.notify();
                 serde_json::to_value(self.snapshot()).map_err(internal)
+            }
+            "fetch" => {
+                let params: FetchParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                self.fetch(params)?;
+                Ok(serde_json::json!({}))
             }
             "rescan" => {
                 let state = self.state.lock().map(|g| *g).unwrap_or(HostState::Error);

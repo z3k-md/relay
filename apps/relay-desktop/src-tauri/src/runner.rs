@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -51,7 +51,8 @@ pub struct ActivityItem {
 struct Inner {
     state: RunnerState,
     events: VecDeque<ActivityItem>,
-    connected: HashSet<String>,
+    /// Peer id → unix ms when the current session started.
+    connected: HashMap<String, i64>,
     thread: Option<JoinHandle<()>>,
     transfers: Vec<TransferLive>,
     scans: Vec<TransferLive>,
@@ -72,7 +73,7 @@ impl Runner {
             inner: Mutex::new(Inner {
                 state: RunnerState::NotInitialized,
                 events: VecDeque::new(),
-                connected: HashSet::new(),
+                connected: HashMap::new(),
                 thread: None,
                 transfers: Vec::new(),
                 scans: Vec::new(),
@@ -102,6 +103,13 @@ impl Runner {
     }
 
     pub fn connected_peers(&self) -> HashSet<String> {
+        self.inner
+            .lock()
+            .map(|g| g.connected.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn connected_since(&self) -> HashMap<String, i64> {
         self.inner
             .lock()
             .map(|g| g.connected.clone())
@@ -196,7 +204,7 @@ impl Runner {
             match item.kind.as_str() {
                 "peerConnected" => {
                     if let Some(id) = item.message.split_whitespace().last() {
-                        inner.connected.insert(id.to_owned());
+                        inner.connected.entry(id.to_owned()).or_insert_with(now_ms);
                     }
                 }
                 "peerDisconnected" => {
@@ -290,7 +298,7 @@ impl Runner {
         if let Ok(mut inner) = self.inner.lock() {
             match event {
                 WatchEvent::PeerConnected { peer, .. } => {
-                    inner.connected.insert(peer.clone());
+                    inner.connected.entry(peer.clone()).or_insert_with(now_ms);
                 }
                 WatchEvent::PeerDisconnected { peer } => {
                     inner.connected.remove(peer);

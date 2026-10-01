@@ -66,6 +66,9 @@ pub struct PeerInfo {
     pub id: DeviceId,
     pub addresses: Vec<String>,
     pub added_at_ms: i64,
+    /// Last live contact. `None` until this device has connected once.
+    /// While the peer is offline, this is when that contact ended.
+    pub last_seen_ms: Option<i64>,
     /// Soft-revoked devices stay listed but are not dialed or shared with.
     pub revoked: bool,
 }
@@ -141,13 +144,7 @@ impl Engine {
             .db
             .transaction(|repo| repo.add_peer(&device, addresses, now))
             .map_err(EngineError::from_db)?;
-        Ok(PeerInfo {
-            name: record.device.name,
-            id: record.device.id,
-            addresses: record.addresses,
-            added_at_ms: record.added_at_ms,
-            revoked: false,
-        })
+        Ok(peer_info(record, false))
     }
 
     pub fn upsert_peer(
@@ -168,13 +165,10 @@ impl Engine {
                 .db
                 .transaction(|repo| repo.update_peer(id, &name, addresses, now))
                 .map_err(EngineError::from_db)?;
-            return Ok(PeerInfo {
-                name: record.device.name,
-                id: record.device.id,
-                addresses: record.addresses,
-                added_at_ms: record.added_at_ms,
-                revoked: self.db.repo().device_status(id)?.as_deref() == Some("revoked"),
-            });
+            return Ok(peer_info(
+                record,
+                self.db.repo().device_status(id)?.as_deref() == Some("revoked"),
+            ));
         }
         self.add_peer(&name, id, addresses)
     }
@@ -204,13 +198,10 @@ impl Engine {
             .db
             .transaction(|repo| repo.update_peer(id, &existing.device.name, addresses, now))
             .map_err(EngineError::from_db)?;
-        Ok(PeerInfo {
-            name: record.device.name,
-            id: record.device.id,
-            addresses: record.addresses,
-            added_at_ms: record.added_at_ms,
-            revoked: self.db.repo().device_status(id)?.as_deref() == Some("revoked"),
-        })
+        Ok(peer_info(
+            record,
+            self.db.repo().device_status(id)?.as_deref() == Some("revoked"),
+        ))
     }
 
     pub fn share_space_id(&mut self, space: SpaceId, peer: DeviceId) -> Result<(), EngineError> {
@@ -242,13 +233,7 @@ impl Engine {
         let mut out = Vec::new();
         for p in self.db.repo().list_peers()? {
             let revoked = self.db.repo().device_status(p.device.id)?.as_deref() == Some("revoked");
-            out.push(PeerInfo {
-                name: p.device.name,
-                id: p.device.id,
-                addresses: p.addresses,
-                added_at_ms: p.added_at_ms,
-                revoked,
-            });
+            out.push(peer_info(p, revoked));
         }
         Ok(out)
     }
@@ -526,6 +511,25 @@ impl Engine {
                 )
             })
             .map_err(EngineError::from_db)
+    }
+
+    /// Stamp `devices.last_seen_ms` for a peer we are talking to, or just lost.
+    pub(crate) fn note_peer_seen(&mut self, id: DeviceId) -> Result<(), EngineError> {
+        let now = self.clock.now_ms();
+        self.db
+            .transaction(|repo| repo.touch_last_seen(id, now))
+            .map_err(EngineError::from_db)
+    }
+}
+
+fn peer_info(record: relay_db::PeerRecord, revoked: bool) -> PeerInfo {
+    PeerInfo {
+        name: record.device.name,
+        id: record.device.id,
+        addresses: record.addresses,
+        added_at_ms: record.added_at_ms,
+        last_seen_ms: record.last_seen_ms,
+        revoked,
     }
 }
 

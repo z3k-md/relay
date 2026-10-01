@@ -46,6 +46,11 @@ pub struct PeerView {
     pub short_id: String,
     pub address: String,
     pub connected: bool,
+    /// When the current session started. Set only while `connected`.
+    pub connected_since_ms: Option<i64>,
+    /// Last live contact. `None` until this peer has connected once.
+    /// While offline, this is when that contact ended.
+    pub last_seen_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -239,20 +244,41 @@ pub fn init_device(app: AppHandle, name: String) -> Result<Overview, String> {
     get_overview(app)
 }
 
+/// Live sessions from the running host when one is listening, otherwise the
+/// in-app runner. The host is the source of truth for the background service.
+fn live_sessions(app: &AppHandle) -> HashMap<String, i64> {
+    if let Ok(Some(mut client)) = host_client(app)
+        && let Ok(status) = client.status()
+    {
+        return status
+            .peers
+            .into_iter()
+            .filter_map(|peer| {
+                let since = i64::try_from(peer.connected_at_ms).ok()?;
+                Some((peer.id, since))
+            })
+            .collect();
+    }
+    app.state::<AppState>().runner.connected_since()
+}
+
 #[tauri::command]
 pub fn list_peers(app: AppHandle) -> Result<Vec<PeerView>, String> {
+    let sessions = live_sessions(&app);
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
-    let connected = state.runner.connected_peers();
     let peers = engine.peers().map_err(|err| error_chain(&err))?;
     Ok(peers
         .into_iter()
         .map(|p| {
             let id = p.id.to_string();
+            let since = sessions.get(&id).copied();
             PeerView {
                 name: p.name,
                 short_id: p.id.short(),
-                connected: connected.contains(&id),
+                connected: since.is_some(),
+                connected_since_ms: since,
+                last_seen_ms: p.last_seen_ms,
                 address: p.addresses.first().cloned().unwrap_or_default(),
                 id,
             }
@@ -283,6 +309,8 @@ pub fn add_peer(
             short_id: peer.id.short(),
             address,
             connected: false,
+            connected_since_ms: None,
+            last_seen_ms: peer.last_seen_ms,
         })
     })
 }

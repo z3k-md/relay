@@ -1,10 +1,11 @@
 <script setup lang="ts">
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
 import { api } from "../lib/api";
-import type { PeerView, SpaceView } from "../lib/types";
+import type { ActivityItem, PeerView, SpaceView } from "../lib/types";
 
 const peers = ref<PeerView[]>([]);
 const spaces = ref<SpaceView[]>([]);
@@ -26,8 +27,12 @@ const pairDone = ref<string | null>(null);
 const pairFailed = ref<string | null>(null);
 const joinCode = ref("");
 const joinAddr = ref("");
+const nowMs = ref(Date.now());
 let statusTimer: number | undefined;
 let tickTimer: number | undefined;
+let clockTimer: number | undefined;
+let stopActivity: UnlistenFn | undefined;
+let loadGen = 0;
 
 const remaining = computed(() => {
   const ms = pairExpires.value - pairNow.value;
@@ -38,18 +43,87 @@ const remaining = computed(() => {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 });
 
-async function load() {
-  loading.value = true;
-  error.value = null;
+async function load(silent = false) {
+  const gen = ++loadGen;
+  if (!silent) {
+    loading.value = true;
+    error.value = null;
+  }
   try {
     const [nextPeers, nextSpaces] = await Promise.all([api.listPeers(), api.listSpaces()]);
+    if (gen !== loadGen) return;
     peers.value = nextPeers;
     spaces.value = nextSpaces;
+    error.value = null;
   } catch (err) {
+    if (gen !== loadGen) return;
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
-    loading.value = false;
+    if (gen === loadGen) loading.value = false;
   }
+}
+
+function formatSpan(ms: number): string {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec < 10) return "a few seconds";
+  if (sec < 60) return `${sec} seconds`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min === 1 ? "1 minute" : `${min} minutes`;
+  const hours = Math.floor(min / 60);
+  const remMin = min % 60;
+  if (hours < 24) {
+    const hourLabel = hours === 1 ? "1 hour" : `${hours} hours`;
+    return remMin === 0 ? hourLabel : `${hours}h ${remMin}m`;
+  }
+  const days = Math.floor(hours / 24);
+  const remH = hours % 24;
+  const dayLabel = days === 1 ? "1 day" : `${days} days`;
+  return remH === 0 ? dayLabel : `${days}d ${remH}h`;
+}
+
+function formatSeen(ms: number): string {
+  const then = new Date(ms);
+  const today = new Date(nowMs.value);
+  const time = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(then);
+  const startOf = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const dayDelta = Math.round((startOf(today) - startOf(then)) / 86_400_000);
+  if (dayDelta === 0) return `today at ${time}`;
+  if (dayDelta === 1) return `yesterday at ${time}`;
+  const date = new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: then.getFullYear() === today.getFullYear() ? undefined : "numeric",
+  }).format(then);
+  return `${date} at ${time}`;
+}
+
+function peerStatus(peer: PeerView): string {
+  if (peer.connected) {
+    if (peer.connectedSinceMs != null) {
+      return `Online for ${formatSpan(nowMs.value - peer.connectedSinceMs)}`;
+    }
+    return "Online";
+  }
+  if (peer.lastSeenMs != null) {
+    return `Offline for ${formatSpan(nowMs.value - peer.lastSeenMs)}`;
+  }
+  return "Not seen yet";
+}
+
+function statusClass(peer: PeerView): string {
+  if (peer.connected) return "text-emerald-700 dark:text-emerald-300";
+  if (peer.lastSeenMs != null) return "";
+  return "text-[var(--color-muted)]";
+}
+
+function sharedLabel(peer: PeerView): string {
+  const names = spaces.value
+    .filter((space) => space.sharedWith.includes(peer.name))
+    .map((space) => space.name);
+  return names.join(", ");
 }
 
 function stopPairWatch() {
@@ -167,9 +241,22 @@ async function removePeer() {
   }
 }
 
-onMounted(load);
+onMounted(async () => {
+  nowMs.value = Date.now();
+  clockTimer = window.setInterval(() => {
+    nowMs.value = Date.now();
+  }, 1000);
+  stopActivity = await listen<ActivityItem>("relay://activity", (event) => {
+    if (event.payload.kind === "peerConnected" || event.payload.kind === "peerDisconnected") {
+      void load(true);
+    }
+  });
+  await load();
+});
 onUnmounted(() => {
   stopPairWatch();
+  if (clockTimer !== undefined) window.clearInterval(clockTimer);
+  stopActivity?.();
   if (pairCode.value && !pairDone.value) {
     api.pairCancel().catch(() => {});
   }
@@ -203,7 +290,7 @@ defineExpose({ load });
     <EmptyState
       v-else-if="peers.length === 0"
       title="No peers yet"
-      body="Pair your other computer with a short code — a Mac and a Windows PC, on the LAN or over Tailscale."
+      body="Pair another computer with a short code. On the same network that is the whole step. Over a VPN, add its address."
     >
       <div class="flex flex-wrap gap-2">
         <button
@@ -226,25 +313,37 @@ defineExpose({ load });
       <li
         v-for="peer in peers"
         :key="peer.id"
-        class="flex items-center justify-between gap-3 rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2"
+        class="flex items-start justify-between gap-3 rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2"
       >
         <div class="min-w-0">
           <div class="flex items-center gap-2">
             <span
-              class="inline-block h-2 w-2 rounded-full"
+              class="inline-block h-2 w-2 shrink-0 rounded-full"
               :class="peer.connected ? 'bg-emerald-500' : 'bg-zinc-400'"
-              :title="peer.connected ? 'Online' : 'Offline'"
+              :title="peerStatus(peer)"
             />
             <span class="font-medium">{{ peer.name }}</span>
             <span class="mono text-[12px] text-[var(--color-muted)]">{{ peer.shortId }}</span>
           </div>
+          <p class="mt-0.5 text-[13px]" :class="statusClass(peer)">
+            {{ peerStatus(peer) }}
+          </p>
+          <p
+            v-if="!peer.connected && peer.lastSeenMs != null"
+            class="text-[12px] text-[var(--color-muted)]"
+          >
+            Last seen {{ formatSeen(peer.lastSeenMs) }}
+          </p>
           <p class="truncate text-[12px] text-[var(--color-muted)]">
             {{ peer.address || "No address" }}
+          </p>
+          <p v-if="sharedLabel(peer)" class="truncate text-[12px] text-[var(--color-muted)]">
+            Spaces: {{ sharedLabel(peer) }}
           </p>
         </div>
         <button
           type="button"
-          class="text-[var(--color-danger)]"
+          class="mt-0.5 shrink-0 text-[var(--color-danger)]"
           @click="confirmName = peer.name"
         >
           Remove

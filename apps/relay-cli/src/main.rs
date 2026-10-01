@@ -39,7 +39,7 @@ const DEV_EXCLUDES: &[&str] = &[
 ];
 
 #[derive(Parser, Debug)]
-#[command(name = "relay", version = VERSION, about = "Local-first multi-device file sync")]
+#[command(name = "relay", version = VERSION, about = "Realtime file sync across your machines")]
 struct Cli {
     /// Relay home directory (database, object store, logs)
     #[arg(long, global = true)]
@@ -111,6 +111,21 @@ enum Command {
     Policy {
         #[command(subcommand)]
         cmd: PolicyCmd,
+    },
+    /// Local materialization rules (what this device stores for a path)
+    Materialize {
+        #[command(subcommand)]
+        cmd: MaterializeCmd,
+    },
+    /// Fetch a demand-mode path onto this device
+    Fetch {
+        /// SPACE/MOUNT/PATH
+        target: String,
+    },
+    /// Drop a demand-mode path's bytes without deleting the index entry
+    Evict {
+        /// SPACE/MOUNT/PATH
+        target: String,
     },
     /// List live conflict copies, or resolve them
     Conflicts {
@@ -359,6 +374,44 @@ enum PolicyCmd {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MatMode {
+    Full,
+    Metadata,
+    Demand,
+    Exclude,
+}
+
+impl MatMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Metadata => "metadata",
+            Self::Demand => "demand",
+            Self::Exclude => "exclude",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum MaterializeCmd {
+    Add {
+        space: String,
+        name: String,
+        #[arg(long, value_enum)]
+        mode: MatMode,
+        #[arg(long = "selector", required = true)]
+        selectors: Vec<String>,
+    },
+    Remove {
+        space: String,
+        name: String,
+    },
+    List {
+        space: Option<String>,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum DeletesCmd {
     /// Apply the peer's deletions on this device
@@ -505,6 +558,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Transport { cmd } => cmd_transport(&home, cmd, json),
         Command::Group { cmd } => cmd_group(&home, cmd, json),
         Command::Policy { cmd } => cmd_policy(&home, cmd, json),
+        Command::Materialize { cmd } => cmd_materialize(&home, cmd, json),
+        Command::Fetch { target } => cmd_fetch(&home, &target, json),
+        Command::Evict { target } => cmd_evict(&home, &target, json),
         Command::Conflicts { space, cmd } => match cmd {
             None => {
                 let engine = Engine::open_read_only(&home)?;
@@ -1671,6 +1727,118 @@ fn cmd_policy(home: &Path, cmd: PolicyCmd, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_materialize(home: &Path, cmd: MaterializeCmd, json: bool) -> Result<ExitCode> {
+    match cmd {
+        MaterializeCmd::Add {
+            space,
+            name,
+            mode,
+            selectors,
+        } => {
+            let mut engine = Engine::open_for_config(home)?;
+            let rule = engine.materialize_add(&space, &name, mode.as_str(), &selectors)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rule)?);
+            } else {
+                println!(
+                    "added materialization {name} on {space} ({}, {} selector(s))",
+                    rule.mode,
+                    rule.selectors.len()
+                );
+            }
+        }
+        MaterializeCmd::Remove { space, name } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.materialize_remove(&space, &name)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"removed": name, "space": space})
+                    )?
+                );
+            } else {
+                println!("removed materialization {name} from {space}");
+            }
+        }
+        MaterializeCmd::List { space } => {
+            let engine = Engine::open_read_only(home)?;
+            let rules = engine.materialization_rules(space.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rules)?);
+            } else if rules.is_empty() {
+                println!("no materialization rules");
+            } else {
+                for rule in rules {
+                    let selectors = rule.selectors.join(", ");
+                    println!(
+                        "{}/{}  {}  selectors=[{selectors}]",
+                        rule.space, rule.name, rule.mode
+                    );
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_fetch(home: &Path, target: &str, json: bool) -> Result<ExitCode> {
+    let (space, mount, path) = require_file_target(target, "fetch")?;
+    if Client::connect(home)?.is_some() {
+        let mut client =
+            Client::connect(home)?.ok_or_else(|| anyhow::anyhow!("Relay is not running"))?;
+        client.fetch(&space, &mount, path.as_str())?;
+    } else {
+        let mut engine = Engine::open_for_config(home)?;
+        engine.fetch_path(&space, &mount, path.as_str())?;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "space": space,
+                "mount": mount,
+                "path": path.as_str(),
+                "materialized": true,
+            }))?
+        );
+    } else {
+        println!("fetched {space}/{mount}/{path}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_evict(home: &Path, target: &str, json: bool) -> Result<ExitCode> {
+    let (space, mount, path) = require_file_target(target, "evict")?;
+    let mut engine = Engine::open_for_config(home)?;
+    engine.evict_path(&space, &mount, path.as_str())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "space": space,
+                "mount": mount,
+                "path": path.as_str(),
+                "materialized": false,
+            }))?
+        );
+    } else {
+        println!("evicted {space}/{mount}/{path}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn require_file_target(raw: &str, cmd: &str) -> Result<(String, String, LogicalPath)> {
+    let parsed = parse_target(raw)?;
+    let mount = parsed
+        .mount
+        .ok_or_else(|| anyhow::anyhow!("{cmd} requires SPACE/MOUNT/PATH"))?;
+    let path = parsed
+        .path
+        .ok_or_else(|| anyhow::anyhow!("{cmd} requires SPACE/MOUNT/PATH"))?;
+    Ok((parsed.space, mount, path))
+}
+
 fn cmd_conflicts(engine: &Engine, space: Option<&str>, json: bool) -> Result<()> {
     let infos = engine.conflict_infos(space)?;
     if json {
@@ -2559,7 +2727,11 @@ fn cmd_ls(
 }
 
 fn ls_row(record: &EntryRecord) -> Vec<String> {
-    let kind = kind_label(&record.content);
+    let kind = if !record.materialized && !record.is_deleted() {
+        "meta"
+    } else {
+        kind_label(&record.content)
+    };
     let (size, object) = match &record.content {
         EntryContent::File { object, size, .. } => (human_bytes(*size), object.short()),
         _ => ("-".to_owned(), "-".to_owned()),

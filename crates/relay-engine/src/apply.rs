@@ -11,7 +11,7 @@ use relay_core::{
     ObjectId, SpaceId, StatHint, TEMP_PREFIX, VectorOrdering, VersionRelation, compare_versions,
     is_bookkeeping_path, is_git_metadata, merge_text,
 };
-use relay_db::MountConfig;
+use relay_db::{MaterializationRuleRecord, MountConfig};
 use relay_fs::{
     MaterializeOptions, check_real_dir_chain, ensure_real_dir_chain, materialize_file,
     resolve_os_path, to_os_path,
@@ -22,6 +22,7 @@ use relay_store::StoreError;
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::materialize::path_mode;
 use crate::order::{apply_sort_key, classify_apply};
 use crate::scan::{recorded_stat, wall_clock_now_ns};
 
@@ -66,6 +67,7 @@ impl Engine {
         });
 
         let mut mounts = self.load_mount_apply(space)?;
+        let rules = self.db.repo().list_materialization_rules(space)?;
         let mut outcome = ApplyOutcome {
             written: 0,
             deleted: 0,
@@ -76,7 +78,12 @@ impl Engine {
         };
 
         for entry in entries {
-            if let Some(obj) = entry.content.object()
+            let local = self.db.repo().entry(&entry.key).ok().flatten();
+            let writing = self
+                .writing_remote(&rules, &entry, local.as_ref())
+                .unwrap_or(true);
+            if writing
+                && let Some(obj) = entry.content.object()
                 && failed_objects.contains(&obj)
             {
                 outcome.skipped += 1;
@@ -96,7 +103,7 @@ impl Engine {
                 });
                 continue;
             };
-            if let Some(reason) = skip_reason(&entry, ctx) {
+            if let Some(reason) = skip_reason(&entry, ctx, writing) {
                 outcome.skipped += 1;
                 outcome.warnings.push(ApplyWarning {
                     path: entry.key.path.to_string(),
@@ -105,7 +112,7 @@ impl Engine {
                 continue;
             }
 
-            match self.apply_entry_reeval(entry, &mut mounts) {
+            match self.apply_entry_reeval(entry, &mut mounts, &rules) {
                 Ok(result) => apply_count(&mut outcome, result),
                 Err(err) if is_transient(&err) => {
                     outcome.transient = true;
@@ -167,10 +174,11 @@ impl Engine {
         &mut self,
         entry: RemoteEntry,
         mounts: &mut HashMap<MountId, MountApply>,
+        rules: &[MaterializationRuleRecord],
     ) -> Result<ApplyResult, EngineError> {
         let current = entry;
         for _ in 0..REEVAL_BOUND {
-            match self.try_apply_entry(&current, mounts)? {
+            match self.try_apply_entry(&current, mounts, rules)? {
                 TryApply::Done(result) => return Ok(result),
                 TryApply::Rescan => {
                     let key = current.key.clone();
@@ -212,6 +220,7 @@ impl Engine {
         &mut self,
         remote: &RemoteEntry,
         mounts: &mut HashMap<MountId, MountApply>,
+        rules: &[MaterializationRuleRecord],
     ) -> Result<TryApply, EngineError> {
         let local = self.db.repo().entry(&remote.key)?;
         let relation = match &local {
@@ -223,6 +232,7 @@ impl Engine {
             ),
             None => VersionRelation::RemoteNewer,
         };
+        let writing = self.writing_remote(rules, remote, local.as_ref())?;
 
         match relation {
             VersionRelation::Same | VersionRelation::LocalNewer => {
@@ -232,11 +242,89 @@ impl Engine {
                 self.store_merged_vector(local.as_ref().unwrap(), remote)?;
                 Ok(TryApply::Done(ApplyResult::Written))
             }
+            VersionRelation::RemoteNewer if !writing => self.commit_index_only(remote, mounts),
             VersionRelation::RemoteNewer => self.apply_remote_newer(remote, local.as_ref(), mounts),
+            VersionRelation::Conflict | VersionRelation::Diverged if !writing => {
+                self.commit_unmaterialized_conflict(remote, local.as_ref(), mounts)?;
+                Ok(TryApply::Done(ApplyResult::Written))
+            }
             VersionRelation::Conflict | VersionRelation::Diverged => {
                 self.apply_conflict(remote, local.as_ref(), mounts)
             }
         }
+    }
+
+    /// Whether this device should write `remote` into the working tree.
+    fn writing_remote(
+        &self,
+        rules: &[MaterializationRuleRecord],
+        remote: &RemoteEntry,
+        local: Option<&EntryRecord>,
+    ) -> Result<bool, EngineError> {
+        let Some(config) = self.db.repo().mount_config(remote.key.mount)? else {
+            return Ok(true);
+        };
+        let mode = path_mode(rules, &config.mount.name, remote.key.path.as_str())?;
+        let hydrated = local.is_some_and(|entry| entry.materialized);
+        Ok(mode.fetches_bytes(hydrated))
+    }
+
+    fn commit_index_only(
+        &mut self,
+        remote: &RemoteEntry,
+        mounts: &mut HashMap<MountId, MountApply>,
+    ) -> Result<TryApply, EngineError> {
+        self.commit_remote(remote, None, None, false)?;
+        if remote.content.is_deleted() {
+            note_gone(mounts, remote);
+            Ok(TryApply::Done(ApplyResult::Deleted))
+        } else {
+            note_live(mounts, remote);
+            Ok(TryApply::Done(ApplyResult::Written))
+        }
+    }
+
+    /// Concurrent edit on a path this device is not writing. Keep the remote
+    /// content in the index and do not create a conflict file.
+    fn commit_unmaterialized_conflict(
+        &mut self,
+        remote: &RemoteEntry,
+        local: Option<&EntryRecord>,
+        mounts: &mut HashMap<MountId, MountApply>,
+    ) -> Result<(), EngineError> {
+        let vector = match local {
+            Some(local) => local.vector.merged(&remote.vector),
+            None => remote.vector.clone(),
+        };
+        let record_object = remote
+            .content
+            .object()
+            .filter(|id| self.store.contains(id))
+            .map(|id| {
+                let size = match &remote.content {
+                    EntryContent::File { size, .. } => *size,
+                    _ => 0,
+                };
+                (id, size)
+            });
+        let now = self.clock.now_ms();
+        let remote_owned = remote.clone();
+        self.db.transaction(|repo| {
+            if let Some((id, size)) = record_object {
+                repo.record_object(id, size, now)?;
+            }
+            let sequence = repo.next_sequence()?;
+            let mut record = remote_owned.into_record(sequence, None, false);
+            record.vector = vector;
+            repo.put_entry(&record)?;
+            Ok::<(), EngineError>(())
+        })?;
+        if remote.content.is_deleted() {
+            note_gone(mounts, remote);
+        } else {
+            note_live(mounts, remote);
+        }
+        Ok(())
     }
 
     fn store_merged_vector(
@@ -277,7 +365,7 @@ impl Engine {
                 executable,
             } => match self.materialize_remote_file(remote, local, &root, *object, *executable)? {
                 MaterializeStep::Done(stat) => {
-                    self.commit_remote(remote, stat, Some((*object, *size)))?;
+                    self.commit_remote(remote, stat, Some((*object, *size)), true)?;
                     note_live(mounts, remote);
                     Ok(TryApply::Done(ApplyResult::Written))
                 }
@@ -288,7 +376,7 @@ impl Engine {
                 if let Err(err) = ensure_real_dir_chain(&root, &dest) {
                     return skip_or_err(err);
                 }
-                self.commit_remote(remote, None, None)?;
+                self.commit_remote(remote, None, None, true)?;
                 note_live(mounts, remote);
                 Ok(TryApply::Done(ApplyResult::Written))
             }
@@ -309,7 +397,7 @@ impl Engine {
                 let stat = fs::symlink_metadata(&dest)
                     .ok()
                     .map(|m| StatHint::from_metadata(&m));
-                self.commit_remote(remote, stat, None)?;
+                self.commit_remote(remote, stat, None, true)?;
                 note_live(mounts, remote);
                 Ok(TryApply::Done(ApplyResult::Written))
             }
@@ -327,7 +415,7 @@ impl Engine {
         let dest = match resolve_os_path(root, &remote.key.path)? {
             Some(p) => p,
             None => {
-                self.commit_remote(remote, None, None)?;
+                self.commit_remote(remote, None, None, true)?;
                 note_gone(mounts, remote);
                 return Ok(TryApply::Done(ApplyResult::Deleted));
             }
@@ -338,7 +426,7 @@ impl Engine {
         let meta = match fs::symlink_metadata(&dest) {
             Ok(m) => m,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                self.commit_remote(remote, None, None)?;
+                self.commit_remote(remote, None, None, true)?;
                 note_gone(mounts, remote);
                 return Ok(TryApply::Done(ApplyResult::Deleted));
             }
@@ -348,7 +436,7 @@ impl Engine {
         if meta.is_dir() && !meta.file_type().is_symlink() {
             match fs::remove_dir(&dest) {
                 Ok(()) => {
-                    self.commit_remote(remote, None, None)?;
+                    self.commit_remote(remote, None, None, true)?;
                     note_gone(mounts, remote);
                     Ok(TryApply::Done(ApplyResult::Deleted))
                 }
@@ -362,7 +450,7 @@ impl Engine {
                 return Ok(TryApply::Rescan);
             }
             fs::remove_file(&dest).map_err(EngineError::Io)?;
-            self.commit_remote(remote, None, None)?;
+            self.commit_remote(remote, None, None, true)?;
             note_gone(mounts, remote);
             Ok(TryApply::Done(ApplyResult::Deleted))
         }
@@ -380,7 +468,7 @@ impl Engine {
         if let Some(done) = self.try_auto_merge(remote, local, mounts)? {
             return Ok(done);
         }
-        let remote_rec = remote.clone().into_record(local.sequence, None);
+        let remote_rec = remote.clone().into_record(local.sequence, None, true);
         let (winner_remote, copy_loser) = conflict_outcome(local, &remote_rec);
 
         let ctx = mounts
@@ -417,6 +505,7 @@ impl Engine {
                 modified_by: loser.modified_by,
                 modified_at_unix_ms: loser.modified_at_unix_ms,
                 stat: None,
+                materialized: true,
             };
             copy_path = Some((path, copy));
         }
@@ -498,6 +587,7 @@ impl Engine {
                 modified_by: winner_modified_by,
                 modified_at_unix_ms: winner_modified_at,
                 stat: path_stat,
+                materialized: true,
             };
             repo.put_entry(&record)?;
             Ok::<(), EngineError>(())
@@ -555,7 +645,7 @@ impl Engine {
             return Ok(None);
         };
 
-        let remote_rec = remote.clone().into_record(local.sequence, None);
+        let remote_rec = remote.clone().into_record(local.sequence, None, true);
         let (winner_remote, _) = conflict_outcome(local, &remote_rec);
         let winner = if winner_remote { &remote_rec } else { local };
         let executable = match &winner.content {
@@ -604,6 +694,7 @@ impl Engine {
                 modified_by,
                 modified_at_unix_ms: modified_at,
                 stat: path_stat,
+                materialized: true,
             };
             repo.put_entry(&record)?;
             Ok::<(), EngineError>(())
@@ -728,21 +819,27 @@ impl Engine {
         remote: &RemoteEntry,
         stat: Option<StatHint>,
         object: Option<(ObjectId, u64)>,
+        materialized: bool,
     ) -> Result<(), EngineError> {
         let now = self.clock.now_ms();
         let remote = remote.clone();
-        self.db.transaction(|repo| {
-            if let Some((id, size)) = object {
-                repo.record_object(id, size, now)?;
-            } else if let Some(id) = remote.content.object() {
+        let candidate = object.or_else(|| {
+            remote.content.object().map(|id| {
                 let size = match &remote.content {
                     EntryContent::File { size, .. } => *size,
                     _ => 0,
                 };
+                (id, size)
+            })
+        });
+        let record_object = candidate.filter(|(id, _)| materialized || self.store.contains(id));
+        let stat = materialized.then_some(stat).flatten();
+        self.db.transaction(|repo| {
+            if let Some((id, size)) = record_object {
                 repo.record_object(id, size, now)?;
             }
             let sequence = repo.next_sequence()?;
-            let record = remote.into_record(sequence, stat);
+            let record = remote.into_record(sequence, stat, materialized);
             repo.put_entry(&record)?;
             Ok::<(), EngineError>(())
         })
@@ -785,14 +882,14 @@ fn apply_count(outcome: &mut ApplyOutcome, result: ApplyResult) {
     }
 }
 
-fn skip_reason(entry: &RemoteEntry, ctx: &MountApply) -> Option<String> {
+fn skip_reason(entry: &RemoteEntry, ctx: &MountApply, writing: bool) -> Option<String> {
     if ctx.config.local_path.is_none() {
         return Some("mount is not attached on this device".into());
     }
     if is_reserved(&entry.key.path) {
         return Some("reserved path".into());
     }
-    if cfg!(windows) && matches!(entry.content, EntryContent::Symlink { .. }) {
+    if writing && cfg!(windows) && matches!(entry.content, EntryContent::Symlink { .. }) {
         return Some("symlinks are not supported on Windows".into());
     }
     if !entry.key.path.current_os_issues().is_empty() {
@@ -838,7 +935,7 @@ fn is_reserved(path: &LogicalPath) -> bool {
     is_bookkeeping_path(path)
 }
 
-fn dest_path(root: &Path, path: &LogicalPath) -> Result<PathBuf, EngineError> {
+pub(crate) fn dest_path(root: &Path, path: &LogicalPath) -> Result<PathBuf, EngineError> {
     match resolve_os_path(root, path)? {
         Some(existing) => Ok(existing),
         None => Ok(to_os_path(root, path)?),
@@ -943,7 +1040,7 @@ fn conflict_outcome(local: &EntryRecord, remote: &EntryRecord) -> (bool, bool) {
     }
 }
 
-fn create_symlink(target: &str, dest: &Path) -> Result<(), EngineError> {
+pub(crate) fn create_symlink(target: &str, dest: &Path) -> Result<(), EngineError> {
     #[cfg(unix)]
     {
         if dest.exists() {

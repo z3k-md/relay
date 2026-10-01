@@ -14,9 +14,10 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_replication_policies.sql"),
     include_str!("../migrations/0010_replica_push.sql"),
     include_str!("../migrations/0011_space_keys.sql"),
+    include_str!("../migrations/0012_materialization.sql"),
 ];
 
-pub(crate) const SCHEMA_VERSION: u32 = 11;
+pub(crate) const SCHEMA_VERSION: u32 = 12;
 
 pub(crate) fn user_version(conn: &Connection) -> Result<u32, DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

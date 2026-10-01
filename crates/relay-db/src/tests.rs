@@ -103,6 +103,7 @@ impl Harness {
             modified_by: self.local.id,
             modified_at_unix_ms: 2_000,
             stat,
+            materialized: true,
         }
     }
 }
@@ -152,13 +153,13 @@ fn migrations_are_idempotent_on_reopen() {
     let path = dir.path().join("nested").join("relay.sqlite");
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
     }
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
         db.repo().init_local_device(&device(9, "again"), 1).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
     }
 }
 
@@ -176,7 +177,7 @@ fn schema_too_new_is_rejected() {
         err,
         DbError::SchemaTooNew {
             found: 99,
-            supported: 11
+            supported: 12
         }
     ));
 }
@@ -219,7 +220,7 @@ fn v1_database_upgrades_to_current_without_data_loss() {
     write_v1_db(&path);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -254,7 +255,7 @@ fn upgrade_collapses_duplicate_history_rows() {
     }
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
@@ -274,7 +275,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooOld {
                 found: 1,
-                supported: 11
+                supported: 12
             }
         ),
         "{err}"
@@ -297,7 +298,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooNew {
                 found: 99,
-                supported: 11
+                supported: 12
             }
         ),
         "{err}"
@@ -319,7 +320,7 @@ fn open_read_only_reads_without_writing() {
         db.repo().create_space(&space, 1).unwrap();
     }
     let db = Database::open_read_only(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     let names: Vec<_> = db
         .repo()
         .list_spaces()
@@ -358,7 +359,7 @@ fn v4_database_upgrades_to_delete_holds() {
     assert_eq!(version, 4);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -370,7 +371,7 @@ fn v4_database_upgrades_to_delete_holds() {
 #[test]
 fn fresh_database_has_delete_hold_tables() {
     let db = Database::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     db.repo().init_local_device(&device(1, "dev"), 1).unwrap();
     let space = space("Personal");
     db.repo().create_space(&space, 1).unwrap();
@@ -498,7 +499,7 @@ fn v5_database_upgrades_to_applied_hold_paths() {
     assert_eq!(version, 5);
 
     let db = Database::open(&db_path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
     let peer = db.repo().peer_by_name("laptop").unwrap().unwrap();
@@ -1034,7 +1035,25 @@ fn peers_shares_offers_and_progress() {
             .add_peer(&peer_dev, &["127.0.0.1:47321".into()], 5_000)
             .unwrap();
     assert_eq!(peer.device.name, "laptop");
+    assert_eq!(peer.last_seen_ms, None);
     assert_eq!(h.db.repo().list_peers().unwrap().len(), 1);
+    h.db.repo().touch_last_seen(peer_dev.id, 9_000).unwrap();
+    assert_eq!(
+        h.db.repo().list_peers().unwrap()[0].last_seen_ms,
+        Some(9_000)
+    );
+    h.db.repo()
+        .update_peer(peer_dev.id, "laptop", &["127.0.0.1:47321".into()], 10_000)
+        .unwrap();
+    assert_eq!(
+        h.db.repo()
+            .peer_by_id(peer_dev.id)
+            .unwrap()
+            .unwrap()
+            .last_seen_ms,
+        Some(9_000),
+        "renaming a peer is not a sighting"
+    );
     assert!(h.db.repo().peer_by_name("laptop").unwrap().is_some());
     assert!(h.db.repo().peer_by_id(peer_dev.id).unwrap().is_some());
 
@@ -1122,6 +1141,7 @@ fn changes_since_in_space_filters_by_mount_space() {
         modified_by: h.local.id,
         modified_at_unix_ms: 2_000,
         stat: None,
+        materialized: true,
     };
     h.db.repo().put_entry(&other_rec).unwrap();
 
@@ -1143,6 +1163,73 @@ fn changes_since_in_space_filters_by_mount_space() {
         h.db.repo().max_sequence_in_space(h.space.id).unwrap(),
         Sequence(1)
     );
+}
+
+#[test]
+fn v11_entries_migrate_as_materialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for sql in [
+            include_str!("../migrations/0001_init.sql"),
+            include_str!("../migrations/0002_mount_state.sql"),
+            include_str!("../migrations/0003_stat_ctime_and_history_unique.sql"),
+            include_str!("../migrations/0004_peers_and_sync.sql"),
+            include_str!("../migrations/0005_delete_holds.sql"),
+            include_str!("../migrations/0006_delete_hold_applied.sql"),
+            include_str!("../migrations/0007_local_settings.sql"),
+            include_str!("../migrations/0008_space_members.sql"),
+            include_str!("../migrations/0009_replication_policies.sql"),
+            include_str!("../migrations/0010_replica_push.sql"),
+            include_str!("../migrations/0011_space_keys.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11u32).unwrap();
+        let device = [9u8; 32];
+        let space = [1u8; 16];
+        let mount = [2u8; 16];
+        conn.execute(
+            "INSERT INTO devices (device_id, name, status, created_at_ms)
+             VALUES (?1, 'legacy', 'active', 1)",
+            params![device.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_device (singleton, device_ref, next_sequence) VALUES (1, 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spaces (id, name, created_at_ms) VALUES (?1, 'Legacy', 1)",
+            params![space.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mounts (id, space_id, name, created_at_ms) VALUES (?1, ?2, 'docs', 1)",
+            params![mount.as_slice(), space.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entries (mount_id, path, kind, deleted, sequence, modified_by, modified_at_ms)
+             VALUES (?1, 'docs', 'directory', 0, 1, 1, 1)",
+            params![mount.as_slice()],
+        )
+        .unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 12);
+    let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
+    let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
+    let entry = db
+        .repo()
+        .entry(&key(space.id, mount.id, "docs"))
+        .unwrap()
+        .unwrap();
+    assert!(entry.materialized);
+    assert!(matches!(entry.content, EntryContent::Directory));
 }
 
 fn arb_vector() -> impl Strategy<Value = VersionVector> {

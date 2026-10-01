@@ -36,6 +36,36 @@ pub enum EngineError {
     #[error("policy needs at least one selector and one target")]
     EmptyPolicy,
 
+    #[error("unknown materialization rule {0:?}")]
+    UnknownMaterialization(String),
+
+    #[error("materialization rule needs at least one selector")]
+    EmptyMaterialization,
+
+    #[error("materialization rule {0:?} already exists")]
+    DuplicateMaterialization(String),
+
+    #[error("unknown materialization mode {0:?}")]
+    UnknownMaterializationMode(String),
+
+    #[error("{path} is {mode}; fetch and evict only work for demand")]
+    NotDemand { path: String, mode: String },
+
+    #[error("no entry for {0}")]
+    UnknownEntry(String),
+
+    #[error("{0} is deleted")]
+    EntryDeleted(String),
+
+    #[error("object not available locally or in the mailbox")]
+    ObjectUnavailable,
+
+    #[error("{path} does not match the index")]
+    EvictMismatch { path: String },
+
+    #[error("{0} is not materialized")]
+    NotMaterialized(String),
+
     #[error("space {name:?} already exists with a different id")]
     SpaceIdConflict { name: String },
 

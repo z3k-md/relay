@@ -810,3 +810,42 @@ remains end to end between the two devices.
 - **Out of scope.** No public TURN account, no global directory beyond the
   mailbox file, no connection migration after a path is up, no Phase 13
   materialization modes.
+
+## D35. Selective materialization
+
+Phase 13. A device can take part in a space without storing every file's
+bytes. Replication policies (D27) still decide who is offered a path.
+Materialization is a local decision about what this device does with a path
+it wants. Rules are not synced and do not change SpaceOffer.
+
+- **Default.** With no rules, every wanted file is fully materialized, which
+  is the behavior through Phase 12.
+- **Rules.** Local to one device and one space. A rule has a name, one or
+  more selectors, and a mode: `full`, `metadata`, `demand`, or `exclude`.
+  Selectors are the same case-sensitive globs as policies, matched against
+  `mountName/relativePath`. Rules run in `position` order. Last match wins.
+  `relay materialize add` appends, so a later rule overrides an older one
+  (`media/**` metadata, then `media/notes/**` full).
+- **Modes.** `full` fetches the object and writes the working tree.
+  `metadata` stores the index row and does not fetch or write. `demand`
+  stays metadata until `relay fetch`, then keeps updating that path until
+  `relay evict`. `exclude` drops the entry on receive: no index row, no
+  file, no warning, same as a policy `wants` miss.
+- **Scanner.** A path this device chose not to write is not a tombstone when
+  it is absent, and a leftover file is not hashed into a new version.
+  Metadata and exclude are ignored both ways. An unhydrated demand path is
+  not tombstoned for absence; a real file that appears is adopted.
+  `relay evict` drops bytes without a tombstone or a version bump, and
+  refuses when the working-tree bytes do not match the index.
+- **Rule changes.** Adding, changing, or removing a rule does not delete
+  files, index rows, or send tombstones. When a file's mode becomes `full`
+  and the row is still index-only, the syncer's periodic tick materializes
+  it from the local store, a connected peer, or the mailbox.
+- **Mailbox.** Push skips an object upload when this device does not have
+  the bytes and still appends the index entry. Pull does not stop the log
+  for a metadata or unhydrated demand entry whose object is missing. Full
+  copies, and demand copies that are already hydrated, still stop on a
+  missing object.
+- **Out of scope.** No GUI editor. No placeholder files. No OS
+  file-on-demand. D27's "no metadata-only mode" line described that phase
+  and stays.

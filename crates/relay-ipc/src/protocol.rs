@@ -232,6 +232,13 @@ pub struct RescanResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchParams {
+    pub space: String,
+    pub mount: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddMountParams {
     pub space: String,
     pub mount: String,

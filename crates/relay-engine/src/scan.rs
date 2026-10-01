@@ -15,6 +15,7 @@ use relay_store::{PutBatch, StoreError};
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::materialize::{MaterializationMode, path_mode};
 use crate::reports::{ScanOptions, ScanReport, Warning, is_large_fraction_delete, is_mass_delete};
 
 const SCAN_APPLY_ATTEMPTS: u32 = 3;
@@ -61,6 +62,13 @@ struct StatUpdate {
     previous_sequence: Sequence,
 }
 
+/// Demand path whose bytes appeared on disk and already match the index.
+struct HydrateUpdate {
+    key: EntryKey,
+    stat: Option<relay_core::StatHint>,
+    previous_sequence: Sequence,
+}
+
 enum ChangeKind {
     Created,
     Modified,
@@ -70,6 +78,7 @@ enum ChangeKind {
 pub(crate) struct ScanPlan {
     writes: Vec<(ChangeKind, VersionWrite)>,
     stat_updates: Vec<StatUpdate>,
+    hydrates: Vec<HydrateUpdate>,
     new_objects: Vec<(relay_core::ObjectId, u64)>,
     report: ScanReport,
 }
@@ -273,7 +282,9 @@ impl Engine {
         let mut unstable = HashSet::new();
         let mut writes = Vec::new();
         let mut stat_updates = Vec::new();
+        let mut hydrates = Vec::new();
         let mut new_objects = Vec::new();
+        let mat_rules = self.db.repo().list_materialization_rules(space.id)?;
         let wall_now_ns = wall_clock_now_ns();
         let mut batch = (!opts.dry_run).then(|| self.store.batch());
 
@@ -286,6 +297,10 @@ impl Engine {
             }
             scanned_paths.insert(entry.path.clone());
             let prev = prev_by_path.get(&entry.path);
+            let mode = path_mode(&mat_rules, &config.mount.name, entry.path.as_str())?;
+            if scan_skip_present(mode, prev) {
+                continue;
+            }
             let mut observe = ObserveCtx {
                 store: &self.store,
                 batch: batch.as_mut(),
@@ -303,6 +318,8 @@ impl Engine {
                 None => continue,
             };
 
+            let adopt = mode == MaterializationMode::Demand
+                && prev.is_some_and(|record| !record.materialized && !record.is_deleted());
             match derive_local_change(prev, Some(&observation)) {
                 LocalChange::Created => {
                     writes.push((
@@ -317,16 +334,38 @@ impl Engine {
                     ));
                 }
                 LocalChange::StatOnly => {
-                    report.stat_only += 1;
-                    if let Some(prev) = prev {
-                        stat_updates.push(StatUpdate {
-                            key: prev.key.clone(),
-                            stat: observation.stat,
-                            previous_sequence: prev.sequence,
-                        });
+                    if adopt {
+                        if let Some(prev) = prev {
+                            hydrates.push(HydrateUpdate {
+                                key: prev.key.clone(),
+                                stat: observation.stat,
+                                previous_sequence: prev.sequence,
+                            });
+                        }
+                    } else {
+                        report.stat_only += 1;
+                        if let Some(prev) = prev {
+                            stat_updates.push(StatUpdate {
+                                key: prev.key.clone(),
+                                stat: observation.stat,
+                                previous_sequence: prev.sequence,
+                            });
+                        }
                     }
                 }
-                LocalChange::Unchanged => report.unchanged += 1,
+                LocalChange::Unchanged => {
+                    if adopt {
+                        if let Some(prev) = prev {
+                            hydrates.push(HydrateUpdate {
+                                key: prev.key.clone(),
+                                stat: observation.stat,
+                                previous_sequence: prev.sequence,
+                            });
+                        }
+                    } else {
+                        report.unchanged += 1;
+                    }
+                }
                 LocalChange::Deleted => {}
             }
         }
@@ -350,6 +389,10 @@ impl Engine {
                 && is_deselected(rules, path, kind)
             {
                 report.deselected.push(path.clone());
+                continue;
+            }
+            let mode = path_mode(&mat_rules, &config.mount.name, path.as_str())?;
+            if scan_skip_absence(mode, record) {
                 continue;
             }
             if unstable.contains(path) {
@@ -421,6 +464,7 @@ impl Engine {
         Ok(ScanPlan {
             writes,
             stat_updates,
+            hydrates,
             new_objects,
             report,
         })
@@ -447,6 +491,14 @@ impl Engine {
                         });
                     }
                 }
+                for update in &plan.hydrates {
+                    let current = repo.entry(&update.key)?;
+                    if current.as_ref().map(|c| c.sequence) != Some(update.previous_sequence) {
+                        return Err(EngineError::ConcurrentModification {
+                            path: update.key.path.clone(),
+                        });
+                    }
+                }
                 for (id, size) in &plan.new_objects {
                     repo.record_object(*id, *size, now)?;
                 }
@@ -465,6 +517,9 @@ impl Engine {
                 }
                 for update in &plan.stat_updates {
                     repo.update_stat(&update.key, update.stat)?;
+                }
+                for update in &plan.hydrates {
+                    repo.set_materialized(&update.key, true, update.stat)?;
                 }
                 Ok(plan.report.clone())
             })
@@ -546,6 +601,28 @@ fn scoped_previous_paths(
         }
     }
     Ok(out)
+}
+
+/// Present path the scanner must not adopt, hash, or stat-update.
+fn scan_skip_present(mode: MaterializationMode, prev: Option<&EntryRecord>) -> bool {
+    match mode {
+        MaterializationMode::Exclude | MaterializationMode::Metadata => true,
+        MaterializationMode::Demand => prev.is_some_and(|record| {
+            !record.materialized
+                && !record.is_deleted()
+                && matches!(record.content, EntryContent::Directory)
+        }),
+        MaterializationMode::Full => false,
+    }
+}
+
+/// Absent path that must not become a tombstone.
+fn scan_skip_absence(mode: MaterializationMode, record: &EntryRecord) -> bool {
+    match mode {
+        MaterializationMode::Exclude | MaterializationMode::Metadata => true,
+        MaterializationMode::Demand => !record.materialized,
+        MaterializationMode::Full => false,
+    }
 }
 
 fn version_write(

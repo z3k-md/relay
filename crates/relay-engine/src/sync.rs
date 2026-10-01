@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::materialize::{FetchPrep, MaterializationMode, path_mode};
 use crate::peers::offered_mounts_from_wire;
 use crate::progress::{IncomingFile, ProgressBook, TransferLive};
 use crate::replica::open_replica;
@@ -28,6 +29,13 @@ const MAX_ATTEMPTS: u32 = 3;
 const MAX_FETCH_ATTEMPTS: u32 = 3;
 /// Delay before re-requesting a range whose objects could not be fetched.
 const RESYNC_DELAY: Duration = Duration::from_secs(30);
+/// How often a live session refreshes `devices.last_seen_ms`. A crash between
+/// refreshes still leaves the offline duration within this window.
+const SEEN_INTERVAL: Duration = Duration::from_secs(30);
+/// How often index-only rows are checked for a mode that now wants bytes.
+/// The watch loop ticks much faster than this; a metadata tree must not be
+/// walked on every poll.
+const HYDRATE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Result of a live [`SyncInput::AddMount`] applied on the engine loop.
 #[derive(Clone, Debug)]
@@ -96,6 +104,13 @@ pub enum SyncInput {
     Share {
         space: String,
         peer: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    /// Hydrate one demand-mode path, asking a connected peer when needed.
+    Fetch {
+        space: String,
+        mount: String,
+        path: String,
         reply: mpsc::Sender<Result<(), String>>,
     },
 }
@@ -206,6 +221,21 @@ struct PendingBatch {
     caught_up: bool,
 }
 
+#[derive(Default)]
+struct DirectFetch {
+    space: Option<SpaceId>,
+    attempts: u32,
+    asked: HashSet<DeviceId>,
+    waiting: bool,
+    gave_up: bool,
+    warned: bool,
+}
+
+struct FetchWaiter {
+    key: EntryKey,
+    reply: mpsc::Sender<Result<(), String>>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fetch {
     Ok,
@@ -214,18 +244,32 @@ enum Fetch {
 
 pub struct Syncer {
     connected: HashMap<DeviceId, Connected>,
+    /// Last time this process wrote `last_seen_ms` for a live peer.
+    seen_at: HashMap<DeviceId, Instant>,
     index_batch_entries: usize,
     progress: ProgressBook,
     next_batch_id: u64,
+    /// Objects requested for full-mode hydration or an explicit fetch.
+    direct: HashMap<ObjectId, DirectFetch>,
+    fetch_waiters: HashMap<ObjectId, Vec<FetchWaiter>>,
+    /// Non-file hydration failures already reported.
+    hydrate_warned: HashSet<EntryKey>,
+    /// Last time index-only rows were considered for hydration.
+    hydrated_at: Option<Instant>,
 }
 
 impl Default for Syncer {
     fn default() -> Self {
         Self {
             connected: HashMap::new(),
+            seen_at: HashMap::new(),
             index_batch_entries: INDEX_BATCH_ENTRIES,
             progress: ProgressBook::default(),
             next_batch_id: 0,
+            direct: HashMap::new(),
+            fetch_waiters: HashMap::new(),
+            hydrate_warned: HashSet::new(),
+            hydrated_at: None,
         }
     }
 }
@@ -258,8 +302,13 @@ impl Syncer {
                 self.on_connected(engine, peer, name, out, &mut events)?;
             }
             SyncInput::PeerDisconnected { peer } => {
+                let was_connected = self.connected.contains_key(&peer);
                 self.connected.remove(&peer);
+                self.seen_at.remove(&peer);
                 self.progress.drop_peer(peer);
+                if was_connected && let Err(err) = engine.note_peer_seen(peer) {
+                    tracing::debug!(%peer, error = %err, "could not record when peer went offline");
+                }
                 events.push(SyncEvent::PeerDisconnected { peer });
                 self.flush_progress(&mut events, true);
             }
@@ -298,6 +347,14 @@ impl Syncer {
                     self.progress
                         .note_upload(peer, object, bytes, Instant::now());
                 }
+            }
+            SyncInput::Fetch {
+                space,
+                mount,
+                path,
+                reply,
+            } => {
+                self.on_fetch_request(engine, &space, &mount, &path, reply, out, &mut events)?;
             }
             SyncInput::Rescan { .. }
             | SyncInput::AddPeer { .. }
@@ -390,6 +447,11 @@ impl Syncer {
         out: &mut dyn FnMut(SyncOutput),
     ) -> Result<Vec<SyncEvent>, EngineError> {
         let mut events = Vec::new();
+        self.touch_presence(engine, now);
+        if self.hydration_due(now) {
+            self.poll_hydration(engine, out, &mut events)?;
+            self.hydrated_at = Some(now);
+        }
         let peers: Vec<DeviceId> = self.connected.keys().copied().collect();
         for peer in peers {
             let spaces: Vec<SpaceId> = self
@@ -436,6 +498,26 @@ impl Syncer {
         Ok(events)
     }
 
+    fn touch_presence(&mut self, engine: &mut Engine, now: Instant) {
+        let due: Vec<DeviceId> = self
+            .connected
+            .keys()
+            .copied()
+            .filter(|peer| {
+                self.seen_at
+                    .get(peer)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= SEEN_INTERVAL)
+            })
+            .collect();
+        for peer in due {
+            if let Err(err) = engine.note_peer_seen(peer) {
+                tracing::debug!(%peer, error = %err, "could not refresh peer last seen");
+                continue;
+            }
+            self.seen_at.insert(peer, now);
+        }
+    }
+
     fn on_connected(
         &mut self,
         engine: &mut Engine,
@@ -470,6 +552,7 @@ impl Syncer {
             peer,
             name: name.clone(),
         });
+        self.seen_at.insert(peer, Instant::now());
 
         let offers = engine.space_offers_for_peer(peer)?;
         out(SyncOutput::Send {
@@ -862,13 +945,19 @@ impl Syncer {
             .map(|cfg| (cfg.mount.id, cfg.mount.name))
             .collect();
         let local = engine.device().id;
+        let rules = engine.rules_for(space)?;
         let mut kept = Vec::with_capacity(entries.len());
         for entry in entries {
             match mount_names.get(&entry.key.mount) {
                 Some(name) => {
-                    if engine.wants(space, local, name, entry.key.path.as_str())? {
-                        kept.push(entry);
+                    if !engine.wants(space, local, name, entry.key.path.as_str())? {
+                        continue;
                     }
+                    let mode = path_mode(&rules, name, entry.key.path.as_str())?;
+                    if mode == MaterializationMode::Exclude {
+                        continue;
+                    }
+                    kept.push(entry);
                 }
                 None => kept.push(entry),
             }
@@ -877,9 +966,17 @@ impl Syncer {
 
         let mut pending = HashSet::new();
         for entry in &entries {
-            if let Some(obj) = entry.content.object()
-                && !engine.store.contains(&obj)
-            {
+            let Some(obj) = entry.content.object() else {
+                continue;
+            };
+            if engine.store.contains(&obj) {
+                continue;
+            }
+            let mode = match mount_names.get(&entry.key.mount) {
+                Some(name) => path_mode(&rules, name, entry.key.path.as_str())?,
+                None => MaterializationMode::Full,
+            };
+            if engine.needs_object_bytes(mode, &entry.key)? {
                 pending.insert(obj);
             }
         }
@@ -892,13 +989,24 @@ impl Syncer {
         let incoming_files: Vec<IncomingFile> = entries
             .iter()
             .filter_map(|entry| match &entry.content {
-                EntryContent::File { object, size, .. } => Some(IncomingFile {
-                    sequence: entry.sequence.0,
-                    path: entry.key.path.as_str().to_owned(),
-                    object: *object,
-                    size: *size,
-                    local: !pending.contains(object),
-                }),
+                EntryContent::File { object, size, .. } if pending.contains(object) => {
+                    Some(IncomingFile {
+                        sequence: entry.sequence.0,
+                        path: entry.key.path.as_str().to_owned(),
+                        object: *object,
+                        size: *size,
+                        local: false,
+                    })
+                }
+                EntryContent::File { object, size, .. } if engine.store.contains(object) => {
+                    Some(IncomingFile {
+                        sequence: entry.sequence.0,
+                        path: entry.key.path.as_str().to_owned(),
+                        object: *object,
+                        size: *size,
+                        local: true,
+                    })
+                }
                 _ => None,
             })
             .collect();
@@ -964,9 +1072,13 @@ impl Syncer {
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
         match fetch {
-            Fetch::Ok => self.note_object_ready(engine, object, out, events),
+            Fetch::Ok => {
+                self.note_object_ready(engine, object, out, events)?;
+                self.settle_direct(engine, object, events)
+            }
             Fetch::Failed { not_found } => {
-                self.on_fetch_failed(engine, peer, object, not_found, out, events)
+                self.on_fetch_failed(engine, peer, object, not_found, out, events)?;
+                self.continue_direct(engine, peer, object, not_found, out, events)
             }
         }
     }
@@ -990,7 +1102,295 @@ impl Syncer {
             self.flush_progress(events, true);
             self.process_head(engine, batch_peer, space, out, events)?;
         }
+        self.materialize_full_ready(engine, object, events)?;
         Ok(())
+    }
+
+    fn hydration_due(&self, now: Instant) -> bool {
+        self.hydrated_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= HYDRATE_INTERVAL)
+    }
+
+    fn poll_hydration(
+        &mut self,
+        engine: &mut Engine,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let pending = engine.full_unmaterialized()?;
+        for item in pending {
+            if item.object.is_none() {
+                self.hydrate_now(engine, &item.key, events);
+                continue;
+            }
+            let Some(object) = item.object else {
+                continue;
+            };
+            if engine.store.contains(&object) {
+                self.hydrate_now(engine, &item.key, events);
+                continue;
+            }
+            if self
+                .direct
+                .get(&object)
+                .is_some_and(|state| state.gave_up || state.waiting)
+                || self.batch_pending(object)
+            {
+                continue;
+            }
+            if let Some(peer) = self.peer_for_space(engine, item.space)? {
+                self.request_direct(peer, object, item.space, out);
+            } else if engine.ingest_mailbox_object(item.space, object)? {
+                self.hydrate_now(engine, &item.key, events);
+            } else {
+                self.give_up_direct(engine, object, item.key.path.as_ref(), events);
+            }
+        }
+        Ok(())
+    }
+
+    fn hydrate_now(&mut self, engine: &mut Engine, key: &EntryKey, events: &mut Vec<SyncEvent>) {
+        if let Err(err) = engine.materialize_indexed(key)
+            && self.hydrate_warned.insert(key.clone())
+        {
+            events.push(SyncEvent::SyncWarning {
+                peer: engine.device().id,
+                path: key.path.to_string(),
+                reason: err.to_string(),
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_fetch_request(
+        &mut self,
+        engine: &mut Engine,
+        space: &str,
+        mount: &str,
+        path: &str,
+        reply: mpsc::Sender<Result<(), String>>,
+        out: &mut dyn FnMut(SyncOutput),
+        _events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        match engine.prepare_demand_fetch(space, mount, path) {
+            Ok(FetchPrep::Done) => {
+                let _ = reply.send(Ok(()));
+            }
+            Ok(FetchPrep::Need { space, object, key }) => {
+                let Some(peer) = self.peer_for_space(engine, space)? else {
+                    let _ = reply.send(Err(EngineError::ObjectUnavailable.to_string()));
+                    return Ok(());
+                };
+                self.fetch_waiters
+                    .entry(object)
+                    .or_default()
+                    .push(FetchWaiter { key, reply });
+                if let Some(state) = self.direct.get_mut(&object) {
+                    state.gave_up = false;
+                    state.warned = false;
+                    state.space = Some(space);
+                }
+                let waiting = self.direct.get(&object).is_some_and(|state| state.waiting)
+                    || self.batch_pending(object);
+                if !waiting {
+                    self.request_direct(peer, object, space, out);
+                }
+            }
+            Err(err) => {
+                let _ = reply.send(Err(err.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_direct(
+        &mut self,
+        engine: &mut Engine,
+        object: ObjectId,
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        self.direct.remove(&object);
+        self.materialize_full_ready(engine, object, events)?;
+        if let Some(waiters) = self.fetch_waiters.remove(&object) {
+            for waiter in waiters {
+                match engine.materialize_indexed(&waiter.key) {
+                    Ok(()) => {
+                        let _ = waiter.reply.send(Ok(()));
+                    }
+                    Err(err) => {
+                        let _ = waiter.reply.send(Err(err.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn continue_direct(
+        &mut self,
+        engine: &mut Engine,
+        failed: DeviceId,
+        object: ObjectId,
+        not_found: bool,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        if engine.store.contains(&object) {
+            return self.settle_direct(engine, object, events);
+        }
+        if !self.direct.contains_key(&object) && !self.fetch_waiters.contains_key(&object) {
+            return Ok(());
+        }
+        let space = self
+            .fetch_waiters
+            .get(&object)
+            .and_then(|waiters| waiters.first().map(|waiter| waiter.key.space))
+            .or_else(|| self.direct.get(&object).and_then(|state| state.space));
+        let attempts = {
+            let state = self.direct.entry(object).or_default();
+            state.waiting = false;
+            state.asked.insert(failed);
+            state.attempts = state.attempts.saturating_add(1);
+            if let Some(space) = space {
+                state.space = Some(space);
+            }
+            state.attempts
+        };
+        let asked = self
+            .direct
+            .get(&object)
+            .map(|state| state.asked.clone())
+            .unwrap_or_default();
+        if let Some(space) = space {
+            if let Some(next) = self.unasked_connected(engine, space, &asked)? {
+                self.request_direct(next, object, space, out);
+                return Ok(());
+            }
+            if engine.ingest_mailbox_object(space, object)? {
+                return self.settle_direct(engine, object, events);
+            }
+            if !not_found
+                && attempts < MAX_FETCH_ATTEMPTS
+                && let Some(peer) = self.peer_for_space(engine, space)?
+            {
+                self.request_direct(peer, object, space, out);
+                return Ok(());
+            }
+        }
+        let path = self
+            .fetch_waiters
+            .get(&object)
+            .and_then(|waiters| waiters.first().map(|waiter| waiter.key.path.to_string()))
+            .unwrap_or_default();
+        self.give_up_direct(engine, object, &path, events);
+        Ok(())
+    }
+
+    fn materialize_full_ready(
+        &mut self,
+        engine: &mut Engine,
+        object: ObjectId,
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        if !engine.store.contains(&object) {
+            return Ok(());
+        }
+        if let Err(err) = engine.materialize_full_object(object) {
+            events.push(SyncEvent::SyncWarning {
+                peer: engine.device().id,
+                path: String::new(),
+                reason: err.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn request_direct(
+        &mut self,
+        peer: DeviceId,
+        object: ObjectId,
+        space: SpaceId,
+        out: &mut dyn FnMut(SyncOutput),
+    ) {
+        let state = self.direct.entry(object).or_default();
+        state.space = Some(space);
+        state.waiting = true;
+        state.gave_up = false;
+        state.asked.insert(peer);
+        out(SyncOutput::FetchObject { peer, object });
+    }
+
+    fn give_up_direct(
+        &mut self,
+        engine: &Engine,
+        object: ObjectId,
+        path: &str,
+        events: &mut Vec<SyncEvent>,
+    ) {
+        let state = self.direct.entry(object).or_default();
+        state.waiting = false;
+        state.gave_up = true;
+        if !state.warned {
+            state.warned = true;
+            events.push(SyncEvent::SyncWarning {
+                peer: engine.device().id,
+                path: path.to_owned(),
+                reason: format!("object {object} is not available to materialize"),
+            });
+        }
+        if let Some(waiters) = self.fetch_waiters.remove(&object) {
+            for waiter in waiters {
+                let _ = waiter
+                    .reply
+                    .send(Err(EngineError::ObjectUnavailable.to_string()));
+            }
+        }
+    }
+
+    fn batch_pending(&self, object: ObjectId) -> bool {
+        self.connected.values().any(|conn| {
+            conn.incoming.values().any(|queue| {
+                queue
+                    .iter()
+                    .any(|batch| batch.pending_objects.contains(&object))
+            })
+        })
+    }
+
+    fn peer_for_space(
+        &self,
+        engine: &Engine,
+        space: SpaceId,
+    ) -> Result<Option<DeviceId>, EngineError> {
+        let mut peers: Vec<DeviceId> = self.connected.keys().copied().collect();
+        peers.sort();
+        for peer in peers {
+            if engine.db.repo().is_shared(space, peer)? {
+                return Ok(Some(peer));
+            }
+        }
+        Ok(None)
+    }
+
+    fn unasked_connected(
+        &self,
+        engine: &Engine,
+        space: SpaceId,
+        asked: &HashSet<DeviceId>,
+    ) -> Result<Option<DeviceId>, EngineError> {
+        let mut peers: Vec<DeviceId> = self
+            .connected
+            .keys()
+            .copied()
+            .filter(|peer| !asked.contains(peer))
+            .collect();
+        peers.sort();
+        for peer in peers {
+            if engine.db.repo().is_shared(space, peer)? {
+                return Ok(Some(peer));
+            }
+        }
+        Ok(None)
     }
 
     /// Other connected peers, then the mailbox, then the original peer's retry budget.

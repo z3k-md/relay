@@ -8,8 +8,8 @@ use std::sync::Arc;
 use relay_core::conflict::conflict_path;
 use relay_core::{DeviceId, EntryContent, LogicalPath, MOUNT_MARKER, ObjectId, SpaceId};
 use relay_engine::{
-    DeleteHoldDecision, Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent, SyncInput,
-    SyncOutput, Syncer, TransferDirection,
+    Clock, DeleteHoldDecision, Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent,
+    SyncInput, SyncOutput, Syncer, TransferDirection,
 };
 use relay_fs::MountMarker;
 use relay_proto::{IndexBatch, entry_to_wire, frame, mount_id_bytes, space_id_bytes};
@@ -87,6 +87,8 @@ struct Harness {
     /// Objects whose fetches fail (as a transient error) while present here.
     broken_objects: HashSet<ObjectId>,
     events: Vec<SyncEvent>,
+    /// Object ids any side asked to fetch during `pump`.
+    fetches: Vec<ObjectId>,
 }
 
 impl Harness {
@@ -115,6 +117,7 @@ impl Harness {
             strict: true,
             broken_objects: HashSet::new(),
             events: Vec::new(),
+            fetches: Vec::new(),
         }
     }
 
@@ -179,23 +182,36 @@ impl Harness {
         self.sb
             .tick(&mut self.b, now, &mut |o| outs.push(o))
             .unwrap();
-        let q = VecDeque::new();
-        let mut outputs: VecDeque<(bool, SyncOutput)> =
-            outs.into_iter().map(|o| (false, o)).collect();
-        // Deliver B's outputs, then pump everything to quiescence.
-        let mut q2 = q;
-        while let Some((from_a, output)) = outputs.pop_front() {
-            if let SyncOutput::Send { body, .. } = output {
-                q2.push_back((
-                    !from_a,
-                    SyncInput::Frame {
-                        peer: self.id_b(),
-                        body,
-                    },
-                ));
+        let mut q = VecDeque::new();
+        for output in outs {
+            match output {
+                SyncOutput::Send { body, .. } => {
+                    q.push_back((
+                        true,
+                        SyncInput::Frame {
+                            peer: self.id_b(),
+                            body,
+                        },
+                    ));
+                }
+                SyncOutput::FetchObject { object, .. } => {
+                    self.fetches.push(object);
+                    let input = if self.broken_objects.contains(&object) {
+                        SyncInput::ObjectFetchFailed {
+                            peer: self.id_a(),
+                            object,
+                            not_found: false,
+                            reason: "simulated I/O error".into(),
+                        }
+                    } else {
+                        copy_object(&self.a, &self.b, self.id_a(), object)
+                    };
+                    q.push_back((false, input));
+                }
+                SyncOutput::SetPeers | SyncOutput::SetRelay(_) => {}
             }
         }
-        self.pump(q2, None);
+        self.pump(q, None);
     }
 
     fn push_both(&mut self) {
@@ -280,6 +296,7 @@ impl Harness {
                 }
                 SyncOutput::SetPeers | SyncOutput::SetRelay(_) => {}
                 SyncOutput::FetchObject { object, .. } => {
+                    self.fetches.push(object);
                     // The engine that emitted FetchObject is the requester.
                     let (src, dst, from_peer) = if from_a {
                         (&self.b, &self.a, self.id_b())
@@ -2599,5 +2616,298 @@ fn device_group_expansion_widens_targets_after_epoch_exchange() {
     assert_eq!(
         fs::read(h.mounts[2].path().join("shared/two.txt")).unwrap(),
         b"two"
+    );
+}
+
+#[test]
+fn disconnect_records_when_a_peer_went_offline() {
+    let mut h = Harness::pair();
+    let clock = Arc::new(ManualClock::new(1_700_000_000_000));
+    h.a.set_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+    h.pair_peers();
+    assert_eq!(h.a.peers().unwrap()[0].last_seen_ms, None);
+
+    h.connect();
+    assert_eq!(
+        h.a.peers().unwrap()[0].last_seen_ms,
+        Some(1_700_000_000_000),
+        "connecting counts as a sighting"
+    );
+
+    clock.set(1_700_000_000_000 + 45_000);
+    h.sa.tick(
+        &mut h.a,
+        std::time::Instant::now() + std::time::Duration::from_secs(31),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        h.a.peers().unwrap()[0].last_seen_ms,
+        Some(1_700_000_000_000 + 45_000),
+        "a live session keeps the last-seen stamp fresh"
+    );
+
+    clock.set(1_700_000_000_000 + 3_600_000);
+    h.disconnect();
+    assert_eq!(
+        h.a.peers().unwrap()[0].last_seen_ms,
+        Some(1_700_000_000_000 + 3_600_000),
+        "offline duration starts when the session ends"
+    );
+}
+
+fn publish(h: &mut Harness, files: &[(&str, &[u8])]) {
+    write_tree(h.mount_a.path(), files);
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.fetches.clear();
+    h.push_both();
+}
+
+#[test]
+fn file_syncs_to_disk_without_materialization_rules() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("note.txt", b"hello")]);
+    assert_eq!(
+        fs::read(h.mount_b.path().join("note.txt")).unwrap(),
+        b"hello"
+    );
+    assert!(entry_at(&h.b, "note.txt").materialized);
+}
+
+#[test]
+fn metadata_rule_keeps_the_index_and_does_not_fetch_or_tombstone() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "notes", "metadata", &["code/note.txt".into()])
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"hello")]);
+
+    let entry = entry_at(&h.b, "note.txt");
+    assert!(!entry.materialized);
+    assert_eq!(entry.content.object().unwrap(), ObjectId::of(b"hello"));
+    assert!(!h.mount_b.path().join("note.txt").exists());
+    assert!(
+        !h.fetches.contains(&ObjectId::of(b"hello")),
+        "metadata must not fetch the object"
+    );
+
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert!(!entry_at(&h.b, "note.txt").is_deleted());
+    assert_eq!(
+        fs::read(h.mount_a.path().join("note.txt")).unwrap(),
+        b"hello"
+    );
+}
+
+#[test]
+fn exclude_rule_drops_the_entry_without_deleting_the_peer() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "skip", "exclude", &["code/secret.txt".into()])
+        .unwrap();
+    publish(&mut h, &[("secret.txt", b"hidden")]);
+
+    assert!(
+        h.b.entries("Personal", "code", true)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.key.path.as_str() != "secret.txt")
+    );
+    assert!(!h.mount_b.path().join("secret.txt").exists());
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert_eq!(
+        fs::read(h.mount_a.path().join("secret.txt")).unwrap(),
+        b"hidden"
+    );
+}
+
+#[test]
+fn switching_a_rule_to_full_materializes_on_tick() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "notes", "metadata", &["code/note.txt".into()])
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"hello")]);
+    assert!(!h.mount_b.path().join("note.txt").exists());
+
+    h.b.materialize_remove("Personal", "notes").unwrap();
+    h.fetches.clear();
+    h.tick_b(std::time::Instant::now());
+    assert_eq!(
+        fs::read(h.mount_b.path().join("note.txt")).unwrap(),
+        b"hello"
+    );
+    assert!(entry_at(&h.b, "note.txt").materialized);
+    assert!(h.fetches.contains(&ObjectId::of(b"hello")));
+}
+
+#[test]
+fn later_materialization_rule_wins() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "data", "metadata", &["code/data/**".into()])
+        .unwrap();
+    h.b.materialize_add("Personal", "keep", "full", &["code/data/keep.txt".into()])
+        .unwrap();
+    publish(
+        &mut h,
+        &[("data/skip.txt", b"skip"), ("data/keep.txt", b"keep")],
+    );
+
+    assert_eq!(
+        fs::read(h.mount_b.path().join("data/keep.txt")).unwrap(),
+        b"keep"
+    );
+    assert!(entry_at(&h.b, "data/keep.txt").materialized);
+    assert!(!h.mount_b.path().join("data/skip.txt").exists());
+    assert!(!entry_at(&h.b, "data/skip.txt").materialized);
+}
+
+#[test]
+fn demand_fetches_updates_and_evicts_without_a_tombstone() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "note", "demand", &["code/note.txt".into()])
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"hello")]);
+
+    let entry = entry_at(&h.b, "note.txt");
+    assert!(!entry.materialized);
+    assert!(!h.mount_b.path().join("note.txt").exists());
+    assert!(!h.fetches.contains(&ObjectId::of(b"hello")));
+
+    let mailbox = tempfile::tempdir().unwrap();
+    h.b.set_replica_path(mailbox.path()).unwrap();
+    let mut replica = FsReplica::open(mailbox.path()).unwrap();
+    replica
+        .put_object(ObjectId::of(b"hello"), b"hello")
+        .unwrap();
+    h.b.fetch_path("Personal", "code", "note.txt").unwrap();
+    assert_eq!(
+        fs::read(h.mount_b.path().join("note.txt")).unwrap(),
+        b"hello"
+    );
+    assert!(entry_at(&h.b, "note.txt").materialized);
+
+    fs::write(h.mount_a.path().join("note.txt"), b"edited").unwrap();
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert_eq!(
+        fs::read(h.mount_b.path().join("note.txt")).unwrap(),
+        b"edited"
+    );
+    assert!(entry_at(&h.b, "note.txt").materialized);
+
+    h.b.evict_path("Personal", "code", "note.txt").unwrap();
+    assert!(!h.mount_b.path().join("note.txt").exists());
+    let evicted = entry_at(&h.b, "note.txt");
+    assert!(!evicted.materialized);
+    assert!(!evicted.is_deleted());
+    let sequence = evicted.sequence;
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    let after = entry_at(&h.b, "note.txt");
+    assert!(!after.is_deleted());
+    assert_eq!(after.sequence, sequence);
+    h.push_both();
+    assert_eq!(
+        fs::read(h.mount_a.path().join("note.txt")).unwrap(),
+        b"edited"
+    );
+}
+
+#[test]
+fn evict_refuses_when_file_bytes_differ() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "note", "demand", &["code/note.txt".into()])
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"hello")]);
+    let mailbox = tempfile::tempdir().unwrap();
+    h.b.set_replica_path(mailbox.path()).unwrap();
+    let mut replica = FsReplica::open(mailbox.path()).unwrap();
+    replica
+        .put_object(ObjectId::of(b"hello"), b"hello")
+        .unwrap();
+    h.b.fetch_path("Personal", "code", "note.txt").unwrap();
+
+    fs::write(h.mount_b.path().join("note.txt"), b"dirty").unwrap();
+    let err = h.b.evict_path("Personal", "code", "note.txt").unwrap_err();
+    assert!(err.to_string().contains("does not match"), "{err}");
+    assert_eq!(
+        fs::read(h.mount_b.path().join("note.txt")).unwrap(),
+        b"dirty"
+    );
+    assert!(entry_at(&h.b, "note.txt").materialized);
+}
+
+#[test]
+fn materialization_rule_crud() {
+    let home = tempfile::tempdir().unwrap();
+    let mut engine = Engine::init(home.path(), "alpha").unwrap();
+    engine.create_space("Personal").unwrap();
+
+    let missing = engine
+        .materialize_add("Missing", "r", "metadata", &["code/**".into()])
+        .unwrap_err();
+    assert!(
+        matches!(missing, relay_engine::EngineError::UnknownSpace(_)),
+        "{missing}"
+    );
+
+    let empty = engine
+        .materialize_add("Personal", "r", "metadata", &[])
+        .unwrap_err();
+    assert!(
+        matches!(empty, relay_engine::EngineError::EmptyMaterialization),
+        "{empty}"
+    );
+
+    let bad_glob = engine
+        .materialize_add("Personal", "r", "metadata", &["[".into()])
+        .unwrap_err();
+    assert!(
+        matches!(bad_glob, relay_engine::EngineError::Policy(_)),
+        "{bad_glob}"
+    );
+
+    let added = engine
+        .materialize_add("Personal", "r", "metadata", &["code/**".into()])
+        .unwrap();
+    assert_eq!(added.mode, "metadata");
+    assert_eq!(added.selectors, vec!["code/**".to_owned()]);
+
+    let duplicate = engine
+        .materialize_add("Personal", "r", "full", &["code/a.txt".into()])
+        .unwrap_err();
+    assert!(
+        matches!(
+            duplicate,
+            relay_engine::EngineError::DuplicateMaterialization(_)
+        ),
+        "{duplicate}"
+    );
+
+    let listed = engine.materialization_rules(Some("Personal")).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "r");
+
+    engine.materialize_remove("Personal", "r").unwrap();
+    assert!(
+        engine
+            .materialization_rules(Some("Personal"))
+            .unwrap()
+            .is_empty()
+    );
+    let gone = engine.materialize_remove("Personal", "r").unwrap_err();
+    assert!(
+        matches!(gone, relay_engine::EngineError::UnknownMaterialization(_)),
+        "{gone}"
     );
 }

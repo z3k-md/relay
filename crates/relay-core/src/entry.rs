@@ -148,6 +148,15 @@ pub struct EntryRecord {
     /// Display only. Never used for ordering.
     pub modified_at_unix_ms: i64,
     pub stat: Option<StatHint>,
+    /// Working-tree copy is present, or this is a normal full entry.
+    /// Index-only rows (metadata, unhydrated demand, exclude-dropped leftovers)
+    /// are false. Old JSON without the field is treated as materialized.
+    #[serde(default = "default_true")]
+    pub materialized: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl EntryRecord {
@@ -177,6 +186,7 @@ impl EntryRecord {
             modified_by: device,
             modified_at_unix_ms: now_unix_ms,
             stat,
+            materialized: true,
         }
     }
 

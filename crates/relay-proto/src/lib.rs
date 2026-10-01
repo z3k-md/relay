@@ -484,6 +484,7 @@ impl RemoteEntry {
         self,
         sequence: Sequence,
         stat: Option<relay_core::StatHint>,
+        materialized: bool,
     ) -> EntryRecord {
         EntryRecord {
             key: self.key,
@@ -494,6 +495,7 @@ impl RemoteEntry {
             modified_by: self.modified_by,
             modified_at_unix_ms: self.modified_at_unix_ms,
             stat, // mtime_ns is applied at materialize time; stored stat is observed after write
+            materialized,
         }
     }
 }

@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::materialize::{MaterializationMode, path_mode};
 
 const REPLICA_PATH_KEY: &str = "replica_path";
 const NAT_HINT: &str = "nat_hint";
@@ -180,6 +181,9 @@ impl Engine {
                     wires.push(entry_to_wire(entry));
                 }
                 for object in &objects {
+                    if !self.store.contains(object) {
+                        continue;
+                    }
                     if self.put_space_object(&replica, space.id, *object)? {
                         report.objects += 1;
                     }
@@ -231,6 +235,7 @@ impl Engine {
                 .map(|cfg| (cfg.mount.id, cfg.mount.name))
                 .collect();
 
+            let rules = self.db.repo().list_materialization_rules(space.id)?;
             for peer in peers {
                 let after = self.db.repo().sync_progress(peer, space.id)?.received_seq;
                 let wires = replica.entries_after(peer, space.id, after.0)?;
@@ -262,7 +267,19 @@ impl Engine {
                         continue;
                     }
 
-                    if let Some(obj) = entry.content.object()
+                    let mode = match mount_names.get(&entry.key.mount) {
+                        Some(name) => path_mode(&rules, name, entry.key.path.as_str())?,
+                        None => MaterializationMode::Full,
+                    };
+                    if mode == MaterializationMode::Exclude {
+                        through = seq;
+                        continue;
+                    }
+
+                    let fetch = entry.content.object().is_some()
+                        && self.needs_object_bytes(mode, &entry.key)?;
+                    if fetch
+                        && let Some(obj) = entry.content.object()
                         && !self.store.contains(&obj)
                     {
                         match self.take_space_object(&replica, space.id, obj)? {

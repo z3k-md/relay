@@ -1084,9 +1084,13 @@ fn read_only_open_upgrades_an_older_schema() {
     drop(init_engine(home.path()));
     {
         let conn = rusqlite::Connection::open(home.path().join("relay.db")).unwrap();
-        // Roll schema back to v7 so open_read_only must migrate through 0008–0011.
+        // Roll schema back to v7 so open_read_only must migrate through 0008–0012.
         conn.execute_batch(
             "
+            DROP TABLE IF EXISTS materialization_selectors;
+            DROP TABLE IF EXISTS materialization_rules;
+            DROP INDEX IF EXISTS idx_entries_index_only;
+            ALTER TABLE entries DROP COLUMN materialized;
             DROP TABLE IF EXISTS peer_box_keys;
             DROP TABLE IF EXISTS space_key_wraps;
             DROP TABLE IF EXISTS replica_push;
@@ -1132,5 +1136,5 @@ fn read_only_open_upgrades_an_older_schema() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }

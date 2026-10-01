@@ -204,7 +204,9 @@ impl Engine {
             std::thread::spawn(move || {
                 while let Ok(input) = sync_inputs.recv() {
                     match input {
-                        input @ (SyncInput::AddMount { .. } | SyncInput::Share { .. }) => {
+                        input @ (SyncInput::AddMount { .. }
+                        | SyncInput::Share { .. }
+                        | SyncInput::Fetch { .. }) => {
                             if priority_tx.send(input).is_err() {
                                 break;
                             }

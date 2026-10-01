@@ -3,6 +3,7 @@
 mod apply;
 mod clock;
 mod error;
+mod materialize;
 mod order;
 mod peers;
 mod policies;
@@ -30,6 +31,7 @@ use relay_store::StoreError;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::EngineError;
+pub use materialize::{MaterializationInfo, MaterializationMode};
 pub use peers::{
     AdoptedMembers, ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict,
     group_git_conflicts,
@@ -610,7 +612,7 @@ impl Engine {
     }
 
     pub fn verify_objects(&self) -> Result<VerifyReport, EngineError> {
-        let live = self.db.repo().live_objects()?;
+        let live = self.db.repo().verification_objects()?;
         let mut missing = Vec::new();
         let mut corrupt = Vec::new();
         for id in &live {

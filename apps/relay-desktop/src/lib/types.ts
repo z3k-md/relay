@@ -26,6 +26,10 @@ export interface PeerView {
   shortId: string;
   address: string;
   connected: boolean;
+  /** Unix ms when the current session started. Set only while connected. */
+  connectedSinceMs: number | null;
+  /** Last live contact. Null until this peer has connected once. */
+  lastSeenMs: number | null;
 }
 
 export interface PairStartResult {

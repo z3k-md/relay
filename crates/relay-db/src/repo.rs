@@ -2,22 +2,23 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use relay_core::{
-    Device, DeviceId, EntryContent, EntryKey, EntryRecord, Mount, MountId, ObjectId, PolicyId,
-    Sequence, Space, SpaceId, StatHint, VersionVector,
+    Device, DeviceId, EntryContent, EntryKey, EntryRecord, MaterializationRuleId, Mount, MountId,
+    ObjectId, PolicyId, Sequence, Space, SpaceId, StatHint, VersionVector,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::DbError;
 use crate::convert::{
     decode_content, decode_stat, device_id_bytes, encode_content, encode_stat, i64_from_u64,
-    is_unique_violation, map_write_err, mount_bytes, mount_from_bytes, object_id_from_blob,
+    is_unique_violation, map_write_err, materialization_rule_bytes,
+    materialization_rule_from_bytes, mount_bytes, mount_from_bytes, object_id_from_blob,
     opt_object_id, policy_bytes, policy_from_bytes, space_bytes, space_from_bytes, u64_from_i64,
 };
 
 const ENTRY_SELECT: &str = "e.id, e.mount_id, e.path, e.kind, e.deleted, e.object_id, e.size,
      e.executable, e.symlink_target, e.parent_object, e.sequence,
      d.device_id, e.modified_at_ms, e.stat_size, e.stat_mtime_ns, e.stat_file_id,
-     e.stat_ctime_ns, m.space_id";
+     e.stat_ctime_ns, m.space_id, e.materialized";
 
 #[derive(Clone, Copy)]
 pub struct Repo<'c> {
@@ -43,6 +44,10 @@ pub struct PeerRecord {
     pub device: Device,
     pub addresses: Vec<String>,
     pub added_at_ms: i64,
+    /// Wall time of the last live session with this device. `None` until the
+    /// first connection. While the peer is offline this is when that session
+    /// ended (or the last presence refresh, if the session did not end cleanly).
+    pub last_seen_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -105,6 +110,27 @@ pub struct PolicyRecord {
     /// Direct device targets (not expanded from groups).
     pub peer_targets: Vec<DeviceId>,
     pub group_targets: Vec<String>,
+}
+
+/// An index row that has no working-tree copy. Hydration reads only these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexOnlyEntry {
+    pub space: SpaceId,
+    pub mount: MountId,
+    pub mount_name: String,
+    pub path: relay_core::LogicalPath,
+    pub object: Option<ObjectId>,
+}
+
+/// A local materialization rule. Selectors are ordered by their own position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationRuleRecord {
+    pub id: MaterializationRuleId,
+    pub space_id: SpaceId,
+    pub name: String,
+    pub mode: String,
+    pub position: i64,
+    pub selectors: Vec<String>,
 }
 
 /// One policy as stored in a peer's snapshot (targets already expanded).
@@ -196,6 +222,7 @@ struct RawEntry {
     stat_file_id: Option<i64>,
     stat_ctime_ns: Option<i64>,
     space_id: [u8; 16],
+    materialized: i64,
 }
 
 impl Repo<'_> {
@@ -283,6 +310,33 @@ impl Repo<'_> {
                 last_seen_ms = excluded.last_seen_ms",
             params![id.as_slice(), device.name.as_str(), now_ms],
         )?;
+        Ok(())
+    }
+
+    /// Insert a device or rename it without treating that as a live sighting.
+    /// New rows keep `last_seen_ms` null until [`Self::touch_last_seen`].
+    fn upsert_device_name(&self, device: &Device, created_at_ms: i64) -> Result<(), DbError> {
+        let id = device_id_bytes(device.id);
+        self.conn.execute(
+            "INSERT INTO devices (device_id, name, status, created_at_ms, last_seen_ms)
+             VALUES (?1, ?2, 'active', ?3, NULL)
+             ON CONFLICT(device_id) DO UPDATE SET
+                name = excluded.name",
+            params![id.as_slice(), device.name.as_str(), created_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Record that `id` was reachable at `now_ms`.
+    pub fn touch_last_seen(&self, id: DeviceId, now_ms: i64) -> Result<(), DbError> {
+        let id = device_id_bytes(id);
+        let updated = self.conn.execute(
+            "UPDATE devices SET last_seen_ms = ?1 WHERE device_id = ?2",
+            params![now_ms, id.as_slice()],
+        )?;
+        if updated == 0 {
+            return Err(DbError::NotFound);
+        }
         Ok(())
     }
 
@@ -622,6 +676,79 @@ impl Repo<'_> {
         Ok(())
     }
 
+    /// Live entries this device has not written (`materialized = 0`), on mounts
+    /// attached locally.
+    pub fn list_index_only(&self) -> Result<Vec<IndexOnlyEntry>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.space_id, m.id, m.name, e.path, e.object_id
+             FROM entries e
+             JOIN mounts m ON m.id = e.mount_id
+             JOIN device_mounts dm ON dm.mount_id = m.id
+             JOIN local_device ld ON ld.device_ref = dm.device_ref
+             WHERE e.materialized = 0 AND e.deleted = 0
+             ORDER BY m.name, e.path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, [u8; 16]>(0)?,
+                row.get::<_, [u8; 16]>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (space, mount, mount_name, path, object) = row?;
+            let path = relay_core::LogicalPath::new(&path)
+                .map_err(|err| DbError::Corrupt(format!("invalid logical path {path:?}: {err}")))?;
+            out.push(IndexOnlyEntry {
+                space: space_from_bytes(space),
+                mount: mount_from_bytes(mount),
+                mount_name,
+                path,
+                object: object.as_deref().map(object_id_from_blob).transpose()?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Flip the local materialization flag without a new version or vector bump.
+    pub fn set_materialized(
+        &self,
+        key: &EntryKey,
+        materialized: bool,
+        stat: Option<StatHint>,
+    ) -> Result<(), DbError> {
+        let Some(space) = self.mount_space(key.mount)? else {
+            return Err(DbError::NotFound);
+        };
+        if space != key.space {
+            return Err(DbError::SpaceMismatch);
+        }
+        let stat = encode_stat(stat)?;
+        let mount = mount_bytes(key.mount);
+        let flag: i64 = if materialized { 1 } else { 0 };
+        let changed = self.conn.execute(
+            "UPDATE entries SET materialized = ?1, stat_size = ?2, stat_mtime_ns = ?3,
+                 stat_file_id = ?4, stat_ctime_ns = ?5
+             WHERE mount_id = ?6 AND path = ?7",
+            params![
+                flag,
+                stat.size,
+                stat.mtime_ns,
+                stat.file_id,
+                stat.ctime_ns,
+                mount.as_slice(),
+                key.path.as_str()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
     pub fn changes_since(
         &self,
         after: Sequence,
@@ -735,6 +862,28 @@ impl Repo<'_> {
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         let mut objects = HashSet::new();
+        for row in rows {
+            objects.insert(object_id_from_blob(&row?)?);
+        }
+        Ok(objects)
+    }
+
+    /// Objects this device stored, plus file entries whose working tree is present.
+    ///
+    /// History-only references, parent pointers, and `materialized = 0` rows are
+    /// not required to exist in the local store.
+    pub fn verification_objects(&self) -> Result<HashSet<ObjectId>, DbError> {
+        let mut objects = HashSet::new();
+        let mut stored = self.conn.prepare_cached("SELECT id FROM objects")?;
+        let rows = stored.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            objects.insert(object_id_from_blob(&row?)?);
+        }
+        let mut live = self.conn.prepare_cached(
+            "SELECT object_id FROM entries
+             WHERE materialized = 1 AND deleted = 0 AND object_id IS NOT NULL",
+        )?;
+        let rows = live.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         for row in rows {
             objects.insert(object_id_from_blob(&row?)?);
         }
@@ -886,7 +1035,7 @@ impl Repo<'_> {
         addresses: &[String],
         now_ms: i64,
     ) -> Result<PeerRecord, DbError> {
-        self.upsert_device(device, now_ms)?;
+        self.upsert_device_name(device, now_ms)?;
         let device_ref = self
             .device_ref(device.id)?
             .ok_or_else(|| DbError::Corrupt("upserted peer device is missing".into()))?;
@@ -904,11 +1053,8 @@ impl Repo<'_> {
             "DELETE FROM dismissed_peers WHERE device_id = ?1",
             params![id_bytes.as_slice()],
         )?;
-        Ok(PeerRecord {
-            device: device.clone(),
-            addresses: addresses.to_vec(),
-            added_at_ms: now_ms,
-        })
+        self.peer_by_id(device.id)?
+            .ok_or_else(|| DbError::Corrupt("inserted peer is missing".into()))
     }
 
     pub fn update_peer(
@@ -918,7 +1064,7 @@ impl Repo<'_> {
         addresses: &[String],
         now_ms: i64,
     ) -> Result<PeerRecord, DbError> {
-        self.upsert_device(
+        self.upsert_device_name(
             &Device {
                 id,
                 name: name.to_owned(),
@@ -938,14 +1084,7 @@ impl Repo<'_> {
             "DELETE FROM dismissed_peers WHERE device_id = ?1",
             params![id_bytes.as_slice()],
         )?;
-        Ok(PeerRecord {
-            device: Device {
-                id,
-                name: name.to_owned(),
-            },
-            addresses: addresses.to_vec(),
-            added_at_ms: now_ms,
-        })
+        self.peer_by_id(id)?.ok_or(DbError::NotFound)
     }
 
     pub fn remove_peer_by_name(&self, name: &str) -> Result<bool, DbError> {
@@ -1004,7 +1143,7 @@ impl Repo<'_> {
 
     pub fn list_peers(&self) -> Result<Vec<PeerRecord>, DbError> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms
+            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms, d.last_seen_ms
              FROM peers p
              JOIN devices d ON d.ref = p.device_ref
              ORDER BY p.name",
@@ -1015,12 +1154,13 @@ impl Repo<'_> {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })?;
         let mut peers = Vec::new();
         for row in rows {
-            let (id, name, addresses, added_at_ms) = row?;
-            peers.push(parse_peer(id, name, addresses, added_at_ms)?);
+            let (id, name, addresses, added_at_ms, last_seen_ms) = row?;
+            peers.push(parse_peer(id, name, addresses, added_at_ms, last_seen_ms)?);
         }
         Ok(peers)
     }
@@ -2020,7 +2160,7 @@ impl Repo<'_> {
         params: impl rusqlite::Params,
     ) -> Result<Option<PeerRecord>, DbError> {
         let sql = format!(
-            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms
+            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms, d.last_seen_ms
              FROM peers p
              JOIN devices d ON d.ref = p.device_ref
              WHERE {where_clause}"
@@ -2032,11 +2172,128 @@ impl Repo<'_> {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })
             .optional()?
-            .map(|(id, name, addresses, added_at_ms)| parse_peer(id, name, addresses, added_at_ms))
+            .map(|(id, name, addresses, added_at_ms, last_seen_ms)| {
+                parse_peer(id, name, addresses, added_at_ms, last_seen_ms)
+            })
             .transpose()
+    }
+
+    pub fn create_materialization_rule(
+        &self,
+        id: MaterializationRuleId,
+        space: SpaceId,
+        name: &str,
+        mode: &str,
+        selectors: &[String],
+        now_ms: i64,
+    ) -> Result<(), DbError> {
+        if !matches!(mode, "full" | "metadata" | "demand" | "exclude") {
+            return Err(DbError::Corrupt(format!(
+                "unknown materialization mode {mode:?}"
+            )));
+        }
+        let id_bytes = materialization_rule_bytes(id);
+        let space_bytes = space_bytes(space);
+        let position: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM materialization_rules WHERE space_id = ?1",
+            params![space_bytes.as_slice()],
+            |row| row.get(0),
+        )?;
+        match self.conn.execute(
+            "INSERT INTO materialization_rules (id, space_id, name, mode, position, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id_bytes.as_slice(),
+                space_bytes.as_slice(),
+                name,
+                mode,
+                position,
+                now_ms
+            ],
+        ) {
+            Ok(_) => {}
+            Err(err) => return Err(map_write_err(err, Some(name))),
+        }
+        for (index, pattern) in selectors.iter().enumerate() {
+            let selector_pos = i64::try_from(index).map_err(|_| DbError::IntegerOverflow)?;
+            self.conn.execute(
+                "INSERT INTO materialization_selectors (rule_id, position, pattern)
+                 VALUES (?1, ?2, ?3)",
+                params![id_bytes.as_slice(), selector_pos, pattern.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_materialization_rule(&self, space: SpaceId, name: &str) -> Result<(), DbError> {
+        let space_bytes = space_bytes(space);
+        let changed = self.conn.execute(
+            "DELETE FROM materialization_rules WHERE space_id = ?1 AND name = ?2",
+            params![space_bytes.as_slice(), name],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Rules for `space`, ordered by `position` ascending (last match wins).
+    pub fn list_materialization_rules(
+        &self,
+        space: SpaceId,
+    ) -> Result<Vec<MaterializationRuleRecord>, DbError> {
+        let space_bytes = space_bytes(space);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, space_id, name, mode, position FROM materialization_rules
+             WHERE space_id = ?1
+             ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![space_bytes.as_slice()], |row| {
+            Ok((
+                row.get::<_, [u8; 16]>(0)?,
+                row.get::<_, [u8; 16]>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, space_id, name, mode, position) = row?;
+            if !matches!(mode.as_str(), "full" | "metadata" | "demand" | "exclude") {
+                return Err(DbError::Corrupt(format!(
+                    "unknown materialization mode {mode:?}"
+                )));
+            }
+            let selectors = self.materialization_selectors(id)?;
+            out.push(MaterializationRuleRecord {
+                id: materialization_rule_from_bytes(id),
+                space_id: space_from_bytes(space_id),
+                name,
+                mode,
+                position,
+                selectors,
+            });
+        }
+        Ok(out)
+    }
+
+    fn materialization_selectors(&self, id: [u8; 16]) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT pattern FROM materialization_selectors
+             WHERE rule_id = ?1
+             ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![id.as_slice()], |row| row.get::<_, String>(0))?;
+        let mut selectors = Vec::new();
+        for row in rows {
+            selectors.push(row?);
+        }
+        Ok(selectors)
     }
 
     fn write_entry(&self, record: &EntryRecord) -> Result<(), DbError> {
@@ -2064,8 +2321,8 @@ impl Repo<'_> {
                     kind = ?1, deleted = ?2, object_id = ?3, size = ?4, executable = ?5,
                     symlink_target = ?6, parent_object = ?7, sequence = ?8, modified_by = ?9,
                     modified_at_ms = ?10, stat_size = ?11, stat_mtime_ns = ?12, stat_file_id = ?13,
-                    stat_ctime_ns = ?14
-                 WHERE id = ?15",
+                    stat_ctime_ns = ?14, materialized = ?15
+                 WHERE id = ?16",
                 params![
                     encoded.kind,
                     encoded.deleted,
@@ -2081,6 +2338,7 @@ impl Repo<'_> {
                     stat.mtime_ns,
                     stat.file_id,
                     stat.ctime_ns,
+                    i64::from(record.materialized),
                     entry_id,
                 ],
             ) {
@@ -2095,8 +2353,8 @@ impl Repo<'_> {
                 "INSERT INTO entries (
                     mount_id, path, kind, deleted, object_id, size, executable, symlink_target,
                     parent_object, sequence, modified_by, modified_at_ms,
-                    stat_size, stat_mtime_ns, stat_file_id, stat_ctime_ns
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    stat_size, stat_mtime_ns, stat_file_id, stat_ctime_ns, materialized
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     mount.as_slice(),
                     record.key.path.as_str(),
@@ -2114,6 +2372,7 @@ impl Repo<'_> {
                     stat.mtime_ns,
                     stat.file_id,
                     stat.ctime_ns,
+                    i64::from(record.materialized),
                 ],
             ) {
                 Ok(_) => self.conn.last_insert_rowid(),
@@ -2188,6 +2447,7 @@ impl Repo<'_> {
                 raw.stat_file_id,
                 raw.stat_ctime_ns,
             )?,
+            materialized: raw.materialized != 0,
         })
     }
 
@@ -2247,6 +2507,7 @@ impl Repo<'_> {
             stat_file_id: row.get(15)?,
             stat_ctime_ns: row.get(16)?,
             space_id: row.get(17)?,
+            materialized: row.get(18)?,
         })
     }
 
@@ -2472,6 +2733,7 @@ fn parse_peer(
     name: String,
     addresses: String,
     added_at_ms: i64,
+    last_seen_ms: Option<i64>,
 ) -> Result<PeerRecord, DbError> {
     Ok(PeerRecord {
         device: Device {
@@ -2480,6 +2742,7 @@ fn parse_peer(
         },
         addresses: serde_json::from_str(&addresses)?,
         added_at_ms,
+        last_seen_ms,
     })
 }
 

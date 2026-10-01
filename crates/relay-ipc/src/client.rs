@@ -9,9 +9,9 @@ use interprocess::local_socket::{Stream, prelude::*};
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, AddMountParams, AddMountResult, Hello, PROTOCOL_VERSION, PairJoinParams,
-    PairJoinResult, PairStartParams, PairStartResult, PairStatus, Request, RescanParams,
-    RescanResult, Response, ShareParams, Status, decode_line, encode_line,
+    ActivityItem, AddMountParams, AddMountResult, FetchParams, Hello, PROTOCOL_VERSION,
+    PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus, Request,
+    RescanParams, RescanResult, Response, ShareParams, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -59,6 +59,19 @@ impl Client {
 
     pub fn resume(&mut self) -> Result<Status, IpcError> {
         self.call("resume", serde_json::json!({}))
+    }
+
+    pub fn fetch(&mut self, space: &str, mount: &str, path: &str) -> Result<(), IpcError> {
+        let params = FetchParams {
+            space: space.to_owned(),
+            mount: mount.to_owned(),
+            path: path.to_owned(),
+        };
+        let _: serde_json::Value = self.call(
+            "fetch",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )?;
+        Ok(())
     }
 
     pub fn rescan(

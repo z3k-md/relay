@@ -9,10 +9,11 @@ release", and phase writeups are not a status report. This file is.
 
 ## Next
 
-**Phase 13 — Selective materialization.**
+**Phase 14 — Integrations.**
 
-Full, metadata-only, on-demand, and excluded copies. Not required for the
-developer workflow. Do not start a hosted backend as part of this phase.
+Editor status, conflict notification, restore, and post-sync automation.
+These stay above the replication engine. Do not start a hosted backend as
+part of this phase.
 
 ## Done
 
@@ -31,6 +32,7 @@ developer workflow. Do not start a hosted backend as part of this phase.
 | 10 History and restore | `relay history` and `relay restore` | No GUI history browser |
 | 11 Text merge | Clean three-way merge when concurrent edits share a parent and do not overlap (D31) | Overlapping edits, binary files, Git metadata, and diverged vectors stay conflict copies |
 | 12 Generalized networking | Dial ranking. User-run UDP relay (`relay transport`, D34) tried after direct addresses fail. Mailbox file `transport/relay` publishes that address. Object fetch asks other connected peers, then the mailbox (D34) | No public TURN account. No connection migration once a path is up. Pairing still needs a direct UDP path (D25) |
+| 13 Selective materialization | Local `relay materialize` rules (`full`, `metadata`, `demand`, `exclude`); last match wins. `relay fetch` and `relay evict`. The scanner does not tombstone a path this device chose not to write. Mailbox push skips objects this device does not have (D35) | No GUI editor. No placeholder files or OS file-on-demand. Changing a rule does not delete files or send tombstones |
 
 Android (D33) is not a numbered phase. It is the same Vue UI and in-process
 engine, foreground only. Sync runs while the process is alive. Device data
@@ -39,25 +41,25 @@ bundled `relay` CLI. Mounts are the app sandbox; there is no folder picker.
 
 ## Later
 
-In order after Phase 13, unless a decision says otherwise:
+In order after Phase 14, unless a decision says otherwise:
 
-1. **Phase 14 — Integrations.** Editor status, conflict notification, restore,
-   and post-sync automation. These stay above the replication engine.
-2. **Hosted durable replica.** The rest of Phase 8. The client architecture
+1. **Hosted durable replica.** The rest of Phase 8. The client architecture
    stays backend-independent. The filesystem mailbox is the only backend
    today.
-3. **Android background sync** and a folder picker. iOS, Play Store signing,
+2. **Android background sync** and a folder picker. iOS, Play Store signing,
    and photo-library access are out of scope until a decision adds them (D33).
 
-Also still open, and not part of Phase 13:
+Also still open:
 
 - Nested `.relayignore` (only the mount-root file is read).
 - Encrypting mailbox entry logs.
 - GUI policy editor and GUI history.
+- Transfer throughput for photos and video. Proposal only:
+  [`proposals/transfer-throughput.md`](proposals/transfer-throughput.md).
 
 ## Accepted limits
 
-These are current behavior, not accidental gaps to close inside Phase 13:
+These are current behavior, not accidental gaps:
 
 - Peer-only mode (no mailbox and no `relay transport` address) is LAN,
   Tailscale, or a manual address. Hole punching needs a mailbox path (D32).

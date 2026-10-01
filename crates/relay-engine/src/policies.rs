@@ -350,7 +350,7 @@ impl Engine {
     }
 }
 
-fn policy_path(mount_name: &str, relative_path: &str) -> String {
+pub(crate) fn policy_path(mount_name: &str, relative_path: &str) -> String {
     if relative_path.is_empty() {
         mount_name.to_owned()
     } else {
