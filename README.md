@@ -2,6 +2,8 @@
 
 **Realtime file sync for all your machines.**
 
+Maintain copies of arbitrary folders and file trees on multiple machines in realtime. Clients available for Windows, Linux, MacOS, and Android. Securely connect machines to your mesh network for seemly end-to-end encrypted file transfer and realtime sync.
+
 Install Relay, pair your computers, and choose the folders that should stay the same. Each machine keeps ordinary local files. Changes show up on the others within about a second. There is no cloud account, and you can keep working when another computer is off.
 
 ## Install
