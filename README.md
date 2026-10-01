@@ -10,6 +10,7 @@ and have the files already be on the Windows desktop where the game runs, with
 no commit/push/pull step in between. `.git` is synced along with everything
 else, so the repository is the same on both machines.
 
+- Where implementation stands, and what is next: [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - Full specification: [`docs/DESIGN.md`](docs/DESIGN.md)
 - Decisions that amend the spec: [`docs/DECISIONS.md`](docs/DECISIONS.md)
 
@@ -31,11 +32,17 @@ tray, starts at login and updates itself from GitHub Releases.
 Mailbox objects are encrypted with a per-space key. Text files with a
 shared parent merge automatically when edits do not overlap. When a mailbox
 is configured, peers exchange STUN addresses through it and hole-punch.
-See [Roadmap](#roadmap). Optional replication policies can limit which subtrees
-sync to which devices (`relay policy` / `relay group`); omit them and a shared
-space syncs everything to every peer it is shared with. An optional durable
-mailbox directory lets a device catch up when the other is offline
-(shared-folder style; not a hosted service).
+If those paths fail, `relay transport` is a user-run UDP relay; the QUIC
+session still ends at the two devices. A missing object is fetched from
+another connected peer or the mailbox before the transfer is given up.
+Optional replication policies can limit which subtrees sync to which devices
+(`relay policy` / `relay group`); omit them and a shared space syncs
+everything to every peer it is shared with. An optional durable mailbox
+directory lets a device catch up when the other is offline (shared-folder
+style; not a hosted service).
+
+Phases 0–12 of the original plan are in the product. What is left is in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Install
 
@@ -296,6 +303,7 @@ noisy metadata copies; add `--branches` to delete the conflicting refs too.
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id (advanced / manual) |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
 | `relay replica set PATH` / `replica clear` / `replica status` | Configure a durable mailbox directory for offline catch-up |
+| `relay transport set HOST:PORT [--serve]` / `transport clear` / `transport status` | UDP relay for peers that cannot dial each other directly. `--serve` forwards on this machine. A mailbox publishes the address |
 | `relay replica gc [--mirror] [--grace-secs N]` | Garbage-collect acked mailbox entries and objects |
 | `relay group create NAME` / `group add NAME PEER` / `group remove NAME PEER` / `group delete NAME` / `group list` | Device groups for replication policies |
 | `relay policy add SPACE NAME --selector GLOB... [--peer NAME]... [--group NAME]...` | Limit which subtrees sync to which devices |
@@ -456,13 +464,21 @@ apps/
   relay-cli      the `relay` binary
 scripts/         install.sh, install.ps1, build-windows.sh, deploy.sh
 docs/
+  ROADMAP.md     what is built, what is next, what is later
   DESIGN.md      original specification
   DECISIONS.md   amendments adopted during implementation
 ```
 
 ## Roadmap
 
-Through the durable mailbox: encryption at rest, automatic text merge, and
-NAT hole punching. Nested `.relayignore` is still root-only. There is no
-hosted backend and no TURN relay; symmetric NATs still need a reachable
-address. Unclean text merges keep both versions as conflict copies.
+Phases 0–12 are shipped. Dial order prefers a local address over Tailscale
+and a public address. If those fail, peers can meet through a user-run UDP
+relay (`relay transport`); the QUIC handshake stays between the two devices.
+A mailbox publishes that relay address. Object bytes can come from another
+connected peer or the mailbox when the announcing peer does not have them.
+
+**Next is Phase 13 — Selective materialization** (full, metadata-only,
+on-demand, and excluded copies). Then Phase 14, editor and automation
+integrations. A hosted mailbox backend is not started. Nested `.relayignore`
+is still root-only. Symmetric NATs still need one reachable relay address.
+The full table is [`docs/ROADMAP.md`](docs/ROADMAP.md).

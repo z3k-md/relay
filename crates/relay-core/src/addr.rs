@@ -60,6 +60,83 @@ pub fn format_socket_addr(addr: SocketAddr) -> String {
     format_ip_port(addr.ip(), addr.port())
 }
 
+/// Dial order for one attempt. Does not change the stored list.
+///
+/// Best first: loopback, RFC1918 and non-Tailscale IPv6 unique-local,
+/// Tailscale, link-local, DNS names, then every other address. Order within
+/// a class stays as given. Empty strings are skipped.
+pub fn rank_addresses(addrs: &[String]) -> Vec<String> {
+    let mut indexed: Vec<(u8, usize, &String)> = addrs
+        .iter()
+        .enumerate()
+        .filter(|(_, addr)| !addr.is_empty())
+        .map(|(index, addr)| (address_class(addr), index, addr))
+        .collect();
+    indexed.sort_by_key(|(class, index, _)| (*class, *index));
+    indexed
+        .into_iter()
+        .map(|(_, _, addr)| addr.clone())
+        .collect()
+}
+
+fn address_class(addr: &str) -> u8 {
+    let host = host_of(addr);
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip_class(ip),
+        Err(_) => 4,
+    }
+}
+
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        rest.split_once("]:").map(|(host, _)| host).unwrap_or(addr)
+    } else if let Some((host, _)) = addr.rsplit_once(':') {
+        host
+    } else {
+        addr
+    }
+}
+
+fn ip_class(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(ip) => {
+            if ip.is_loopback() {
+                0
+            } else if is_rfc1918(ip) {
+                1
+            } else if is_tailscale_v4(ip) {
+                2
+            } else if ip.is_link_local() {
+                3
+            } else {
+                5
+            }
+        }
+        IpAddr::V6(ip) => {
+            if ip.is_loopback() {
+                0
+            } else if is_tailscale_v6(ip) {
+                2
+            } else if is_ipv6_unique_local(ip) {
+                1
+            } else if is_ipv6_link_local(ip) {
+                3
+            } else {
+                5
+            }
+        }
+    }
+}
+
+fn is_rfc1918(ip: Ipv4Addr) -> bool {
+    match ip.octets() {
+        [10, ..] => true,
+        [172, second, ..] if (16..32).contains(&second) => true,
+        [192, 168, ..] => true,
+        _ => false,
+    }
+}
+
 /// Put newly discovered (typically LAN) addresses first, keep existing ones
 /// (Tailscale, VPN), drop duplicates, cap at [`MAX_PEER_ADDRESSES`].
 pub fn merge_peer_addresses(existing: &[String], discovered: &[String]) -> Vec<String> {
@@ -178,5 +255,66 @@ mod tests {
     fn formats_v6_with_brackets() {
         let ip: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
         assert_eq!(format_ip_port(ip, 47321), "[fd7a:115c:a1e0::1]:47321");
+    }
+
+    #[test]
+    fn rank_orders_classes_and_keeps_relative_order() {
+        let addrs = vec![
+            "8.8.8.8:1".into(),
+            "192.168.1.10:2".into(),
+            "100.64.1.2:3".into(),
+            "example.com:4".into(),
+            "".into(),
+            "127.0.0.1:5".into(),
+            "169.254.1.1:6".into(),
+            "10.1.2.3:7".into(),
+            "[::1]:8".into(),
+            "[fd00::1]:9".into(),
+            "[fd7a:115c:a1e0::1]:10".into(),
+            "[fe80::1]:11".into(),
+            "172.16.0.1:12".into(),
+            "172.15.0.1:13".into(),
+            "100.63.0.1:14".into(),
+            "203.0.113.1:9".into(),
+            "vpn.example:15".into(),
+            "172.31.5.5:16".into(),
+            "172.32.0.1:17".into(),
+        ];
+        assert_eq!(
+            rank_addresses(&addrs),
+            vec![
+                "127.0.0.1:5",
+                "[::1]:8",
+                "192.168.1.10:2",
+                "10.1.2.3:7",
+                "[fd00::1]:9",
+                "172.16.0.1:12",
+                "172.31.5.5:16",
+                "100.64.1.2:3",
+                "[fd7a:115c:a1e0::1]:10",
+                "169.254.1.1:6",
+                "[fe80::1]:11",
+                "example.com:4",
+                "vpn.example:15",
+                "8.8.8.8:1",
+                "172.15.0.1:13",
+                "100.63.0.1:14",
+                "203.0.113.1:9",
+                "172.32.0.1:17",
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_is_stable_for_public_addresses() {
+        let addrs = vec![
+            "8.8.8.8:1".into(),
+            "1.1.1.1:1".into(),
+            "203.0.113.5:9".into(),
+        ];
+        assert_eq!(
+            rank_addresses(&addrs),
+            vec!["8.8.8.8:1", "1.1.1.1:1", "203.0.113.5:9"]
+        );
     }
 }

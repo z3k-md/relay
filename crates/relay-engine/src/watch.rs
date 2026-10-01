@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::Engine;
 use crate::error::EngineError;
 use crate::progress::TransferLive;
+use crate::replica::ReplicaPush;
 use crate::reports::{ScanOptions, ScanReport};
 use crate::sync::{AddMountApplied, SyncEvent, SyncInput, SyncOutput, Syncer};
 
@@ -300,7 +301,12 @@ impl Engine {
         // Retry a mailbox push even when the scan found nothing. A crash after
         // the append and before the watermark leaves the entries in the mailbox
         // and the local cursor behind; the next edit would be the only retry.
-        emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
+        emit_push(
+            self.push_replica_watch(),
+            &mut replica_warned,
+            on_event,
+            &mut output,
+        );
         emit_pull(self, &mut replica_warned, on_event, &mut output);
         last_replica_pull = Some(Instant::now());
 
@@ -354,17 +360,28 @@ impl Engine {
                         }
                     }
                     SyncInput::NatHint { addresses } => {
-                        if let Err(err) = self.set_nat_hint(&addresses).and_then(|_| {
-                            if self.exchange_nat()? {
-                                output(SyncOutput::SetPeers);
-                            }
-                            Ok(())
-                        }) {
+                        if let Err(err) = self.set_nat_hint(&addresses) {
                             on_event(&WatchEvent::SyncWarning {
                                 peer: String::new(),
                                 path: String::new(),
                                 reason: err.to_string(),
                             });
+                        } else {
+                            match self.exchange_nat_detail() {
+                                Ok(report) => {
+                                    if report.addresses_changed {
+                                        output(SyncOutput::SetPeers);
+                                    }
+                                    if let Some(addr) = report.relay_adopted {
+                                        output(SyncOutput::SetRelay(Some(addr)));
+                                    }
+                                }
+                                Err(err) => on_event(&WatchEvent::SyncWarning {
+                                    peer: String::new(),
+                                    path: String::new(),
+                                    reason: err.to_string(),
+                                }),
+                            }
                         }
                     }
                     SyncInput::AddMount {
@@ -393,7 +410,12 @@ impl Engine {
                     other => {
                         emit_sync(syncer.handle(self, other, &mut output), on_event);
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
-                        emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
+                        emit_push(
+                            self.push_replica_watch(),
+                            &mut replica_warned,
+                            on_event,
+                            &mut output,
+                        );
                     }
                 },
                 Err(RecvTimeoutError::Timeout) => {}
@@ -440,7 +462,12 @@ impl Engine {
                     ScanStep::Finished { committed } => {
                         if committed {
                             emit_sync(syncer.push_local_changes(self, &mut output), on_event);
-                            emit_replica(self.push_replica_watch(), &mut replica_warned, on_event);
+                            emit_push(
+                                self.push_replica_watch(),
+                                &mut replica_warned,
+                                on_event,
+                                &mut output,
+                            );
                         }
                     }
                 }
@@ -538,8 +565,13 @@ impl Engine {
         poll_priority: &mut dyn FnMut() -> bool,
     ) -> ScanStep {
         let n = paths.len();
-        let result =
-            self.scan_reporting(&state.space, &state.mount, Some(paths), on_event, poll_priority);
+        let result = self.scan_reporting(
+            &state.space,
+            &state.mount,
+            Some(paths),
+            on_event,
+            poll_priority,
+        );
         finish_or_yield(state, false, n, result, on_event)
     }
 }
@@ -731,28 +763,32 @@ fn emit_pull(
             if pull.addresses_changed {
                 output(SyncOutput::SetPeers);
             }
-        }
-        Err(err) => {
-            if !*warned {
-                *warned = true;
-                on_event(&WatchEvent::SyncWarning {
-                    peer: String::new(),
-                    path: String::new(),
-                    reason: format!("replica: {err}"),
-                });
+            if let Some(addr) = pull.relay_adopted {
+                output(SyncOutput::SetRelay(Some(addr)));
             }
         }
+        Err(err) => warn_replica(err, warned, on_event),
     }
 }
 
-fn emit_replica<T>(
-    result: Result<T, EngineError>,
+fn emit_push(
+    result: Result<ReplicaPush, EngineError>,
     warned: &mut bool,
     on_event: &mut dyn FnMut(&WatchEvent),
+    output: &mut dyn FnMut(SyncOutput),
 ) {
-    if let Err(err) = result
-        && !*warned
-    {
+    match result {
+        Ok(push) => {
+            if let Some(addr) = push.relay_adopted {
+                output(SyncOutput::SetRelay(Some(addr)));
+            }
+        }
+        Err(err) => warn_replica(err, warned, on_event),
+    }
+}
+
+fn warn_replica(err: EngineError, warned: &mut bool, on_event: &mut dyn FnMut(&WatchEvent)) {
+    if !*warned {
         *warned = true;
         on_event(&WatchEvent::SyncWarning {
             peer: String::new(),

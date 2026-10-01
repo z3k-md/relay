@@ -13,18 +13,20 @@ mod discovery;
 mod error;
 mod io;
 mod pairing;
+mod relay;
 mod session;
 mod stun;
 mod tls;
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
+use quinn::AsyncUdpSocket;
 use relay_core::{DeviceId, ObjectId};
 use relay_crypto::DeviceIdentity;
 use relay_proto::encode_frame;
@@ -34,6 +36,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 pub use addr::advertised_addresses;
 pub use error::NetError;
+pub use relay::{RelayServer, serve_relay};
 use session::{
     CLOSE_SHUTDOWN, Inner, apply_set_peers, close_code, drive_connection, spawn_dialers,
     spawn_fetch,
@@ -66,6 +69,10 @@ pub struct NetConfig {
     /// When set, query a public STUN server on the listen socket before Quinn
     /// takes it, and remember the reflexive address for NAT hole punching.
     pub enable_stun: bool,
+    /// `host:port` peers dial after every direct address fails. `None` disables relay dial.
+    pub relay: Option<String>,
+    /// Bind `0.0.0.0:<port>` and serve. The port comes from [`Self::relay`].
+    pub serve_relay: bool,
 }
 
 /// Notifications delivered on the network thread via the callback passed to [`start`].
@@ -148,6 +155,8 @@ pub enum NetCommand {
         addr: Option<String>,
     },
     PairCancel,
+    /// Replace the relay address used for dialing. Does not restart the endpoint.
+    SetRelay(Option<String>),
     Shutdown,
 }
 
@@ -173,6 +182,7 @@ pub struct NetHandle {
     local_addr: SocketAddr,
     /// Public address learned from STUN, if `enable_stun` succeeded.
     reflexive: Option<SocketAddr>,
+    relay: Option<RelayServer>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -212,6 +222,7 @@ impl NetHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.relay.take();
     }
 }
 
@@ -245,6 +256,7 @@ pub fn start(
     };
     let _ = socket.set_nonblocking(true);
 
+    let relay_server = relay_server_for(config.serve_relay, config.relay.as_deref())?;
     let store = ObjectStore::open(&config.store_root)?;
     let tls = TlsMaterials::from_identity(&config.identity)?;
     let trusted = Arc::new(RwLock::new(
@@ -265,6 +277,8 @@ pub fn start(
         tls,
         identity: config.identity,
         listen_port: local_addr.port(),
+        relay_target: Mutex::new(config.relay),
+        relay_sock: OnceLock::new(),
         pairing: Mutex::new(None),
         pairing_ads: Mutex::new(HashMap::new()),
         discovery: Mutex::new(None),
@@ -291,11 +305,34 @@ pub fn start(
                 };
                 rt.block_on(async move {
                     // Endpoint construction needs a Tokio reactor (Quinn's TokioRuntime).
-                    let endpoint = match quinn::Endpoint::new(
-                        quinn::EndpointConfig::default(),
+                    let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+                    let wrapped = match runtime.wrap_udp_socket(socket) {
+                        Ok(sock) => sock,
+                        Err(err) => {
+                            let _ = ready_tx.send(Err(NetError::from(err)));
+                            return;
+                        }
+                    };
+                    let relay_sock = Arc::new(relay::RelaySocket::new(
+                        wrapped,
+                        inner.our_id,
+                        Arc::clone(&inner.trusted),
+                    ));
+                    if inner.relay_sock.set(Arc::clone(&relay_sock)).is_err() {
+                        let _ = ready_tx.send(Err(NetError::Runtime(
+                            "relay socket already installed".into(),
+                        )));
+                        return;
+                    }
+                    let mut endpoint_config = quinn::EndpointConfig::default();
+                    endpoint_config
+                        .max_udp_payload_size(relay::ENDPOINT_MAX_UDP_PAYLOAD)
+                        .expect("1400 is within Quinn's UDP payload bounds");
+                    let endpoint = match quinn::Endpoint::new_with_abstract_socket(
+                        endpoint_config,
                         Some(server),
-                        socket,
-                        Arc::new(quinn::TokioRuntime),
+                        relay_sock,
+                        runtime,
                     ) {
                         Ok(ep) => {
                             let _ = ready_tx.send(Ok(()));
@@ -320,8 +357,46 @@ pub fn start(
         cmd_tx,
         local_addr,
         reflexive,
+        relay: relay_server,
         thread: Some(thread),
     })
+}
+
+async fn prime_relay(inner: &Inner) {
+    let target = inner
+        .relay_target
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    let Some(target) = target else {
+        return;
+    };
+    let prefer_ipv4 = inner
+        .relay_sock
+        .get()
+        .and_then(|sock| sock.local_addr().ok().map(|bound| bound.is_ipv4()));
+    let resolved = relay::resolve_relay(&target, prefer_ipv4).await;
+    if let Some(sock) = inner.relay_sock.get() {
+        sock.set_relay(resolved);
+    }
+}
+
+fn relay_server_for(serve: bool, relay: Option<&str>) -> Result<Option<RelayServer>, NetError> {
+    if !serve {
+        return Ok(None);
+    }
+    let Some(target) = relay else {
+        tracing::error!("serve_relay is set but no relay address is configured");
+        return Ok(None);
+    };
+    let Some(port) = relay::relay_port(target) else {
+        tracing::error!(addr = %target, "serve_relay is set but the relay address has no port");
+        return Ok(None);
+    };
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let server = serve_relay(addr)?;
+    tracing::info!(%addr, "serving udp relay");
+    Ok(Some(server))
 }
 
 async fn run(
@@ -329,6 +404,7 @@ async fn run(
     endpoint: quinn::Endpoint,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NetCommand>,
 ) {
+    prime_relay(&inner).await;
     let mut dialers = HashMap::new();
     spawn_dialers(&inner, &endpoint, &mut dialers);
     if let Some(discovery) = discovery::start(&inner, inner.listen_port) {
@@ -355,6 +431,22 @@ async fn run(
                         tokio::spawn(pairing::join(inner.clone(), endpoint.clone(), code, addr));
                     }
                     Some(NetCommand::PairCancel) => pairing::cancel_session(&inner),
+                    Some(NetCommand::SetRelay(addr)) => {
+                        *inner
+                            .relay_target
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner()) = addr.clone();
+                        let prefer_ipv4 = inner.relay_sock.get().and_then(|sock| {
+                            sock.local_addr().ok().map(|bound| bound.is_ipv4())
+                        });
+                        let resolved = match addr.as_deref() {
+                            Some(target) => relay::resolve_relay(target, prefer_ipv4).await,
+                            None => None,
+                        };
+                        if let Some(sock) = inner.relay_sock.get() {
+                            sock.set_relay(resolved);
+                        }
+                    }
                 }
             }
             incoming = endpoint.accept() => {

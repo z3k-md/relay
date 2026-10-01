@@ -19,7 +19,7 @@ pub mod version;
 
 pub use addr::{
     MAX_PEER_ADDRESSES, collect_peer_addresses, format_ip_port, format_socket_addr,
-    is_advertisable_ip, is_tailscale_v4, is_tailscale_v6, merge_peer_addresses,
+    is_advertisable_ip, is_tailscale_v4, is_tailscale_v6, merge_peer_addresses, rank_addresses,
 };
 pub use entry::{EntryContent, EntryKey, EntryKind, EntryRecord, StatHint};
 pub use error::CoreError;

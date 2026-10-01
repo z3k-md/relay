@@ -1,11 +1,13 @@
 # Relay
 ## Local-First Multi-Device File Replication System
 
-**Status:** Initial design specification  
+**Status:** Original design specification. Live progress is [`ROADMAP.md`](ROADMAP.md).  
 **Initial platforms:** Windows and macOS  
 **Primary initial use case:** Developer workspaces and source trees  
 **Generalized scope:** Arbitrary user-selected files and directories across trusted devices  
 **Core principle:** Every participating machine works from ordinary local files. Relay continuously reconciles those local replicas and optionally uses an encrypted persistent relay to bridge periods when devices are not simultaneously online.
+
+Implementation has passed the original MVP (about Phase 4). Where this file and [`DECISIONS.md`](DECISIONS.md) disagree, DECISIONS.md wins. Do not infer what is built from "eventually", "initial release", or the phase list in §51. Current progress and the next phase are in [`ROADMAP.md`](ROADMAP.md).
 
 ---
 
@@ -95,7 +97,7 @@ Initial versions will **not** attempt to provide:
 - Full distributed filesystem mounting.
 - Remote filesystem access similar to SMB/NFS.
 - Arbitrary WAN NAT traversal without supporting infrastructure.
-- Mobile clients.
+- Mobile clients. An Android foreground shell has since shipped (see [`ROADMAP.md`](ROADMAP.md)); iOS has not.
 - Files-on-demand.
 - General CRDT editing.
 - Very large media-file optimization.
@@ -2064,6 +2066,10 @@ Cross-platform tests should use the same logical synchronization scenarios.
 
 The implementation should be deliberately staged so each phase proves one fundamental property.
 
+This section is the original plan, kept as the definition of each phase.
+Phases 0–12 are implemented. Phase 13 is next. What shipped inside each
+phase, and what was deferred, is [`ROADMAP.md`](ROADMAP.md).
+
 ---
 
 # Phase 0 — Repository and Domain Model
@@ -2547,6 +2553,9 @@ Keep these above the core replication engine.
 ---
 
 # 52. MVP Scope Recommendation
+
+This was the original stop line for a first useful version. That bar has been
+met; do not treat Phase 4 as the current roadmap. See [`ROADMAP.md`](ROADMAP.md).
 
 The first genuinely useful version should stop at roughly Phase 4.
 

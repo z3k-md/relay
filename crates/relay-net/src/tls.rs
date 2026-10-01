@@ -28,6 +28,11 @@ pub(crate) fn transport_config() -> Arc<quinn::TransportConfig> {
         quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is a valid idle timeout"),
     ));
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    // The endpoint receive buffer is 1400 bytes. A relay DATA header is 21
+    // bytes, so path MTU stays inside what that buffer can hold after wrapping.
+    let mut discovery = quinn::MtuDiscoveryConfig::default();
+    discovery.upper_bound(crate::relay::RELAY_PATH_MTU);
+    transport.mtu_discovery_config(Some(discovery));
     Arc::new(transport)
 }
 

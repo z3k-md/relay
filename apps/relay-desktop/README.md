@@ -35,7 +35,7 @@ If `relay service` is already running, the app does not start a second sync loop
 
 ## Android
 
-The Android app is the same Vue UI and in-process engine. It does not ship the tray, autostart, updater, or the `relay` CLI. Sync runs while the app process is alive. Device data is stored in the app data directory.
+The Android app is the same Vue UI and in-process engine. It does not ship the tray, autostart, updater, or the `relay` CLI. Sync runs while the app process is alive. Device data is stored in the app data directory. Background execution, a folder picker, iOS, and Play Store signing are later work (decision D33). See [`../../docs/ROADMAP.md`](../../docs/ROADMAP.md).
 
 One-time setup: Android SDK, NDK 29 (`ndk;29.0.13846066`, the version Tauri CLI 2.12 asks for), and JDK 17+. From this directory, with `ANDROID_HOME` and `NDK_HOME` set:
 

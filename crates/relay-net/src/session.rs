@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::discovery::{Discovery, PairingAd};
 use crate::pairing::PairSession;
 
-use quinn::{Connection, RecvStream, SendStream, VarInt};
-use relay_core::{DeviceId, ObjectId};
+use quinn::{AsyncUdpSocket, Connection, RecvStream, SendStream, VarInt};
+use relay_core::{DeviceId, ObjectId, rank_addresses};
 use relay_crypto::{DeviceIdentity, device_id_from_certificate};
 use relay_proto::frame::Body;
 use relay_proto::{
@@ -21,6 +21,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, Semaphore};
 
 use crate::io::{IoErr, read_message};
+use crate::relay::{RelaySocket, resolve_relay, virtual_peer_addr};
 use crate::tls::{SERVER_NAME, TlsMaterials, make_client_config};
 use crate::{NetEvent, PeerConfig};
 
@@ -36,6 +37,7 @@ const CHUNK: usize = 64 * 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DIAL_ATTEMPT: Duration = Duration::from_secs(2);
+const RELAY_DIAL: Duration = Duration::from_secs(5);
 
 pub(crate) fn close_code(code: u32) -> VarInt {
     VarInt::from_u32(code)
@@ -52,10 +54,12 @@ pub(crate) struct Inner {
     pub shutdown: Notify,
     pub shutting_down: AtomicBool,
     pub tls: TlsMaterials,
-    /// Held so the identity outlives the runtime thread.
-    #[allow(dead_code)]
+    /// Signs relay BIND frames. Also keeps the key alive for the runtime thread.
     pub identity: Arc<DeviceIdentity>,
     pub listen_port: u16,
+    /// `host:port` to dial after every direct address fails. `None` disables it.
+    pub relay_target: Mutex<Option<String>>,
+    pub relay_sock: OnceLock<Arc<RelaySocket>>,
     pub pairing: Mutex<Option<PairSession>>,
     pub pairing_ads: Mutex<HashMap<String, PairingAd>>,
     pub discovery: Mutex<Option<Discovery>>,
@@ -918,7 +922,8 @@ async fn try_dial(
         }
     };
 
-    for addr_str in addresses {
+    let ranked = rank_addresses(addresses);
+    for addr_str in &ranked {
         if inner.is_shutting_down() || inner.has_session(peer_id) {
             return None;
         }
@@ -950,7 +955,53 @@ async fn try_dial(
             }
         }
     }
-    None
+    try_relay_dial(inner, endpoint, peer_id, &client).await
+}
+
+async fn try_relay_dial(
+    inner: &Inner,
+    endpoint: &quinn::Endpoint,
+    peer_id: DeviceId,
+    client: &quinn::ClientConfig,
+) -> Option<Connection> {
+    if inner.is_shutting_down() || inner.has_session(peer_id) {
+        return None;
+    }
+    let target = inner
+        .relay_target
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()?;
+    let sock = inner.relay_sock.get()?;
+    let prefer_ipv4 = sock.local_addr().ok().map(|addr| addr.is_ipv4());
+    let relay_addr = resolve_relay(&target, prefer_ipv4).await?;
+    sock.set_relay(Some(relay_addr));
+    if let Err(err) = sock.send_bind(peer_id, &inner.identity).await {
+        tracing::debug!(peer = %peer_id, error = %err, "relay bind failed");
+        return None;
+    }
+    if inner.is_shutting_down() || inner.has_session(peer_id) {
+        return None;
+    }
+    let virtual_addr = virtual_peer_addr(peer_id);
+    tracing::debug!(peer = %peer_id, relay = %relay_addr, "dialing via relay");
+    match endpoint.connect_with(client.clone(), virtual_addr, SERVER_NAME) {
+        Ok(connecting) => match tokio::time::timeout(RELAY_DIAL, connecting).await {
+            Ok(Ok(conn)) => Some(conn),
+            Ok(Err(err)) => {
+                tracing::debug!(peer = %peer_id, error = %err, "relay dial failed");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(peer = %peer_id, "relay dial timed out");
+                None
+            }
+        },
+        Err(err) => {
+            tracing::debug!(peer = %peer_id, error = %err, "relay connect_with failed");
+            None
+        }
+    }
 }
 
 pub(crate) fn spawn_dialers(

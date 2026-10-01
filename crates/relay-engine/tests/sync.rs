@@ -13,6 +13,7 @@ use relay_engine::{
 };
 use relay_fs::MountMarker;
 use relay_proto::{IndexBatch, entry_to_wire, frame, mount_id_bytes, space_id_bytes};
+use relay_replica::{DurableReplica, FsReplica};
 use tempfile::TempDir;
 
 fn init(home: &Path, name: &str, racy_window: std::time::Duration) -> Engine {
@@ -277,7 +278,7 @@ impl Harness {
                         },
                     ));
                 }
-                SyncOutput::SetPeers => {}
+                SyncOutput::SetPeers | SyncOutput::SetRelay(_) => {}
                 SyncOutput::FetchObject { object, .. } => {
                     // The engine that emitted FetchObject is the requester.
                     let (src, dst, from_peer) = if from_a {
@@ -693,6 +694,301 @@ fn failed_fetches_are_re_requested_instead_of_dropped() {
 }
 
 #[test]
+fn fetch_failure_asks_other_peer_then_mailbox() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.disconnect();
+
+    let bytes = b"from-mailbox";
+    let object = ObjectId::of(bytes);
+    write_tree(h.mount_a.path(), &[("note.txt", bytes)]);
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+
+    let id_c = DeviceId::random();
+    h.b.add_peer("charlie", id_c, &["127.0.0.1:9".into()])
+        .unwrap();
+    h.b.share("Personal", "charlie").unwrap();
+
+    let mailbox = TempDir::new().unwrap();
+    h.b.set_replica_path(mailbox.path()).unwrap();
+    let path = h.b.replica_path().unwrap().unwrap();
+    let mut replica = FsReplica::open(&path).unwrap();
+    replica.put_object(object, bytes).unwrap();
+
+    let id_a = h.id_a();
+    let id_b = h.id_b();
+    let mut from_b = Vec::new();
+    let events =
+        h.sb.handle(
+            &mut h.b,
+            SyncInput::PeerConnected {
+                peer: id_a,
+                name: "alpha".into(),
+            },
+            &mut |output| from_b.push(output),
+        )
+        .unwrap();
+    assert_no_warnings(&events, true);
+    let events =
+        h.sb.handle(
+            &mut h.b,
+            SyncInput::PeerConnected {
+                peer: id_c,
+                name: "charlie".into(),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_no_warnings(&events, true);
+    let events =
+        h.sa.handle(
+            &mut h.a,
+            SyncInput::PeerConnected {
+                peer: id_b,
+                name: "bravo".into(),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_no_warnings(&events, true);
+
+    let mut from_a = Vec::new();
+    for output in from_b {
+        let SyncOutput::Send { body, peer } = output else {
+            continue;
+        };
+        if peer != id_a {
+            continue;
+        }
+        let frame::Body::IndexRequest(_) = &body else {
+            continue;
+        };
+        let events =
+            h.sa.handle(
+                &mut h.a,
+                SyncInput::Frame { peer: id_b, body },
+                &mut |output| from_a.push(output),
+            )
+            .unwrap();
+        assert_no_warnings(&events, true);
+    }
+
+    let mut fetches = Vec::new();
+    for output in from_a {
+        let SyncOutput::Send { body, peer } = output else {
+            continue;
+        };
+        if peer != id_b {
+            continue;
+        }
+        let events =
+            h.sb.handle(
+                &mut h.b,
+                SyncInput::Frame { peer: id_a, body },
+                &mut |output| fetches.push(output),
+            )
+            .unwrap();
+        assert_no_warnings(&events, true);
+    }
+
+    let initial: Vec<DeviceId> = fetches
+        .iter()
+        .filter_map(|output| match output {
+            SyncOutput::FetchObject { peer, object: id } if *id == object => Some(*peer),
+            SyncOutput::FetchObject { .. } => panic!("unexpected fetch: {output:?}"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        initial,
+        vec![id_a],
+        "first fetch stays with the index source"
+    );
+
+    let mut next = Vec::new();
+    let events =
+        h.sb.handle(
+            &mut h.b,
+            SyncInput::ObjectFetchFailed {
+                peer: id_a,
+                object,
+                not_found: true,
+                reason: "not found".into(),
+            },
+            &mut |output| next.push(output),
+        )
+        .unwrap();
+    assert_no_warnings(&events, true);
+    let asked: Vec<DeviceId> = next
+        .iter()
+        .filter_map(|output| match output {
+            SyncOutput::FetchObject { peer, object: id } if *id == object => Some(*peer),
+            SyncOutput::FetchObject { .. } => panic!("unexpected fetch: {output:?}"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked, vec![id_c]);
+    assert!(!h.b.store().contains(&object));
+    assert!(!h.mount_b.path().join("note.txt").exists());
+
+    let mut done = Vec::new();
+    let events =
+        h.sb.handle(
+            &mut h.b,
+            SyncInput::ObjectFetchFailed {
+                peer: id_c,
+                object,
+                not_found: true,
+                reason: "not found".into(),
+            },
+            &mut |output| done.push(output),
+        )
+        .unwrap();
+    assert_no_warnings(&events, true);
+    assert!(
+        done.iter()
+            .all(|output| !matches!(output, SyncOutput::FetchObject { .. })),
+        "mailbox should satisfy the object without another fetch: {done:?}"
+    );
+    assert!(h.b.store().contains(&object));
+    assert_eq!(h.b.store().read(&object).unwrap(), bytes);
+    assert_eq!(fs::read(h.mount_b.path().join("note.txt")).unwrap(), bytes);
+    assert!(
+        h.b.entries("Personal", "code", true)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.key.path.as_str() == "note.txt")
+    );
+}
+
+#[test]
+fn alternate_not_found_still_retries_a_transient_source() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.disconnect();
+
+    let bytes = b"still-on-source";
+    let object = ObjectId::of(bytes);
+    write_tree(h.mount_a.path(), &[("note.txt", bytes)]);
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+
+    let id_c = DeviceId::random();
+    h.b.add_peer("charlie", id_c, &["127.0.0.1:9".into()])
+        .unwrap();
+    h.b.share("Personal", "charlie").unwrap();
+
+    let id_a = h.id_a();
+    let id_b = h.id_b();
+    let mut from_b = Vec::new();
+    h.sb.handle(
+        &mut h.b,
+        SyncInput::PeerConnected {
+            peer: id_a,
+            name: "alpha".into(),
+        },
+        &mut |output| from_b.push(output),
+    )
+    .unwrap();
+    h.sb.handle(
+        &mut h.b,
+        SyncInput::PeerConnected {
+            peer: id_c,
+            name: "charlie".into(),
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    h.sa.handle(
+        &mut h.a,
+        SyncInput::PeerConnected {
+            peer: id_b,
+            name: "bravo".into(),
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let mut from_a = Vec::new();
+    for output in from_b {
+        let SyncOutput::Send { body, peer } = output else {
+            continue;
+        };
+        if peer != id_a {
+            continue;
+        }
+        let frame::Body::IndexRequest(_) = &body else {
+            continue;
+        };
+        h.sa.handle(
+            &mut h.a,
+            SyncInput::Frame { peer: id_b, body },
+            &mut |output| from_a.push(output),
+        )
+        .unwrap();
+    }
+
+    let mut fetches = Vec::new();
+    for output in from_a {
+        let SyncOutput::Send { body, peer } = output else {
+            continue;
+        };
+        if peer != id_b {
+            continue;
+        }
+        h.sb.handle(
+            &mut h.b,
+            SyncInput::Frame { peer: id_a, body },
+            &mut |output| fetches.push(output),
+        )
+        .unwrap();
+    }
+    assert!(fetches.iter().any(|output| matches!(
+        output,
+        SyncOutput::FetchObject { peer, object: id } if *peer == id_a && *id == object
+    )));
+
+    let mut next = Vec::new();
+    h.sb.handle(
+        &mut h.b,
+        SyncInput::ObjectFetchFailed {
+            peer: id_a,
+            object,
+            not_found: false,
+            reason: "reset".into(),
+        },
+        &mut |output| next.push(output),
+    )
+    .unwrap();
+    assert!(next.iter().any(|output| matches!(
+        output,
+        SyncOutput::FetchObject { peer, object: id } if *peer == id_c && *id == object
+    )));
+
+    let mut retry = Vec::new();
+    h.sb.handle(
+        &mut h.b,
+        SyncInput::ObjectFetchFailed {
+            peer: id_c,
+            object,
+            not_found: true,
+            reason: "not found".into(),
+        },
+        &mut |output| retry.push(output),
+    )
+    .unwrap();
+    assert!(
+        retry.iter().any(|output| matches!(
+            output,
+            SyncOutput::FetchObject { peer, object: id } if *peer == id_a && *id == object
+        )),
+        "a missing alternate must not cancel retries of a transient source: {retry:?}"
+    );
+    assert!(!h.mount_b.path().join("note.txt").exists());
+}
+
+#[test]
 fn delete_vs_modify_modify_wins() {
     let mut h = Harness::pair();
     h.setup_shared_space(&[("x.txt", b"old"), ("keep.txt", b"k")]);
@@ -822,7 +1118,7 @@ fn reconnect_after_drop_and_restart_sends_only_new_changes() {
                 SyncOutput::FetchObject { object, .. } => {
                     Some((false, copy_object(&h.a, &h.b, h.id_a(), object)))
                 }
-                SyncOutput::SetPeers => None,
+                SyncOutput::SetPeers | SyncOutput::SetRelay(_) => None,
             })
             .collect(),
         None,
@@ -1657,7 +1953,7 @@ impl Hub {
                         },
                     ));
                 }
-                SyncOutput::SetPeers => {}
+                SyncOutput::SetPeers | SyncOutput::SetRelay(_) => {}
                 SyncOutput::FetchObject { peer, object } => {
                     let src = self.index_of(peer);
                     let input = copy_object(&self.engines[src], &self.engines[from], peer, object);

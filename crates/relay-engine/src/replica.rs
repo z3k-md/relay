@@ -17,6 +17,8 @@ use crate::error::EngineError;
 
 const REPLICA_PATH_KEY: &str = "replica_path";
 const NAT_HINT: &str = "nat_hint";
+const TRANSPORT_RELAY: &str = "transport_relay";
+const TRANSPORT_SERVE: &str = "transport_serve";
 const PUSH_BATCH: usize = 256;
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -24,6 +26,8 @@ pub struct ReplicaPush {
     pub spaces: usize,
     pub entries: usize,
     pub objects: usize,
+    /// Relay address adopted from the mailbox on this push.
+    pub relay_adopted: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -37,6 +41,22 @@ pub struct ReplicaPull {
     pub skipped: usize,
     /// Peer address lists changed because of mailbox NAT candidates.
     pub addresses_changed: bool,
+    /// Relay address adopted from the mailbox on this pull.
+    pub relay_adopted: Option<String>,
+}
+
+/// Relay address this device dials, and whether it also serves that port.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TransportStatus {
+    pub relay: Option<String>,
+    pub serve: bool,
+    pub mailbox: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NatExchange {
+    pub addresses_changed: bool,
+    pub relay_adopted: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -133,7 +153,7 @@ impl Engine {
         };
         let mut replica = open_replica(&path)?;
         self.prepare_mailbox(&replica)?;
-        let _ = self.exchange_nat_on(&replica)?;
+        let exchanged = self.exchange_nat_on(&replica)?;
         let local = self.device().id;
         let spaces = self.db.repo().list_spaces()?;
         let mut report = ReplicaPush::default();
@@ -182,6 +202,7 @@ impl Engine {
                 report.spaces += 1;
             }
         }
+        report.relay_adopted = exchanged.relay_adopted;
         Ok(report)
     }
 
@@ -192,11 +213,12 @@ impl Engine {
         };
         let mut replica = open_replica(&path)?;
         self.prepare_mailbox(&replica)?;
-        let addresses_changed = self.exchange_nat_on(&replica)?;
+        let exchanged = self.exchange_nat_on(&replica)?;
         let local = self.device().id;
         let spaces = self.db.repo().list_spaces()?;
         let mut report = ReplicaPull {
-            addresses_changed,
+            addresses_changed: exchanged.addresses_changed,
+            relay_adopted: exchanged.relay_adopted,
             ..ReplicaPull::default()
         };
         let mut peers_touched = HashSet::new();
@@ -339,15 +361,77 @@ impl Engine {
     /// Publish this device's NAT candidates and merge peers' candidates into
     /// their stored addresses. Returns whether any peer address list changed.
     pub fn exchange_nat(&mut self) -> Result<bool, EngineError> {
+        Ok(self.exchange_nat_detail()?.addresses_changed)
+    }
+
+    pub(crate) fn exchange_nat_detail(&mut self) -> Result<NatExchange, EngineError> {
         self.ensure_writable()?;
         let Some(path) = self.replica_path()? else {
-            return Ok(false);
+            return Ok(NatExchange::default());
         };
         let replica = open_replica(&path)?;
         self.exchange_nat_on(&replica)
     }
 
-    pub(crate) fn exchange_nat_on(&mut self, replica: &FsReplica) -> Result<bool, EngineError> {
+    pub fn transport_relay(&self) -> Result<Option<String>, EngineError> {
+        Ok(self
+            .db
+            .repo()
+            .local_setting(TRANSPORT_RELAY)?
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()))
+    }
+
+    pub fn transport_serve(&self) -> Result<bool, EngineError> {
+        Ok(self.db.repo().local_setting(TRANSPORT_SERVE)?.as_deref() == Some("1"))
+    }
+
+    pub fn set_transport_relay(&mut self, addr: &str, serve: bool) -> Result<(), EngineError> {
+        self.ensure_writable()?;
+        let addr = addr.trim();
+        if !valid_transport_relay(addr) {
+            return Err(EngineError::BadRelayAddress);
+        }
+        self.db
+            .transaction(|repo| {
+                repo.set_local_setting(TRANSPORT_RELAY, addr)?;
+                if serve {
+                    repo.set_local_setting(TRANSPORT_SERVE, "1")
+                } else {
+                    repo.clear_local_setting(TRANSPORT_SERVE)
+                }
+            })
+            .map_err(EngineError::from_db)
+    }
+
+    pub fn clear_transport(&mut self) -> Result<(), EngineError> {
+        self.ensure_writable()?;
+        self.db
+            .transaction(|repo| {
+                repo.clear_local_setting(TRANSPORT_RELAY)?;
+                repo.clear_local_setting(TRANSPORT_SERVE)
+            })
+            .map_err(EngineError::from_db)
+    }
+
+    pub fn transport_status(&self) -> Result<TransportStatus, EngineError> {
+        let relay = self.transport_relay()?;
+        let serve = self.transport_serve()?;
+        let mailbox = match self.replica_path()? {
+            Some(root) if root.is_dir() => FsReplica::read_transport_relay(&root)?,
+            _ => None,
+        };
+        Ok(TransportStatus {
+            relay,
+            serve,
+            mailbox,
+        })
+    }
+
+    pub(crate) fn exchange_nat_on(
+        &mut self,
+        replica: &FsReplica,
+    ) -> Result<NatExchange, EngineError> {
         if let Some(hint) = self.db.repo().local_setting(NAT_HINT)? {
             let addrs: Vec<String> = hint
                 .lines()
@@ -376,8 +460,43 @@ impl Engine {
         for (device, addrs) in &updates {
             self.set_peer_addresses(*device, addrs)?;
         }
-        Ok(!updates.is_empty())
+        let relay_adopted = self.exchange_transport_relay(replica)?;
+        Ok(NatExchange {
+            addresses_changed: !updates.is_empty(),
+            relay_adopted,
+        })
     }
+
+    fn exchange_transport_relay(
+        &mut self,
+        replica: &FsReplica,
+    ) -> Result<Option<String>, EngineError> {
+        let local = self.transport_relay()?;
+        if let Some(addr) = local {
+            replica.put_transport_relay(&addr)?;
+            return Ok(None);
+        }
+        let Some(remote) = replica.transport_relay()? else {
+            return Ok(None);
+        };
+        self.db
+            .transaction(|repo| repo.set_local_setting(TRANSPORT_RELAY, &remote))
+            .map_err(EngineError::from_db)?;
+        Ok(Some(remote))
+    }
+}
+
+fn valid_transport_relay(addr: &str) -> bool {
+    if addr.is_empty() || addr.len() > 200 || addr.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty() && !host.contains(':') && port.parse::<u16>().is_ok()
 }
 
 /// `RELAY_SIM_STALL` is a file path set by `relay-sim` on its daemon

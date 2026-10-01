@@ -84,6 +84,9 @@ pub enum EngineError {
     #[error("relay home is open read-only")]
     ReadOnly,
 
+    #[error("relay address must be host:port")]
+    BadRelayAddress,
+
     #[error("peer {0} is revoked")]
     PeerRevoked(String),
 

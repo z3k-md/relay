@@ -4,6 +4,10 @@
 implementation deliberately departs from or tightens it, and why. When the two
 disagree, this file wins.
 
+What is built and what is next is [`ROADMAP.md`](ROADMAP.md). A sentence here
+that says "next phase", "not yet", or "this phase still has no …" describes
+that decision when it was written. Later decisions supersede it.
+
 ## D1. `.git` is synchronized like any other directory
 
 The whole working tree, including `.git`, replicates. Relay never runs Git
@@ -684,7 +688,8 @@ non-materializing mailbox so each can catch up later. No QUIC session is
 required for that catch-up. The mailbox stores the same content-addressed
 bytes as the local object store plus length-prefixed prost entry logs; it is
 not a filesystem and does not reconstruct working trees. Encryption of
-objects at rest is the next phase — this phase stores plaintext CAS bytes.
+objects at rest was the following phase (shipped in D30). This phase stores
+plaintext CAS bytes.
 
 - **Path.** Local setting `replica_path` (string). Empty or absent means
   peer-only sync (today's behavior). `relay replica set PATH` / `clear` /
@@ -751,7 +756,8 @@ on the QUIC socket before Quinn takes it) to `nat/<device>` in the mailbox.
 Peers merge those addresses into the dial list. Both sides dialing the
 reflexive address is the hole punch. No hosted account and no TURN relay.
 Peer-only mode (no mailbox) stays LAN, Tailscale, or a manual address.
-Symmetric NAT still fails closed to those reachable addresses.
+Symmetric NAT still fails closed to those reachable addresses. A user-run
+UDP relay for that case is D34.
 
 ## D33. Android is a foreground Tauri shell
 
@@ -770,3 +776,37 @@ close-to-tray behavior are not part of the Android build.
   not a supported workflow.
 - **Out of scope.** iOS, Play Store signing, background execution, and photo
   library access.
+
+## D34. Generalized networking
+
+Phase 12 removes the requirement that every pair of devices share a LAN,
+Tailscale, or hand-written address. There is still no hosted account. Direct
+QUIC stays preferred. The relay is a dumb UDP forwarder so the QUIC handshake
+remains end to end between the two devices.
+
+- **Ranking.** Dial order is computed at dial time and does not change the
+  stored address list. Best first: loopback, RFC1918, Tailscale, link-local,
+  DNS names, then other public addresses (including STUN reflexives). Order
+  within a class stays as stored. The relay is not an address in that list.
+  It is tried only after every direct address has failed.
+- **Relay.** Optional. `relay transport set HOST:PORT` stores `transport_relay`.
+  `--serve` also sets `transport_serve`, and the host binds `0.0.0.0:<port>`
+  and forwards between two peers that have bound the same session. The session
+  id is `blake3` of the two device ids, so both sides derive it. A bind frame
+  names both devices and is signed by the sender. The relay accepts it only
+  when the session id matches that pair. Data frames are accepted only from a
+  bound source address. Quinn's max UDP payload is capped at 1400 bytes so a
+  21-byte relay header still fits the receive buffer. Virtual dial addresses
+  use `198.18.0.0/15` and never go on the wire.
+- **Discovery.** When a mailbox is configured, the non-empty local relay
+  address is written to `transport/relay`. A device with no local address
+  adopts that file. Peer-only mode (no mailbox and no local setting) does not
+  learn a relay.
+- **Multi-source fetch.** An object id is content-addressed, so any peer that
+  shares the space, or the mailbox, can supply the bytes. After a fetch
+  failure the engine asks each other connected peer once, then opens the
+  mailbox object (sealed or legacy plaintext) into the local store, before
+  the existing retry limit gives up.
+- **Out of scope.** No public TURN account, no global directory beyond the
+  mailbox file, no connection migration after a path is up, no Phase 13
+  materialization modes.

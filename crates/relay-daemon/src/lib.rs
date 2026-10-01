@@ -128,6 +128,7 @@ fn run_loop(
                 })
                 .collect(),
         );
+        let (transport_relay, transport_serve) = transport_settings(&engine);
         let listen_error = Arc::new(Mutex::new(None::<String>));
         let sink = {
             let listen_error = Arc::clone(&listen_error);
@@ -217,6 +218,8 @@ fn run_loop(
                     .collect(),
                 store_root: engine.store().root().to_path_buf(),
                 enable_stun: opts.enable_stun,
+                relay: transport_relay.clone(),
+                serve_relay: transport_serve,
             },
             Box::new(sink),
         )
@@ -272,6 +275,9 @@ fn run_loop(
                     }
                     SyncOutput::FetchObject { peer, object } => {
                         net.send(NetCommand::FetchObject { peer, object });
+                    }
+                    SyncOutput::SetRelay(addr) => {
+                        net.send(NetCommand::SetRelay(addr));
                     }
                     SyncOutput::SetPeers => {
                         if let Ok(engine) = Engine::open_read_only(home)
@@ -467,6 +473,24 @@ fn settle(home: &Path, stop: &AtomicBool) {
         }
         version = now;
     }
+}
+
+fn transport_settings(engine: &Engine) -> (Option<String>, bool) {
+    let relay = match engine.transport_relay() {
+        Ok(value) => value.filter(|addr| !addr.is_empty()),
+        Err(err) => {
+            tracing::warn!(error = %err, "could not read transport_relay");
+            None
+        }
+    };
+    let serve = match engine.transport_serve() {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not read transport_serve");
+            false
+        }
+    };
+    (relay, serve)
 }
 
 fn read_data_version(home: &Path) -> Option<u32> {

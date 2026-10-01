@@ -10,6 +10,7 @@
 //! keys/wrap/<space_hex>/<generation>/<device>
 //! keys/recovery/<space_hex>/<generation>
 //! nat/<device_hex>                             one address per line
+//! transport/relay                              single host:port line
 //! tmp/
 //! ```
 //!
@@ -37,6 +38,8 @@ const ENTRIES_DIR: &str = "entries";
 const ACKS_DIR: &str = "acks";
 const KEYS_DIR: &str = "keys";
 const NAT_DIR: &str = "nat";
+const TRANSPORT_DIR: &str = "transport";
+const RELAY_FILE: &str = "relay";
 const TMP_DIR: &str = "tmp";
 
 /// A space-key wrap read from the mailbox.
@@ -382,6 +385,27 @@ impl FsReplica {
             out.push((device, addrs));
         }
         Ok(out)
+    }
+
+    /// `transport/relay`: one `host:port` line, with no newline in the address.
+    pub fn put_transport_relay(&self, addr: &str) -> Result<(), ReplicaError> {
+        let addr = addr.trim();
+        if addr.is_empty() || addr.contains('\n') || addr.contains('\r') || addr.len() > 200 {
+            return Err(ReplicaError::CorruptLog(
+                "relay address must be a single host:port line".into(),
+            ));
+        }
+        let dest = self.root.join(TRANSPORT_DIR).join(RELAY_FILE);
+        write_if_changed(&dest, addr.as_bytes(), &self.tmp_dir())
+    }
+
+    pub fn transport_relay(&self) -> Result<Option<String>, ReplicaError> {
+        load_transport_relay(&self.root)
+    }
+
+    /// Read `transport/relay` without creating replica directories.
+    pub fn read_transport_relay(root: &Path) -> Result<Option<String>, ReplicaError> {
+        load_transport_relay(root)
     }
 
     fn read_log(&self, path: &Path) -> Result<Vec<StoredEntry>, ReplicaError> {
@@ -865,6 +889,20 @@ fn parse_space_hex(s: &str) -> Result<SpaceId, ()> {
     Ok(SpaceId::from_uuid(uuid::Uuid::from_bytes(bytes)))
 }
 
+fn load_transport_relay(root: &Path) -> Result<Option<String>, ReplicaError> {
+    let path = root.join(TRANSPORT_DIR).join(RELAY_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(|err| ReplicaError::io(&path, err))?;
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(line.to_owned()))
+    }
+}
+
 fn create_dir(path: &Path) -> Result<(), ReplicaError> {
     fs::create_dir_all(path).map_err(|e| ReplicaError::io(path, e))
 }
@@ -1126,5 +1164,21 @@ mod tests {
         assert_eq!(report.entries_removed, 2);
         assert_eq!(report.objects_removed, 1);
         assert!(r.get_object(&id1).unwrap().is_none());
+    }
+
+    #[test]
+    fn transport_relay_is_one_line_without_a_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let replica = FsReplica::open(dir.path()).unwrap();
+        assert!(replica.transport_relay().unwrap().is_none());
+        replica.put_transport_relay("relay.example:47322").unwrap();
+        assert_eq!(
+            FsReplica::read_transport_relay(dir.path())
+                .unwrap()
+                .as_deref(),
+            Some("relay.example:47322")
+        );
+        let raw = fs::read(dir.path().join("transport/relay")).unwrap();
+        assert_eq!(raw, b"relay.example:47322");
     }
 }

@@ -18,6 +18,8 @@ use crate::Engine;
 use crate::error::EngineError;
 use crate::peers::offered_mounts_from_wire;
 use crate::progress::{IncomingFile, ProgressBook, TransferLive};
+use crate::replica::open_replica;
+use crate::secrets::MailboxRead;
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_ATTEMPTS: u32 = 3;
@@ -100,9 +102,17 @@ pub enum SyncInput {
 
 #[derive(Clone, Debug)]
 pub enum SyncOutput {
-    Send { peer: DeviceId, body: frame::Body },
-    FetchObject { peer: DeviceId, object: ObjectId },
+    Send {
+        peer: DeviceId,
+        body: frame::Body,
+    },
+    FetchObject {
+        peer: DeviceId,
+        object: ObjectId,
+    },
     SetPeers,
+    /// Relay address learned from the mailbox. Applied without reloading.
+    SetRelay(Option<String>),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -172,11 +182,23 @@ struct Connected {
     held_emitted: HashSet<(SpaceId, MountId)>,
 }
 
+#[derive(Clone, Copy)]
+struct QueuedBatch {
+    peer: DeviceId,
+    space: SpaceId,
+    id: u64,
+}
+
 struct PendingBatch {
+    id: u64,
     after_sequence: u64,
     through_sequence: u64,
     entries: Vec<RemoteEntry>,
     pending_objects: HashSet<ObjectId>,
+    /// Peers already asked for each object, including the index source.
+    asked: HashMap<ObjectId, HashSet<DeviceId>>,
+    /// Index source reported the object missing. Alternate peers do not set this.
+    source_missing: HashSet<ObjectId>,
     failed_objects: HashSet<ObjectId>,
     fetch_attempts: HashMap<ObjectId, u32>,
     attempts: u32,
@@ -194,6 +216,7 @@ pub struct Syncer {
     connected: HashMap<DeviceId, Connected>,
     index_batch_entries: usize,
     progress: ProgressBook,
+    next_batch_id: u64,
 }
 
 impl Default for Syncer {
@@ -202,6 +225,7 @@ impl Default for Syncer {
             connected: HashMap::new(),
             index_batch_entries: INDEX_BATCH_ENTRIES,
             progress: ProgressBook::default(),
+            next_batch_id: 0,
         }
     }
 }
@@ -859,7 +883,9 @@ impl Syncer {
                 pending.insert(obj);
             }
         }
+        let mut asked = HashMap::new();
         for obj in &pending {
+            asked.insert(*obj, HashSet::from([peer]));
             out(SyncOutput::FetchObject { peer, object: *obj });
         }
 
@@ -903,11 +929,16 @@ impl Syncer {
         );
         self.flush_progress(events, true);
 
+        let batch_id = self.next_batch_id;
+        self.next_batch_id = self.next_batch_id.wrapping_add(1);
         let pending_batch = PendingBatch {
+            id: batch_id,
             after_sequence: batch.after_sequence,
             through_sequence: batch.through_sequence,
             entries,
             pending_objects: pending,
+            asked,
+            source_missing: HashSet::new(),
             failed_objects: HashSet::new(),
             fetch_attempts: HashMap::new(),
             attempts: 0,
@@ -932,43 +963,308 @@ impl Syncer {
         out: &mut dyn FnMut(SyncOutput),
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
-        let spaces: Vec<SpaceId> = self
-            .connected
-            .get(&peer)
-            .map(|c| c.incoming.keys().copied().collect())
-            .unwrap_or_default();
-        for space in spaces {
-            if let Some(conn) = self.connected.get_mut(&peer)
-                && let Some(queue) = conn.incoming.get_mut(&space)
-                && let Some(head) = queue.front_mut()
-                && head.pending_objects.contains(&object)
-            {
-                if let Fetch::Failed { not_found } = fetch {
-                    let attempts = head.fetch_attempts.entry(object).or_insert(0);
-                    *attempts += 1;
-                    if !not_found && *attempts < MAX_FETCH_ATTEMPTS {
-                        out(SyncOutput::FetchObject { peer, object });
-                        continue;
-                    }
-                    head.failed_objects.insert(object);
-                    let retries = head.failed_objects.len() as u64;
-                    let _ = head;
-                    self.progress.set_retries(peer, space, retries);
-                } else {
-                    let _ = head;
-                    self.progress.note_fetched(peer, object, Instant::now());
-                    self.flush_progress(events, true);
-                }
-                if let Some(conn) = self.connected.get_mut(&peer)
-                    && let Some(queue) = conn.incoming.get_mut(&space)
-                    && let Some(head) = queue.front_mut()
+        match fetch {
+            Fetch::Ok => self.note_object_ready(engine, object, out, events),
+            Fetch::Failed { not_found } => {
+                self.on_fetch_failed(engine, peer, object, not_found, out, events)
+            }
+        }
+    }
+
+    /// A successful fetch fills every connected peer's batch that still lists
+    /// `object`. Progress is credited to the batch's index source.
+    fn note_object_ready(
+        &mut self,
+        engine: &mut Engine,
+        object: ObjectId,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let targets = self.spaces_pending_object(object);
+        for (batch_peer, space) in targets {
+            if !self.clear_pending_object(batch_peer, space, object) {
+                continue;
+            }
+            self.progress
+                .note_fetched(batch_peer, object, Instant::now());
+            self.flush_progress(events, true);
+            self.process_head(engine, batch_peer, space, out, events)?;
+        }
+        Ok(())
+    }
+
+    /// Other connected peers, then the mailbox, then the original peer's retry budget.
+    fn on_fetch_failed(
+        &mut self,
+        engine: &mut Engine,
+        peer: DeviceId,
+        object: ObjectId,
+        not_found: bool,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), EngineError> {
+        let targets = self.failure_targets(object, peer);
+        let mut emitted = HashSet::new();
+        for (batch_peer, space, batch_id) in targets {
+            if peer == batch_peer && not_found {
+                self.mark_source_missing(batch_peer, space, batch_id, object);
+            }
+            if !self.note_failed_peer(batch_peer, space, batch_id, object, peer) {
+                continue;
+            }
+            let asked = self.asked_peers(batch_peer, space, batch_id, object);
+            if let Some(next) = self.unasked_peer(engine, space, batch_peer, &asked)? {
+                if self.remember_ask(batch_peer, space, batch_id, object, next)
+                    && emitted.insert(next)
                 {
-                    head.pending_objects.remove(&object);
+                    tracing::debug!(%batch_peer, %next, %object, "object fetch trying another peer");
+                    out(SyncOutput::FetchObject { peer: next, object });
                 }
-                self.process_head(engine, peer, space, out, events)?;
+                continue;
+            }
+            if let Some(bytes) = mailbox_object(engine, space, object)? {
+                engine.store.put_bytes(&bytes)?;
+                tracing::debug!(%object, %space, "object fetch used mailbox");
+                self.note_object_ready(engine, object, out, events)?;
+                return Ok(());
+            }
+            let source_missing = self.source_is_missing(batch_peer, space, batch_id, object);
+            if self.retry_original(
+                engine,
+                QueuedBatch {
+                    peer: batch_peer,
+                    space,
+                    id: batch_id,
+                },
+                object,
+                source_missing,
+                out,
+                events,
+            )? && emitted.insert(batch_peer)
+            {
+                out(SyncOutput::FetchObject {
+                    peer: batch_peer,
+                    object,
+                });
             }
         }
         Ok(())
+    }
+
+    fn spaces_pending_object(&self, object: ObjectId) -> Vec<(DeviceId, SpaceId)> {
+        let mut out = Vec::new();
+        for (peer, conn) in &self.connected {
+            for (space, queue) in &conn.incoming {
+                if queue
+                    .iter()
+                    .any(|batch| batch.pending_objects.contains(&object))
+                {
+                    out.push((*peer, *space));
+                }
+            }
+        }
+        out
+    }
+
+    fn clear_pending_object(&mut self, peer: DeviceId, space: SpaceId, object: ObjectId) -> bool {
+        let Some(queue) = self
+            .connected
+            .get_mut(&peer)
+            .and_then(|conn| conn.incoming.get_mut(&space))
+        else {
+            return false;
+        };
+        let mut found = false;
+        for batch in queue.iter_mut() {
+            if batch.pending_objects.remove(&object) {
+                found = true;
+            }
+        }
+        found
+    }
+
+    fn failure_targets(&self, object: ObjectId, failed: DeviceId) -> Vec<(DeviceId, SpaceId, u64)> {
+        let mut out = Vec::new();
+        for (peer, conn) in &self.connected {
+            for (space, queue) in &conn.incoming {
+                for batch in queue {
+                    if batch.pending_objects.contains(&object)
+                        && batch
+                            .asked
+                            .get(&object)
+                            .is_some_and(|asked| asked.contains(&failed))
+                    {
+                        out.push((*peer, *space, batch.id));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn batch_by_id_mut(
+        &mut self,
+        peer: DeviceId,
+        space: SpaceId,
+        batch_id: u64,
+    ) -> Option<&mut PendingBatch> {
+        self.connected
+            .get_mut(&peer)?
+            .incoming
+            .get_mut(&space)?
+            .iter_mut()
+            .find(|batch| batch.id == batch_id)
+    }
+
+    fn mark_source_missing(
+        &mut self,
+        batch_peer: DeviceId,
+        space: SpaceId,
+        batch_id: u64,
+        object: ObjectId,
+    ) {
+        let Some(batch) = self.batch_by_id_mut(batch_peer, space, batch_id) else {
+            return;
+        };
+        batch.source_missing.insert(object);
+    }
+
+    fn source_is_missing(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        batch_id: u64,
+        object: ObjectId,
+    ) -> bool {
+        self.connected
+            .get(&peer)
+            .and_then(|conn| conn.incoming.get(&space))
+            .and_then(|queue| queue.iter().find(|batch| batch.id == batch_id))
+            .is_some_and(|batch| batch.source_missing.contains(&object))
+    }
+
+    fn note_failed_peer(
+        &mut self,
+        batch_peer: DeviceId,
+        space: SpaceId,
+        batch_id: u64,
+        object: ObjectId,
+        failed: DeviceId,
+    ) -> bool {
+        let Some(batch) = self.batch_by_id_mut(batch_peer, space, batch_id) else {
+            return false;
+        };
+        if !batch.pending_objects.contains(&object) {
+            return false;
+        }
+        let Some(asked) = batch.asked.get_mut(&object) else {
+            return false;
+        };
+        if !asked.contains(&failed) {
+            return false;
+        }
+        asked.insert(failed);
+        true
+    }
+
+    fn remember_ask(
+        &mut self,
+        batch_peer: DeviceId,
+        space: SpaceId,
+        batch_id: u64,
+        object: ObjectId,
+        peer: DeviceId,
+    ) -> bool {
+        let Some(batch) = self.batch_by_id_mut(batch_peer, space, batch_id) else {
+            return false;
+        };
+        if !batch.pending_objects.contains(&object) {
+            return false;
+        }
+        batch.asked.entry(object).or_default().insert(peer);
+        true
+    }
+
+    fn asked_peers(
+        &self,
+        peer: DeviceId,
+        space: SpaceId,
+        batch_id: u64,
+        object: ObjectId,
+    ) -> HashSet<DeviceId> {
+        self.connected
+            .get(&peer)
+            .and_then(|conn| conn.incoming.get(&space))
+            .and_then(|queue| queue.iter().find(|batch| batch.id == batch_id))
+            .and_then(|batch| batch.asked.get(&object).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Smallest device id among connected peers that share `space` and have not
+    /// been asked. The index source is never chosen here.
+    fn unasked_peer(
+        &self,
+        engine: &Engine,
+        space: SpaceId,
+        batch_peer: DeviceId,
+        asked: &HashSet<DeviceId>,
+    ) -> Result<Option<DeviceId>, EngineError> {
+        let mut candidates: Vec<DeviceId> = self
+            .connected
+            .keys()
+            .copied()
+            .filter(|id| *id != batch_peer && !asked.contains(id))
+            .collect();
+        candidates.sort();
+        for id in candidates {
+            if engine.db.repo().is_shared(space, id)? {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `Ok(true)` means the caller should ask `batch.peer` again.
+    fn retry_original(
+        &mut self,
+        engine: &mut Engine,
+        batch: QueuedBatch,
+        object: ObjectId,
+        not_found: bool,
+        out: &mut dyn FnMut(SyncOutput),
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<bool, EngineError> {
+        enum Step {
+            Retry,
+            Failed { retries: u64 },
+        }
+        let step = {
+            let Some(pending) = self.batch_by_id_mut(batch.peer, batch.space, batch.id) else {
+                return Ok(false);
+            };
+            if !pending.pending_objects.contains(&object) {
+                return Ok(false);
+            }
+            let attempts = pending.fetch_attempts.entry(object).or_insert(0);
+            *attempts += 1;
+            if !not_found && *attempts < MAX_FETCH_ATTEMPTS {
+                Step::Retry
+            } else {
+                pending.failed_objects.insert(object);
+                pending.pending_objects.remove(&object);
+                Step::Failed {
+                    retries: pending.failed_objects.len() as u64,
+                }
+            }
+        };
+        match step {
+            Step::Retry => Ok(true),
+            Step::Failed { retries } => {
+                self.progress.set_retries(batch.peer, batch.space, retries);
+                self.process_head(engine, batch.peer, batch.space, out, events)?;
+                Ok(false)
+            }
+        }
     }
 
     fn on_ack(&mut self, engine: &mut Engine, peer: DeviceId, ack: Ack) -> Result<(), EngineError> {
@@ -1317,6 +1613,21 @@ impl Syncer {
 enum MassDeleteAction {
     Proceed,
     Hold,
+}
+
+fn mailbox_object(
+    engine: &Engine,
+    space: SpaceId,
+    object: ObjectId,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    let Some(path) = engine.replica_path()? else {
+        return Ok(None);
+    };
+    let replica = open_replica(&path)?;
+    match engine.take_space_object(&replica, space, object)? {
+        MailboxRead::Ready(bytes) if ObjectId::of(&bytes) == object => Ok(Some(bytes)),
+        MailboxRead::Ready(_) | MailboxRead::Locked | MailboxRead::Missing => Ok(None),
+    }
 }
 
 fn live_tombstones(

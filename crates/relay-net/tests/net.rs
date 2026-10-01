@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rand::RngCore;
 use relay_core::{DeviceId, ObjectId, PairingCode};
 use relay_crypto::DeviceIdentity;
-use relay_net::{NetCommand, NetConfig, NetEvent, NetHandle, PeerConfig, start};
+use relay_net::{NetCommand, NetConfig, NetEvent, NetHandle, PeerConfig, serve_relay, start};
 use relay_proto::{Ack, frame};
 use relay_store::ObjectStore;
 use tempfile::TempDir;
@@ -104,6 +104,7 @@ fn start_from_identity(
     identity_dir: TempDir,
     peers: Vec<PeerConfig>,
     listen: SocketAddr,
+    relay: Option<String>,
 ) -> Node {
     let store_dir = TempDir::new().unwrap();
     let store = ObjectStore::open(store_dir.path()).unwrap();
@@ -116,6 +117,8 @@ fn start_from_identity(
             peers,
             store_root: store_dir.path().to_owned(),
             enable_stun: false,
+            relay,
+            serve_relay: false,
         },
         Box::new(move |ev| {
             let _ = tx.send(ev);
@@ -135,7 +138,7 @@ fn start_from_identity(
 fn spawn(name: &str, peers: Vec<PeerConfig>) -> Node {
     let identity_dir = TempDir::new().unwrap();
     let identity = Arc::new(DeviceIdentity::generate(identity_dir.path()).unwrap());
-    start_from_identity(name, identity, identity_dir, peers, listen())
+    start_from_identity(name, identity, identity_dir, peers, listen(), None)
 }
 
 fn trust(id: DeviceId, name: &str, addr: Option<SocketAddr>) -> PeerConfig {
@@ -391,7 +394,7 @@ fn reconnects_after_peer_restart() {
     let bob_id_dir = TempDir::new().unwrap();
     let identity = Arc::new(DeviceIdentity::generate(bob_id_dir.path()).unwrap());
     let bob_id = identity.device_id();
-    let mut bob = start_from_identity("bob", identity, bob_id_dir, vec![], listen());
+    let mut bob = start_from_identity("bob", identity, bob_id_dir, vec![], listen(), None);
     let restart_addr = bob.handle.local_addr();
 
     let mut alice = spawn("alice", vec![trust(bob_id, "bob", Some(restart_addr))]);
@@ -414,6 +417,7 @@ fn reconnects_after_peer_restart() {
         restart_dir,
         vec![trust(alice_id, "alice", None)],
         restart_addr,
+        None,
     );
 
     wait_connected(&mut alice.events, bob_id, "bob");
@@ -578,4 +582,47 @@ fn set_peers_removing_peer_disconnects() {
     alice.handle.send(NetCommand::SetPeers(vec![]));
     wait_disconnected(&mut alice.events, bob_id);
     wait_disconnected(&mut bob.events, alice_id);
+}
+
+#[test]
+fn relay_connects_when_direct_address_is_a_blackhole() {
+    let server = serve_relay("127.0.0.1:0".parse().unwrap()).unwrap();
+    let relay = server.local_addr().to_string();
+    let blackhole = vec!["203.0.113.1:9".to_owned()];
+
+    let alice_dir = TempDir::new().unwrap();
+    let alice_identity = Arc::new(DeviceIdentity::generate(alice_dir.path()).unwrap());
+    let bob_dir = TempDir::new().unwrap();
+    let bob_identity = Arc::new(DeviceIdentity::generate(bob_dir.path()).unwrap());
+    let alice_id = alice_identity.device_id();
+    let bob_id = bob_identity.device_id();
+
+    let mut alice = start_from_identity(
+        "alice",
+        alice_identity,
+        alice_dir,
+        vec![PeerConfig {
+            id: bob_id,
+            name: "bob".to_owned(),
+            addresses: blackhole.clone(),
+        }],
+        listen(),
+        Some(relay.clone()),
+    );
+    let mut bob = start_from_identity(
+        "bob",
+        bob_identity,
+        bob_dir,
+        vec![PeerConfig {
+            id: alice_id,
+            name: "alice".to_owned(),
+            addresses: blackhole,
+        }],
+        listen(),
+        Some(relay),
+    );
+
+    wait_connected(&mut alice.events, bob_id, "bob");
+    wait_connected(&mut bob.events, alice_id, "alice");
+    deliver_ack(&alice.handle, alice_id, &mut bob.events, bob_id, 7);
 }

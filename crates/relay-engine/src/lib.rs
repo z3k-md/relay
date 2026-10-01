@@ -47,7 +47,7 @@ pub use relay_crypto::DeviceIdentity;
 pub use relay_db::{HistoryRecord, MountConfig};
 pub use relay_fs::{FsError, ScanWarning};
 pub use relay_store::ObjectStore;
-pub use replica::{ReplicaPull, ReplicaPush, ReplicaSpacePush, ReplicaStatus};
+pub use replica::{ReplicaPull, ReplicaPush, ReplicaSpacePush, ReplicaStatus, TransportStatus};
 pub use reports::{
     DeleteHold, DeleteHoldDecision, GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT,
     MASS_DELETE_NUMERATOR, MountStatus, PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport,

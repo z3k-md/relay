@@ -16,8 +16,8 @@ use relay_core::{
 use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{
     ConflictClass, ConflictInfo, DeleteHoldDecision, Engine, EngineError, Resolution, ScanOptions,
-    ScanReport, WatchEvent, WatchOptions, default_home, group_git_conflicts, resolve_conflict,
-    resolve_git_conflicts,
+    ScanReport, TransportStatus, WatchEvent, WatchOptions, default_home, group_git_conflicts,
+    resolve_conflict, resolve_git_conflicts,
 };
 use relay_ipc::{ActivityItem, Client, PairStatus, Status as DaemonStatus};
 
@@ -96,6 +96,11 @@ enum Command {
     Replica {
         #[command(subcommand)]
         cmd: ReplicaCmd,
+    },
+    /// UDP relay peers dial when a direct path does not connect
+    Transport {
+        #[command(subcommand)]
+        cmd: TransportCmd,
     },
     /// Device groups for replication policies
     Group {
@@ -217,6 +222,22 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TransportCmd {
+    /// Store the relay address peers should dial
+    Set {
+        /// host:port
+        addr: String,
+        /// Bind 0.0.0.0 and forward for that port
+        #[arg(long)]
+        serve: bool,
+    },
+    /// Remove the relay address and stop serving
+    Clear,
+    /// Show the relay address, whether this device serves, and the mailbox copy
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -481,6 +502,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Recovery { cmd } => cmd_recovery(&home, cmd, json),
         Command::Replica { cmd } => cmd_replica(&home, cmd, json),
+        Command::Transport { cmd } => cmd_transport(&home, cmd, json),
         Command::Group { cmd } => cmd_group(&home, cmd, json),
         Command::Policy { cmd } => cmd_policy(&home, cmd, json),
         Command::Conflicts { space, cmd } => match cmd {
@@ -1400,6 +1422,50 @@ fn cmd_recovery(home: &Path, cmd: RecoveryCmd, json: bool) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_transport(home: &Path, cmd: TransportCmd, json: bool) -> Result<ExitCode> {
+    match cmd {
+        TransportCmd::Set { addr, serve } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.set_transport_relay(&addr, serve)?;
+            print_transport(&engine.transport_status()?, json)?;
+        }
+        TransportCmd::Clear => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.clear_transport()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({"cleared": true}))?
+                );
+            } else {
+                println!("relay cleared");
+            }
+        }
+        TransportCmd::Status => {
+            let engine = Engine::open_read_only(home)?;
+            print_transport(&engine.transport_status()?, json)?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_transport(status: &TransportStatus, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+        return Ok(());
+    }
+    match &status.relay {
+        Some(addr) => println!("relay {addr}"),
+        None => println!("relay not set"),
+    }
+    println!("serve {}", if status.serve { "yes" } else { "no" });
+    match &status.mailbox {
+        Some(addr) => println!("mailbox {addr}"),
+        None => println!("mailbox not set"),
+    }
+    Ok(())
 }
 
 fn cmd_replica(home: &Path, cmd: ReplicaCmd, json: bool) -> Result<ExitCode> {
