@@ -227,7 +227,7 @@ defineExpose({ load });
       <EmptyState
         v-if="spaces.length === 0"
         title="No spaces yet"
-        body="A space is a named collection of folders you sync — for example Code or Game mods. Create one, add a folder, then share it with a peer."
+        body="A space is a set of folders you sync, such as Projects or Documents. Create one, add a folder, then share it with another computer."
       >
         <button
           type="button"
@@ -319,7 +319,7 @@ defineExpose({ load });
         id="space-name"
         v-model="spaceName"
         class="mt-1 w-full rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-3 py-2"
-        placeholder="Code"
+        placeholder="Projects"
         maxlength="64"
         autocomplete="off"
         @keydown.enter="createSpace"

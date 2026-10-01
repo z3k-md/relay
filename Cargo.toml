@@ -18,8 +18,8 @@ members = [
     "apps/relay-desktop/src-tauri",
 ]
 # Plain `cargo build` / `cargo test` skip the desktop app: it needs the
-# webview system libraries, a built frontend and a sidecar binary (see
-# apps/relay-desktop/README.md). CI builds everything with --workspace.
+# webview system libraries, a built frontend and a sidecar binary.
+# See docs/DEVELOPMENT.md. CI builds everything with --workspace.
 default-members = [
     "crates/relay-core",
     "crates/relay-policy",

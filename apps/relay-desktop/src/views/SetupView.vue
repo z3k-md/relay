@@ -38,8 +38,8 @@ async function submit() {
       </p>
       <h1 class="mt-1 text-xl font-semibold tracking-tight">Set up this device</h1>
       <p class="mt-2 text-[var(--color-muted)]">
-        Relay keeps selected folders in sync between your computers. Start by naming this
-        machine — you’ll give the other computer this device id next.
+        Relay keeps the folders you choose in sync across your computers, in real time.
+        Name this machine to get started.
       </p>
       <ErrorBanner class="mt-3" :message="error" />
       <label class="mt-4 block text-[12px] font-medium text-[var(--color-muted)]" for="device-name">

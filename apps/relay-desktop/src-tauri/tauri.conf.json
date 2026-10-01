@@ -27,6 +27,10 @@
   },
   "bundle": {
     "active": true,
+    "category": "Productivity",
+    "shortDescription": "Realtime file sync for your machines",
+    "longDescription": "Relay keeps the folders you choose in sync across your computers. Files stay local. No cloud account.",
+    "homepage": "https://github.com/z3k-md/relay",
     "createUpdaterArtifacts": true,
     "targets": ["app", "dmg", "nsis"],
     "externalBin": ["binaries/relay"],

@@ -1,5 +1,6 @@
 {
   "name": "relay-desktop",
+  "description": "Realtime file sync for your machines",
   "private": true,
   "version": "0.1.7",
   "packageManager": "bun@1.4.2",

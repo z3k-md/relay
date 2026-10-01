@@ -1,26 +1,27 @@
 # Releasing Relay
 
-Desktop builds and signed auto-updates are produced only when a release is
-cut. A normal commit or push does not publish a new version. The headless
-CLI (`relay service`) is still installed with `scripts/install.sh` /
-`scripts/deploy.sh` for SSH and servers.
+Desktop builds and signed auto-updates are published to
+[github.com/z3k-md/relay](https://github.com/z3k-md/relay) only when a release
+is cut. A normal commit or push does not publish a new version.
 
-Until the GitHub repo exists, URLs below use the placeholder **OWNER/REPO**.
-`scripts/release.sh` and `scripts/setup-updater-key.sh` replace that from
-`git remote get-url origin` when it points at github.com.
+Commands below write `OWNER/REPO` as a placeholder.
+`scripts/release.sh` and `scripts/setup-updater-key.sh` fill it from
+`git remote get-url origin` when that remote points at github.com.
+The updater endpoint in `tauri.conf.json` already points at this repository.
 
 ## One-time setup
 
-1. **Create the GitHub repo** and push `main`:
+1. **Confirm the release repo.** Releases and the updater download from the
+   public GitHub repo. If `origin` is not set:
 
    ```bash
-   git remote add origin https://github.com/OWNER/REPO.git
+   git remote add origin https://github.com/z3k-md/relay.git
    git push -u origin main
    ```
 
-   If the source repo is private, also create a **public** repo that will host
-   Releases (the updater downloads `latest.json` and the installers; that URL
-   must be publicly reachable). Note its `owner/name`.
+   If the source repo is private, Releases have to live in a public repo
+   (the updater downloads `latest.json` and the installers). Note its
+   `owner/name` and pass it to the signing-key script below.
 
 2. **Generate the updater signing key** on a trusted machine (Bun):
 

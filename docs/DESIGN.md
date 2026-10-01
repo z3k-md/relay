@@ -1,11 +1,10 @@
 # Relay
-## Local-First Multi-Device File Replication System
+## Realtime file sync across your machines
 
 **Status:** Original design specification. Live progress is [`ROADMAP.md`](ROADMAP.md).  
-**Initial platforms:** Windows and macOS  
-**Primary initial use case:** Developer workspaces and source trees  
-**Generalized scope:** Arbitrary user-selected files and directories across trusted devices  
-**Core principle:** Every participating machine works from ordinary local files. Relay continuously reconciles those local replicas and optionally uses an encrypted persistent relay to bridge periods when devices are not simultaneously online.
+**Platforms:** macOS and Windows, plus a command-line build  
+**Scope:** The folders you choose, across your own machines  
+**Core principle:** Every participating machine works from ordinary local files. Relay continuously reconciles those local copies and can use an encrypted folder you control to bridge periods when devices are not simultaneously online.
 
 Implementation has passed the original MVP (about Phase 4). Where this file and [`DECISIONS.md`](DECISIONS.md) disagree, DECISIONS.md wins. Do not infer what is built from "eventually", "initial release", or the phase list in §51. Current progress and the next phase are in [`ROADMAP.md`](ROADMAP.md).
 
@@ -17,17 +16,17 @@ Relay is a local-first file synchronization system designed around a simple user
 
 > Switch devices and continue working from the same filesystem state without manually committing, pushing, pulling, copying, mounting remote disks, or depending on another machine being online.
 
-Relay is initially motivated by development workflows where source files must physically exist on a target machine for immediate testing. A canonical example is editing a game mod from a MacBook while the game runs on a Windows desktop. Traditional Git workflows introduce unnecessary manual checkpoints, while remote-development workflows fail when the target machine is unavailable.
+The files have to exist on the machine you are using. Copying them by hand, or waiting on a commit and a pull, gets in the way. A remote disk fails when the other machine is off.
 
-Relay solves this by maintaining normal local copies of selected files on each participating device and continuously reconciling changes between them.
+Relay keeps a normal local copy of each selected folder on every participating device and continuously reconciles changes between them.
 
-The system is intentionally broader than source code. A Relay user can synchronize arbitrary logical collections composed of multiple filesystem roots, selectively include or exclude subtrees, and define different replication policies for different sets of files and devices.
+A user can synchronize any collection of filesystem roots, include or exclude subtrees, and define different replication policies for different sets of files and devices.
 
 Examples include:
 
-- `~/Code/**` on a MacBook, Windows desktop, and Linux workstation.
+- `~/Projects/**` on a laptop, a desktop, and a workstation.
 - A subset of `Documents/**` only between personal machines.
-- A game mod tree between a laptop and gaming desktop.
+- Notes or a photo library between a laptop and a desktop.
 - Configuration files across all machines.
 - A work subtree only between a work computer and one trusted desktop.
 - Large datasets on a desktop but metadata-only or excluded on portable devices in later versions.
@@ -79,9 +78,8 @@ Relay should eventually support:
 - Optional global discovery.
 - Selective one-way replication.
 - Remote fetch of metadata-only files.
-- Integration with editors such as Cursor.
-- Application-aware workflows such as deploy-on-sync or test-on-sync.
-- General-purpose file synchronization beyond development.
+- Editor status, conflict notification, and restore.
+- Application-aware workflows such as a script after sync.
 
 ---
 
@@ -207,7 +205,7 @@ For example:
 ```text
 Space: Personal
 Mount: code
-Path: game/inventory/Core.lua
+Path: notes/todo.md
 ```
 
 This survives different operating systems, disk layouts, and usernames.
@@ -263,8 +261,8 @@ The UI should present a hierarchical tree:
 
 ```text
 ☑ ~/Code
-   ☑ game-mods
-   ☑ stepwise
+   ☑ projects
+   ☑ notes
    ☐ old-projects
    ☑ evident
       ☐ node_modules
@@ -329,11 +327,11 @@ Targets:
 Another:
 
 ```text
-Policy: Portable Development
+Policy: Portable
 
 Selector:
-  code/personal/**
-  games/game-mods/**
+  notes/**
+  photos/**
 
 Targets:
   MacBook
@@ -431,7 +429,7 @@ Relay must never require:
 If the MacBook is offline:
 
 ```text
-Cursor -> local filesystem
+editor -> local filesystem
 ```
 
 works normally.
@@ -1221,13 +1219,13 @@ Internal logical paths should:
 Example:
 
 ```text
-code/game/inventory/Core.lua
+notes/todo.md
 ```
 
 not:
 
 ```text
-C:\Users\Alice\Code\game\inventory\Core.lua
+C:\Users\Alice\Documents\notes\todo.md
 ```
 
 ## 31.1 Case collisions
@@ -1264,7 +1262,7 @@ follow_external_symlinks = false
 
 Windows junctions and symlinks require deliberate handling.
 
-For developer workflows, Windows junctions may still be useful for mapping Relay-managed source directories into application-specific directories such as a game's mods folder.
+Windows junctions may still be useful when an application expects files in a fixed directory and the synced folder lives somewhere else.
 
 ---
 
@@ -1348,16 +1346,16 @@ Because all file contents are immutable objects, Relay can cheaply track local h
 Example:
 
 ```text
-10:31:01 Core.lua -> AAA
-10:31:14 Core.lua -> BBB
-10:31:37 Core.lua -> CCC
+10:31:01 notes.md -> AAA
+10:31:14 notes.md -> BBB
+10:31:37 notes.md -> CCC
 ```
 
 Future CLI:
 
 ```bash
-relay history code/game/Core.lua
-relay restore code/game/Core.lua --at "10:31"
+relay history notes/notes.md
+relay restore notes/notes.md --at "10:31"
 ```
 
 History should remain separate from Git history.
@@ -2067,7 +2065,7 @@ Cross-platform tests should use the same logical synchronization scenarios.
 The implementation should be deliberately staged so each phase proves one fundamental property.
 
 This section is the original plan, kept as the definition of each phase.
-Phases 0–12 are implemented. Phase 13 is next. What shipped inside each
+Phases 0–13 are implemented. Phase 14 is next. What shipped inside each
 phase, and what was deferred, is [`ROADMAP.md`](ROADMAP.md).
 
 ---
@@ -2197,16 +2195,16 @@ No cloud.
 
 ```text
 MacBook:
-~/Code/game
+~/Projects
 
 Windows:
-D:\Code\game
+D:\Projects
 ```
 
 Edit on Mac:
 
 ```text
-Core.lua
+notes.txt
 ```
 
 File appears on Windows within seconds.
@@ -2214,7 +2212,7 @@ File appears on Windows within seconds.
 Edit on Windows:
 
 ```text
-UI.lua
+todo.txt
 ```
 
 File appears on Mac.
@@ -2223,7 +2221,7 @@ Either device can be offline temporarily and catches up when both are online aga
 
 ## Success criteria
 
-This phase should already be useful for the original game mod workflow.
+This phase should already be useful for everyday work across two machines.
 
 ---
 
@@ -2361,10 +2359,10 @@ Expose flexible synchronization topology.
 ## Example supported configuration
 
 ```text
-code/personal/** -> Mac, Desktop, Linux
-code/work/**     -> Work PC, Desktop
-games/mygame/**     -> Mac, Desktop
-documents/**     -> Mac, Desktop
+notes/**      -> Laptop, Desktop
+work/**       -> Work PC, Desktop
+photos/**     -> Laptop, Desktop
+documents/**  -> Laptop, Desktop
 ```
 
 ## Success criteria
@@ -2520,7 +2518,7 @@ Use cases:
 - Archives.
 - Desktop-only assets.
 
-Not required for early development workflows.
+Not required to sync whole folders between machines.
 
 ---
 
@@ -2528,7 +2526,7 @@ Not required for early development workflows.
 
 Possible later integrations:
 
-## Cursor / editors
+## Editors and other apps
 
 - Current sync state.
 - Conflict notification.
@@ -2537,15 +2535,14 @@ Possible later integrations:
 - “Open on device.”
 - Post-sync tasks.
 
-## Developer automation
+## Automation
 
 Example:
 
 ```text
-When files under games/mygame/** change on Desktop:
--> validate TOC
--> deploy/junction
--> emit ready state
+When files under projects/** change on the desktop:
+-> run a check
+-> write a ready marker
 ```
 
 Keep these above the core replication engine.
@@ -2583,46 +2580,39 @@ The GUI, policy editor, and cloud persistence should come after the engine prove
 
 # 53. First Real-World Dogfood Scenario
 
-Use the original game mod workflow as the primary real-world test.
+Use a shared project folder between a laptop and a desktop as the primary real-world test.
 
 ### Windows
 
 ```text
-D:\Code\game-mods
-```
-
-Optionally junction into:
-
-```text
-C:\Games\MyGame\Mods
+D:\Projects
 ```
 
 ### macOS
 
 ```text
-~/Code/game-mods
+~/Projects
 ```
 
 Relay:
 
 ```text
 Space: Personal
-Mount: code
-Selector: game-mods/**
-Targets: MacBook, Desktop
+Mount: work
+Selector: **
+Targets: Laptop, Desktop
 ```
 
 Expected loop:
 
 ```text
-Mac Cursor edit
+Edit on the laptop
 -> save
 -> Relay indexes new object
 -> direct QUIC transfer
--> Windows verifies object
+-> the desktop verifies the object
 -> atomic materialization
--> Game sees file
--> /reload
+-> the file is there
 ```
 
 This scenario should be used continuously during development because it is concrete, latency-sensitive, and immediately exposes poor behavior.
@@ -2832,16 +2822,15 @@ It needs to be trustworthy.
 
 # 58. Long-Term Product Direction
 
-Relay can ultimately become a general-purpose local-first data replication layer:
+Relay is a local-first replication layer for the files you choose:
 
 ```text
-Files
 Documents
-Code
+Projects
+Notes
+Photos
 Configs
-Game data
 Research data
-Project assets
 Machine-specific working sets
 ```
 
