@@ -988,9 +988,14 @@ fn folder_pair_params(
     }
 }
 
-/// Canonical form, so `/var` and `/private/var` on macOS compare equal.
+/// Canonical the way Relay does it: `/var` and `/private/var` on macOS
+/// compare equal, and Windows paths stay `C:\…` rather than `\\?\C:\…`.
+fn canonical(path: &Path) -> std::path::PathBuf {
+    dunce::canonicalize(path).unwrap()
+}
+
 fn dunce_like(path: &Path) -> String {
-    fs::canonicalize(path).unwrap().to_str().unwrap().to_owned()
+    canonical(path).to_str().unwrap().to_owned()
 }
 
 /// Remote explorer Stage 3: bob, allowed to manage alice, pairs folders in
@@ -1156,7 +1161,7 @@ fn open_remote_files_and_remove_quick_opens() {
     assert!(
         opened
             .path
-            .starts_with(fs::canonicalize(root.path()).unwrap().join("alice"))
+            .starts_with(canonical(root.path()).join("alice"))
     );
     let folder = opened.path.parent().unwrap().to_path_buf();
     assert!(
