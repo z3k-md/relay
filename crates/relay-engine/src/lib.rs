@@ -23,7 +23,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use relay_core::{DeviceId, EntryKey, MOUNT_MARKER, validate_name};
 use relay_crypto::BoxKeyPair;
@@ -1155,20 +1155,7 @@ fn open_read_only_db(home: &Path, db_path: &Path) -> Result<Database, EngineErro
 }
 
 fn acquire_lock(home: &Path) -> Result<File, EngineError> {
-    let path = home.join(LOCK_FILE);
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => Err(EngineError::Busy {
-            home: home.to_path_buf(),
-        }),
-        Err(fs::TryLockError::Error(err)) => Err(EngineError::Io(err)),
-    }
+    try_lock_file(home, LOCK_FILE)
 }
 
 /// Exclusive lock held for the duration of [`Engine::run`] / [`Engine::watch`].
@@ -1177,19 +1164,36 @@ fn acquire_lock(home: &Path) -> Result<File, EngineError> {
 /// process can `Engine::open` and commit config. This lock keeps two run
 /// loops from overlapping.
 pub(crate) fn acquire_run_lock(home: &Path) -> Result<File, EngineError> {
-    let path = home.join(RUN_LOCK_FILE);
+    try_lock_file(home, RUN_LOCK_FILE)
+}
+
+/// How long a lock that looks taken is retried before reporting `Busy`.
+/// Another thread's fork briefly holds a copy of a just-released lock fd
+/// until the child execs, which is enough to fail a single attempt.
+const LOCK_RETRY: Duration = Duration::from_millis(100);
+
+/// Take the exclusive lock on `home/name` without waiting on a real holder.
+fn try_lock_file(home: &Path, name: &str) -> Result<File, EngineError> {
     let file = File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => Err(EngineError::Busy {
-            home: home.to_path_buf(),
-        }),
-        Err(fs::TryLockError::Error(err)) => Err(EngineError::Io(err)),
+        .open(home.join(name))?;
+    let deadline = Instant::now() + LOCK_RETRY;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(EngineError::Busy {
+                    home: home.to_path_buf(),
+                });
+            }
+            Err(fs::TryLockError::Error(err)) => return Err(EngineError::Io(err)),
+        }
     }
 }
 

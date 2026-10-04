@@ -783,10 +783,12 @@ fn init_and_open_guards() {
         Err(EngineError::NotInitialized)
     ));
     Engine::init(home.path(), "one").unwrap();
-    assert!(matches!(
-        Engine::init(home.path(), "two"),
-        Err(EngineError::AlreadyInitialized)
-    ));
+    let second = Engine::init(home.path(), "two");
+    assert!(
+        matches!(second, Err(EngineError::AlreadyInitialized)),
+        "{:?}",
+        second.err()
+    );
     Engine::open(home.path()).unwrap();
 }
 
