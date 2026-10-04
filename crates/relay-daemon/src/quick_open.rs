@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use relay_core::remote::{Located, RemoteCall, RemoteError, RemoteReply};
+use relay_core::remote::{Located, MountRef, RemoteCall, RemoteError, RemoteReply};
 use relay_core::{ConfigChange, DeviceId, SpaceId};
 use relay_engine::{CopyState, Engine, PeerInfo};
 use relay_ipc::{
@@ -54,6 +54,12 @@ struct Record {
 
 pub(crate) fn open(host: &Host, params: &OpenRemoteParams) -> Result<OpenedRemote, RpcErrorBody> {
     let peer = host.peer_named(&params.peer)?;
+    if params.read_only {
+        return Ok(OpenedRemote {
+            path: crate::read_copy::copy(host, &peer, &params.path)?,
+            synced: None,
+        });
+    }
     let located = match ask(
         host,
         &peer,
@@ -101,9 +107,8 @@ pub(crate) fn open(host: &Host, params: &OpenRemoteParams) -> Result<OpenedRemot
         .local_file_path(&space, &mount, &path)
         .map_err(engine_error)?;
     Ok(OpenedRemote {
-        space,
-        mount,
         path: local,
+        synced: Some(MountRef { space, mount }),
     })
 }
 

@@ -1049,3 +1049,31 @@ managed device opens here as if it had been synced all along.
   `--into`; the app has no setting yet). Whole-file transfer, so a large
   file opens only after it fully downloads; the app asks first above 1 GB.
 
+## D41. Read-only copies
+
+Remote explorer Stage 5: a quick look at a file on a managed device that
+sets nothing up on either device.
+
+- **Same stream as objects.** `ObjectRequest.read_file { path, max_bytes }`
+  (tag 3) is answered like an object: an `ObjectHeader` (now also carrying
+  `error` and `modified_ms`), then exactly `size` bytes. It goes only to
+  peers with `FEATURE_CONTROL`, so older peers never see it.
+- **Same gate as calls.** The network layer admits a copy exactly as it
+  admits a call: the manage grant, a handler, and one of the peer's four
+  call slots, held while the bytes stream. The daemon's
+  `ControlHandler::open_file` checks the grant again, requires an absolute
+  path to a file outside the Relay home, and refuses files over 256 MB
+  (`READ_COPY_MAX`); bigger files are opened by syncing their folder (D40).
+  The owner logs "bob copied <path>" to activity.
+- **On the asking device** the copy lands in `<home>/read-only/<n>/<name>`,
+  written to a `.relay-partial` file and renamed when the byte count
+  matches, then marked read-only. A file that changes size mid-copy is
+  refused. A copy that stalls for 30 s fails. The folder is emptied when the
+  host starts, clearing read-only flags first so Windows can delete them.
+- **One open request.** `OpenRemoteParams.read_only` selects a copy instead
+  of a quick-open pair; `OpenedRemote.synced` is `None` for a copy. CLI:
+  `relay open PEER PATH --read-only`. The app's Browse view offers
+  "Read-only" next to each file and then "Sync this folder to edit".
+- **Whole file.** No hashing against an index (there is none); the size
+  check and QUIC's integrity are what a quick look gets.
+

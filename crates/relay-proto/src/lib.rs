@@ -31,7 +31,7 @@ pub mod control;
 
 pub use control::{
     ControlRequest, ControlResponse, FEATURE_CONTROL, PeerGrants, call_from_wire, call_to_wire,
-    result_from_wire, result_to_wire,
+    error_from_wire, error_to_wire, result_from_wire, result_to_wire,
 };
 
 use relay_core::entry::EntryKey;
@@ -380,6 +380,20 @@ pub struct ObjectRequest {
     /// with [`FEATURE_CONTROL`].
     #[prost(message, optional, tag = "2")]
     pub control: Option<ControlRequest>,
+    /// Set to copy one file by path instead of an object (D41). Answered
+    /// like an object: an [`ObjectHeader`], then the bytes. Sent only to
+    /// peers with [`FEATURE_CONTROL`].
+    #[prost(message, optional, tag = "3")]
+    pub read_file: Option<ReadFileRequest>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadFileRequest {
+    /// In the answering device's path format.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(uint64, tag = "2")]
+    pub max_bytes: u64,
 }
 
 /// First frame the responder writes on an object stream. When `found`, exactly
@@ -391,6 +405,12 @@ pub struct ObjectHeader {
     pub found: bool,
     #[prost(uint64, tag = "2")]
     pub size: u64,
+    /// Why a read-file request was refused. Never set for objects.
+    #[prost(message, optional, tag = "3")]
+    pub error: Option<control::WireRemoteError>,
+    /// Read-file only: when the file last changed.
+    #[prost(int64, optional, tag = "4")]
+    pub modified_ms: Option<i64>,
 }
 
 #[derive(Debug, thiserror::Error)]

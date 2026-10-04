@@ -28,15 +28,22 @@ pub fn folder_pair(app: AppHandle, params: FolderPairParams) -> Result<FolderPai
         .map_err(|err| error_chain(&err))
 }
 
-/// Get a file from another device (syncing its folder here online-only if
-/// needed) and open it with its app. Returns the local path.
+/// Get a file from another device and open it with its app: syncing its
+/// folder here online-only if needed, or as a read-only copy that sets
+/// nothing up. Returns the local path.
 #[tauri::command(async)]
-pub fn open_remote_file(app: AppHandle, peer: String, path: String) -> Result<String, String> {
+pub fn open_remote_file(
+    app: AppHandle,
+    peer: String,
+    path: String,
+    read_only: bool,
+) -> Result<String, String> {
     let opened = running(&app)?
         .open_remote(&OpenRemoteParams {
             peer,
             path,
             root: None,
+            read_only,
         })
         .map_err(|err| error_chain(&err))?;
     let local = opened.path.to_string_lossy().to_string();

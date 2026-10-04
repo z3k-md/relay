@@ -7,6 +7,7 @@
 mod folder_pair;
 mod host;
 mod quick_open;
+mod read_copy;
 mod remote;
 
 use std::fs::File;
@@ -71,6 +72,7 @@ pub fn run(
     tracing::debug!(verbose = opts.verbose, listen = %opts.listen, host = %opts.host, "daemon starting");
     let _host_lock = acquire_host_lock(home)?;
     let host = Host::new(home, opts.host, opts.watch.use_watcher);
+    read_copy::clear(home);
     let ipc_stop = Arc::new(AtomicBool::new(false));
     let server = Server::bind(home).context("starting the local IPC server")?;
     let ipc_host = Arc::clone(&host);

@@ -376,10 +376,7 @@ pub fn result_to_wire(result: &RemoteResult) -> ControlResponse {
             }),
         }),
         Ok(RemoteReply::Done) => Reply::Done(Empty {}),
-        Err(err) => Reply::Error(WireRemoteError {
-            code: err.code.as_str().to_owned(),
-            message: err.message.clone(),
-        }),
+        Err(err) => Reply::Error(error_to_wire(err)),
     };
     ControlResponse { reply: Some(reply) }
 }
@@ -461,12 +458,21 @@ pub fn result_from_wire(response: ControlResponse) -> Result<RemoteResult, Proto
                 },
             }),
             Reply::Done(_) => Ok(RemoteReply::Done),
-            Reply::Error(err) => Err(RemoteError::new(
-                RemoteErrorCode::parse(&err.code),
-                err.message,
-            )),
+            Reply::Error(err) => Err(error_from_wire(err)),
         },
     )
+}
+
+pub fn error_to_wire(err: &RemoteError) -> WireRemoteError {
+    WireRemoteError {
+        code: err.code.as_str().to_owned(),
+        message: err.message.clone(),
+    }
+}
+
+/// An unknown code from a newer peer reads as `failed`.
+pub fn error_from_wire(err: WireRemoteError) -> RemoteError {
+    RemoteError::new(RemoteErrorCode::parse(&err.code), err.message)
 }
 
 fn entry_to_wire(entry: &DirEntry) -> WireDirEntry {
@@ -609,15 +615,15 @@ mod tests {
     fn control_rides_the_object_request() {
         let old = encode_frame(&ObjectRequest {
             object_id: vec![7; 32],
-            control: None,
+            ..Default::default()
         })
         .unwrap();
         let decoded: ObjectRequest = decode_message(&old[4..]).unwrap();
         assert!(decoded.control.is_none());
 
         let call = encode_frame(&ObjectRequest {
-            object_id: Vec::new(),
             control: Some(call_to_wire(&RemoteCall::Roots)),
+            ..Default::default()
         })
         .unwrap();
         let decoded: ObjectRequest = decode_message(&call[4..]).unwrap();

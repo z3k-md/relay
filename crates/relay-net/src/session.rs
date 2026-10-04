@@ -665,6 +665,11 @@ async fn serve_object(
             .await
             .map_err(|message| ServeErr { message });
     }
+    if let Some(read) = req.read_file {
+        return control::serve_read(inner, peer, send, read)
+            .await
+            .map_err(|message| ServeErr { message });
+    }
 
     let id = match object_id_from_bytes(&req.object_id) {
         Ok(id) => id,
@@ -696,11 +701,7 @@ async fn serve_object(
 
     match found {
         None => {
-            let bytes = encode_frame(&ObjectHeader {
-                found: false,
-                size: 0,
-            })
-            .map_err(|e| ServeErr {
+            let bytes = encode_frame(&ObjectHeader::default()).map_err(|e| ServeErr {
                 message: e.to_string(),
             })?;
             send.write_all(&bytes).await.map_err(|e| ServeErr {
@@ -709,10 +710,14 @@ async fn serve_object(
             let _ = send.finish();
         }
         Some(size) => {
-            let bytes =
-                encode_frame(&ObjectHeader { found: true, size }).map_err(|e| ServeErr {
-                    message: e.to_string(),
-                })?;
+            let bytes = encode_frame(&ObjectHeader {
+                found: true,
+                size,
+                ..Default::default()
+            })
+            .map_err(|e| ServeErr {
+                message: e.to_string(),
+            })?;
             send.write_all(&bytes).await.map_err(|e| ServeErr {
                 message: e.to_string(),
             })?;
@@ -860,7 +865,7 @@ async fn do_fetch(
     let (mut send, mut recv) = conn.open_bi().await.map_err(FetchFail::err)?;
     let req = encode_frame(&ObjectRequest {
         object_id: object.as_bytes().to_vec(),
-        control: None,
+        ..Default::default()
     })
     .map_err(FetchFail::err)?;
     send.write_all(&req).await.map_err(FetchFail::err)?;

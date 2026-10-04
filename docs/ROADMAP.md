@@ -9,11 +9,11 @@ release", and phase writeups are not a status report. This file is.
 
 ## Next
 
-**Remote explorer** ([proposal](proposals/remote-explorer.md)). Stages 0–4
+**Remote explorer** ([proposal](proposals/remote-explorer.md)). Stages 0–5
 shipped: config changes on the running host (D36), the Files view (D38),
 the manage grant and remote browsing (D37), folder pairs set up from either
-device (D39), and opening files that are not synced (D40). Stage 5
-(read-only copies) is optional; OS placeholder files are a separate later
+device (D39), opening files that are not synced (D40), and read-only copies
+(D41). OS placeholder files in Finder and File Explorer are a separate
 decision.
 
 **Phase 14 — Integrations.**

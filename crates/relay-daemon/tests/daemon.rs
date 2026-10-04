@@ -1145,15 +1145,49 @@ fn open_remote_files_and_remove_quick_opens() {
         "bob never learned alice's grant"
     );
     let mut bob = wait_ipc(home_b.path());
-    let open = |client: &mut relay_ipc::Client, file: &Path| {
+    let open_as = |client: &mut relay_ipc::Client, file: &Path, read_only: bool| {
         client
             .open_remote(&relay_ipc::OpenRemoteParams {
                 peer: "alice".into(),
                 path: dunce_like(file),
                 root: Some(root.path().to_path_buf()),
+                read_only,
             })
             .expect("open remote")
     };
+    let open = |client: &mut relay_ipc::Client, file: &Path| open_as(client, file, false);
+    let space = |opened: &relay_ipc::OpenedRemote| opened.synced.clone().unwrap().space;
+
+    // A read-only copy sets nothing up on either device (D41).
+    let copy = open_as(&mut bob, &docs.path().join("report.docx"), true);
+    assert_eq!(copy.synced, None);
+    assert_eq!(fs::read(&copy.path).unwrap(), b"quarterly");
+    assert!(fs::metadata(&copy.path).unwrap().permissions().readonly());
+    assert!(copy.path.starts_with(home_b.path().join("read-only")));
+    assert!(
+        Engine::open_read_only(home_b.path())
+            .unwrap()
+            .spaces()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        Engine::open_read_only(home_a.path())
+            .unwrap()
+            .spaces()
+            .unwrap()
+            .len(),
+        1
+    );
+    let logged = wait_ipc(home_a.path())
+        .activity(Some(20))
+        .expect("activity");
+    assert!(
+        logged
+            .iter()
+            .any(|item| item.kind == "remote_change" && item.summary.starts_with("bob copied ")),
+        "alice did not log the copy: {logged:?}"
+    );
 
     // Case 3: in no synced folder.
     let opened = open(&mut bob, &docs.path().join("report.docx"));
@@ -1170,7 +1204,7 @@ fn open_remote_files_and_remove_quick_opens() {
     );
     // A second file in the same folder reuses that pair.
     let notes = open(&mut bob, &docs.path().join("notes.txt"));
-    assert_eq!(notes.space, opened.space);
+    assert_eq!(space(&notes), space(&opened));
     assert_eq!(fs::read(&notes.path).unwrap(), b"notes");
     // Edits flow back like any synced file.
     fs::write(&opened.path, b"edited on bob").unwrap();
@@ -1184,7 +1218,7 @@ fn open_remote_files_and_remove_quick_opens() {
 
     // Case 2: inside alice's own space, which bob does not sync.
     let plan = open(&mut bob, &synced.path().join("plan.md"));
-    assert_eq!(plan.space, "Work");
+    assert_eq!(space(&plan), "Work");
     assert_eq!(fs::read(&plan.path).unwrap(), b"plan");
 
     let quick = bob.quick_opens().expect("list");
@@ -1192,7 +1226,7 @@ fn open_remote_files_and_remove_quick_opens() {
     assert!(
         quick
             .iter()
-            .any(|q| q.space == opened.space && q.created_on_peer)
+            .any(|q| q.space == space(&opened) && q.created_on_peer)
     );
     assert!(
         quick
@@ -1201,7 +1235,10 @@ fn open_remote_files_and_remove_quick_opens() {
     );
 
     // Removing undoes only what quick-open did.
-    assert_eq!(bob.quick_open_remove(&opened.space).expect("remove"), None);
+    assert_eq!(
+        bob.quick_open_remove(&space(&opened)).expect("remove"),
+        None
+    );
     assert_eq!(bob.quick_open_remove("Work").expect("remove"), None);
     assert!(bob.quick_opens().expect("list").is_empty());
     let alice = Engine::open_read_only(home_a.path()).unwrap();

@@ -4,7 +4,7 @@ Build plan for browsing another device's folders, setting up sync from
 either machine, and opening files that are not on this device yet. This does
 not amend [`DESIGN.md`](../DESIGN.md) or [`DECISIONS.md`](../DECISIONS.md).
 Stage 0 is recorded as D36, Stage 1 as D38, Stage 2 as D37, Stage 3 as
-D39, and Stage 4 as D40.
+D39, Stage 4 as D40, and Stage 5 as D41.
 
 The stages are in build order. Each one ships on its own and is useful
 without the next. Stages 0 and 1 change no wire format and no trust rules.
@@ -343,6 +343,11 @@ Files view. Saving it on the Mac updates the PC's file. A concurrent edit on
 the PC produces a conflict copy, not a lost edit.
 
 ## Stage 5. Read-only copy (optional)
+
+**Shipped (D41).** The request rides the object stream (`ObjectRequest.
+read_file`) rather than a `ControlResponse` header. The copy lives under the
+Relay home and is cleared when the host starts, since the host, not the app,
+fetches it.
 
 A quick look without creating a pair. Stage 4 covers the main case, so this
 can wait.

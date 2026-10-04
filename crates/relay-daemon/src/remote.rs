@@ -49,6 +49,20 @@ impl ControlHandler for Browser {
         drop(engine);
         answer(&self.host, &self.home, call, &name)
     }
+
+    fn open_file(
+        &self,
+        peer: DeviceId,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<fs::File, RemoteError> {
+        let engine = Engine::open_read_only(&self.home)
+            .map_err(|err| RemoteError::new(RemoteErrorCode::Busy, err.to_string()))?;
+        let name = authorize(&engine, peer)?;
+        let (file, path) = Context::load(&engine, &self.home)?.open_for_copy(path, max_bytes)?;
+        log(&self.host, &name, &format!("copied {}", path.display()));
+        Ok(file)
+    }
 }
 
 /// Answer `call` on this device. `by` names who asked, for the activity log.
@@ -368,6 +382,35 @@ impl Context {
         })
     }
 
+    /// Open one file for a read-only copy, with its canonical path.
+    fn open_for_copy(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<(fs::File, PathBuf), RemoteError> {
+        let path = self.resolve(path)?;
+        let meta = fs::metadata(&path).map_err(|err| io_error(&err, &path))?;
+        if !meta.is_file() {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Invalid,
+                format!("{} is not a file", path.display()),
+            ));
+        }
+        if meta.len() > max_bytes {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Invalid,
+                format!(
+                    "{} is {} MB, more than a read-only copy takes ({} MB); open it to sync its folder instead",
+                    path.display(),
+                    meta.len().div_ceil(1024 * 1024),
+                    max_bytes / (1024 * 1024)
+                ),
+            ));
+        }
+        let file = fs::File::open(&path).map_err(|err| io_error(&err, &path))?;
+        Ok((file, path))
+    }
+
     /// The folder, name, and mount of one file.
     fn locate(&self, path: &str) -> Result<Located, RemoteError> {
         let file = self.resolve(path)?;
@@ -665,6 +708,34 @@ mod tests {
 
         let inside = ctx.list(synced.to_str().unwrap(), 0, 0).unwrap();
         assert_eq!(inside.inside_mount.unwrap().space, "S");
+    }
+
+    #[test]
+    fn copies_only_small_files_outside_the_relay_home() {
+        let root = tempfile::TempDir::new().unwrap();
+        let root_path = dunce::canonicalize(root.path()).unwrap();
+        let home = root_path.join("relay-home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("device.key"), b"secret").unwrap();
+        fs::write(root_path.join("big.bin"), vec![0u8; 2048]).unwrap();
+        let ctx = context(&home, Vec::new());
+
+        let (_, path) = ctx
+            .open_for_copy(root_path.join("big.bin").to_str().unwrap(), 4096)
+            .unwrap();
+        assert_eq!(path, root_path.join("big.bin"));
+        let err = ctx
+            .open_for_copy(root_path.join("big.bin").to_str().unwrap(), 1024)
+            .unwrap_err();
+        assert_eq!(err.code, RemoteErrorCode::Invalid);
+        let err = ctx
+            .open_for_copy(home.join("device.key").to_str().unwrap(), 4096)
+            .unwrap_err();
+        assert_eq!(err.code, RemoteErrorCode::Denied);
+        let err = ctx
+            .open_for_copy(root_path.to_str().unwrap(), 4096)
+            .unwrap_err();
+        assert_eq!(err.code, RemoteErrorCode::Invalid, "a folder is not a file");
     }
 
     #[test]

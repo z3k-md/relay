@@ -261,7 +261,7 @@ impl Host {
         self.pair_cv.notify_all();
     }
 
-    fn net_sender(&self) -> Result<NetSender, RpcErrorBody> {
+    pub(crate) fn net_sender(&self) -> Result<NetSender, RpcErrorBody> {
         self.net
             .lock()
             .ok()

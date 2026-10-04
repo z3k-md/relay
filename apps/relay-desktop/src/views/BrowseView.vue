@@ -21,6 +21,10 @@ const notice = ref<string | null>(null);
 
 /** Above this, ask before downloading a file just to open it. */
 const LARGE_FILE = 1024 ** 3;
+/** The most a read-only copy fetches (relay-core READ_COPY_MAX). */
+const READ_COPY_MAX = 256 * 1024 ** 2;
+/** The file last opened as a read-only copy, for the "sync to edit" offer. */
+const copied = ref<DirEntry | null>(null);
 
 const browsable = computed(() => peers.value.filter((p) => p.connected && p.canManage));
 const unavailable = computed(() => peers.value.filter((p) => !(p.connected && p.canManage)));
@@ -69,6 +73,29 @@ async function openFile(entry: DirEntry) {
   } finally {
     opening.value = null;
   }
+}
+
+async function copyFile(entry: DirEntry) {
+  const name = device.value;
+  if (!name || opening.value) return;
+  opening.value = entry.path;
+  error.value = null;
+  notice.value = null;
+  copied.value = null;
+  try {
+    await api.openRemoteFile(name, entry.path, true);
+    copied.value = entry;
+  } catch (err) {
+    error.value = describeRemoteError(err, name);
+  } finally {
+    opening.value = null;
+  }
+}
+
+async function syncToEdit() {
+  const entry = copied.value;
+  copied.value = null;
+  if (entry) await openFile(entry);
 }
 
 async function loadQuickOpens() {
@@ -235,6 +262,16 @@ onMounted(() => Promise.all([loadPeers(), loadQuickOpens()]));
                 Opening…
               </span>
             </button>
+            <button
+              v-if="!isFolder(entry) && (entry.size ?? 0) <= READ_COPY_MAX"
+              type="button"
+              class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+              :disabled="!!opening"
+              title="Open a copy that sets up nothing; edits stay on this computer"
+              @click="copyFile(entry)"
+            >
+              Read-only
+            </button>
             <span
               v-if="entry.mount"
               class="shrink-0 rounded-full bg-emerald-100 px-2 text-[11px] text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200"
@@ -281,6 +318,26 @@ onMounted(() => Promise.all([loadPeers(), loadQuickOpens()]));
       <p v-if="loading" class="mt-2 text-[12px] text-[var(--color-muted)]">Loading…</p>
     </template>
 
+    <div
+      v-if="copied && device"
+      class="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2 text-[13px]"
+    >
+      <span>
+        Opened a read-only copy of {{ copied.name }}. Edits to it stay on this computer.
+      </span>
+      <span class="flex shrink-0 gap-2">
+        <button
+          type="button"
+          class="rounded-md bg-[var(--color-accent)] px-2 py-0.5 text-[12px] text-[var(--color-accent-fg)]"
+          @click="syncToEdit"
+        >
+          Sync this folder to edit
+        </button>
+        <button type="button" class="text-[12px] text-[var(--color-muted)]" @click="copied = null">
+          Dismiss
+        </button>
+      </span>
+    </div>
     <p v-if="notice" class="mt-3 text-[12px] text-[var(--color-muted)]">{{ notice }}</p>
     <section v-if="quickOpens.length" class="mt-6">
       <h3 class="mb-1 text-[13px] font-semibold">Opened from other devices</h3>

@@ -107,8 +107,8 @@ export const api = {
   folderPairPreview: (params: FolderPairParams) =>
     call<FolderPairPlan>("folder_pair_preview", { params }),
   folderPair: (params: FolderPairParams) => call<FolderPairResult>("folder_pair", { params }),
-  openRemoteFile: (peer: string, path: string) =>
-    call<string>("open_remote_file", { peer, path }),
+  openRemoteFile: (peer: string, path: string, readOnly = false) =>
+    call<string>("open_remote_file", { peer, path, readOnly }),
   listQuickOpens: () => call<QuickOpen[]>("list_quick_opens"),
   removeQuickOpen: (space: string) => call<string | null>("remove_quick_open", { space }),
   joinSpace: (space: string, fromPeer: string) =>

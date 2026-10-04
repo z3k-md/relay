@@ -165,6 +165,9 @@ enum Command {
         /// Where folders opened this way go (default ~/Relay)
         #[arg(long)]
         into: Option<PathBuf>,
+        /// Copy just this file, read-only, without syncing its folder
+        #[arg(long, conflicts_with = "into")]
+        read_only: bool,
     },
     /// List folders set up by `relay open`, or remove one
     Opened {
@@ -659,11 +662,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Policy { cmd } => cmd_policy(&home, cmd, json),
         Command::Materialize { cmd } => cmd_materialize(&home, cmd, json),
         Command::Browse { peer, path, all } => cmd_browse(&home, &peer, path, all, json),
-        Command::Open { peer, path, into } => {
+        Command::Open {
+            peer,
+            path,
+            into,
+            read_only,
+        } => {
             let opened = running_host(&home)?.open_remote(&OpenRemoteParams {
                 peer,
                 path,
                 root: into,
+                read_only,
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&opened)?);

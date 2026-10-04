@@ -14,6 +14,8 @@ use crate::config::{ConfigApplied, ConfigChange};
 pub const MAX_LISTING: u32 = 5_000;
 /// Entries per page when the caller does not ask for a size.
 pub const DEFAULT_LISTING: u32 = 2_000;
+/// Largest file a read-only copy fetches (D41). Bigger files sync instead.
+pub const READ_COPY_MAX: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "call", rename_all = "snake_case")]
@@ -74,6 +76,13 @@ pub enum RemoteReply {
     Applied { applied: ConfigApplied },
     Located { located: Located },
     Done,
+}
+
+/// A read-only copy that arrived (D41).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopiedFile {
+    pub size: u64,
+    pub modified_ms: Option<i64>,
 }
 
 /// A file found by [`RemoteCall::Locate`].

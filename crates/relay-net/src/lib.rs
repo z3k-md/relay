@@ -28,7 +28,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use quinn::AsyncUdpSocket;
-use relay_core::remote::{RemoteCall, RemoteResult};
+use relay_core::remote::{CopiedFile, RemoteCall, RemoteError, RemoteResult};
 use relay_core::{DeviceId, ObjectId};
 use relay_crypto::DeviceIdentity;
 use relay_proto::encode_frame;
@@ -178,6 +178,14 @@ pub enum NetCommand {
         peer: DeviceId,
         call: RemoteCall,
         reply: std::sync::mpsc::Sender<RemoteResult>,
+    },
+    /// Copy one file from a peer into `dest`, which must not exist (D41).
+    ReadFile {
+        peer: DeviceId,
+        path: String,
+        max_bytes: u64,
+        dest: PathBuf,
+        reply: std::sync::mpsc::Sender<Result<CopiedFile, RemoteError>>,
     },
     Shutdown,
 }
@@ -454,6 +462,13 @@ async fn run(
                         tokio::spawn(pairing::join(inner.clone(), endpoint.clone(), code, addr));
                     }
                     Some(NetCommand::PairCancel) => pairing::cancel_session(&inner),
+                    Some(NetCommand::ReadFile { peer, path, max_bytes, dest, reply }) => {
+                        let inner = inner.clone();
+                        tokio::spawn(async move {
+                            let copied = control::read_file(inner, peer, path, max_bytes, dest).await;
+                            let _ = reply.send(copied);
+                        });
+                    }
                     Some(NetCommand::Control { peer, call, reply }) => {
                         let inner = inner.clone();
                         tokio::spawn(async move {

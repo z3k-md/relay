@@ -62,7 +62,7 @@ relay opened
 relay opened remove Documents
 ```
 
-`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. In the app, click a file in Browse.
+`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. `relay open --read-only` instead copies just that file (up to 256 MB) into Relay's folder as read-only and sets nothing up; edits to the copy stay here. In the app, click a file in Browse.
 
 The first browse form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
 
@@ -164,7 +164,7 @@ relay service logs -f
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
 | `relay peer allow-manage NAME` / `peer deny-manage NAME` | Let a peer browse this device and set up sync on it, or stop |
 | `relay browse PEER [PATH] [--all]` | List a managed device's roots, or one of its folders |
-| `relay open PEER PATH [--into DIR]` | Get a file from a managed device: its folder syncs here online-only and the file downloads. Prints the local path |
+| `relay open PEER PATH [--into DIR \| --read-only]` | Get a file from a managed device: its folder syncs here online-only and the file downloads, or with `--read-only` a one-off copy. Prints the local path |
 | `relay opened` / `opened remove SPACE` | List folders set up by `relay open`, or remove one |
 | `relay pair-folder SOURCE DEST [--from DEVICE] [--to DEVICE] [--create NAME] [--exclude SUB]... [--online-only] [--check]` | Sync a folder on one device with a folder on another, set up from here |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |

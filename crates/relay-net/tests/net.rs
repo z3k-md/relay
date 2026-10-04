@@ -667,6 +667,21 @@ impl ControlHandler for EchoHandler {
             _ => Err(RemoteError::new(RemoteErrorCode::Unsupported, "echo")),
         }
     }
+
+    fn open_file(
+        &self,
+        _peer: DeviceId,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<std::fs::File, RemoteError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let file = std::fs::File::open(path)
+            .map_err(|e| RemoteError::new(RemoteErrorCode::NotFound, e.to_string()))?;
+        if file.metadata().unwrap().len() > max_bytes {
+            return Err(RemoteError::new(RemoteErrorCode::Invalid, "too large"));
+        }
+        Ok(file)
+    }
 }
 
 /// Alice answers calls; bob calls her. `grant` is whether alice lets bob
@@ -748,4 +763,48 @@ fn call_to_a_device_that_is_not_connected_is_offline() {
     let stranger = DeviceId::random();
     let err = remote_call(&bob, stranger, RemoteCall::Roots).unwrap_err();
     assert_eq!(err.code, RemoteErrorCode::Offline);
+}
+
+fn read_copy(
+    caller: &Node,
+    peer: DeviceId,
+    path: &std::path::Path,
+    max_bytes: u64,
+    dest: &std::path::Path,
+) -> Result<relay_core::remote::CopiedFile, RemoteError> {
+    let (reply, rx) = std::sync::mpsc::channel();
+    caller.handle.send(NetCommand::ReadFile {
+        peer,
+        path: path.to_str().unwrap().to_owned(),
+        max_bytes,
+        dest: dest.to_path_buf(),
+        reply,
+    });
+    rx.recv_timeout(TIMEOUT).expect("read reply")
+}
+
+#[test]
+fn read_only_copy_streams_a_file_and_respects_grant_and_size() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("report.docx");
+    let bytes: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&source, &bytes).unwrap();
+
+    let (alice, bob, handler) = managed_pair(true);
+    let dest = dir.path().join("copy.docx");
+    let copied = read_copy(&bob, alice.id, &source, 1 << 20, &dest).expect("copy");
+    assert_eq!(copied.size, bytes.len() as u64);
+    assert!(copied.modified_ms.is_some());
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+
+    let err = read_copy(&bob, alice.id, &source, 10, &dir.path().join("small")).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Invalid, "{err}");
+    assert!(!dir.path().join("small").exists());
+    assert!(!dir.path().join("small.relay-partial").exists());
+    assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let (alice, bob, handler) = managed_pair(false);
+    let err = read_copy(&bob, alice.id, &source, 1 << 20, &dir.path().join("x")).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Forbidden, "{err}");
+    assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

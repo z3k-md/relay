@@ -337,15 +337,18 @@ pub struct OpenRemoteParams {
     /// Where quick-open folders go; `~/Relay` when omitted.
     #[serde(default)]
     pub root: Option<PathBuf>,
+    /// Copy just this file, read-only, and set nothing up (D41).
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// A remote file, now here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenedRemote {
-    pub space: String,
-    pub mount: String,
-    /// The local copy, ready to open.
+    /// The local file, ready to open.
     pub path: PathBuf,
+    /// The synced folder it is in. `None` for a read-only copy.
+    pub synced: Option<relay_core::remote::MountRef>,
 }
 
 /// A folder synced only so its files could be opened here.
