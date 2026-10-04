@@ -13,8 +13,8 @@ pub use endpoint::{Endpoint, home_token};
 pub use protocol::{
     ActivityItem, FetchParams, Hello, HostKind, HostState, Idle, MountLive, PROTOCOL_VERSION,
     PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive,
-    Request, RescanParams, RescanResult, RpcError, RpcErrorBody, Status, TransferDirection,
-    TransferLive, Watching, decode_line, encode_line,
+    RemoteParams, Request, RescanParams, RescanResult, RpcError, RpcErrorBody, Status,
+    TransferDirection, TransferLive, Watching, decode_line, encode_line,
 };
 pub use server::{Handler, Server};
 

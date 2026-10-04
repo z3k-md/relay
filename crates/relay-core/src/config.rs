@@ -81,6 +81,11 @@ pub enum ConfigChange {
     RevokePeer {
         peer: String,
     },
+    /// Let `peer` manage this device (browse and set up sync), or stop (D37).
+    SetPeerManage {
+        peer: String,
+        allowed: bool,
+    },
     GroupCreate {
         group: String,
     },
@@ -140,6 +145,7 @@ impl ConfigChange {
             Self::AddPeer { .. }
             | Self::RemovePeer { .. }
             | Self::RevokePeer { .. }
+            | Self::SetPeerManage { .. }
             | Self::GroupCreate { .. }
             | Self::GroupAdd { .. }
             | Self::GroupRemove { .. }

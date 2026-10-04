@@ -61,7 +61,7 @@ pub use reports::{
 pub use resolve::{
     GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
 };
-pub use sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
+pub use sync::{PairedPeer, SyncEvent, SyncInput, SyncOutput, Syncer};
 pub use watch::{RunExit, WatchEvent, WatchOptions};
 
 const DB_FILE: &str = "relay.db";

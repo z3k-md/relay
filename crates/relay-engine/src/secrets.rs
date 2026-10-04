@@ -419,6 +419,7 @@ impl Engine {
         let spaces = self.db.repo().list_spaces()?;
         self.db.transaction(|repo| {
             repo.set_device_status(id, "revoked")?;
+            repo.set_peer_manage(id, false)?;
             for space in &spaces {
                 repo.unshare_space(space.id, id)?;
             }

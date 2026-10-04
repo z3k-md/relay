@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+directories.workspace = true
+dunce = "1"
 relay-core.workspace = true
 relay-engine.workspace = true
 relay-ipc.workspace = true

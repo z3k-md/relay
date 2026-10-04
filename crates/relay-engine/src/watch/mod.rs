@@ -16,7 +16,7 @@ use crate::live_config::{Applied, ConfigQueue};
 use crate::progress::TransferLive;
 use crate::replica::ReplicaPush;
 use crate::reports::{ScanOptions, ScanReport};
-use crate::sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
+use crate::sync::{PairedPeer, SyncEvent, SyncInput, SyncOutput, Syncer};
 
 mod events;
 mod mounts;
@@ -339,23 +339,10 @@ impl Engine {
                     SyncInput::Rescan { mounts } => {
                         mark_rescan(&mut states, &mounts, Instant::now());
                     }
-                    SyncInput::AddPeer {
-                        peer,
-                        name,
-                        addresses,
-                        share,
-                    } => {
-                        if let Err(err) = apply_add_peer(
-                            self,
-                            &syncer,
-                            peer,
-                            &name,
-                            &addresses,
-                            &share,
-                            &mut output,
-                        ) {
+                    SyncInput::AddPeer(paired) => {
+                        if let Err(err) = apply_add_peer(self, &syncer, &paired, &mut output) {
                             on_event(&WatchEvent::SyncWarning {
-                                peer: peer.to_string(),
+                                peer: paired.peer.to_string(),
                                 path: String::new(),
                                 reason: err.to_string(),
                             });
@@ -526,15 +513,15 @@ impl Engine {
 fn apply_add_peer(
     engine: &mut Engine,
     syncer: &Syncer,
-    peer: relay_core::DeviceId,
-    name: &str,
-    addresses: &[String],
-    share: &[SpaceId],
+    paired: &PairedPeer,
     output: &mut dyn FnMut(SyncOutput),
 ) -> Result<(), EngineError> {
-    engine.upsert_peer(name, peer, addresses)?;
+    let peer = paired.peer;
+    let added = engine.upsert_peer(&paired.name, peer, &paired.addresses)?;
+    // Pairing again with the box unchecked takes a grant back.
+    engine.set_peer_manage(&added.name, paired.may_manage)?;
     let mut shared = Vec::new();
-    for space in share {
+    for space in &paired.share {
         match engine.share_space_id(*space, peer) {
             Ok(()) => shared.push(*space),
             Err(err) => {

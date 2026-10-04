@@ -1,5 +1,6 @@
 mod commands;
 mod error;
+mod privacy;
 mod runner;
 mod settings;
 #[cfg(not(target_os = "android"))]
@@ -59,6 +60,8 @@ pub fn run() {
             commands::list_peers,
             commands::add_peer,
             commands::remove_peer,
+            commands::set_peer_manage,
+            commands::remote_call,
             commands::pair_start,
             commands::pair_status,
             commands::pair_join,
@@ -87,6 +90,8 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::open_logs_folder,
+            commands::full_disk_access,
+            commands::open_full_disk_access,
             commands::cli_status,
             commands::install_cli,
         ])

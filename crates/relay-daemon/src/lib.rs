@@ -5,6 +5,7 @@
 //! when another process commits to the database.
 
 mod host;
+mod remote;
 
 use std::fs::File;
 use std::net::SocketAddr;
@@ -16,7 +17,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use host::Host;
-use relay_engine::{Engine, EngineError, RunExit, SyncInput, SyncOutput, WatchEvent, WatchOptions};
+use relay_engine::{
+    Engine, EngineError, PairedPeer, PeerInfo, RunExit, SyncInput, SyncOutput, WatchEvent,
+    WatchOptions,
+};
 use relay_ipc::{Client, HostState, Server};
 use relay_net::{NetCommand, NetConfig, NetEvent, PeerConfig};
 
@@ -118,16 +122,7 @@ fn run_loop(
 
         let (tx, rx) = mpsc::channel::<SyncInput>();
         host.set_sync_tx(Some(tx.clone()));
-        host.set_known_peers(
-            peers
-                .iter()
-                .map(|p| PeerConfig {
-                    id: p.id,
-                    name: p.name.clone(),
-                    addresses: p.addresses.clone(),
-                })
-                .collect(),
-        );
+        host.set_known_peers(peers.iter().map(peer_config).collect());
         let (transport_relay, transport_serve) = transport_settings(&engine);
         let listen_error = Arc::new(Mutex::new(None::<String>));
         let sink = {
@@ -136,12 +131,26 @@ fn run_loop(
             let host = Arc::clone(host);
             move |event: NetEvent| {
                 let input = match event {
-                    NetEvent::PeerConnected { peer, name, .. } => {
+                    NetEvent::PeerConnected {
+                        peer,
+                        name,
+                        supports_control,
+                        ..
+                    } => {
+                        host.note_remote_connected(peer, supports_control);
                         SyncInput::PeerConnected { peer, name }
                     }
                     NetEvent::PeerDisconnected { peer, reason } => {
                         tracing::info!(%peer, %reason, "peer disconnected");
+                        host.forget_remote(peer);
                         SyncInput::PeerDisconnected { peer }
+                    }
+                    NetEvent::PeerGrants {
+                        peer,
+                        may_manage_you,
+                    } => {
+                        host.note_remote_grants(peer, may_manage_you);
+                        return;
                     }
                     NetEvent::Frame { peer, body } => SyncInput::Frame { peer, body },
                     NetEvent::ObjectFetched { peer, object } => {
@@ -182,14 +191,15 @@ fn run_loop(
                         addresses,
                         ..
                     } => {
-                        let share = host.take_pair_share();
+                        let terms = host.take_pair_terms();
                         host.finish_pair(Ok((name.clone(), peer.to_string())));
-                        SyncInput::AddPeer {
+                        SyncInput::AddPeer(PairedPeer {
                             peer,
                             name,
                             addresses,
-                            share,
-                        }
+                            share: terms.share,
+                            may_manage: terms.allow_manage,
+                        })
                     }
                     NetEvent::PairFailed { reason } => {
                         host.finish_pair(Err(reason));
@@ -208,18 +218,12 @@ fn run_loop(
                 identity,
                 device_name: engine.device().name.clone(),
                 listen: opts.listen,
-                peers: peers
-                    .iter()
-                    .map(|p| PeerConfig {
-                        id: p.id,
-                        name: p.name.clone(),
-                        addresses: p.addresses.clone(),
-                    })
-                    .collect(),
+                peers: peers.iter().map(peer_config).collect(),
                 store_root: engine.store().root().to_path_buf(),
                 enable_stun: opts.enable_stun,
                 relay: transport_relay.clone(),
                 serve_relay: transport_serve,
+                control: Some(Arc::new(remote::Browser::new(home))),
             },
             Box::new(sink),
         )
@@ -286,11 +290,7 @@ fn run_loop(
                             let configs: Vec<PeerConfig> = peers
                                 .iter()
                                 .filter(|p| !p.revoked)
-                                .map(|p| PeerConfig {
-                                    id: p.id,
-                                    name: p.name.clone(),
-                                    addresses: p.addresses.clone(),
-                                })
+                                .map(peer_config)
                                 .collect();
                             host.set_known_peers(configs.clone());
                             net.send(NetCommand::SetPeers(configs));
@@ -491,6 +491,16 @@ fn transport_settings(engine: &Engine) -> (Option<String>, bool) {
         }
     };
     (relay, serve)
+}
+
+/// The network's view of a peer: where to dial it and what it may do here.
+fn peer_config(peer: &PeerInfo) -> PeerConfig {
+    PeerConfig {
+        id: peer.id,
+        name: peer.name.clone(),
+        addresses: peer.addresses.clone(),
+        may_manage: peer.may_manage,
+    }
 }
 
 fn read_data_version(home: &Path) -> Option<u32> {

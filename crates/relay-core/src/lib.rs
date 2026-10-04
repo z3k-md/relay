@@ -15,6 +15,7 @@ pub mod merge;
 pub mod model;
 pub mod pairing;
 pub mod path;
+pub mod remote;
 pub mod reserved;
 pub mod version;
 

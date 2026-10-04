@@ -9,6 +9,7 @@
 //! [`NetEvent::ListenFailed`] is emitted.
 
 mod addr;
+mod control;
 mod discovery;
 mod error;
 mod io;
@@ -27,6 +28,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use quinn::AsyncUdpSocket;
+use relay_core::remote::{RemoteCall, RemoteResult};
 use relay_core::{DeviceId, ObjectId};
 use relay_crypto::DeviceIdentity;
 use relay_proto::encode_frame;
@@ -35,6 +37,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 pub use addr::advertised_addresses;
+pub use control::ControlHandler;
 pub use error::NetError;
 pub use relay::{RelayServer, serve_relay};
 use session::{
@@ -54,6 +57,9 @@ pub struct PeerConfig {
     pub name: String,
     /// `"host:port"` strings. DNS names are resolved on every dial attempt.
     pub addresses: Vec<String>,
+    /// This peer may manage this device (D37). Checked before any remote
+    /// call reaches the [`ControlHandler`].
+    pub may_manage: bool,
 }
 
 /// Configuration for [`start`].
@@ -73,6 +79,8 @@ pub struct NetConfig {
     pub relay: Option<String>,
     /// Bind `0.0.0.0:<port>` and serve. The port comes from [`Self::relay`].
     pub serve_relay: bool,
+    /// Answers remote calls. `None` refuses them as unsupported.
+    pub control: Option<Arc<dyn ControlHandler>>,
 }
 
 /// Notifications delivered on the network thread via the callback passed to [`start`].
@@ -82,6 +90,13 @@ pub enum NetEvent {
         peer: DeviceId,
         name: String,
         address: SocketAddr,
+        /// The peer answers remote calls (`FEATURE_CONTROL`).
+        supports_control: bool,
+    },
+    /// The peer says whether this device may manage it.
+    PeerGrants {
+        peer: DeviceId,
+        may_manage_you: bool,
     },
     PeerDisconnected {
         peer: DeviceId,
@@ -157,6 +172,13 @@ pub enum NetCommand {
     PairCancel,
     /// Replace the relay address used for dialing. Does not restart the endpoint.
     SetRelay(Option<String>),
+    /// Make a remote call on a peer (D37). The answer, or why there is
+    /// none, arrives on `reply`.
+    Control {
+        peer: DeviceId,
+        call: RemoteCall,
+        reply: std::sync::mpsc::Sender<RemoteResult>,
+    },
     Shutdown,
 }
 
@@ -282,6 +304,7 @@ pub fn start(
         pairing: Mutex::new(None),
         pairing_ads: Mutex::new(HashMap::new()),
         discovery: Mutex::new(None),
+        control: config.control,
     });
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -431,6 +454,12 @@ async fn run(
                         tokio::spawn(pairing::join(inner.clone(), endpoint.clone(), code, addr));
                     }
                     Some(NetCommand::PairCancel) => pairing::cancel_session(&inner),
+                    Some(NetCommand::Control { peer, call, reply }) => {
+                        let inner = inner.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(control::call(inner, peer, call).await);
+                        });
+                    }
                     Some(NetCommand::SetRelay(addr)) => {
                         *inner
                             .relay_target

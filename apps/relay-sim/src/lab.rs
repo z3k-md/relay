@@ -487,12 +487,19 @@ fn pair_all(lab: &Lab) -> Result<()> {
             )
         })?;
         let started = host_client
-            .pair_start(std::slice::from_ref(&lab.space))
+            .pair_start(&relay_ipc::PairStartParams {
+                share: vec![lab.space.clone()],
+                allow_manage: false,
+            })
             .with_context(|| format!("pair_start on {}", host.name))?;
         let listen = listen_of(&host.home)?;
         let mut guest_client = connect(&guest.home, START_TIMEOUT)?;
         guest_client
-            .pair_join(&started.code, Some(&listen))
+            .pair_join(&relay_ipc::PairJoinParams {
+                code: started.code.clone(),
+                addr: Some(listen.clone()),
+                allow_manage: false,
+            })
             .with_context(|| {
                 format!(
                     "pair_join {} -> {} ({listen})\n{}\n{}",

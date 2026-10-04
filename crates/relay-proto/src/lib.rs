@@ -16,6 +16,8 @@
 //!   wants bytes). The requester writes one [`ObjectRequest`] frame and
 //!   finishes its send side. The responder writes one [`ObjectHeader`] frame,
 //!   then exactly `size` raw bytes, then finishes.
+//! - Remote calls (D37) on the same kind of stream: the request's `control`
+//!   field is set instead of `object_id`. See [`control`].
 //!
 //! # Index sync
 //!
@@ -24,6 +26,13 @@
 //! peer answers with [`IndexBatch`]es and keeps streaming new batches as its
 //! index changes. After applying a batch the receiver sends [`Ack`], which the
 //! sender records as "peer has everything through N".
+
+pub mod control;
+
+pub use control::{
+    ControlRequest, ControlResponse, FEATURE_CONTROL, PeerGrants, call_from_wire, call_to_wire,
+    result_from_wire, result_to_wire,
+};
 
 use relay_core::entry::EntryKey;
 use relay_core::{
@@ -55,7 +64,7 @@ pub const INDEX_BATCH_ENTRIES: usize = 1_000;
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Frame {
-    #[prost(oneof = "frame::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "frame::Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub body: Option<frame::Body>,
 }
 
@@ -78,6 +87,9 @@ pub mod frame {
         Pong(super::Ping),
         #[prost(message, tag = "8")]
         Error(super::ErrorFrame),
+        /// Only sent to peers with [`super::FEATURE_CONTROL`].
+        #[prost(message, tag = "9")]
+        PeerGrants(super::PeerGrants),
     }
 }
 
@@ -99,6 +111,9 @@ pub struct Hello {
     pub device_name: String,
     #[prost(string, tag = "4")]
     pub client_version: String,
+    /// `FEATURE_*` bits. An older peer sends none, which decodes as 0.
+    #[prost(uint64, tag = "5")]
+    pub features: u64,
 }
 
 /// Spaces the sender shares with the receiver. Sent after `Hello` and again
@@ -361,6 +376,10 @@ pub struct PairDeviceInfo {
 pub struct ObjectRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub object_id: Vec<u8>,
+    /// Set for a remote call instead of an object (D37). Sent only to peers
+    /// with [`FEATURE_CONTROL`].
+    #[prost(message, optional, tag = "2")]
+    pub control: Option<ControlRequest>,
 }
 
 /// First frame the responder writes on an object stream. When `found`, exactly

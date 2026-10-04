@@ -71,6 +71,8 @@ pub struct PeerInfo {
     pub last_seen_ms: Option<i64>,
     /// Soft-revoked devices stay listed but are not dialed or shared with.
     pub revoked: bool,
+    /// This peer may manage this device (D37).
+    pub may_manage: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -226,6 +228,25 @@ impl Engine {
         if !removed {
             return Err(EngineError::UnknownPeer(name.to_owned()));
         }
+        Ok(())
+    }
+
+    /// Let `peer` manage this device, or stop letting it (D37). Only the
+    /// device being managed sets this.
+    pub fn set_peer_manage(&mut self, peer: &str, allowed: bool) -> Result<(), EngineError> {
+        self.ensure_writable()?;
+        let record = self
+            .db
+            .repo()
+            .peer_by_name(peer)?
+            .ok_or_else(|| EngineError::UnknownPeer(peer.to_owned()))?;
+        if allowed && self.db.repo().device_status(record.device.id)?.as_deref() == Some("revoked")
+        {
+            return Err(EngineError::PeerRevoked(peer.to_owned()));
+        }
+        self.db
+            .transaction(|repo| repo.set_peer_manage(record.device.id, allowed))
+            .map_err(EngineError::from_db)?;
         Ok(())
     }
 
@@ -530,6 +551,7 @@ fn peer_info(record: relay_db::PeerRecord, revoked: bool) -> PeerInfo {
         added_at_ms: record.added_at_ms,
         last_seen_ms: record.last_seen_ms,
         revoked,
+        may_manage: record.may_manage,
     }
 }
 

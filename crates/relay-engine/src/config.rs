@@ -89,6 +89,10 @@ impl Engine {
                 self.revoke_peer(peer)?;
                 ConfigApplied::Done
             }
+            ConfigChange::SetPeerManage { peer, allowed } => {
+                self.set_peer_manage(peer, *allowed)?;
+                ConfigApplied::Done
+            }
             ConfigChange::GroupCreate { group } => {
                 self.group_create(group)?;
                 ConfigApplied::Done

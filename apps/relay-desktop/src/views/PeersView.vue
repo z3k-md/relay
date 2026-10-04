@@ -27,6 +27,8 @@ const pairDone = ref<string | null>(null);
 const pairFailed = ref<string | null>(null);
 const joinCode = ref("");
 const joinAddr = ref("");
+/** Pairing lets the other device manage this one unless unchecked (D37). */
+const allowManage = ref(true);
 const nowMs = ref(Date.now());
 let statusTimer: number | undefined;
 let tickTimer: number | undefined;
@@ -143,7 +145,7 @@ async function startPair() {
   pairDone.value = null;
   pairFailed.value = null;
   try {
-    const started = await api.pairStart(share.value);
+    const started = await api.pairStart(share.value, allowManage.value);
     pairCode.value = started.code;
     pairExpires.value = started.expiresAtMs;
     pairNow.value = Date.now();
@@ -197,7 +199,11 @@ async function joinPair() {
   busy.value = true;
   error.value = null;
   try {
-    await api.pairJoin(joinCode.value.trim(), joinAddr.value.trim() || undefined);
+    await api.pairJoin(
+      joinCode.value.trim(),
+      joinAddr.value.trim() || undefined,
+      allowManage.value,
+    );
     joining.value = false;
     joinCode.value = "";
     joinAddr.value = "";
@@ -219,6 +225,19 @@ async function addPeer() {
     deviceId.value = "";
     address.value = "";
     await load();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function toggleManage(peer: PeerView) {
+  busy.value = true;
+  error.value = null;
+  try {
+    await api.setPeerManage(peer.name, !peer.allowedToManage);
+    await load(true);
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -340,6 +359,18 @@ defineExpose({ load });
           <p v-if="sharedLabel(peer)" class="truncate text-[12px] text-[var(--color-muted)]">
             Spaces: {{ sharedLabel(peer) }}
           </p>
+          <label class="mt-1 flex items-center gap-2 text-[12px]">
+            <input
+              type="checkbox"
+              :checked="peer.allowedToManage"
+              :disabled="busy"
+              @change="toggleManage(peer)"
+            />
+            <span>Can browse and set up sync on this computer</span>
+          </label>
+          <p v-if="peer.canManage" class="text-[12px] text-[var(--color-muted)]">
+            You can browse {{ peer.name }} from Browse.
+          </p>
         </div>
         <button
           type="button"
@@ -402,6 +433,15 @@ defineExpose({ load });
         <p v-if="spaces.length === 0" class="text-[12px] text-[var(--color-muted)]">
           No spaces yet — you can share later.
         </p>
+        <label class="mt-3 flex items-start gap-2">
+          <input v-model="allowManage" type="checkbox" class="mt-1" />
+          <span>
+            Let the other device browse this computer and set up sync on it
+            <span class="block text-[12px] text-[var(--color-muted)]">
+              You can change this later in Peers.
+            </span>
+          </span>
+        </label>
         <div class="mt-4 flex justify-end gap-2">
           <button type="button" class="rounded-md px-2.5 py-1" @click="closePair">Cancel</button>
           <button
@@ -434,6 +474,15 @@ defineExpose({ load });
         class="mt-1 mb-4 w-full rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-3 py-2"
         placeholder="my-mac:47321 or 100.x.y.z:47321"
       />
+      <label class="mb-4 flex items-start gap-2">
+        <input v-model="allowManage" type="checkbox" class="mt-1" />
+        <span>
+          Let the other device browse this computer and set up sync on it
+          <span class="block text-[12px] text-[var(--color-muted)]">
+            You can change this later in Peers.
+          </span>
+        </span>
+      </label>
       <div class="flex justify-end gap-2">
         <button type="button" class="rounded-md px-2.5 py-1" @click="joining = false">Cancel</button>
         <button

@@ -4,6 +4,16 @@
 <dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Relay finds and syncs with your other computers on the local network.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Relay syncs folders you choose, and lets devices you allowed browse this Mac.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Relay syncs folders you choose, and lets devices you allowed browse this Mac.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Relay syncs folders you choose, and lets devices you allowed browse this Mac.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Relay syncs folders you choose on external drives.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Relay syncs folders you choose on network drives.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_relay._udp</string>

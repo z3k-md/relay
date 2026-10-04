@@ -81,12 +81,8 @@ pub enum SyncInput {
     Rescan {
         mounts: Vec<(SpaceId, MountId)>,
     },
-    AddPeer {
-        peer: DeviceId,
-        name: String,
-        addresses: Vec<String>,
-        share: Vec<SpaceId>,
-    },
+    /// A device just paired.
+    AddPeer(PairedPeer),
     PeerAddresses {
         peer: DeviceId,
         addresses: Vec<String>,
@@ -109,6 +105,18 @@ pub enum SyncInput {
         path: String,
         reply: mpsc::Sender<Result<(), String>>,
     },
+}
+
+/// A device that just finished pairing with this one.
+#[derive(Clone, Debug)]
+pub struct PairedPeer {
+    pub peer: DeviceId,
+    pub name: String,
+    pub addresses: Vec<String>,
+    /// Spaces to share with it right away (`relay pair --share`).
+    pub share: Vec<SpaceId>,
+    /// The grant chosen while pairing (D37).
+    pub may_manage: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -353,7 +361,7 @@ impl Syncer {
                 self.on_fetch_request(engine, &space, &mount, &path, reply, out, &mut events)?;
             }
             SyncInput::Rescan { .. }
-            | SyncInput::AddPeer { .. }
+            | SyncInput::AddPeer(_)
             | SyncInput::PeerAddresses { .. }
             | SyncInput::NatHint { .. }
             | SyncInput::Config { .. } => {}
@@ -561,10 +569,12 @@ impl Syncer {
                 self.on_ack(engine, peer, ack)?;
                 self.flush_progress(events, true);
             }
+            // Grants are handled by the network layer and never reach here.
             frame::Body::Hello(_)
             | frame::Body::Ping(_)
             | frame::Body::Pong(_)
-            | frame::Body::Error(_) => {}
+            | frame::Body::Error(_)
+            | frame::Body::PeerGrants(_) => {}
         }
         Ok(())
     }

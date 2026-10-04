@@ -30,7 +30,76 @@ export interface PeerView {
   connectedSinceMs: number | null;
   /** Last live contact. Null until this peer has connected once. */
   lastSeenMs: number | null;
+  /** This peer may browse this computer and set up sync on it. */
+  allowedToManage: boolean;
+  /** This peer lets this computer manage it. Known only while connected. */
+  canManage: boolean;
+  /** This peer's Relay answers remote calls. Known only while connected. */
+  supportsRemote: boolean;
 }
+
+// Remote calls (D37). These are relay-core's shapes as-is, so their fields
+// are snake_case like the rest of the IPC protocol.
+
+export type RemoteCall =
+  | { call: "roots" }
+  | { call: "list_dir"; path: string; cursor?: number; limit?: number }
+  | { call: "stat"; path: string }
+  | { call: "spaces" };
+
+export interface RemoteRoot {
+  name: string;
+  path: string;
+}
+
+export interface MountRef {
+  space: string;
+  mount: string;
+}
+
+export interface DirEntry {
+  name: string;
+  path: string;
+  kind: "file" | "directory" | "symlink" | "other";
+  size: number | null;
+  modified_ms: number | null;
+  hidden: boolean;
+  /** A cloud placeholder: syncing it would download it. */
+  cloud_only: boolean;
+  mount: MountRef | null;
+  contains_mount: boolean;
+}
+
+export interface DirListing {
+  path: string;
+  parent: string | null;
+  entries: DirEntry[];
+  next_cursor: number | null;
+  total: number;
+  inside_mount: MountRef | null;
+}
+
+export interface RemoteSpace {
+  name: string;
+  mounts: { name: string; path: string | null }[];
+}
+
+export type RemoteReply =
+  | { reply: "roots"; roots: RemoteRoot[] }
+  | { reply: "listing"; listing: DirListing }
+  | { reply: "stat"; entry: DirEntry }
+  | { reply: "spaces"; spaces: RemoteSpace[] };
+
+export type RemoteErrorCode =
+  | "forbidden"
+  | "denied"
+  | "not_found"
+  | "timeout"
+  | "unsupported"
+  | "invalid"
+  | "busy"
+  | "offline"
+  | "failed";
 
 export interface PairStartResult {
   code: string;
@@ -199,6 +268,7 @@ export type Page =
   | "overview"
   | "peers"
   | "spaces"
+  | "browse"
   | "conflicts"
   | "activity"
   | "settings";

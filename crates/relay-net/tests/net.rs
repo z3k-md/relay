@@ -4,9 +4,14 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime};
 
 use rand::RngCore;
+use relay_core::remote::{
+    RemoteCall, RemoteError, RemoteErrorCode, RemoteReply, RemoteResult, RemoteRoot,
+};
 use relay_core::{DeviceId, ObjectId, PairingCode};
 use relay_crypto::DeviceIdentity;
-use relay_net::{NetCommand, NetConfig, NetEvent, NetHandle, PeerConfig, serve_relay, start};
+use relay_net::{
+    ControlHandler, NetCommand, NetConfig, NetEvent, NetHandle, PeerConfig, serve_relay, start,
+};
 use relay_proto::{Ack, frame};
 use relay_store::ObjectStore;
 use tempfile::TempDir;
@@ -106,6 +111,18 @@ fn start_from_identity(
     listen: SocketAddr,
     relay: Option<String>,
 ) -> Node {
+    start_node(name, identity, identity_dir, peers, listen, relay, None)
+}
+
+fn start_node(
+    name: &str,
+    identity: Arc<DeviceIdentity>,
+    identity_dir: TempDir,
+    peers: Vec<PeerConfig>,
+    listen: SocketAddr,
+    relay: Option<String>,
+    control: Option<Arc<dyn ControlHandler>>,
+) -> Node {
     let store_dir = TempDir::new().unwrap();
     let store = ObjectStore::open(store_dir.path()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -119,6 +136,7 @@ fn start_from_identity(
             enable_stun: false,
             relay,
             serve_relay: false,
+            control,
         },
         Box::new(move |ev| {
             let _ = tx.send(ev);
@@ -146,6 +164,7 @@ fn trust(id: DeviceId, name: &str, addr: Option<SocketAddr>) -> PeerConfig {
         id,
         name: name.to_owned(),
         addresses: addr.map(|a| a.to_string()).into_iter().collect(),
+        may_manage: false,
     }
 }
 
@@ -605,6 +624,7 @@ fn relay_connects_when_direct_address_is_a_blackhole() {
             id: bob_id,
             name: "bob".to_owned(),
             addresses: blackhole.clone(),
+            may_manage: false,
         }],
         listen(),
         Some(relay.clone()),
@@ -617,6 +637,7 @@ fn relay_connects_when_direct_address_is_a_blackhole() {
             id: alice_id,
             name: "alice".to_owned(),
             addresses: blackhole,
+            may_manage: false,
         }],
         listen(),
         Some(relay),
@@ -625,4 +646,106 @@ fn relay_connects_when_direct_address_is_a_blackhole() {
     wait_connected(&mut alice.events, bob_id, "bob");
     wait_connected(&mut bob.events, alice_id, "alice");
     deliver_ack(&alice.handle, alice_id, &mut bob.events, bob_id, 7);
+}
+
+/// Answers `Roots` with the caller's id and counts how often it ran.
+#[derive(Default)]
+struct EchoHandler {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ControlHandler for EchoHandler {
+    fn handle(&self, peer: DeviceId, call: RemoteCall) -> RemoteResult {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match call {
+            RemoteCall::Roots => Ok(RemoteReply::Roots {
+                roots: vec![RemoteRoot {
+                    name: "caller".into(),
+                    path: peer.to_string(),
+                }],
+            }),
+            _ => Err(RemoteError::new(RemoteErrorCode::Unsupported, "echo")),
+        }
+    }
+}
+
+/// Alice answers calls; bob calls her. `grant` is whether alice lets bob
+/// manage her.
+fn managed_pair(grant: bool) -> (Node, Node, Arc<EchoHandler>) {
+    let handler = Arc::new(EchoHandler::default());
+    let mut bob = spawn("bob", vec![]);
+    let alice_dir = TempDir::new().unwrap();
+    let alice_identity = Arc::new(DeviceIdentity::generate(alice_dir.path()).unwrap());
+    let mut bob_for_alice = trust(bob.id, "bob", Some(bob.handle.local_addr()));
+    bob_for_alice.may_manage = grant;
+    let mut alice = start_node(
+        "alice",
+        alice_identity,
+        alice_dir,
+        vec![bob_for_alice],
+        listen(),
+        None,
+        Some(handler.clone() as Arc<dyn ControlHandler>),
+    );
+    bob.handle
+        .send(NetCommand::SetPeers(vec![trust(alice.id, "alice", None)]));
+    wait_connected(&mut alice.events, bob.id, "bob");
+    wait_connected(&mut bob.events, alice.id, "alice");
+    (alice, bob, handler)
+}
+
+fn remote_call(caller: &Node, peer: DeviceId, call: RemoteCall) -> RemoteResult {
+    let (reply, rx) = std::sync::mpsc::channel();
+    caller
+        .handle
+        .send(NetCommand::Control { peer, call, reply });
+    rx.recv_timeout(TIMEOUT).expect("control reply")
+}
+
+fn wait_grants(events: &mut Events, from: DeviceId, expected: bool) {
+    events.wait_match(TIMEOUT, |ev| match ev {
+        NetEvent::PeerGrants {
+            peer,
+            may_manage_you,
+        } if *peer == from && *may_manage_you == expected => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn granted_peer_can_call_and_learns_the_grant() {
+    let (alice, mut bob, handler) = managed_pair(true);
+    wait_grants(&mut bob.events, alice.id, true);
+    let reply = remote_call(&bob, alice.id, RemoteCall::Roots).expect("roots");
+    let RemoteReply::Roots { roots } = reply else {
+        panic!("unexpected reply {reply:?}");
+    };
+    assert_eq!(roots[0].path, bob.id.to_string(), "handler saw the caller");
+    assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn call_without_grant_is_refused_before_the_handler() {
+    let (alice, bob, handler) = managed_pair(false);
+    let err = remote_call(&bob, alice.id, RemoteCall::Roots).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Forbidden, "{err}");
+    assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn granting_later_is_pushed_to_the_peer() {
+    let (alice, mut bob, _) = managed_pair(false);
+    let mut bob_for_alice = trust(bob.id, "bob", Some(bob.handle.local_addr()));
+    bob_for_alice.may_manage = true;
+    alice.handle.send(NetCommand::SetPeers(vec![bob_for_alice]));
+    wait_grants(&mut bob.events, alice.id, true);
+    assert!(remote_call(&bob, alice.id, RemoteCall::Roots).is_ok());
+}
+
+#[test]
+fn call_to_a_device_that_is_not_connected_is_offline() {
+    let bob = spawn("bob", vec![]);
+    let stranger = DeviceId::random();
+    let err = remote_call(&bob, stranger, RemoteCall::Roots).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Offline);
 }

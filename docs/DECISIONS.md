@@ -895,3 +895,50 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
   carry the same code. The message alone is what people see.
 - **One decision type.** `DeleteHoldDecision` lives in `relay-core`; the
   database and engine copies are gone.
+
+## D37. Remote management
+
+A paired device can be allowed to manage another: browse its folders now,
+set up sync on it later (remote explorer proposal, Stages 2 and 3).
+
+- **A separate grant.** `peers.may_manage` on the managed device means
+  "this peer may manage me." It is set only on purpose: the pairing option
+  (`relay pair --allow-manage`, a checkbox in the app that defaults on) or
+  `relay peer allow-manage`. Membership adoption (D26), offers, and
+  `peer add` never set it. `deny-manage` and `peer revoke` clear it.
+  Pairing again with the option off takes it back. One grant covers
+  browsing, reading, and setup, because reading any file is as sensitive
+  as configuring.
+- **Remote calls, not replicated config.** The manager asks; the managed
+  device runs the same code a local request would (D36) and stays the only
+  authority over its own config.
+- **Wire.** `PROTOCOL_VERSION` stays 1. `Hello.features` (tag 5) carries
+  `FEATURE_CONTROL`. `PeerGrants` (`Frame` tag 9) tells a peer whether it may
+  manage the sender; it is sent after `Hello` and whenever the trusted set
+  changes, only to peers with the bit, because an older peer closes the
+  connection on an unknown frame. A call rides its own stream: an
+  `ObjectRequest` whose `control` field (tag 2) is set, answered by one
+  `ControlResponse`. Calls go only to peers with the bit.
+- **Where checks happen.** `PeerConfig.may_manage` reaches the network
+  layer through `SetPeers`; a call from a peer without it is refused
+  `forbidden` before the daemon sees it. The daemon's `ControlHandler`
+  checks the database again. Each peer may run four calls at once; a call
+  gets ten seconds on a blocking thread (a macOS privacy prompt can stall
+  one) and the caller waits fifteen.
+- **Paths are opaque.** Paths travel in the managed device's native form.
+  The manager shows them and sends them back, never joins them. The
+  managed device requires absolute paths, canonicalizes, and refuses its
+  Relay home, which holds the device key.
+- **Listings.** Folders first, then by name; pages of 2,000 (at most 5,000)
+  with a cursor. Entries mark mount roots, ancestors of mounts, hidden
+  files, and cloud placeholders (Windows recall and offline attributes;
+  `~/Library/CloudStorage` and `~/Library/Mobile Documents` on macOS).
+- **Errors** are `relay_core::remote::RemoteErrorCode`: `forbidden`,
+  `denied`, `not_found`, `timeout`, `unsupported`, `invalid`, `busy`,
+  `offline`, `failed`. An unknown code from a newer peer reads as `failed`.
+- **macOS.** `Info.plist` carries folder usage strings. Settings shows
+  whether Relay has Full Disk Access and opens the pane.
+- **Known limits.** Read-only so far: no remote writes (Stage 3) and no file
+  contents (Stage 5). The target must be online. Listings are not logged to
+  activity; remote writes will be.
+

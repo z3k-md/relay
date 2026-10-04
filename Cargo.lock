@@ -4136,6 +4136,8 @@ name = "relay-daemon"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "directories",
+ "dunce",
  "relay-core",
  "relay-engine",
  "relay-ipc",

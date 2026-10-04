@@ -204,6 +204,10 @@ impl Syncer {
                     self.refresh_offers(engine, peer, out)?;
                 }
             }
+            ConfigChange::SetPeerManage { .. } => {
+                // The network layer holds the grant and tells the peer.
+                out(SyncOutput::SetPeers);
+            }
             ConfigChange::AddPeer { .. }
             | ConfigChange::RemovePeer { .. }
             | ConfigChange::RevokePeer { .. } => {

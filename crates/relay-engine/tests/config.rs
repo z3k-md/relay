@@ -147,3 +147,37 @@ fn delete_space_requires_detached_mounts_and_leaves_files() {
         })
         .unwrap();
 }
+
+#[test]
+fn manage_grant_is_explicit_and_revoke_clears_it() {
+    let home = TempDir::new().unwrap();
+    let mut engine = Engine::init(home.path(), "dev").unwrap();
+    let id = relay_engine::DeviceIdentity::generate(TempDir::new().unwrap().path())
+        .unwrap()
+        .device_id();
+    engine
+        .apply_config(&ConfigChange::AddPeer {
+            peer: "laptop".into(),
+            id,
+            addresses: vec!["127.0.0.1:1".into()],
+        })
+        .unwrap();
+    let grant = |engine: &Engine| engine.peers().unwrap()[0].may_manage;
+    assert!(!grant(&engine), "adding a peer grants nothing");
+
+    let allow = ConfigChange::SetPeerManage {
+        peer: "laptop".into(),
+        allowed: true,
+    };
+    engine.apply_config(&allow).unwrap();
+    assert!(grant(&engine));
+
+    engine
+        .apply_config(&ConfigChange::RevokePeer {
+            peer: "laptop".into(),
+        })
+        .unwrap();
+    assert!(!grant(&engine), "revoke takes the grant back");
+    let err = engine.apply_config(&allow).unwrap_err();
+    assert!(matches!(err, EngineError::PeerRevoked(_)), "{err}");
+}

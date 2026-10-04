@@ -1,10 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use relay_core::{ConfigApplied, ConfigChange, PairingCode, SpaceId};
+use relay_core::remote::RemoteReply;
+use relay_core::{ConfigApplied, ConfigChange, DeviceId, PairingCode, SpaceId};
 use relay_engine::{
     Engine, ScanReport, SyncInput, TransferDirection, TransferLive as EngineTransfer, WatchEvent,
     bookends, index_row,
@@ -12,8 +13,8 @@ use relay_engine::{
 use relay_ipc::{
     ActivityItem, FetchParams, Handler, Hello, HostKind, HostState, Idle, MountLive,
     PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
-    PeerLive, RescanParams, RpcErrorBody, Status, TransferDirection as IpcDirection, TransferLive,
-    Watching,
+    PeerLive, RemoteParams, RescanParams, RpcErrorBody, Status, TransferDirection as IpcDirection,
+    TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -44,9 +45,30 @@ pub(crate) struct Host {
     pub known_peers: Mutex<Vec<PeerConfig>>,
     pub pair: Mutex<PairPhase>,
     pub pair_cv: Condvar,
-    pub pair_share: Mutex<Vec<SpaceId>>,
+    pub pair_terms: Mutex<PairTerms>,
+    /// What each connected peer supports and grants this device (D37).
+    /// Kept apart from `peers`: grants can arrive before the engine reports
+    /// the peer as connected.
+    remote_access: Mutex<HashMap<DeviceId, RemoteAccess>>,
     pub wake: Wake,
 }
+
+/// What the device on the other end of a pairing gets, chosen when the
+/// pairing started or was joined.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PairTerms {
+    pub share: Vec<SpaceId>,
+    pub allow_manage: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RemoteAccess {
+    supports_remote: bool,
+    manageable: bool,
+}
+
+/// How long a remote call may take end to end before IPC gives up.
+const REMOTE_CALL_WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub(crate) enum PairPhase {
@@ -128,7 +150,8 @@ impl Host {
             known_peers: Mutex::new(Vec::new()),
             pair: Mutex::new(PairPhase::Idle),
             pair_cv: Condvar::new(),
-            pair_share: Mutex::new(Vec::new()),
+            pair_terms: Mutex::new(PairTerms::default()),
+            remote_access: Mutex::new(HashMap::new()),
             wake: Wake::new(),
         })
     }
@@ -145,11 +168,57 @@ impl Host {
         }
     }
 
-    pub fn take_pair_share(&self) -> Vec<SpaceId> {
-        self.pair_share
+    pub fn take_pair_terms(&self) -> PairTerms {
+        self.pair_terms
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default()
+    }
+
+    fn set_pair_terms(&self, terms: PairTerms) {
+        if let Ok(mut g) = self.pair_terms.lock() {
+            *g = terms;
+        }
+    }
+
+    pub fn note_remote_connected(&self, peer: DeviceId, supports_remote: bool) {
+        if let Ok(mut map) = self.remote_access.lock() {
+            map.entry(peer).or_default().supports_remote = supports_remote;
+        }
+    }
+
+    pub fn note_remote_grants(&self, peer: DeviceId, manageable: bool) {
+        if let Ok(mut map) = self.remote_access.lock() {
+            map.entry(peer).or_default().manageable = manageable;
+        }
+    }
+
+    pub fn forget_remote(&self, peer: DeviceId) {
+        if let Ok(mut map) = self.remote_access.lock() {
+            map.remove(&peer);
+        }
+    }
+
+    /// Make a remote call on a peer by its local name.
+    fn remote(&self, params: RemoteParams) -> Result<RemoteReply, RpcErrorBody> {
+        let peer = Engine::open_read_only(&self.home)
+            .and_then(|engine| engine.peers())
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
+            .into_iter()
+            .find(|p| p.name == params.peer)
+            .ok_or_else(|| {
+                RpcErrorBody::new("not_found", format!("unknown peer {:?}", params.peer))
+            })?;
+        let net = self.net_sender()?;
+        let (reply, rx) = mpsc::channel();
+        net.send(NetCommand::Control {
+            peer: peer.id,
+            call: params.call,
+            reply,
+        });
+        rx.recv_timeout(REMOTE_CALL_WAIT)
+            .map_err(|_| RpcErrorBody::new("timeout", "no answer from the network"))?
+            .map_err(|err| RpcErrorBody::new(err.code.as_str(), err.message))
     }
 
     pub fn finish_pair(&self, result: Result<(String, String), String>) {
@@ -295,9 +364,10 @@ impl Host {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        if let Ok(mut g) = self.pair_share.lock() {
-            *g = share;
-        }
+        self.set_pair_terms(PairTerms {
+            share,
+            allow_manage: params.allow_manage,
+        });
         if let Ok(mut g) = self.pair.lock() {
             *g = PairPhase::Waiting { expires_at_ms };
         }
@@ -349,6 +419,10 @@ impl Host {
         let net = self.net_sender()?;
         let code = PairingCode::parse(&params.code)
             .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+        self.set_pair_terms(PairTerms {
+            share: Vec::new(),
+            allow_manage: params.allow_manage,
+        });
         if let Ok(mut g) = self.pair.lock() {
             *g = PairPhase::Joining;
         }
@@ -413,9 +487,7 @@ impl Host {
         if let Ok(mut g) = self.pair.lock() {
             *g = PairPhase::Idle;
         }
-        if let Ok(mut g) = self.pair_share.lock() {
-            g.clear();
-        }
+        self.set_pair_terms(PairTerms::default());
         self.pair_cv.notify_all();
         Ok(())
     }
@@ -532,6 +604,8 @@ impl Host {
                         id: peer.clone(),
                         name: name.clone(),
                         connected_at_ms: now_ms(),
+                        supports_remote: false,
+                        manageable: false,
                     });
                 }
             }
@@ -598,6 +672,23 @@ impl Host {
         }
     }
 
+    fn live_peers(&self) -> Vec<PeerLive> {
+        let mut peers = self.peers.lock().map(|g| g.clone()).unwrap_or_default();
+        if let Ok(access) = self.remote_access.lock() {
+            for peer in &mut peers {
+                if let Some(a) = access
+                    .iter()
+                    .find(|(id, _)| id.to_string() == peer.id)
+                    .map(|(_, a)| *a)
+                {
+                    peer.supports_remote = a.supports_remote;
+                    peer.manageable = a.manageable;
+                }
+            }
+        }
+        peers
+    }
+
     pub fn snapshot(&self) -> Status {
         let state = self.state.lock().map(|g| *g).unwrap_or(HostState::Error);
         let mut transfers = self.progress_rows();
@@ -611,7 +702,7 @@ impl Host {
             state,
             message: self.message.lock().ok().and_then(|g| g.clone()),
             listen: self.listen.lock().ok().and_then(|g| g.clone()),
-            peers: self.peers.lock().map(|g| g.clone()).unwrap_or_default(),
+            peers: self.live_peers(),
             mounts: self.mounts.lock().map(|g| g.clone()).unwrap_or_default(),
             transfers,
             idle: Idle {
@@ -760,6 +851,11 @@ impl Handler for Host {
                 serde_json::to_value(self.pair_start(params)?).map_err(internal)
             }
             "pair_status" => serde_json::to_value(self.pair_status()).map_err(internal),
+            "remote" => {
+                let params: RemoteParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(self.remote(params)?).map_err(internal)
+            }
             "pair_join" => {
                 let params: PairJoinParams = serde_json::from_value(params)
                     .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;

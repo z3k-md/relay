@@ -5,14 +5,15 @@ use std::thread;
 use std::time::Duration;
 
 use interprocess::local_socket::{Stream, prelude::*};
+use relay_core::remote::{RemoteCall, RemoteReply};
 use relay_core::{ConfigApplied, ConfigChange};
 
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
     ActivityItem, FetchParams, Hello, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
-    PairStartParams, PairStartResult, PairStatus, Request, RescanParams, RescanResult, Response,
-    Status, decode_line, encode_line,
+    PairStartParams, PairStartResult, PairStatus, RemoteParams, Request, RescanParams,
+    RescanResult, Response, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -98,10 +99,7 @@ impl Client {
         )
     }
 
-    pub fn pair_start(&mut self, share: &[String]) -> Result<PairStartResult, IpcError> {
-        let params = PairStartParams {
-            share: share.to_vec(),
-        };
+    pub fn pair_start(&mut self, params: &PairStartParams) -> Result<PairStartResult, IpcError> {
         self.call(
             "pair_start",
             serde_json::to_value(params).map_err(IpcError::codec)?,
@@ -112,17 +110,22 @@ impl Client {
         self.call("pair_status", serde_json::json!({}))
     }
 
-    pub fn pair_join(
-        &mut self,
-        code: &str,
-        addr: Option<&str>,
-    ) -> Result<PairJoinResult, IpcError> {
-        let params = PairJoinParams {
-            code: code.to_owned(),
-            addr: addr.map(ToOwned::to_owned),
-        };
+    pub fn pair_join(&mut self, params: &PairJoinParams) -> Result<PairJoinResult, IpcError> {
         self.call(
             "pair_join",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    /// Make a remote call on a paired device (D37). A refusal comes back as
+    /// [`IpcError::Remote`] whose `code` is a `RemoteErrorCode` string.
+    pub fn remote(&mut self, peer: &str, call: &RemoteCall) -> Result<RemoteReply, IpcError> {
+        let params = RemoteParams {
+            peer: peer.to_owned(),
+            call: call.clone(),
+        };
+        self.call(
+            "remote",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
     }

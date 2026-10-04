@@ -14,6 +14,9 @@ import type {
   OfferView,
   Overview,
   PeerView,
+  RemoteCall,
+  RemoteErrorCode,
+  RemoteReply,
   ResolveReport,
   RunnerState,
   Settings,
@@ -32,6 +35,28 @@ function asError(err: unknown): Error {
   return new Error(String(err));
 }
 
+/** A refused remote call, with the stable code from the other device. */
+export class RemoteCallError extends Error {
+  constructor(
+    readonly code: RemoteErrorCode,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+async function remoteCall(peer: string, request: RemoteCall): Promise<RemoteReply> {
+  try {
+    return await invoke<RemoteReply>("remote_call", { peer, call: request });
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && "message" in err) {
+      const { code, message } = err as { code: RemoteErrorCode; message: string };
+      throw new RemoteCallError(code, message);
+    }
+    throw asError(err);
+  }
+}
+
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
     return await invoke<T>(cmd, args);
@@ -47,10 +72,14 @@ export const api = {
   addPeer: (name: string, deviceId: string, address: string) =>
     call<PeerView>("add_peer", { name, deviceId, address }),
   removePeer: (name: string) => call<void>("remove_peer", { name }),
-  pairStart: (share: string[]) => call<PairStartResult>("pair_start", { share }),
+  setPeerManage: (name: string, allowed: boolean) =>
+    call<void>("set_peer_manage", { name, allowed }),
+  remoteCall,
+  pairStart: (share: string[], allowManage: boolean) =>
+    call<PairStartResult>("pair_start", { share, allowManage }),
   pairStatus: () => call<PairStatus>("pair_status"),
-  pairJoin: (code: string, addr?: string) =>
-    call<PairJoinResult>("pair_join", { code, addr: addr || null }),
+  pairJoin: (code: string, addr: string | undefined, allowManage: boolean) =>
+    call<PairJoinResult>("pair_join", { code, addr: addr || null, allowManage }),
   pairCancel: () => call<void>("pair_cancel"),
   listSpaces: () => call<SpaceView[]>("list_spaces"),
   createSpace: (name: string) => call<SpaceView>("create_space", { name }),
@@ -102,6 +131,8 @@ export const api = {
   setSettings: (patch: Partial<Settings>) =>
     call<Settings>("set_settings", { patch }),
   openLogsFolder: () => call<void>("open_logs_folder"),
+  fullDiskAccess: () => call<boolean | null>("full_disk_access"),
+  openFullDiskAccess: () => call<void>("open_full_disk_access"),
   cliStatus: () => call<CliStatus>("cli_status"),
   installCli: (shell?: CliShell) =>
     call<CliInstallResult>("install_cli", { shell: shell ?? null }),

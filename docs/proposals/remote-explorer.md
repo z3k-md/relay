@@ -3,8 +3,7 @@
 Build plan for browsing another device's folders, setting up sync from
 either machine, and opening files that are not on this device yet. This does
 not amend [`DESIGN.md`](../DESIGN.md) or [`DECISIONS.md`](../DECISIONS.md).
-Stage 0 is recorded as D36. The decisions below become D37 when the first
-stage that needs them lands.
+Stage 0 is recorded as D36 and Stage 2 as D37.
 
 The stages are in build order. Each one ships on its own and is useful
 without the next. Stages 0 and 1 change no wire format and no trust rules.
@@ -179,6 +178,14 @@ Done when: on a mount with a `demand` rule, a file can be found in the Files
 view, opened, and evicted without the CLI.
 
 ## Stage 2. Manage grant and remote browsing
+
+**Shipped (D37).** Calls and results are one set of `relay_core::remote`
+types; `relay-proto::control` maps them to the wire. The network layer owns
+the grant check and `PeerGrants`; the daemon's `ControlHandler` does the
+filesystem work. Desktop: a Browse view and the pairing checkbox. CLI:
+`relay browse`. The per-entry `denied` flag was dropped: probing each child
+folder would trigger the very prompts it reports, so a refused listing
+returns `denied` instead.
 
 Read-only. No remote writes yet.
 

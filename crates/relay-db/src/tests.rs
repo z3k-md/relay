@@ -8,6 +8,7 @@ use relay_core::{
 
 use rusqlite::params;
 
+use crate::migrate::SCHEMA_VERSION;
 use crate::{Database, DbError};
 
 fn device(n: u8, name: &str) -> Device {
@@ -153,13 +154,13 @@ fn migrations_are_idempotent_on_reopen() {
     let path = dir.path().join("nested").join("relay.sqlite");
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     }
     {
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
         db.repo().init_local_device(&device(9, "again"), 1).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     }
 }
 
@@ -177,7 +178,7 @@ fn schema_too_new_is_rejected() {
         err,
         DbError::SchemaTooNew {
             found: 99,
-            supported: 12
+            supported: SCHEMA_VERSION
         }
     ));
 }
@@ -220,7 +221,7 @@ fn v1_database_upgrades_to_current_without_data_loss() {
     write_v1_db(&path);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 12);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -255,7 +256,7 @@ fn upgrade_collapses_duplicate_history_rows() {
     }
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 12);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
@@ -275,7 +276,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooOld {
                 found: 1,
-                supported: 12
+                supported: SCHEMA_VERSION
             }
         ),
         "{err}"
@@ -298,7 +299,7 @@ fn open_read_only_does_not_migrate_and_rejects_version_mismatch() {
             err,
             DbError::SchemaTooNew {
                 found: 99,
-                supported: 12
+                supported: SCHEMA_VERSION
             }
         ),
         "{err}"
@@ -320,7 +321,7 @@ fn open_read_only_reads_without_writing() {
         db.repo().create_space(&space, 1).unwrap();
     }
     let db = Database::open_read_only(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 12);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     let names: Vec<_> = db
         .repo()
         .list_spaces()
@@ -359,7 +360,7 @@ fn v4_database_upgrades_to_delete_holds() {
     assert_eq!(version, 4);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 12);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     assert_eq!(space.name, "Legacy");
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
@@ -371,7 +372,7 @@ fn v4_database_upgrades_to_delete_holds() {
 #[test]
 fn fresh_database_has_delete_hold_tables() {
     let db = Database::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 12);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     db.repo().init_local_device(&device(1, "dev"), 1).unwrap();
     let space = space("Personal");
     db.repo().create_space(&space, 1).unwrap();
@@ -499,7 +500,7 @@ fn v5_database_upgrades_to_applied_hold_paths() {
     assert_eq!(version, 5);
 
     let db = Database::open(&db_path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 12);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
     let peer = db.repo().peer_by_name("laptop").unwrap().unwrap();
@@ -1220,7 +1221,7 @@ fn v11_entries_migrate_as_materialized() {
     }
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 12);
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
     let space = db.repo().space_by_name("Legacy").unwrap().unwrap();
     let mount = db.repo().mount_by_name(space.id, "docs").unwrap().unwrap();
     let entry = db
@@ -1257,4 +1258,34 @@ proptest! {
         prop_assert_eq!(got.vector, record.vector);
         prop_assert_eq!(got.content, record.content);
     }
+}
+
+#[test]
+fn peers_start_without_the_manage_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("relay.sqlite")).unwrap();
+    db.repo().init_local_device(&device(1, "dev"), 1).unwrap();
+    let peer = device(9, "laptop");
+    db.repo()
+        .add_peer(&peer, &["127.0.0.1:1".into()], 2)
+        .unwrap();
+    assert!(!db.repo().peer_by_id(peer.id).unwrap().unwrap().may_manage);
+
+    assert!(db.repo().set_peer_manage(peer.id, true).unwrap());
+    assert!(
+        db.repo()
+            .peer_by_name("laptop")
+            .unwrap()
+            .unwrap()
+            .may_manage
+    );
+    assert!(db.repo().list_peers().unwrap()[0].may_manage);
+
+    // Renaming or re-addressing a peer keeps its grant.
+    db.repo()
+        .update_peer(peer.id, "desk", &["127.0.0.1:2".into()], 3)
+        .unwrap();
+    assert!(db.repo().peer_by_id(peer.id).unwrap().unwrap().may_manage);
+
+    assert!(!db.repo().set_peer_manage(device(8, "x").id, true).unwrap());
 }

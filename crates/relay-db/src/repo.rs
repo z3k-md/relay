@@ -49,6 +49,8 @@ pub struct PeerRecord {
     /// first connection. While the peer is offline this is when that session
     /// ended (or the last presence refresh, if the session did not end cleanly).
     pub last_seen_ms: Option<i64>,
+    /// This peer may manage this device (D37).
+    pub may_manage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1178,27 +1180,28 @@ impl Repo<'_> {
     }
 
     pub fn list_peers(&self) -> Result<Vec<PeerRecord>, DbError> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms, d.last_seen_ms
-             FROM peers p
-             JOIN devices d ON d.ref = p.device_ref
-             ORDER BY p.name",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, [u8; 32]>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("{PEER_SELECT} ORDER BY p.name"))?;
+        let rows = stmt.query_map([], read_peer_row)?;
         let mut peers = Vec::new();
         for row in rows {
-            let (id, name, addresses, added_at_ms, last_seen_ms) = row?;
-            peers.push(parse_peer(id, name, addresses, added_at_ms, last_seen_ms)?);
+            peers.push(row?.parse()?);
         }
         Ok(peers)
+    }
+
+    /// Record whether `peer` may manage this device. Returns false when the
+    /// peer is unknown.
+    pub fn set_peer_manage(&self, peer: DeviceId, allowed: bool) -> Result<bool, DbError> {
+        let Some(device_ref) = self.device_ref(peer)? else {
+            return Ok(false);
+        };
+        let changed = self.conn.execute(
+            "UPDATE peers SET may_manage = ?1 WHERE device_ref = ?2",
+            params![allowed, device_ref],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn share_space(&self, space: SpaceId, peer: DeviceId) -> Result<(), DbError> {
@@ -2192,26 +2195,14 @@ impl Repo<'_> {
         where_clause: &str,
         params: impl rusqlite::Params,
     ) -> Result<Option<PeerRecord>, DbError> {
-        let sql = format!(
-            "SELECT d.device_id, p.name, p.addresses, p.added_at_ms, d.last_seen_ms
-             FROM peers p
-             JOIN devices d ON d.ref = p.device_ref
-             WHERE {where_clause}"
-        );
         self.conn
-            .query_row(&sql, params, |row| {
-                Ok((
-                    row.get::<_, [u8; 32]>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })
+            .query_row(
+                &format!("{PEER_SELECT} WHERE {where_clause}"),
+                params,
+                read_peer_row,
+            )
             .optional()?
-            .map(|(id, name, addresses, added_at_ms, last_seen_ms)| {
-                parse_peer(id, name, addresses, added_at_ms, last_seen_ms)
-            })
+            .map(PeerRow::parse)
             .transpose()
     }
 
@@ -2767,22 +2758,45 @@ pub struct SpaceKeyWrap {
     pub wrapped: Vec<u8>,
 }
 
-fn parse_peer(
+const PEER_SELECT: &str =
+    "SELECT d.device_id, p.name, p.addresses, p.added_at_ms, d.last_seen_ms, p.may_manage
+     FROM peers p
+     JOIN devices d ON d.ref = p.device_ref";
+
+/// One row of [`PEER_SELECT`], before the JSON address list is parsed.
+struct PeerRow {
     id: [u8; 32],
     name: String,
     addresses: String,
     added_at_ms: i64,
     last_seen_ms: Option<i64>,
-) -> Result<PeerRecord, DbError> {
-    Ok(PeerRecord {
-        device: Device {
-            id: DeviceId::from_bytes(id),
-            name,
-        },
-        addresses: serde_json::from_str(&addresses)?,
-        added_at_ms,
-        last_seen_ms,
+    may_manage: bool,
+}
+
+fn read_peer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRow> {
+    Ok(PeerRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        addresses: row.get(2)?,
+        added_at_ms: row.get(3)?,
+        last_seen_ms: row.get(4)?,
+        may_manage: row.get(5)?,
     })
+}
+
+impl PeerRow {
+    fn parse(self) -> Result<PeerRecord, DbError> {
+        Ok(PeerRecord {
+            device: Device {
+                id: DeviceId::from_bytes(self.id),
+                name: self.name,
+            },
+            addresses: serde_json::from_str(&self.addresses)?,
+            added_at_ms: self.added_at_ms,
+            last_seen_ms: self.last_seen_ms,
+            may_manage: self.may_manage,
+        })
+    }
 }
 
 fn parse_members_json(raw: &str) -> Result<Vec<OfferedMember>, DbError> {

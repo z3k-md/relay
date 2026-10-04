@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use relay_core::remote::{RemoteCall, RemoteError, RemoteErrorCode, RemoteReply};
 use relay_core::{ConfigApplied, ConfigChange, DeviceId};
 use relay_engine::{
     ConflictClass, DeleteHoldDecision, Engine, EngineError, Resolution,
@@ -19,7 +20,7 @@ use crate::sidecar::{self, CliInstallResult, CliStatus, ShellKind};
 #[cfg(not(target_os = "android"))]
 use crate::updates::{self, UpdateInfo};
 use crate::{AppState, settings};
-use relay_ipc::Client;
+use relay_ipc::{Client, PairJoinParams, PairStartParams, PeerLive};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,12 @@ pub struct PeerView {
     /// Last live contact. `None` until this peer has connected once.
     /// While offline, this is when that contact ended.
     pub last_seen_ms: Option<i64>,
+    /// This peer may browse this device and set up sync on it.
+    pub allowed_to_manage: bool,
+    /// This peer lets this device manage it. Known only while connected.
+    pub can_manage: bool,
+    /// This peer's Relay answers remote calls. Known only while connected.
+    pub supports_remote: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -231,20 +238,32 @@ pub fn init_device(app: AppHandle, name: String) -> Result<Overview, String> {
 
 /// Live sessions from the running host when one is listening, otherwise the
 /// in-app runner. The host is the source of truth for the background service.
-fn live_sessions(app: &AppHandle) -> HashMap<String, i64> {
+/// Connected peers by device id, from the running host when there is one.
+fn live_sessions(app: &AppHandle) -> HashMap<String, PeerLive> {
     if let Ok(Some(mut client)) = host_client(app)
         && let Ok(status) = client.status()
     {
         return status
             .peers
             .into_iter()
-            .filter_map(|peer| {
-                let since = i64::try_from(peer.connected_at_ms).ok()?;
-                Some((peer.id, since))
-            })
+            .map(|peer| (peer.id.clone(), peer))
             .collect();
     }
-    app.state::<AppState>().runner.connected_since()
+    app.state::<AppState>()
+        .runner
+        .connected_since()
+        .into_iter()
+        .map(|(id, since)| {
+            let peer = PeerLive {
+                id: id.clone(),
+                name: String::new(),
+                connected_at_ms: u64::try_from(since).unwrap_or_default(),
+                supports_remote: false,
+                manageable: false,
+            };
+            (id, peer)
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -257,18 +276,53 @@ pub fn list_peers(app: AppHandle) -> Result<Vec<PeerView>, String> {
         .into_iter()
         .map(|p| {
             let id = p.id.to_string();
-            let since = sessions.get(&id).copied();
+            let live = sessions.get(&id);
             PeerView {
                 name: p.name,
                 short_id: p.id.short(),
-                connected: since.is_some(),
-                connected_since_ms: since,
+                connected: live.is_some(),
+                connected_since_ms: live.and_then(|l| i64::try_from(l.connected_at_ms).ok()),
                 last_seen_ms: p.last_seen_ms,
                 address: p.addresses.first().cloned().unwrap_or_default(),
+                allowed_to_manage: p.may_manage,
+                can_manage: live.is_some_and(|l| l.manageable),
+                supports_remote: live.is_some_and(|l| l.supports_remote),
                 id,
             }
         })
         .collect())
+}
+
+#[tauri::command(async)]
+pub fn set_peer_manage(app: AppHandle, name: String, allowed: bool) -> Result<(), String> {
+    apply_config(
+        &app,
+        ConfigChange::SetPeerManage {
+            peer: name,
+            allowed,
+        },
+    )
+    .map(drop)
+}
+
+/// A remote call on a paired device. Errors keep their stable code so the UI
+/// can tell "needs permission" from "offline".
+#[tauri::command(async)]
+pub fn remote_call(
+    app: AppHandle,
+    peer: String,
+    call: RemoteCall,
+) -> Result<RemoteReply, RemoteError> {
+    let mut client = host_client(&app)
+        .ok()
+        .flatten()
+        .ok_or_else(|| RemoteError::new(RemoteErrorCode::Offline, "Relay is not running here"))?;
+    client.remote(&peer, &call).map_err(|err| match err {
+        relay_ipc::IpcError::Remote { code, message } => {
+            RemoteError::new(RemoteErrorCode::parse(&code), message)
+        }
+        other => RemoteError::new(RemoteErrorCode::Failed, error_chain(&other)),
+    })
 }
 
 #[tauri::command(async)]
@@ -305,6 +359,9 @@ pub fn add_peer(
         connected: false,
         connected_since_ms: None,
         last_seen_ms: None,
+        allowed_to_manage: false,
+        can_manage: false,
+        supports_remote: false,
     })
 }
 
@@ -360,9 +417,18 @@ fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
 }
 
 #[tauri::command]
-pub fn pair_start(app: AppHandle, share: Vec<String>) -> Result<PairStartView, String> {
+pub fn pair_start(
+    app: AppHandle,
+    share: Vec<String>,
+    allow_manage: bool,
+) -> Result<PairStartView, String> {
     let mut client = pairing_client(&app)?;
-    let started = client.pair_start(&share).map_err(|err| error_chain(&err))?;
+    let started = client
+        .pair_start(&PairStartParams {
+            share,
+            allow_manage,
+        })
+        .map_err(|err| error_chain(&err))?;
     Ok(PairStartView {
         code: started.code,
         expires_at_ms: started.expires_at_ms,
@@ -389,11 +455,20 @@ pub fn pair_join(
     app: AppHandle,
     code: String,
     addr: Option<String>,
+    allow_manage: bool,
 ) -> Result<PairJoinView, String> {
     let mut client = pairing_client(&app)?;
-    let addr = addr.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let addr = addr
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let joined = client
-        .pair_join(code.trim(), addr)
+        .pair_join(&PairJoinParams {
+            code: code.trim().to_owned(),
+            addr,
+            allow_manage,
+        })
         .map_err(|err| error_chain(&err))?;
     Ok(PairJoinView {
         peer_name: joined.peer_name,
@@ -890,6 +965,27 @@ pub fn open_logs_folder(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(logs.to_string_lossy().to_string(), None::<&str>)
         .map_err(|err| anyhow_chain(err.into()))
+}
+
+/// Whether this Mac lets Relay read every folder. `None` off macOS.
+#[tauri::command]
+pub fn full_disk_access() -> Option<bool> {
+    crate::privacy::full_disk_access()
+}
+
+#[tauri::command]
+pub fn open_full_disk_access(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        app.opener()
+            .open_url(crate::privacy::FULL_DISK_ACCESS_PANE, None::<&str>)
+            .map_err(|err| anyhow_chain(err.into()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("Full Disk Access is a macOS setting".to_owned())
+    }
 }
 
 #[cfg(not(target_os = "android"))]

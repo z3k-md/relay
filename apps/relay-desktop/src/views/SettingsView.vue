@@ -19,6 +19,21 @@ const cliMessage = ref<string | null>(null);
 const busy = ref(false);
 const checking = computed(() => updateActive.value);
 const selectedShell = ref<CliShell>("zsh");
+/** macOS only: whether devices allowed to manage this Mac can read every folder. */
+const fullDiskAccess = ref<boolean | null>(null);
+
+async function openFullDiskAccess() {
+  error.value = null;
+  try {
+    await api.openFullDiskAccess();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function recheckFullDiskAccess() {
+  fullDiskAccess.value = await api.fullDiskAccess();
+}
 
 const selectedHint = computed(() => {
   const hints = cli.value?.shellHints ?? [];
@@ -48,9 +63,14 @@ async function load() {
       settings.value = await api.getSettings();
       return;
     }
-    const [s, c] = await Promise.all([api.getSettings(), api.cliStatus()]);
+    const [s, c, fda] = await Promise.all([
+      api.getSettings(),
+      api.cliStatus(),
+      api.fullDiskAccess(),
+    ]);
     settings.value = s;
     cli.value = c;
+    fullDiskAccess.value = fda;
     if (c.detectedShell) {
       selectedShell.value = c.detectedShell;
     }
@@ -116,6 +136,43 @@ defineExpose({ load });
       <p v-if="mobile" class="text-[var(--color-muted)]">
         Relay syncs while this app is open. Version {{ props.version }}.
       </p>
+      <section
+        v-if="fullDiskAccess !== null"
+        class="rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2"
+      >
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <p class="font-medium">Access to all folders</p>
+            <p class="text-[12px] text-[var(--color-muted)]">
+              <template v-if="fullDiskAccess">
+                Relay has Full Disk Access. Devices you allowed can browse Desktop, Documents, and
+                Downloads without a prompt on this Mac.
+              </template>
+              <template v-else>
+                Without Full Disk Access, browsing Desktop, Documents, or Downloads from another
+                device waits on a prompt on this Mac. Turn it on for Relay, then check again.
+              </template>
+            </p>
+          </div>
+          <div class="flex shrink-0 gap-2">
+            <button
+              v-if="!fullDiskAccess"
+              type="button"
+              class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+              @click="openFullDiskAccess"
+            >
+              Open settings
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+              @click="recheckFullDiskAccess"
+            >
+              Check again
+            </button>
+          </div>
+        </div>
+      </section>
       <section
         v-if="!mobile"
         class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)]"

@@ -7,9 +7,11 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use relay_core::remote::{RemoteCall, RemoteReply};
 use relay_core::{ConfigApplied, ConfigChange, DeleteHoldDecision};
 use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{Engine, WatchEvent, WatchOptions};
+use relay_ipc::{PairJoinParams, PairStartParams};
 use tempfile::TempDir;
 
 const CONVERGE: Duration = Duration::from_secs(15);
@@ -465,7 +467,12 @@ fn pair_via_ipc_shares_and_syncs_without_reload() {
     drain(&session_b);
 
     let mut client_a = wait_ipc(home_a.path());
-    let started = client_a.pair_start(&["S".to_owned()]).expect("pair_start");
+    let started = client_a
+        .pair_start(&PairStartParams {
+            share: vec!["S".to_owned()],
+            allow_manage: false,
+        })
+        .expect("pair_start");
     assert_eq!(
         started.code.chars().filter(|c| c.is_ascii_digit()).count(),
         10
@@ -473,7 +480,11 @@ fn pair_via_ipc_shares_and_syncs_without_reload() {
 
     let mut client_b = wait_ipc(home_b.path());
     let joined = client_b
-        .pair_join(&started.code, Some(&addr_a.to_string()))
+        .pair_join(&PairJoinParams {
+            code: started.code.clone(),
+            addr: Some(addr_a.to_string()),
+            allow_manage: false,
+        })
         .expect("pair_join");
     assert_eq!(joined.peer_name, "alice");
 
@@ -542,9 +553,24 @@ fn reload_count(session: &DaemonSession) -> usize {
 
 /// Pair alice (listening on `addr_a`) with bob, sharing nothing yet.
 fn pair(home_a: &Path, addr_a: SocketAddr, home_b: &Path) {
-    let code = wait_ipc(home_a).pair_start(&[]).expect("pair_start").code;
+    pair_granting(home_a, addr_a, home_b, false);
+}
+
+/// Pair alice with bob. `alice_allows_bob` lets bob manage alice.
+fn pair_granting(home_a: &Path, addr_a: SocketAddr, home_b: &Path, alice_allows_bob: bool) {
+    let code = wait_ipc(home_a)
+        .pair_start(&PairStartParams {
+            share: Vec::new(),
+            allow_manage: alice_allows_bob,
+        })
+        .expect("pair_start")
+        .code;
     wait_ipc(home_b)
-        .pair_join(&code, Some(&addr_a.to_string()))
+        .pair_join(&PairJoinParams {
+            code,
+            addr: Some(addr_a.to_string()),
+            allow_manage: false,
+        })
         .expect("pair_join");
     assert!(
         wait_until(CONVERGE, || has_peer(home_a, "bob")
@@ -765,6 +791,86 @@ fn live_delete_hold_decision_resumes_without_reload() {
         "applied deletes did not go through live"
     );
     assert_eq!(reload_count(&session_b), 0, "bob reloaded");
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}
+
+/// Bob browses alice's folders over the network after alice granted it while
+/// pairing; alice, without a grant from bob, is refused.
+#[test]
+fn granted_peer_browses_folders_over_ipc() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let folder = TempDir::new().unwrap();
+    fs::create_dir(folder.path().join("Projects")).unwrap();
+    fs::write(folder.path().join("notes.txt"), b"hi").unwrap();
+    Engine::init(home_a.path(), "alice").unwrap();
+    Engine::init(home_b.path(), "bob").unwrap();
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    pair_granting(home_a.path(), addr_a, home_b.path(), true);
+
+    let alice_peers = Engine::open_read_only(home_a.path())
+        .unwrap()
+        .peers()
+        .unwrap();
+    assert!(alice_peers.iter().any(|p| p.name == "bob" && p.may_manage));
+    assert!(
+        wait_until(CONVERGE, || wait_ipc(home_b.path()).status().is_ok_and(
+            |s| s.peers.iter().any(|p| p.name == "alice" && p.manageable)
+        )),
+        "bob never learned alice's grant"
+    );
+
+    let path = folder.path().to_str().unwrap().to_owned();
+    let reply = wait_ipc(home_b.path())
+        .remote(
+            "alice",
+            &RemoteCall::ListDir {
+                path,
+                cursor: 0,
+                limit: 0,
+            },
+        )
+        .expect("list alice's folder");
+    let RemoteReply::Listing { listing } = reply else {
+        panic!("unexpected reply {reply:?}");
+    };
+    let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["Projects", "notes.txt"]);
+
+    let refused = wait_ipc(home_a.path())
+        .remote("bob", &RemoteCall::Roots)
+        .unwrap_err();
+    assert!(
+        matches!(refused, relay_ipc::IpcError::Remote { ref code, .. } if code == "forbidden"),
+        "{refused:?}"
+    );
+
+    // Taking the grant back is pushed to bob and enforced.
+    config(
+        home_a.path(),
+        ConfigChange::SetPeerManage {
+            peer: "bob".into(),
+            allowed: false,
+        },
+    );
+    assert!(
+        wait_until(CONVERGE, || wait_ipc(home_b.path()).status().is_ok_and(
+            |s| s.peers.iter().any(|p| p.name == "alice" && !p.manageable)
+        )),
+        "bob still thinks it may manage alice"
+    );
+    let refused = wait_ipc(home_b.path())
+        .remote("alice", &RemoteCall::Roots)
+        .unwrap_err();
+    assert!(
+        matches!(refused, relay_ipc::IpcError::Remote { ref code, .. } if code == "forbidden"),
+        "{refused:?}"
+    );
+    assert_eq!(reload_count(&session_a), 0, "alice reloaded");
     stop_daemon(session_a);
     stop_daemon(session_b);
 }

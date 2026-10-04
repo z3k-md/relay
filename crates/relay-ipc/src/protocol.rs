@@ -178,6 +178,12 @@ pub struct PeerLive {
     pub id: String,
     pub name: String,
     pub connected_at_ms: u64,
+    /// The peer's Relay answers remote calls (D37).
+    #[serde(default)]
+    pub supports_remote: bool,
+    /// The peer lets this device manage it.
+    #[serde(default)]
+    pub manageable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +248,9 @@ pub struct FetchParams {
 pub struct PairStartParams {
     #[serde(default)]
     pub share: Vec<String>,
+    /// Let the device that joins manage this one (D37).
+    #[serde(default)]
+    pub allow_manage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +264,16 @@ pub struct PairJoinParams {
     pub code: String,
     #[serde(default)]
     pub addr: Option<String>,
+    /// Let the device showing the code manage this one (D37).
+    #[serde(default)]
+    pub allow_manage: bool,
+}
+
+/// A remote call on a paired device, by its local peer name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteParams {
+    pub peer: String,
+    pub call: relay_core::remote::RemoteCall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

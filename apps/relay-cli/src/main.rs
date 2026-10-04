@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use relay_core::remote::{DirEntryKind, RemoteCall, RemoteReply};
 use relay_core::{
     ConfigApplied, ConfigChange, DeviceId, EntryContent, EntryRecord, LogicalPath, PairingCode,
     Sequence, VersionVector,
@@ -20,7 +21,9 @@ use relay_engine::{
     ScanReport, TransportStatus, WatchEvent, WatchOptions, default_home, group_git_conflicts,
     resolve_conflict, resolve_git_conflicts,
 };
-use relay_ipc::{ActivityItem, Client, PairStatus, Status as DaemonStatus};
+use relay_ipc::{
+    ActivityItem, Client, PairJoinParams, PairStartParams, PairStatus, Status as DaemonStatus,
+};
 
 mod output;
 mod service;
@@ -75,6 +78,9 @@ enum Command {
         /// Address to dial when joining (Tailscale/VPN; skip on the same LAN)
         #[arg(long)]
         addr: Option<String>,
+        /// Let the other device browse this one and set up sync on it
+        #[arg(long)]
+        allow_manage: bool,
         /// UDP listen address when this command starts a temporary host
         #[arg(long, default_value = DEFAULT_LISTEN)]
         listen: SocketAddr,
@@ -117,6 +123,15 @@ enum Command {
     Materialize {
         #[command(subcommand)]
         cmd: MaterializeCmd,
+    },
+    /// List folders on a paired device that lets this one manage it
+    Browse {
+        peer: String,
+        /// Folder on that device, in its own path format (omit for its roots)
+        path: Option<String>,
+        /// Include dot-files and hidden files
+        #[arg(long)]
+        all: bool,
     },
     /// Fetch a demand-mode path onto this device
     Fetch {
@@ -340,6 +355,14 @@ enum PeerCmd {
     Revoke {
         name: String,
     },
+    /// Let a peer browse this device and set up sync on it
+    AllowManage {
+        name: String,
+    },
+    /// Stop letting a peer manage this device
+    DenyManage {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -531,8 +554,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             code,
             share,
             addr,
+            allow_manage,
             listen,
-        } => cmd_pair(&home, code, share, addr, listen, json),
+        } => cmd_pair(&home, code, share, addr, allow_manage, listen, json),
         Command::Peer { cmd } => cmd_peer(&home, cmd, json),
         Command::Share { space, peer } => {
             apply_config(
@@ -580,6 +604,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Group { cmd } => cmd_group(&home, cmd, json),
         Command::Policy { cmd } => cmd_policy(&home, cmd, json),
         Command::Materialize { cmd } => cmd_materialize(&home, cmd, json),
+        Command::Browse { peer, path, all } => cmd_browse(&home, &peer, path, all, json),
         Command::Fetch { target } => cmd_fetch(&home, &target, json),
         Command::Evict { target } => cmd_evict(&home, &target, json),
         Command::Conflicts { space, cmd } => match cmd {
@@ -1000,6 +1025,7 @@ fn cmd_pair(
     code: Option<String>,
     share: Vec<String>,
     addr: Option<String>,
+    allow_manage: bool,
     listen: SocketAddr,
     json: bool,
 ) -> Result<ExitCode> {
@@ -1023,9 +1049,18 @@ fn cmd_pair(
     };
     let mut client = wait_pair_client(home, host.as_mut())?;
     let result = if let Some(code) = joining {
-        pair_join_cli(home, &code, addr.as_deref(), json)
+        let params = PairJoinParams {
+            code: code.format(),
+            addr,
+            allow_manage,
+        };
+        pair_join_cli(home, params, json)
     } else {
-        pair_start_cli(&mut client, home, &share, json)
+        let params = PairStartParams {
+            share,
+            allow_manage,
+        };
+        pair_start_cli(&mut client, home, &params, json)
     };
     drop(host);
     result
@@ -1139,10 +1174,10 @@ fn install_pair_cancel() -> Result<Arc<AtomicBool>> {
 fn pair_start_cli(
     client: &mut Client,
     home: &Path,
-    share: &[String],
+    params: &PairStartParams,
     json: bool,
 ) -> Result<ExitCode> {
-    let started = client.pair_start(share)?;
+    let started = client.pair_start(params)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&started)?);
     } else {
@@ -1183,28 +1218,20 @@ fn pair_start_cli(
     }
 }
 
-fn pair_join_cli(
-    home: &Path,
-    code: &PairingCode,
-    addr: Option<&str>,
-    json: bool,
-) -> Result<ExitCode> {
+fn pair_join_cli(home: &Path, params: PairJoinParams, json: bool) -> Result<ExitCode> {
     let cancel = install_pair_cancel()?;
     let home_owned = home.to_path_buf();
-    let digits = code.format();
-    let addr_owned = addr.map(ToOwned::to_owned);
+    let addr = params.addr.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = (|| {
             let mut client = wait_pair_client(&home_owned, None)?;
-            client
-                .pair_join(&digits, addr_owned.as_deref())
-                .map_err(anyhow::Error::from)
+            client.pair_join(&params).map_err(anyhow::Error::from)
         })();
         let _ = tx.send(result);
     });
     if !json {
-        match addr {
+        match addr.as_deref() {
             Some(addr) => println!("Joining via {addr}…"),
             None => println!("Looking for the other device on the LAN…"),
         }
@@ -1528,7 +1555,12 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
                         peer.addresses.join(", ")
                     };
                     let mark = if peer.revoked { " revoked" } else { "" };
-                    println!("{}  {}  {addrs}{mark}", peer.name, peer.id);
+                    let manage = if peer.may_manage {
+                        " manages this device"
+                    } else {
+                        ""
+                    };
+                    println!("{}  {}  {addrs}{mark}{manage}", peer.name, peer.id);
                 }
             }
         }
@@ -1543,6 +1575,8 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
                 println!("removed peer {name}");
             }
         }
+        PeerCmd::AllowManage { name } => set_peer_manage(home, name, true, json)?,
+        PeerCmd::DenyManage { name } => set_peer_manage(home, name, false, json)?,
         PeerCmd::Revoke { name } => {
             apply_config(home, ConfigChange::RevokePeer { peer: name.clone() })?;
             if json {
@@ -1556,6 +1590,29 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn set_peer_manage(home: &Path, peer: String, allowed: bool, json: bool) -> Result<()> {
+    apply_config(
+        home,
+        ConfigChange::SetPeerManage {
+            peer: peer.clone(),
+            allowed,
+        },
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"peer": peer, "may_manage": allowed})
+            )?
+        );
+    } else if allowed {
+        println!("{peer} can now browse this device and set up sync on it");
+    } else {
+        println!("{peer} can no longer manage this device");
+    }
+    Ok(())
 }
 
 fn cmd_recovery(home: &Path, cmd: RecoveryCmd, json: bool) -> Result<ExitCode> {
@@ -1939,6 +1996,73 @@ fn cmd_materialize(home: &Path, cmd: MaterializeCmd, json: bool) -> Result<ExitC
                 }
             }
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_browse(
+    home: &Path,
+    peer: &str,
+    path: Option<String>,
+    all: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut client = Client::connect(home)?
+        .ok_or_else(|| anyhow::anyhow!("Relay is not running; browsing needs a live connection"))?;
+    let reply = match path {
+        None => client.remote(peer, &RemoteCall::Roots)?,
+        Some(path) => client.remote(
+            peer,
+            &RemoteCall::ListDir {
+                path,
+                cursor: 0,
+                limit: relay_core::remote::MAX_LISTING,
+            },
+        )?,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    match reply {
+        RemoteReply::Roots { roots } => {
+            for root in roots {
+                println!("{}  {}", root.name, root.path);
+            }
+        }
+        RemoteReply::Listing { listing } => {
+            println!("{}", listing.path);
+            for entry in listing.entries.iter().filter(|e| all || !e.hidden) {
+                let slash = if entry.kind == DirEntryKind::Directory {
+                    "/"
+                } else {
+                    ""
+                };
+                let mut notes = Vec::new();
+                if let Some(mount) = &entry.mount {
+                    notes.push(format!("synced {}/{}", mount.space, mount.mount));
+                } else if entry.contains_mount {
+                    notes.push("contains synced folder".to_owned());
+                }
+                if entry.cloud_only {
+                    notes.push("cloud".to_owned());
+                }
+                let notes = if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", notes.join(", "))
+                };
+                println!("  {}{slash}{notes}", entry.name);
+            }
+            if listing.next_cursor.is_some() {
+                println!(
+                    "  … {} entries in all; showing the first {}",
+                    listing.total,
+                    listing.entries.len()
+                );
+            }
+        }
+        other => println!("{other:?}"),
     }
     Ok(ExitCode::SUCCESS)
 }

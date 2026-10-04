@@ -30,6 +30,24 @@ Pass `--share SPACE` on the machine showing the code if that space already exist
 
 `relay peer add NAME ID --addr HOST:PORT` is the manual path when you already have both device ids.
 
+## Manage another device
+
+Add `--allow-manage` on a machine while pairing (the desktop app's pairing dialogs have the same checkbox, on by default) to let the other device browse this one and, in a later release, set up sync on it. The grant is one-way and belongs to the device being managed:
+
+```bash
+relay peer allow-manage laptop
+relay peer deny-manage laptop
+```
+
+From the other device, with both online:
+
+```bash
+relay browse desktop
+relay browse desktop 'C:\Users\zach'
+```
+
+The first form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
+
 ## Share a folder
 
 On the first machine:
@@ -122,8 +140,10 @@ relay service logs -f
 | `relay service uninstall` / `start` / `stop` / `restart` / `status` | Remove or control the background service |
 | `relay service logs [-n N] [-f]` | Show the service log (`<relay home>/logs/relay.log`) |
 | `relay status` | Device, mounts, peers, sync progress, and whether a host is running |
-| `relay pair [--share SPACE]...` / `relay pair CODE [--addr HOST:PORT]` | Pair with another device |
+| `relay pair [--share SPACE]... [--allow-manage]` / `relay pair CODE [--addr HOST:PORT] [--allow-manage]` | Pair with another device. `--allow-manage` lets it manage this one |
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
+| `relay peer allow-manage NAME` / `peer deny-manage NAME` | Let a peer browse this device and set up sync on it, or stop |
+| `relay browse PEER [PATH] [--all]` | List a managed device's roots, or one of its folders |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
 | `relay replica set PATH` / `replica clear` / `replica status` | Durable mailbox directory for offline catch-up |
 | `relay transport set HOST:PORT [--serve]` / `transport clear` / `transport status` | UDP relay when peers cannot dial each other. `--serve` forwards on this machine |

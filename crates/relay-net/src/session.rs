@@ -11,7 +11,7 @@ use relay_core::{DeviceId, ObjectId, rank_addresses};
 use relay_crypto::{DeviceIdentity, device_id_from_certificate};
 use relay_proto::frame::Body;
 use relay_proto::{
-    ErrorFrame, Frame, Hello, ObjectHeader, ObjectRequest, PROTOCOL_VERSION, Ping,
+    ErrorFrame, FEATURE_CONTROL, Frame, Hello, ObjectHeader, ObjectRequest, PROTOCOL_VERSION, Ping,
     device_id_from_bytes, encode_frame, object_id_from_bytes,
 };
 use relay_store::ObjectStore;
@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, Semaphore};
 
+use crate::control::{self, ControlHandler};
 use crate::io::{IoErr, read_message};
 use crate::relay::{RelaySocket, resolve_relay, virtual_peer_addr};
 use crate::tls::{SERVER_NAME, TlsMaterials, make_client_config};
@@ -63,6 +64,8 @@ pub(crate) struct Inner {
     pub pairing: Mutex<Option<PairSession>>,
     pub pairing_ads: Mutex<HashMap<String, PairingAd>>,
     pub discovery: Mutex<Option<Discovery>>,
+    /// Answers remote calls from peers with the manage grant (D37).
+    pub control: Option<Arc<dyn ControlHandler>>,
 }
 
 type EstablishedSession = (
@@ -81,6 +84,12 @@ pub(crate) struct LiveSession {
     pub in_flight: Arc<Mutex<HashSet<ObjectId>>>,
     pub established: bool,
     pub name: String,
+    /// `FEATURE_*` bits from the peer's `Hello`.
+    pub features: u64,
+    /// The peer lets this device manage it (its last `PeerGrants`).
+    pub grants_us: bool,
+    /// Remote calls this peer may have running here at once.
+    pub control_slots: Arc<Semaphore>,
 }
 
 impl LiveSession {
@@ -94,6 +103,9 @@ impl LiveSession {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             established: false,
             name: String::new(),
+            features: 0,
+            grants_us: false,
+            control_slots: Arc::new(Semaphore::new(control::MAX_CONCURRENT_CALLS)),
         }
     }
 }
@@ -112,6 +124,70 @@ impl Inner {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(id)
+    }
+
+    /// Whether `peer` may manage this device, per the trusted set.
+    pub(crate) fn may_manage(&self, peer: DeviceId) -> bool {
+        self.trusted
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .is_some_and(|p| p.may_manage)
+    }
+
+    fn with_established<T>(&self, peer: DeviceId, f: impl FnOnce(&LiveSession) -> T) -> Option<T> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(&peer).filter(|s| s.established).map(f)
+    }
+
+    pub(crate) fn control_connection(&self, peer: DeviceId) -> Option<Connection> {
+        self.with_established(peer, |s| s.conn.clone())
+    }
+
+    pub(crate) fn peer_has_feature(&self, peer: DeviceId, feature: u64) -> bool {
+        self.with_established(peer, |s| s.features & feature != 0)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn control_slots(&self, peer: DeviceId) -> Option<Arc<Semaphore>> {
+        self.with_established(peer, |s| s.control_slots.clone())
+    }
+
+    fn note_grants(&self, peer: DeviceId, may_manage_you: bool) {
+        let changed = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match sessions.get_mut(&peer) {
+                Some(s) if s.grants_us != may_manage_you => {
+                    s.grants_us = may_manage_you;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.emit(NetEvent::PeerGrants {
+                peer,
+                may_manage_you,
+            });
+        }
+    }
+
+    /// Tell every connected peer that understands grants whether it may
+    /// manage this device. Called after the trusted set changes.
+    fn send_grants(&self) {
+        let targets: Vec<(DeviceId, UnboundedSender<Vec<u8>>)> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions
+                .iter()
+                .filter(|(_, s)| s.established && s.features & FEATURE_CONTROL != 0)
+                .filter_map(|(id, s)| Some((*id, s.write_tx.clone()?)))
+                .collect()
+        };
+        for (peer, write_tx) in targets {
+            if let Some(bytes) = control::grants_frame(self.may_manage(peer)) {
+                let _ = write_tx.send(bytes);
+            }
+        }
     }
 
     pub(crate) fn has_session(&self, peer: DeviceId) -> bool {
@@ -183,6 +259,7 @@ impl Inner {
         stable_id: usize,
         write_tx: UnboundedSender<Vec<u8>>,
         name: String,
+        features: u64,
     ) -> bool {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         match sessions.get_mut(&peer) {
@@ -190,6 +267,7 @@ impl Inner {
                 s.write_tx = Some(write_tx);
                 s.established = true;
                 s.name = name;
+                s.features = features;
                 true
             }
             _ => false,
@@ -339,6 +417,7 @@ async fn run_session(
         device_id: inner.our_id.as_bytes().to_vec(),
         device_name: inner.device_name.clone(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
+        features: FEATURE_CONTROL,
     }));
     let hello_bytes = encode_frame(&hello).map_err(|e| e.to_string())?;
 
@@ -402,8 +481,13 @@ async fn run_session(
         conn.stable_id(),
         write_tx.clone(),
         peer_name.clone(),
+        h.features,
     ) {
         return Err("superseded during handshake".into());
+    }
+    let supports_control = h.features & FEATURE_CONTROL != 0;
+    if supports_control && let Some(bytes) = control::grants_frame(inner.may_manage(peer_id)) {
+        let _ = write_tx.send(bytes);
     }
 
     tracing::info!(peer = %peer_id, name = %peer_name, addr = %remote, "peer connected");
@@ -411,6 +495,7 @@ async fn run_session(
         peer: peer_id,
         name: peer_name,
         address: remote,
+        supports_control,
     });
 
     let writer = tokio::spawn(write_loop(send, write_rx));
@@ -469,6 +554,7 @@ async fn read_loop(
                     }
                 }
                 Some(Body::Pong(_)) => {}
+                Some(Body::PeerGrants(grants)) => inner.note_grants(peer, grants.may_manage_you),
                 Some(body) => inner.emit(NetEvent::Frame { peer, body }),
                 None => {
                     tracing::warn!(peer = %peer, "empty control frame");
@@ -573,6 +659,12 @@ async fn serve_object(
             });
         }
     };
+
+    if let Some(control) = req.control {
+        return control::serve(inner, peer, send, recv, control)
+            .await
+            .map_err(|message| ServeErr { message });
+    }
 
     let id = match object_id_from_bytes(&req.object_id) {
         Ok(id) => id,
@@ -768,6 +860,7 @@ async fn do_fetch(
     let (mut send, mut recv) = conn.open_bi().await.map_err(FetchFail::err)?;
     let req = encode_frame(&ObjectRequest {
         object_id: object.as_bytes().to_vec(),
+        control: None,
     })
     .map_err(FetchFail::err)?;
     send.write_all(&req).await.map_err(FetchFail::err)?;
@@ -1054,5 +1147,6 @@ pub(crate) fn apply_set_peers(inner: &Inner, peers: Vec<PeerConfig>) -> Vec<Devi
     for id in &removed {
         inner.close_peer(*id, "removed from peer set");
     }
+    inner.send_grants();
     removed
 }
