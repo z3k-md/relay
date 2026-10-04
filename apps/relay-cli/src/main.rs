@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use relay_core::{
-    DeviceId, EntryContent, EntryRecord, LogicalPath, PairingCode, Sequence, VersionVector,
+    ConfigApplied, ConfigChange, DeviceId, EntryContent, EntryRecord, LogicalPath, PairingCode,
+    Sequence, VersionVector,
 };
 use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{
@@ -312,6 +313,11 @@ enum SpaceCmd {
         #[arg(long = "from")]
         from: String,
     },
+    /// Forget a space on this device. Detach its mounts first. Files on disk are
+    /// not touched.
+    Delete {
+        name: String,
+    },
     /// Rotate the space key. Future mailbox objects use the new generation.
     Rotate {
         name: String,
@@ -445,6 +451,11 @@ enum MountCmd {
         #[arg(long)]
         dev_excludes: bool,
     },
+    /// Stop syncing a mount on this device. Files on disk are not touched.
+    Remove {
+        space: String,
+        mount: String,
+    },
     List {
         space: Option<String>,
     },
@@ -524,8 +535,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => cmd_pair(&home, code, share, addr, listen, json),
         Command::Peer { cmd } => cmd_peer(&home, cmd, json),
         Command::Share { space, peer } => {
-            let mut engine = Engine::open_for_config(&home)?;
-            engine.share(&space, &peer)?;
+            apply_config(
+                &home,
+                ConfigChange::Share {
+                    space: space.clone(),
+                    peer: peer.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -539,8 +555,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Unshare { space, peer } => {
-            let mut engine = Engine::open_for_config(&home)?;
-            engine.unshare(&space, &peer)?;
+            apply_config(
+                &home,
+                ConfigChange::Unshare {
+                    space: space.clone(),
+                    peer: peer.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -577,8 +598,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Deletes { cmd } => cmd_deletes(&home, cmd, json),
         Command::Space { cmd } => match cmd {
             SpaceCmd::Create { name } => {
-                let mut engine = Engine::open_for_config(&home)?;
-                let space = engine.create_space(&name)?;
+                let space = applied_space(apply_config(
+                    &home,
+                    ConfigChange::CreateSpace { space: name },
+                )?)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&space)?);
                 } else {
@@ -624,8 +647,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
             SpaceCmd::Join { name_or_id, from } => {
-                let mut engine = Engine::open_for_config(&home)?;
-                let space = engine.join_space(&name_or_id, &from)?;
+                let space = applied_space(apply_config(
+                    &home,
+                    ConfigChange::JoinSpace {
+                        space: name_or_id,
+                        from_peer: from,
+                        wait_ms: 0,
+                    },
+                )?)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&space)?);
                 } else {
@@ -633,6 +662,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         "joined space {} ({}); attach mounts with `relay mount add`",
                         space.name, space.id
                     );
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            SpaceCmd::Delete { name } => {
+                apply_config(
+                    &home,
+                    ConfigChange::DeleteSpace {
+                        space: name.clone(),
+                    },
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({"deleted": name}))?
+                    );
+                } else {
+                    println!("deleted space {name}; files on disk were not touched");
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -662,8 +708,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 if dev_excludes {
                     excludes.extend(DEV_EXCLUDES.iter().map(|s| (*s).to_owned()));
                 }
-                let mut engine = Engine::open_for_config(&home)?;
-                let config = engine.add_mount(&space, &mount, &path, &includes, &excludes)?;
+                apply_config(
+                    &home,
+                    ConfigChange::AddMount {
+                        space: space.clone(),
+                        mount: mount.clone(),
+                        path: path.clone(),
+                        includes,
+                        excludes,
+                    },
+                )?;
+                let config = Engine::open_read_only(&home)?
+                    .mounts(Some(&space))?
+                    .into_iter()
+                    .map(|(_, config)| config)
+                    .find(|config| config.mount.name == mount)
+                    .ok_or_else(|| anyhow::anyhow!("mount {space}/{mount} was not added"))?;
                 if json {
                     println!(
                         "{}",
@@ -676,6 +736,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| path.display().to_string());
                     println!("added mount {space}/{mount} at {shown}");
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            MountCmd::Remove { space, mount } => {
+                apply_config(
+                    &home,
+                    ConfigChange::RemoveMount {
+                        space: space.clone(),
+                        mount: mount.clone(),
+                    },
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({"removed": true, "space": space, "mount": mount})
+                        )?
+                    );
+                } else {
+                    println!("stopped syncing {space}/{mount}; files on disk were not touched");
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -1203,6 +1283,9 @@ fn print_watch_event(
                 output::out_line(&format!("{} watching {}", utc_hms(), mounts.join(", ")));
             }
         }
+        WatchEvent::MountRemoved { space, mount } => {
+            output::out_line(&format!("{} stopped syncing {space}/{mount}", utc_hms()));
+        }
         WatchEvent::Scanned {
             space,
             mount,
@@ -1375,6 +1458,22 @@ fn cmd_init(home: &Path, name: Option<String>, json: bool) -> Result<()> {
         println!("initialized device {} ({})", device.name, device.id);
     }
     Ok(())
+}
+
+/// Apply a config change through the running host so its sessions stay up;
+/// with no host running, write it directly.
+fn apply_config(home: &Path, change: ConfigChange) -> Result<ConfigApplied> {
+    if let Some(mut client) = Client::connect(home)? {
+        return Ok(client.config(&change)?);
+    }
+    Ok(Engine::open_for_config(home)?.apply_config(&change)?)
+}
+
+fn applied_space(applied: ConfigApplied) -> Result<relay_core::Space> {
+    match applied {
+        ConfigApplied::Space { space } => Ok(space),
+        other => bail!("unexpected result {other:?}"),
+    }
 }
 
 fn cmd_id(engine: &Engine, json: bool) -> Result<()> {
@@ -1735,8 +1834,20 @@ fn cmd_materialize(home: &Path, cmd: MaterializeCmd, json: bool) -> Result<ExitC
             mode,
             selectors,
         } => {
-            let mut engine = Engine::open_for_config(home)?;
-            let rule = engine.materialize_add(&space, &name, mode.as_str(), &selectors)?;
+            apply_config(
+                home,
+                ConfigChange::MaterializeAdd {
+                    space: space.clone(),
+                    name: name.clone(),
+                    mode: mode.as_str().to_owned(),
+                    selectors,
+                },
+            )?;
+            let rule = Engine::open_read_only(home)?
+                .materialization_rules(Some(&space))?
+                .into_iter()
+                .find(|rule| rule.name == name)
+                .ok_or_else(|| anyhow::anyhow!("materialization {name} was not added"))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rule)?);
             } else {
@@ -1748,8 +1859,13 @@ fn cmd_materialize(home: &Path, cmd: MaterializeCmd, json: bool) -> Result<ExitC
             }
         }
         MaterializeCmd::Remove { space, name } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.materialize_remove(&space, &name)?;
+            apply_config(
+                home,
+                ConfigChange::MaterializeRemove {
+                    space: space.clone(),
+                    name: name.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -1784,9 +1900,7 @@ fn cmd_materialize(home: &Path, cmd: MaterializeCmd, json: bool) -> Result<ExitC
 
 fn cmd_fetch(home: &Path, target: &str, json: bool) -> Result<ExitCode> {
     let (space, mount, path) = require_file_target(target, "fetch")?;
-    if Client::connect(home)?.is_some() {
-        let mut client =
-            Client::connect(home)?.ok_or_else(|| anyhow::anyhow!("Relay is not running"))?;
+    if let Some(mut client) = Client::connect(home)? {
         client.fetch(&space, &mount, path.as_str())?;
     } else {
         let mut engine = Engine::open_for_config(home)?;

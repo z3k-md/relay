@@ -3,7 +3,8 @@
 Build plan for browsing another device's folders, setting up sync from
 either machine, and opening files that are not on this device yet. This does
 not amend [`DESIGN.md`](../DESIGN.md) or [`DECISIONS.md`](../DECISIONS.md).
-The decisions below become D36 when the first stage that needs them lands.
+Stage 0 is recorded as D36. The decisions below become D37 when the first
+stage that needs them lands.
 
 The stages are in build order. Each one ships on its own and is useful
 without the next. Stages 0 and 1 change no wire format and no trust rules.
@@ -38,7 +39,7 @@ other machine again:
 | Fetch wait | Host `fetch` waits up to 60 s for the reply (`host.rs`) | Too short for a large file over a slow link |
 | Mount rules | Include/exclude are set at `add_mount` / attach only | No editing after the fact. Subfolder checkboxes use D35 `exclude` rules instead (below) |
 
-## Decisions to adopt (D36)
+## Decisions to adopt (D37)
 
 ### A separate manage grant
 
@@ -107,6 +108,11 @@ listing can be large, and index sync shouldn't wait behind it.
   `add_mount` already refuses mounts that overlap it.
 
 ## Stage 0. Config writes through the loop
+
+**Shipped (D36).** Implemented as one `ConfigChange` type and one
+`SyncInput::Config` input rather than one variant per operation. Stage 3's
+remote write calls map onto the same type. `Evict` and `ScanPath` move to
+the stages that use them (1 and 4).
 
 Prerequisite for everything remote. It also fixes today's behavior: desktop
 config edits drop every live session while the host reloads.

@@ -11,6 +11,7 @@ publish.workspace = true
 blake3.workspace = true
 hex.workspace = true
 interprocess.workspace = true
+relay-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

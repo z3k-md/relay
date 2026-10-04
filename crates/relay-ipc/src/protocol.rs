@@ -238,26 +238,6 @@ pub struct FetchParams {
     pub path: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddMountParams {
-    pub space: String,
-    pub mount: String,
-    pub path: PathBuf,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddMountResult {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShareParams {
-    pub space: String,
-    pub peer: String,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairStartParams {
     #[serde(default)]

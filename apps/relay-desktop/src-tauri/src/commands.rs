@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use relay_core::DeviceId;
+use relay_core::{ConfigApplied, ConfigChange, DeviceId};
 use relay_engine::{
     ConflictClass, DeleteHoldDecision, Engine, EngineError, Resolution,
     resolve_conflict as engine_resolve_conflict, resolve_git_conflicts as engine_resolve_git,
@@ -480,36 +480,21 @@ pub fn list_spaces(app: AppHandle) -> Result<Vec<SpaceView>, String> {
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_space(app: AppHandle, name: String) -> Result<SpaceView, String> {
     let name = name.trim().to_owned();
     relay_core::validate_name(&name).map_err(|err| error_chain(&err))?;
-    let home = app.state::<AppState>().home.clone();
-    // `open_for_config` is safe while the sync loop runs: the loop drops its
-    // writer lock and reloads after the commit. Stopping the loop to write
-    // restarts it, which waits on the sync thread and flashes console windows
-    // for `relay service status`.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let space = loop {
-        match Engine::open_for_config(&home) {
-            Ok(mut engine) => {
-                if engine
-                    .spaces()
-                    .map_err(|err| error_chain(&err))?
-                    .iter()
-                    .any(|space| space.name == name)
-                {
-                    return Err(format!("a space named {name:?} already exists"));
-                }
-                break engine
-                    .create_space(&name)
-                    .map_err(|err| error_chain(&err))?;
-            }
-            Err(EngineError::Busy { .. }) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(err) => return Err(error_chain(&err)),
-        }
+    let exists = open_ro(&app.state::<AppState>().home)?
+        .spaces()
+        .map_err(|err| error_chain(&err))?
+        .iter()
+        .any(|space| space.name == name);
+    if exists {
+        return Err(format!("a space named {name:?} already exists"));
+    }
+    let applied = apply_config(&app, ConfigChange::CreateSpace { space: name })?;
+    let ConfigApplied::Space { space } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
     };
     Ok(SpaceView {
         name: space.name,
@@ -526,46 +511,49 @@ pub fn add_mount(
     mount: String,
     path: String,
 ) -> Result<MountView, String> {
-    let path = PathBuf::from(path);
-    if let Some(mut client) = host_client(&app)? {
-        let added = client
-            .add_mount(&space, &mount, &path)
-            .map_err(|err| error_chain(&err))?;
-        return Ok(MountView {
-            name: added.name,
-            path: added.path.as_ref().map(|p| p.display().to_string()),
-            attached: added.path.is_some(),
-            state: "OK".to_owned(),
-        });
-    }
-    with_write(&app, |engine| {
-        let config = engine.add_mount(&space, &mount, &path, &[], &[])?;
-        Ok(MountView {
-            name: config.mount.name,
-            path: config.local_path.as_ref().map(|p| p.display().to_string()),
-            attached: config.local_path.is_some(),
-            state: "OK".to_owned(),
-        })
+    let applied = apply_config(
+        &app,
+        ConfigChange::AddMount {
+            space,
+            mount,
+            path: PathBuf::from(path),
+            includes: Vec::new(),
+            excludes: Vec::new(),
+        },
+    )?;
+    let ConfigApplied::Mount { mount, path } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
+    };
+    Ok(MountView {
+        name: mount.name,
+        attached: path.is_some(),
+        path: path.map(|p| p.display().to_string()),
+        state: "OK".to_owned(),
     })
 }
 
 #[tauri::command(async)]
-pub fn share(app: AppHandle, space: String, peer: String) -> Result<(), String> {
-    if let Some(mut client) = host_client(&app)? {
-        return client.share(&space, &peer).map_err(|err| error_chain(&err));
-    }
-    with_write(&app, |engine| {
-        engine.share(&space, &peer)?;
-        Ok(())
-    })
+pub fn remove_mount(app: AppHandle, space: String, mount: String) -> Result<(), String> {
+    apply_config(&app, ConfigChange::RemoveMount { space, mount }).map(drop)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+pub fn share(app: AppHandle, space: String, peer: String) -> Result<(), String> {
+    apply_config(&app, ConfigChange::Share { space, peer }).map(drop)
+}
+
+#[tauri::command(async)]
 pub fn unshare(app: AppHandle, space: String, peer: String) -> Result<(), String> {
-    with_write(&app, |engine| {
-        engine.unshare(&space, &peer)?;
-        Ok(())
-    })
+    apply_config(&app, ConfigChange::Unshare { space, peer }).map(drop)
+}
+
+/// Apply a config change through the running host so live sessions survive.
+/// With no host running, write it directly.
+fn apply_config(app: &AppHandle, change: ConfigChange) -> Result<ConfigApplied, String> {
+    if let Some(mut client) = host_client(app)? {
+        return client.config(&change).map_err(|err| error_chain(&err));
+    }
+    with_write(app, |engine| Ok(engine.apply_config(&change)?))
 }
 
 #[tauri::command]
@@ -588,17 +576,30 @@ pub fn list_offers(app: AppHandle) -> Result<Vec<OfferView>, String> {
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn join_space(app: AppHandle, space: String, from_peer: String) -> Result<SpaceView, String> {
-    with_write(&app, |engine| {
-        let created = engine.join_space(&space, &from_peer)?;
-        Ok(SpaceView {
-            name: created.name,
-            id: created.id.to_string(),
-            mounts: Vec::new(),
-            shared_with: vec![from_peer.clone()],
-        })
+    let applied = apply_config(
+        &app,
+        ConfigChange::JoinSpace {
+            space,
+            from_peer: from_peer.clone(),
+            wait_ms: 0,
+        },
+    )?;
+    let ConfigApplied::Space { space } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
+    };
+    Ok(SpaceView {
+        name: space.name,
+        id: space.id.to_string(),
+        mounts: Vec::new(),
+        shared_with: vec![from_peer],
     })
+}
+
+#[tauri::command(async)]
+pub fn delete_space(app: AppHandle, space: String) -> Result<(), String> {
+    apply_config(&app, ConfigChange::DeleteSpace { space }).map(drop)
 }
 
 #[tauri::command]

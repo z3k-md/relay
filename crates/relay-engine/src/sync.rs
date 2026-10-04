@@ -1,12 +1,14 @@
 //! Engine-native peer sync I/O. The CLI/daemon maps these 1:1 onto relay-net.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use relay_core::version::VectorOrdering;
-use relay_core::{DeviceId, EntryContent, EntryKey, MountId, ObjectId, Sequence, SpaceId};
+use relay_core::{
+    ConfigApplied, ConfigChange, DeviceId, EntryContent, EntryKey, MountId, ObjectId, Sequence,
+    SpaceId,
+};
 use relay_db::{OfferedMember, PeerOfferRow};
 use relay_proto::{
     Ack, INDEX_BATCH_ENTRIES, IndexBatch, IndexRequest, RemoteEntry, device_id_from_bytes,
@@ -36,15 +38,6 @@ const SEEN_INTERVAL: Duration = Duration::from_secs(30);
 /// The watch loop ticks much faster than this; a metadata tree must not be
 /// walked on every poll.
 const HYDRATE_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Result of a live [`SyncInput::AddMount`] applied on the engine loop.
-#[derive(Clone, Debug)]
-pub struct AddMountApplied {
-    pub name: String,
-    pub path: Option<PathBuf>,
-    pub space_id: SpaceId,
-    pub mount_id: MountId,
-}
 
 #[derive(Clone, Debug)]
 pub enum SyncInput {
@@ -93,18 +86,12 @@ pub enum SyncInput {
     NatHint {
         addresses: Vec<String>,
     },
-    /// Add a local mount through the loop writer (D19 / D24 / D25).
-    AddMount {
-        space: String,
-        mount: String,
-        path: PathBuf,
-        reply: mpsc::Sender<Result<AddMountApplied, String>>,
-    },
-    /// Share a space with a peer through the loop writer.
-    Share {
-        space: String,
-        peer: String,
-        reply: mpsc::Sender<Result<(), String>>,
+    /// Apply a config change through the loop writer (D19 / D24 / D25), so
+    /// live sessions survive. The reply is sent before any watcher or UI
+    /// follow-up runs.
+    Config {
+        change: ConfigChange,
+        reply: mpsc::Sender<Result<ConfigApplied, String>>,
     },
     /// Hydrate one demand-mode path, asking a connected peer when needed.
     Fetch {
@@ -360,8 +347,7 @@ impl Syncer {
             | SyncInput::AddPeer { .. }
             | SyncInput::PeerAddresses { .. }
             | SyncInput::NatHint { .. }
-            | SyncInput::AddMount { .. }
-            | SyncInput::Share { .. } => {}
+            | SyncInput::Config { .. } => {}
         }
         self.flush_progress(&mut events, false);
         Ok(events)
@@ -419,6 +405,36 @@ impl Syncer {
         Ok(())
     }
 
+    /// Peers with a live session.
+    pub(crate) fn connected_peers(&self) -> Vec<DeviceId> {
+        self.connected.keys().copied().collect()
+    }
+
+    /// Ask every connected member of `space` for its index from the stored
+    /// watermark. After a live join or attach: entries for a mount with no
+    /// local path were skipped (D16), and attaching reset the watermark.
+    pub(crate) fn request_index(
+        &self,
+        engine: &Engine,
+        space: SpaceId,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<(), EngineError> {
+        for &peer in self.connected.keys() {
+            if engine.db.repo().is_shared(space, peer)? {
+                resume_index(engine, peer, space, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop pushing `space` to `peer`. Batches already received stay queued;
+    /// new ones are refused because the space is no longer shared.
+    pub(crate) fn stop_sending(&mut self, peer: DeviceId, space: SpaceId) {
+        if let Some(conn) = self.connected.get_mut(&peer) {
+            conn.send_cursor.remove(&space);
+        }
+    }
+
     pub fn push_local_changes(
         &mut self,
         engine: &mut Engine,
@@ -474,13 +490,7 @@ impl Syncer {
                 if let Some(conn) = self.connected.get_mut(&peer) {
                     conn.resync_at.remove(&space);
                 }
-                out(SyncOutput::Send {
-                    peer,
-                    body: frame::Body::IndexRequest(IndexRequest {
-                        space_id: space_id_bytes(&space),
-                        after_sequence: hole,
-                    }),
-                });
+                out(index_request(peer, space, hole));
             }
             for space in spaces {
                 let due = self
@@ -564,14 +574,7 @@ impl Syncer {
             if engine.db.repo().space(space_id)?.is_none() {
                 continue;
             }
-            let after = engine.db.repo().sync_progress(peer, space_id)?.received_seq;
-            out(SyncOutput::Send {
-                peer,
-                body: frame::Body::IndexRequest(IndexRequest {
-                    space_id: space_id_bytes(&space_id),
-                    after_sequence: after.0,
-                }),
-            });
+            resume_index(engine, peer, space_id, out)?;
         }
         Ok(())
     }
@@ -699,14 +702,7 @@ impl Syncer {
                 .get(&member)
                 .is_some_and(|c| !c.send_cursor.contains_key(&space));
             if needs_index {
-                let after = engine.db.repo().sync_progress(member, space)?.received_seq;
-                out(SyncOutput::Send {
-                    peer: member,
-                    body: frame::Body::IndexRequest(IndexRequest {
-                        space_id: space_id_bytes(&space),
-                        after_sequence: after.0,
-                    }),
-                });
+                resume_index(engine, member, space, out)?;
             }
         }
         for space in policy_replays {
@@ -714,13 +710,7 @@ impl Syncer {
                 conn.send_cursor.insert(space, Sequence::ZERO);
             }
             self.send_batches(engine, peer, space, true, out, events)?;
-            out(SyncOutput::Send {
-                peer,
-                body: frame::Body::IndexRequest(IndexRequest {
-                    space_id: space_id_bytes(&space),
-                    after_sequence: 0,
-                }),
-            });
+            out(index_request(peer, space, 0));
         }
         let hint: Vec<_> = listed
             .iter()
@@ -2105,4 +2095,27 @@ fn delete_held_event(
         deletions,
         live,
     })
+}
+
+/// `IndexRequest` for `space` to `peer`, starting after `after_sequence`.
+fn index_request(peer: DeviceId, space: SpaceId, after_sequence: u64) -> SyncOutput {
+    SyncOutput::Send {
+        peer,
+        body: frame::Body::IndexRequest(IndexRequest {
+            space_id: space_id_bytes(&space),
+            after_sequence,
+        }),
+    }
+}
+
+/// Request `peer`'s index for `space` from the stored receive watermark.
+fn resume_index(
+    engine: &Engine,
+    peer: DeviceId,
+    space: SpaceId,
+    out: &mut dyn FnMut(SyncOutput),
+) -> Result<(), EngineError> {
+    let after = engine.db.repo().sync_progress(peer, space)?.received_seq;
+    out(index_request(peer, space, after.0));
+    Ok(())
 }

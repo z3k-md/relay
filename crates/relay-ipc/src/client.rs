@@ -5,13 +5,14 @@ use std::thread;
 use std::time::Duration;
 
 use interprocess::local_socket::{Stream, prelude::*};
+use relay_core::{ConfigApplied, ConfigChange};
 
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, AddMountParams, AddMountResult, FetchParams, Hello, PROTOCOL_VERSION,
-    PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus, Request,
-    RescanParams, RescanResult, Response, ShareParams, Status, decode_line, encode_line,
+    ActivityItem, FetchParams, Hello, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
+    PairStartParams, PairStartResult, PairStatus, Request, RescanParams, RescanResult, Response,
+    Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -89,33 +90,12 @@ impl Client {
         )
     }
 
-    pub fn add_mount(
-        &mut self,
-        space: &str,
-        mount: &str,
-        path: &Path,
-    ) -> Result<AddMountResult, IpcError> {
-        let params = AddMountParams {
-            space: space.to_owned(),
-            mount: mount.to_owned(),
-            path: path.to_path_buf(),
-        };
+    /// Apply a config change on the running host.
+    pub fn config(&mut self, change: &ConfigChange) -> Result<ConfigApplied, IpcError> {
         self.call(
-            "add_mount",
-            serde_json::to_value(params).map_err(IpcError::codec)?,
+            "config",
+            serde_json::to_value(change).map_err(IpcError::codec)?,
         )
-    }
-
-    pub fn share(&mut self, space: &str, peer: &str) -> Result<(), IpcError> {
-        let params = ShareParams {
-            space: space.to_owned(),
-            peer: peer.to_owned(),
-        };
-        let _: serde_json::Value = self.call(
-            "share",
-            serde_json::to_value(params).map_err(IpcError::codec)?,
-        )?;
-        Ok(())
     }
 
     pub fn pair_start(&mut self, share: &[String]) -> Result<PairStartResult, IpcError> {

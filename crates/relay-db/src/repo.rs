@@ -480,10 +480,7 @@ impl Repo<'_> {
     }
 
     pub fn set_local_mount_path(&self, mount: MountId, path: &Path) -> Result<(), DbError> {
-        let local = self.local_device()?.ok_or(DbError::NotInitialized)?;
-        let device_ref = self
-            .device_ref(local.device.id)?
-            .ok_or_else(|| DbError::Corrupt("local device row is missing".into()))?;
+        let device_ref = self.local_device_ref()?;
         let path = path.to_str().ok_or(DbError::NonUtf8Path)?;
         let mount = mount_bytes(mount);
         match self.conn.execute(
@@ -495,6 +492,64 @@ impl Repo<'_> {
             Ok(_) => Ok(()),
             Err(err) => Err(map_write_err(err, None)),
         }
+    }
+
+    /// Return a mount to the unattached state an offered mount starts in.
+    ///
+    /// An unattached mount stores no entries (D16), so its index rows and
+    /// history go too. Keeping them would make a later attach to a different
+    /// folder look like every file was deleted. The `mounts` row stays: the
+    /// mount still exists in the space on other devices.
+    pub fn detach_local_mount(&self, mount: MountId) -> Result<(), DbError> {
+        let device_ref = self.local_device_ref()?;
+        let mount = mount_bytes(mount);
+        let mount = mount.as_slice();
+        for sql in [
+            "DELETE FROM entries WHERE mount_id = ?1",
+            "DELETE FROM delete_holds WHERE mount_id = ?1",
+            "DELETE FROM mount_state WHERE mount_id = ?1",
+            "DELETE FROM mount_rules WHERE mount_id = ?1",
+        ] {
+            self.conn.execute(sql, params![mount])?;
+        }
+        self.conn.execute(
+            "DELETE FROM device_mounts WHERE device_ref = ?1 AND mount_id = ?2",
+            params![device_ref, mount],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a space and everything scoped to it on this device. The caller
+    /// detaches its mounts first.
+    ///
+    /// Kept on purpose: `peer_offers`, so the space can be joined again, and
+    /// `space_key_wraps`, so a rejoin can still open mailbox objects sealed
+    /// under earlier key generations (D30).
+    pub fn delete_space(&self, space: SpaceId) -> Result<(), DbError> {
+        let space = space_bytes(space);
+        let space = space.as_slice();
+        for sql in [
+            "DELETE FROM space_shares WHERE space_id = ?1",
+            "DELETE FROM sync_progress WHERE space_id = ?1",
+            "DELETE FROM delete_holds WHERE space_id = ?1",
+            "DELETE FROM peer_policy_snapshots WHERE space_id = ?1",
+            "DELETE FROM replication_policies WHERE space_id = ?1",
+            "DELETE FROM replica_push WHERE space_id = ?1",
+            "DELETE FROM materialization_rules WHERE space_id = ?1",
+            "DELETE FROM mount_state WHERE mount_id IN (SELECT id FROM mounts WHERE space_id = ?1)",
+            "DELETE FROM mount_rules WHERE mount_id IN (SELECT id FROM mounts WHERE space_id = ?1)",
+            "DELETE FROM mounts WHERE space_id = ?1",
+        ] {
+            self.conn.execute(sql, params![space])?;
+        }
+        if self
+            .conn
+            .execute("DELETE FROM spaces WHERE id = ?1", params![space])?
+            == 0
+        {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
     }
 
     pub fn set_mount_rules(
@@ -2597,6 +2652,12 @@ impl Repo<'_> {
             )
             .optional()
             .map_err(DbError::from)
+    }
+
+    fn local_device_ref(&self) -> Result<i64, DbError> {
+        let local = self.local_device()?.ok_or(DbError::NotInitialized)?;
+        self.device_ref(local.device.id)?
+            .ok_or_else(|| DbError::Corrupt("local device row is missing".into()))
     }
 
     fn device_ref(&self, id: DeviceId) -> Result<Option<i64>, DbError> {

@@ -4,22 +4,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use relay_core::{PairingCode, SpaceId};
+use relay_core::{ConfigApplied, ConfigChange, PairingCode, SpaceId};
 use relay_engine::{
     Engine, ScanReport, SyncInput, TransferDirection, TransferLive as EngineTransfer, WatchEvent,
     bookends, index_row,
 };
 use relay_ipc::{
-    ActivityItem, AddMountParams, AddMountResult, FetchParams, Handler, Hello, HostKind, HostState,
-    Idle, MountLive, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams,
-    PairStartResult, PairStatus, PeerLive, RescanParams, RpcErrorBody, ShareParams, Status,
-    TransferDirection as IpcDirection, TransferLive, Watching,
+    ActivityItem, FetchParams, Handler, Hello, HostKind, HostState, Idle, MountLive,
+    PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
+    PeerLive, RescanParams, RpcErrorBody, Status, TransferDirection as IpcDirection, TransferLive,
+    Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
 const ACTIVITY_CAP: usize = 500;
 const PAIR_TTL: Duration = Duration::from_secs(10 * 60);
 const PAIR_JOIN_WAIT: Duration = Duration::from_secs(60);
+/// How long a config change may take on the loop, on top of a join's own wait.
+const CONFIG_REPLY_WAIT: Duration = Duration::from_secs(30);
 
 pub(crate) struct Host {
     pub home: PathBuf,
@@ -212,56 +214,42 @@ impl Host {
         self.sync_tx.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Apply a config write on the running engine loop when possible; otherwise
-    /// fall back to `open_for_config` (paused or between reload cycles).
-    fn add_mount(&self, params: AddMountParams) -> Result<AddMountResult, RpcErrorBody> {
-        if let Some(tx) = self.sync_tx() {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(SyncInput::AddMount {
-                space: params.space.clone(),
-                mount: params.mount.clone(),
-                path: params.path.clone(),
-                reply: reply_tx,
-            })
-            .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
-            let applied = reply_rx
-                .recv_timeout(Duration::from_secs(30))
-                .map_err(|_| RpcErrorBody::new("unavailable", "timed out applying add_mount"))?
-                .map_err(|message| RpcErrorBody::new("failed", message))?;
-            if let Ok(mut live) = self.mounts.lock()
-                && !live
-                    .iter()
-                    .any(|m| m.space == params.space && m.mount == applied.name)
-            {
-                live.push(MountLive {
-                    space: params.space,
-                    mount: applied.name.clone(),
-                    path: applied.path.clone(),
-                    watching: if self.use_watcher {
-                        Watching::Native
-                    } else {
-                        Watching::Poll
-                    },
-                    last_scan_ms: None,
-                    last_scan_summary: None,
-                    last_error: None,
-                });
+    /// Apply a config change on the running engine loop when possible;
+    /// otherwise write it directly (paused, or between reload cycles).
+    fn config(&self, change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
+        let applied = match self.sync_tx() {
+            Some(tx) => {
+                let wait = CONFIG_REPLY_WAIT
+                    + match &change {
+                        ConfigChange::JoinSpace { wait_ms, .. } => Duration::from_millis(*wait_ms),
+                        _ => Duration::ZERO,
+                    };
+                let (reply_tx, reply_rx) = mpsc::channel();
+                tx.send(SyncInput::Config {
+                    change: change.clone(),
+                    reply: reply_tx,
+                })
+                .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
+                reply_rx
+                    .recv_timeout(wait)
+                    .map_err(|_| RpcErrorBody::new("unavailable", "timed out applying change"))?
+                    .map_err(|message| RpcErrorBody::new("failed", message))?
             }
-            return Ok(AddMountResult {
-                name: applied.name,
-                path: applied.path,
-            });
+            None => Engine::open_for_config(&self.home)
+                .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
+                .apply_config(&change)
+                .map_err(|err| RpcErrorBody::new("failed", err.to_string()))?,
+        };
+        // Status right after the reply should already show the change; the
+        // loop's watch events follow a moment later and are idempotent.
+        match (&change, &applied) {
+            (ConfigChange::AddMount { space, .. }, ConfigApplied::Mount { mount, path }) => {
+                self.track_mount(space, &mount.name, path.clone());
+            }
+            (ConfigChange::RemoveMount { space, mount }, _) => self.untrack_mount(space, mount),
+            _ => {}
         }
-
-        let mut engine = Engine::open_for_config(&self.home)
-            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
-        let config = engine
-            .add_mount(&params.space, &params.mount, &params.path, &[], &[])
-            .map_err(|err| RpcErrorBody::new("failed", err.to_string()))?;
-        Ok(AddMountResult {
-            name: config.mount.name,
-            path: config.local_path,
-        })
+        Ok(applied)
     }
 
     fn fetch(&self, params: FetchParams) -> Result<(), RpcErrorBody> {
@@ -283,28 +271,6 @@ impl Host {
             .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
         engine
             .fetch_path(&params.space, &params.mount, &params.path)
-            .map_err(|err| RpcErrorBody::new("failed", err.to_string()))
-    }
-
-    fn share(&self, params: ShareParams) -> Result<(), RpcErrorBody> {
-        if let Some(tx) = self.sync_tx() {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(SyncInput::Share {
-                space: params.space,
-                peer: params.peer,
-                reply: reply_tx,
-            })
-            .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
-            return reply_rx
-                .recv_timeout(Duration::from_secs(30))
-                .map_err(|_| RpcErrorBody::new("unavailable", "timed out applying share"))?
-                .map_err(|message| RpcErrorBody::new("failed", message));
-        }
-
-        let mut engine = Engine::open_for_config(&self.home)
-            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
-        engine
-            .share(&params.space, &params.peer)
             .map_err(|err| RpcErrorBody::new("failed", err.to_string()))
     }
 
@@ -509,28 +475,13 @@ impl Host {
     pub fn apply_watch(&self, event: &WatchEvent) {
         match event {
             WatchEvent::Started { mounts } => {
-                if let Ok(mut live) = self.mounts.lock() {
-                    for name in mounts {
-                        if let Some((space, mount)) = name.split_once('/')
-                            && !live.iter().any(|m| m.space == space && m.mount == mount)
-                        {
-                            live.push(MountLive {
-                                space: space.to_owned(),
-                                mount: mount.to_owned(),
-                                path: None,
-                                watching: if self.use_watcher {
-                                    Watching::Native
-                                } else {
-                                    Watching::Poll
-                                },
-                                last_scan_ms: None,
-                                last_scan_summary: None,
-                                last_error: None,
-                            });
-                        }
+                for name in mounts {
+                    if let Some((space, mount)) = name.split_once('/') {
+                        self.track_mount(space, mount, None);
                     }
                 }
             }
+            WatchEvent::MountRemoved { space, mount } => self.untrack_mount(space, mount),
             WatchEvent::Scanned {
                 space,
                 mount,
@@ -593,6 +544,35 @@ impl Host {
         }
         if let Some(item) = activity_from_watch(event) {
             self.push_activity(item);
+        }
+    }
+
+    /// Add a mount to the live list unless it is already there.
+    fn track_mount(&self, space: &str, mount: &str, path: Option<PathBuf>) {
+        let Ok(mut live) = self.mounts.lock() else {
+            return;
+        };
+        if live.iter().any(|m| m.space == space && m.mount == mount) {
+            return;
+        }
+        live.push(MountLive {
+            space: space.to_owned(),
+            mount: mount.to_owned(),
+            path,
+            watching: if self.use_watcher {
+                Watching::Native
+            } else {
+                Watching::Poll
+            },
+            last_scan_ms: None,
+            last_scan_summary: None,
+            last_error: None,
+        });
+    }
+
+    fn untrack_mount(&self, space: &str, mount: &str) {
+        if let Ok(mut live) = self.mounts.lock() {
+            live.retain(|m| !(m.space == space && m.mount == mount));
         }
     }
 
@@ -769,16 +749,10 @@ impl Handler for Host {
                     .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
                 serde_json::to_value(relay_ipc::RescanResult { queued }).map_err(internal)
             }
-            "add_mount" => {
-                let params: AddMountParams = serde_json::from_value(params)
+            "config" => {
+                let change: ConfigChange = serde_json::from_value(params)
                     .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
-                serde_json::to_value(self.add_mount(params)?).map_err(internal)
-            }
-            "share" => {
-                let params: ShareParams = serde_json::from_value(params)
-                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
-                self.share(params)?;
-                Ok(serde_json::json!({}))
+                serde_json::to_value(self.config(change)?).map_err(internal)
             }
             "pair_start" => {
                 let params: PairStartParams = serde_json::from_value(params)
@@ -906,6 +880,11 @@ fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
                 format!("watching {}", mounts.join(", "))
             },
             None,
+        ),
+        WatchEvent::MountRemoved { space, mount } => (
+            "mount_removed",
+            format!("stopped syncing {space}/{mount}"),
+            Some(format!("{space}/{mount}")),
         ),
         WatchEvent::Scanned {
             space,

@@ -2,7 +2,9 @@
 
 mod apply;
 mod clock;
+mod config;
 mod error;
+mod live_config;
 mod materialize;
 mod order;
 mod peers;
@@ -42,8 +44,8 @@ pub use progress::{
     summary_line,
 };
 pub use relay_core::{
-    Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount, MountId, ObjectId, Sequence,
-    Space, SpaceId, VectorOrdering,
+    ConfigApplied, ConfigChange, Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount,
+    MountId, ObjectId, Sequence, Space, SpaceId, VectorOrdering,
 };
 pub use relay_crypto::DeviceIdentity;
 pub use relay_db::{HistoryRecord, MountConfig};
@@ -58,7 +60,7 @@ pub use reports::{
 pub use resolve::{
     GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
 };
-pub use sync::{AddMountApplied, SyncEvent, SyncInput, SyncOutput, Syncer};
+pub use sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
 pub use watch::{RunExit, WatchEvent, WatchOptions};
 
 const DB_FILE: &str = "relay.db";
@@ -1081,7 +1083,13 @@ impl Engine {
         if marker.created_by != self.device.id {
             return Ok(false);
         }
-        Ok(self.db.repo().mount_config(marker.mount)?.is_none())
+        // Ours, for a mount that no longer exists or is no longer attached
+        // here (a `remove_mount` that could not delete the marker).
+        Ok(self
+            .db
+            .repo()
+            .mount_config(marker.mount)?
+            .is_none_or(|config| config.local_path.is_none()))
     }
 }
 

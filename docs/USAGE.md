@@ -48,7 +48,9 @@ Optional `relay materialize` rules are local to this computer. They decide wheth
 
 On macOS, prefer a folder outside `~/Documents`, `~/Desktop`, `~/Downloads`, and iCloud Drive unless the binary has Full Disk Access. See [Platform notes](#platform-notes).
 
-A running Relay picks up `peer`, `share`, `space`, and `mount` changes within about a second. You do not need to restart it.
+A running Relay applies `space`, `mount`, `share`, and `materialize` changes immediately, without dropping its connections. `peer` changes are picked up within about a second. You do not need to restart it.
+
+To stop syncing a folder on one machine, run `relay mount remove SPACE MOUNT`. The files stay on disk and other machines keep syncing. `relay space delete SPACE` then forgets the space on this machine; you can join it again from a peer's offer.
 
 On the other machine:
 
@@ -134,8 +136,10 @@ relay service logs -f
 | `relay fetch SPACE/MOUNT/PATH` | Write one `demand` file from a peer, the mailbox, or the local store |
 | `relay evict SPACE/MOUNT/PATH` | Remove a fetched `demand` file here. The index row stays, and other devices are unchanged |
 | `relay space create NAME` / `space list` | Manage spaces |
+| `relay space delete NAME` | Forget a space on this device. Its mounts must be removed first. Files are not touched |
 | `relay space offers` / `space join NAME --from PEER` | See and accept spaces other devices shared with you |
 | `relay mount add SPACE MOUNT PATH [--include P]... [--exclude P]... [--dev-excludes]` | Map a directory into a space, or attach a joined mount to a local folder |
+| `relay mount remove SPACE MOUNT` | Stop syncing a mount on this device. Files stay on disk; its local index and history are dropped |
 | `relay mount list [SPACE]` | List mounts and their rules |
 | `relay conflicts [--space SPACE]` | List conflict copies |
 | `relay conflicts resolve SPACE/MOUNT/PATH --keep current\|copy` | Keep the current file or replace it with the conflict copy |
@@ -158,7 +162,7 @@ Exit codes: `0` ok, `1` error, `2` mass delete refused, `3` `relay verify` found
 
 `--dev-excludes` adds `**/node_modules/**`, `**/target/**`, `**/dist/**`, `**/build/**`, `**/.venv/**`, and `**/__pycache__/**`. A `.relayignore` file at the mount root adds more exclude globs, one per line. Rules are per device.
 
-A running Relay picks up `peer add` / `peer remove`, `share` / `unshare`, `space create` / `space join`, `mount add`, and `deletes apply` / `deletes restore` within about a second. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
+A running Relay applies `space create` / `join` / `delete`, `mount add` / `remove`, `share` / `unshare`, and `materialize add` / `remove` on its live loop. It picks up `peer add` / `peer remove` and `deletes apply` / `deletes restore` within about a second by reloading. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
 
 ## Catch-up and hard-to-reach networks
 

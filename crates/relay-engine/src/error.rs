@@ -90,6 +90,9 @@ pub enum EngineError {
     #[error("mount has no local path on this device")]
     MountNotLocal,
 
+    #[error("space {space:?} still has attached mounts: {}", mounts.join(", "))]
+    SpaceHasAttachedMounts { space: String, mounts: Vec<String> },
+
     #[error("{0}")]
     InvalidName(#[from] CoreError),
 

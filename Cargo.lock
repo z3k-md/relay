@@ -4233,6 +4233,7 @@ dependencies = [
  "blake3",
  "hex",
  "interprocess",
+ "relay-core",
  "serde",
  "serde_json",
  "tempfile",

@@ -436,6 +436,10 @@ fn describe_watch(event: &WatchEvent) -> (String, String) {
             };
             ("watch".to_owned(), msg)
         }
+        WatchEvent::MountRemoved { space, mount } => (
+            "watch".to_owned(),
+            format!("Stopped syncing {space}/{mount}"),
+        ),
         WatchEvent::Scanned {
             space,
             mount,

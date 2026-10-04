@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use relay_core::{ConfigApplied, ConfigChange};
 use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{Engine, WatchEvent, WatchOptions};
 use tempfile::TempDir;
@@ -385,12 +386,26 @@ fn ipc_add_mount_and_share_without_reload() {
 
     let mut client = wait_ipc(home.path());
     let added = client
-        .add_mount("Personal", "two", mount_b.path())
+        .config(&ConfigChange::AddMount {
+            space: "Personal".into(),
+            mount: "two".into(),
+            path: mount_b.path().to_path_buf(),
+            includes: Vec::new(),
+            excludes: Vec::new(),
+        })
         .expect("add_mount via ipc");
-    assert_eq!(added.name, "two");
-    assert!(added.path.is_some());
+    let ConfigApplied::Mount { mount, path } = added else {
+        panic!("unexpected result {added:?}");
+    };
+    assert_eq!(mount.name, "two");
+    assert!(path.is_some());
 
-    client.share("Personal", "bob").expect("share via ipc");
+    client
+        .config(&ConfigChange::Share {
+            space: "Personal".into(),
+            peer: "bob".into(),
+        })
+        .expect("share via ipc");
 
     assert!(
         wait_until(CONVERGE, || live_has(
@@ -514,6 +529,129 @@ fn pair_via_ipc_shares_and_syncs_without_reload() {
         "file did not sync after pairing"
     );
 
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}
+
+fn reload_count(session: &DaemonSession) -> usize {
+    drain(session)
+        .into_iter()
+        .filter(|e| matches!(e, DaemonEvent::Reloading))
+        .count()
+}
+
+fn has_peer(home: &Path, name: &str) -> bool {
+    Engine::open_read_only(home)
+        .and_then(|engine| engine.peers())
+        .is_ok_and(|peers| peers.iter().any(|p| p.name == name))
+}
+
+fn synced(folder: &Path, name: &str, bytes: &[u8]) -> bool {
+    fs::read(folder.join(name)).ok().as_deref() == Some(bytes)
+}
+
+/// Join, attach, share, and detach from another process all apply on the
+/// running loop: the join waits for an offer that arrives later, files flow
+/// without a reconnect, and neither host reloads.
+#[test]
+fn live_config_join_attach_and_remove_without_reload() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let mount_a = TempDir::new().unwrap();
+    let mount_b = TempDir::new().unwrap();
+    fs::write(mount_a.path().join("hello.txt"), b"from-a").unwrap();
+    {
+        let mut engine = Engine::init(home_a.path(), "alice").unwrap();
+        engine.create_space("S").unwrap();
+        engine
+            .add_mount("S", "docs", mount_a.path(), &[], &[])
+            .unwrap();
+    }
+    Engine::init(home_b.path(), "bob").unwrap();
+
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+
+    // Pair without sharing anything yet.
+    let mut client_a = wait_ipc(home_a.path());
+    let code = client_a.pair_start(&[]).expect("pair_start").code;
+    wait_ipc(home_b.path())
+        .pair_join(&code, Some(&addr_a.to_string()))
+        .expect("pair_join");
+    assert!(
+        wait_until(CONVERGE, || has_peer(home_a.path(), "bob")
+            && has_peer(home_b.path(), "alice")),
+        "pairing was not recorded on both sides"
+    );
+
+    // Bob asks to join before Alice shares; the loop holds the join.
+    let home_b_path = home_b.path().to_path_buf();
+    let join = thread::spawn(move || {
+        wait_ipc(&home_b_path).config(&ConfigChange::JoinSpace {
+            space: "S".into(),
+            from_peer: "alice".into(),
+            wait_ms: 10_000,
+        })
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert!(!join.is_finished(), "join should wait for the offer");
+    client_a
+        .config(&ConfigChange::Share {
+            space: "S".into(),
+            peer: "bob".into(),
+        })
+        .expect("share via ipc");
+    let joined = join.join().unwrap().expect("join via ipc");
+    assert!(matches!(joined, ConfigApplied::Space { ref space } if space.name == "S"));
+
+    let mut client_b = wait_ipc(home_b.path());
+    client_b
+        .config(&ConfigChange::AddMount {
+            space: "S".into(),
+            mount: "docs".into(),
+            path: mount_b.path().to_path_buf(),
+            includes: Vec::new(),
+            excludes: Vec::new(),
+        })
+        .expect("attach via ipc");
+    assert!(
+        wait_until(CONVERGE, || synced(mount_b.path(), "hello.txt", b"from-a")),
+        "existing file did not arrive after a live attach"
+    );
+
+    client_b
+        .config(&ConfigChange::RemoveMount {
+            space: "S".into(),
+            mount: "docs".into(),
+        })
+        .expect("remove via ipc");
+    let status = client_b.status().expect("status");
+    assert!(
+        !status.mounts.iter().any(|m| m.space == "S"),
+        "removed mount still listed: {:?}",
+        status.mounts
+    );
+    fs::write(mount_a.path().join("later.txt"), b"later").unwrap();
+    assert!(
+        wait_until(CONVERGE, || live_has(
+            home_a.path(),
+            "S",
+            "docs",
+            "later.txt"
+        )),
+        "alice did not index the new file"
+    );
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        !mount_b.path().join("later.txt").exists(),
+        "a detached folder must not receive files"
+    );
+    assert!(synced(mount_b.path(), "hello.txt", b"from-a"), "files stay");
+
+    assert_eq!(reload_count(&session_a), 0, "alice reloaded");
+    assert_eq!(reload_count(&session_b), 0, "bob reloaded");
     stop_daemon(session_a);
     stop_daemon(session_b);
 }

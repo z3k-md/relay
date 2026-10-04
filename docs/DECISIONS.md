@@ -849,3 +849,42 @@ it wants. Rules are not synced and do not change SpaceOffer.
 - **Out of scope.** No GUI editor. No placeholder files. No OS
   file-on-demand. D27's "no metadata-only mode" line described that phase
   and stays.
+
+## D36. Configuration changes on the running host
+
+Space, mount, share, and materialization edits are data: a
+`relay_core::ConfigChange`. Every caller builds one: the CLI, the desktop
+app, and later a peer that manages this device (remote explorer proposal).
+This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
+`add_mount` / `share` IPC methods.
+
+- **One implementation.** `Engine::apply_config` maps a change onto engine
+  calls. With no host running, callers use it through `open_for_config`.
+- **One live path.** With a host running, callers send IPC `config` (params
+  are the change). The host passes `SyncInput::Config` to the loop on the
+  priority channel, so a running scan yields. The loop applies the change,
+  replies, and only then runs follow-ups: mount watchers, offers to members,
+  `IndexRequest`s, and dropping send cursors on unshare or delete. Nothing
+  reloads, so sessions stay up. Peer and delete-hold edits still reload (D24).
+- **Attach requests the index.** A joined mount with no local path skips
+  incoming entries (D16), and attaching resets the receive watermark (D15).
+  The live attach and join now ask connected members for the index from that
+  watermark. Before this, a live attach waited for the next reconnect.
+- **Join can wait for its offer.** `JoinSpace { wait_ms }` is held on the
+  loop and retried after peer frames until the offer arrives or the wait
+  ends. A third device setting up a pair sends the join and the share on
+  different connections. Direct writes do not wait.
+- **Remove mount.** Detach only. The folder and its files stay (§48.6). The
+  local index rows and history for that mount are dropped, because an
+  unattached mount stores no entries (D16): kept rows would turn a later
+  attach to another folder into "every file was deleted." The `.relay-mount`
+  marker is removed. A marker this device wrote for a mount that is no
+  longer attached is adoptable, so a failed marker delete cannot wedge the
+  folder.
+- **Delete space.** Refused while any mount in it is attached. Shares,
+  progress, policies, rules, and mounts go. Stored offers stay so the space
+  can be joined again, and key wraps stay so a rejoin can still open
+  mailbox objects (D30).
+- **Errors over IPC are strings.** The CLI keeps typed engine errors and
+  exit codes only on the direct path. A host-applied change fails with exit
+  code 1 and the engine's message.

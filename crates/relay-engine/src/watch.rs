@@ -6,16 +6,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use relay_core::{LogicalPath, MOUNT_MARKER, MountId, SpaceId};
+use relay_core::{ConfigApplied, ConfigChange, LogicalPath, MOUNT_MARKER, Mount, MountId, SpaceId};
 use relay_fs::{MountWatcher, WatchSignal, to_logical_path};
 use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::live_config::{Applied, ConfigQueue};
 use crate::progress::TransferLive;
 use crate::replica::ReplicaPush;
 use crate::reports::{ScanOptions, ScanReport};
-use crate::sync::{AddMountApplied, SyncEvent, SyncInput, SyncOutput, Syncer};
+use crate::sync::{SyncEvent, SyncInput, SyncOutput, Syncer};
 
 const STOP_POLL: Duration = Duration::from_millis(100);
 const RELOAD_POLL: Duration = Duration::from_secs(1);
@@ -62,6 +63,11 @@ pub enum RunExit {
 pub enum WatchEvent {
     Started {
         mounts: Vec<String>,
+    },
+    /// A mount was detached live and is no longer watched or scanned.
+    MountRemoved {
+        space: String,
+        mount: String,
     },
     Scanned {
         space: String,
@@ -194,8 +200,9 @@ impl Engine {
         let mut last_replica_pull: Option<Instant>;
         let mut replica_warned = false;
         let mut syncer = Syncer::new();
+        let mut config = ConfigQueue::default();
         let (tx, rx) = mpsc::channel::<LoopMsg>();
-        // Mount and share replies must not wait out a full index of a large
+        // Config and fetch replies must not wait out a full index of a large
         // folder. Those inputs travel on their own channel so a scan can notice
         // them and pause.
         let (priority_tx, priority_rx) = mpsc::channel::<SyncInput>();
@@ -204,9 +211,7 @@ impl Engine {
             std::thread::spawn(move || {
                 while let Ok(input) = sync_inputs.recv() {
                     match input {
-                        input @ (SyncInput::AddMount { .. }
-                        | SyncInput::Share { .. }
-                        | SyncInput::Fetch { .. }) => {
+                        input @ (SyncInput::Config { .. } | SyncInput::Fetch { .. }) => {
                             if priority_tx.send(input).is_err() {
                                 break;
                             }
@@ -386,31 +391,36 @@ impl Engine {
                             }
                         }
                     }
-                    SyncInput::AddMount {
-                        space,
-                        mount,
-                        path,
-                        reply,
-                    } => {
-                        apply_add_mount(
-                            self,
-                            &mut syncer,
-                            &mut states,
-                            watcher.as_mut(),
-                            &space,
-                            &mount,
-                            &path,
-                            &mut output,
-                            on_event,
-                            reply,
-                        );
-                    }
-                    SyncInput::Share { space, peer, reply } => {
-                        let result = apply_share(self, &syncer, &space, &peer, &mut output);
-                        let _ = reply.send(result);
+                    SyncInput::Config { change, reply } => {
+                        if let Some(applied) = config.submit(self, change, reply) {
+                            after_config(
+                                self,
+                                &mut syncer,
+                                &mut states,
+                                watcher.as_mut(),
+                                &applied,
+                                &mut output,
+                                on_event,
+                            );
+                        }
                     }
                     other => {
+                        // Only a peer frame can carry the offer a waiting join needs.
+                        let may_bring_offer = matches!(other, SyncInput::Frame { .. });
                         emit_sync(syncer.handle(self, other, &mut output), on_event);
+                        if may_bring_offer && config.is_waiting() {
+                            for applied in config.retry(self) {
+                                after_config(
+                                    self,
+                                    &mut syncer,
+                                    &mut states,
+                                    watcher.as_mut(),
+                                    &applied,
+                                    &mut output,
+                                    on_event,
+                                );
+                            }
+                        }
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
                         emit_push(
                             self.push_replica_watch(),
@@ -428,6 +438,7 @@ impl Engine {
             }
 
             let now = Instant::now();
+            config.expire(now);
             emit_sync(syncer.tick(self, now, &mut output), on_event);
             if let Some(rows) = syncer.poll_transfers(now) {
                 on_event(&WatchEvent::Transfers(rows));
@@ -626,71 +637,96 @@ fn apply_add_peer(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_add_mount(
+/// Loop-side follow-ups for an applied config change: mount watches here,
+/// then live sessions in [`Syncer::after_config`].
+fn after_config(
     engine: &mut Engine,
     syncer: &mut Syncer,
     states: &mut Vec<MountWatch>,
     watcher: Option<&mut MountWatcher>,
-    space: &str,
-    mount: &str,
-    path: &Path,
+    applied: &Applied,
     output: &mut dyn FnMut(SyncOutput),
     on_event: &mut dyn FnMut(&WatchEvent),
-    reply: mpsc::Sender<Result<AddMountApplied, String>>,
 ) {
-    let config = match engine.add_mount(space, mount, path, &[], &[]) {
-        Ok(config) => config,
-        Err(err) => {
-            let _ = reply.send(Err(err.to_string()));
-            return;
+    match (&applied.change, &applied.result) {
+        (
+            ConfigChange::AddMount { space, .. },
+            ConfigApplied::Mount {
+                mount,
+                path: Some(root),
+            },
+        ) => track_mount(states, watcher, space, mount, root, on_event),
+        (ConfigChange::RemoveMount { space, mount }, _) => {
+            untrack_mount(states, watcher, space, mount, on_event);
         }
-    };
-    let space_id = config.mount.space;
-    let mount_id = config.mount.id;
-    let name = config.mount.name.clone();
-    let local_path = config.local_path.clone();
-    // Reply before watcher setup or UI events. Those run on this thread, and a
-    // desktop command waiting on the reply can be the UI thread those events
-    // need. The index itself runs later, off this reply.
-    let _ = reply.send(Ok(AddMountApplied {
-        name: name.clone(),
-        path: local_path.clone(),
-        space_id,
-        mount_id,
-    }));
-
-    if let Some(root) = local_path {
-        let mut state = MountWatch {
-            space_id,
-            mount_id,
-            space: space.to_owned(),
-            mount: name.clone(),
-            root,
-            dirty: HashSet::new(),
-            first_event: None,
-            last_event: Some(Instant::now()),
-            full_pending: true,
-            last_full: None,
-            failed: false,
-            watcher_attached: false,
-        };
-        if let Some(watcher) = watcher {
-            attach_watcher(watcher, &mut state, on_event);
-        }
-        states.push(state);
-        on_event(&WatchEvent::Started {
-            mounts: vec![format!("{space}/{name}")],
-        });
+        _ => {}
     }
-
-    if let Err(err) = syncer.refresh_offers_for_space(engine, space_id, output) {
+    if let Err(err) = syncer.after_config(engine, applied, output) {
         on_event(&WatchEvent::SyncWarning {
             peer: String::new(),
             path: String::new(),
             reason: err.to_string(),
         });
     }
+}
+
+/// Start watching a newly attached mount. Its first full scan is due now.
+fn track_mount(
+    states: &mut Vec<MountWatch>,
+    watcher: Option<&mut MountWatcher>,
+    space: &str,
+    mount: &Mount,
+    root: &Path,
+    on_event: &mut dyn FnMut(&WatchEvent),
+) {
+    let mut state = MountWatch {
+        space_id: mount.space,
+        mount_id: mount.id,
+        space: space.to_owned(),
+        mount: mount.name.clone(),
+        root: root.to_path_buf(),
+        dirty: HashSet::new(),
+        first_event: None,
+        last_event: Some(Instant::now()),
+        full_pending: true,
+        last_full: None,
+        failed: false,
+        watcher_attached: false,
+    };
+    if let Some(watcher) = watcher {
+        attach_watcher(watcher, &mut state, on_event);
+    }
+    states.push(state);
+    on_event(&WatchEvent::Started {
+        mounts: vec![format!("{space}/{}", mount.name)],
+    });
+}
+
+/// Stop watching a detached mount and drop its pending scans.
+fn untrack_mount(
+    states: &mut Vec<MountWatch>,
+    watcher: Option<&mut MountWatcher>,
+    space: &str,
+    mount: &str,
+    on_event: &mut dyn FnMut(&WatchEvent),
+) {
+    let Some(index) = states
+        .iter()
+        .position(|state| state.space == space && state.mount == mount)
+    else {
+        return;
+    };
+    let state = states.remove(index);
+    if state.watcher_attached
+        && let Some(watcher) = watcher
+        && let Err(err) = watcher.unwatch(&state.root)
+    {
+        tracing::debug!(path = %state.root.display(), error = %err, "unwatch failed");
+    }
+    on_event(&WatchEvent::MountRemoved {
+        space: space.to_owned(),
+        mount: mount.to_owned(),
+    });
 }
 
 struct PriorityQueue {
@@ -712,27 +748,6 @@ impl PriorityQueue {
         self.poll();
         self.buf.pop_front()
     }
-}
-
-fn apply_share(
-    engine: &mut Engine,
-    syncer: &Syncer,
-    space: &str,
-    peer: &str,
-    output: &mut dyn FnMut(SyncOutput),
-) -> Result<(), String> {
-    engine.share(space, peer).map_err(|err| err.to_string())?;
-    let space_id = engine
-        .spaces()
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .find(|s| s.name == space)
-        .map(|s| s.id)
-        .ok_or_else(|| format!("unknown space {space}"))?;
-    syncer
-        .refresh_offers_for_space(engine, space_id, output)
-        .map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 fn scan_committed(report: &ScanReport) -> bool {

@@ -56,11 +56,13 @@ export const api = {
   createSpace: (name: string) => call<SpaceView>("create_space", { name }),
   addMount: (space: string, mount: string, path: string) =>
     call<MountView>("add_mount", { space, mount, path }),
+  removeMount: (space: string, mount: string) => call<void>("remove_mount", { space, mount }),
   share: (space: string, peer: string) => call<void>("share", { space, peer }),
   unshare: (space: string, peer: string) => call<void>("unshare", { space, peer }),
   listOffers: () => call<OfferView[]>("list_offers"),
   joinSpace: (space: string, fromPeer: string) =>
     call<SpaceView>("join_space", { space, fromPeer }),
+  deleteSpace: (space: string) => call<void>("delete_space", { space }),
   listConflicts: () => call<ConflictView[]>("list_conflicts"),
   resolveConflict: (
     space: string,

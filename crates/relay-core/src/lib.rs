@@ -4,6 +4,7 @@
 //! other crate speaks in these types.
 
 pub mod addr;
+pub mod config;
 pub mod conflict;
 pub mod entry;
 pub mod error;
@@ -21,6 +22,7 @@ pub use addr::{
     MAX_PEER_ADDRESSES, collect_peer_addresses, format_ip_port, format_socket_addr,
     is_advertisable_ip, is_tailscale_v4, is_tailscale_v6, merge_peer_addresses, rank_addresses,
 };
+pub use config::{ConfigApplied, ConfigChange};
 pub use entry::{EntryContent, EntryKey, EntryKind, EntryRecord, StatHint};
 pub use error::CoreError;
 pub use git::{git_dir_of, is_git_metadata};

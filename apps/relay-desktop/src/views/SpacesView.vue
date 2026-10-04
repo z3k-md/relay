@@ -6,7 +6,7 @@ import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
 import { api } from "../lib/api";
-import type { OfferView, PeerView, SpaceView, TransferLive } from "../lib/types";
+import type { MountView, OfferView, PeerView, SpaceView, TransferLive } from "../lib/types";
 
 const props = defineProps<{
   transfers?: TransferLive[];
@@ -69,61 +69,48 @@ function spaceNameIssue(name: string): string | null {
 const nameIssue = computed(() => spaceNameIssue(trimmedSpaceName.value));
 const canCreateSpace = computed(() => nameIssue.value === null);
 
-async function createSpace() {
-  if (busy.value || !canCreateSpace.value) return;
+/** Run one action with the shared busy flag and error banner, then reload. */
+async function run(action: () => Promise<unknown>) {
+  if (busy.value) return;
   busy.value = true;
   error.value = null;
   try {
+    await action();
+    await load();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    busy.value = false;
+  }
+}
+
+function createSpace() {
+  if (!canCreateSpace.value) return;
+  return run(async () => {
     await api.createSpace(trimmedSpaceName.value);
     creating.value = false;
     spaceName.value = "";
-    await load();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    busy.value = false;
-  }
+  });
+}
+
+async function chooseFolder(title: string): Promise<string | null> {
+  const selected = await open({ directory: true, multiple: false, title });
+  return typeof selected === "string" ? selected : null;
 }
 
 async function addFolder(space: string) {
-  error.value = null;
-  const selected = await open({ directory: true, multiple: false, title: "Choose a folder to sync" });
-  if (!selected || typeof selected !== "string") return;
-  const mount = folderName(selected);
-  busy.value = true;
-  try {
-    const added = await api.addMount(space, mount, selected);
-    const target = spaces.value.find((s) => s.name === space);
-    if (target && !target.mounts.some((m) => m.name === added.name)) {
-      target.mounts.push(added);
-    }
-    await load();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    busy.value = false;
-  }
+  const selected = await chooseFolder("Choose a folder to sync");
+  if (selected) await run(() => api.addMount(space, folderName(selected), selected));
 }
 
-async function doShare() {
-  if (!shareFor.value || !sharePeer.value) return;
-  const spaceName = shareFor.value;
-  const peerName = sharePeer.value;
-  busy.value = true;
-  error.value = null;
-  try {
-    await api.share(spaceName, peerName);
+function doShare() {
+  const space = shareFor.value;
+  const peer = sharePeer.value;
+  if (!space || !peer) return;
+  return run(async () => {
+    await api.share(space, peer);
     shareFor.value = null;
-    const target = spaces.value.find((s) => s.name === spaceName);
-    if (target && !target.sharedWith.includes(peerName)) {
-      target.sharedWith.push(peerName);
-    }
-    await load();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    busy.value = false;
-  }
+  });
 }
 
 async function openFolder(path: string) {
@@ -135,41 +122,52 @@ async function openFolder(path: string) {
   }
 }
 
-async function doUnshare(space: string, peer: string) {
-  busy.value = true;
-  error.value = null;
-  try {
-    await api.unshare(space, peer);
-    await load();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    busy.value = false;
-  }
+function doUnshare(space: string, peer: string) {
+  return run(() => api.unshare(space, peer));
 }
 
 async function joinOffer(offer: OfferView) {
-  error.value = null;
-  const selected = await open({
-    directory: true,
-    multiple: false,
-    title: `Choose a local folder for ${offer.name}`,
-  });
-  if (!selected || typeof selected !== "string") return;
-  busy.value = true;
-  try {
+  const selected = await chooseFolder(`Choose a local folder for ${offer.name}`);
+  if (!selected) return;
+  await run(async () => {
     await api.joinSpace(offer.name, offer.peer);
-    if (offer.mounts.length === 1) {
-      await api.addMount(offer.name, offer.mounts[0].name, selected);
-    } else if (offer.mounts.length > 1) {
-      await api.addMount(offer.name, offer.mounts[0].name, selected);
-    }
-    await load();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  } finally {
-    busy.value = false;
-  }
+    const first = offer.mounts[0];
+    if (first) await api.addMount(offer.name, first.name, selected);
+  });
+}
+
+type Confirm = { title: string; body: string; action: string; run: () => Promise<unknown> };
+const confirming = ref<Confirm | null>(null);
+
+function confirmRemoveMount(space: string, mount: MountView) {
+  confirming.value = {
+    title: `Stop syncing ${mount.name}?`,
+    body: `This computer stops syncing ${mount.path ?? mount.name}. The files stay where they are, and other devices keep their copies.`,
+    action: "Stop syncing",
+    run: () => api.removeMount(space, mount.name),
+  };
+}
+
+function confirmDeleteSpace(space: SpaceView) {
+  confirming.value = {
+    title: `Delete ${space.name}?`,
+    body: "This computer forgets the space and stops sharing it. Other devices keep it, and you can join it again from their offer.",
+    action: "Delete space",
+    run: () => api.deleteSpace(space.name),
+  };
+}
+
+function runConfirmed() {
+  const pending = confirming.value;
+  if (!pending) return;
+  return run(async () => {
+    await pending.run();
+    confirming.value = null;
+  });
+}
+
+function hasAttachedMount(space: SpaceView): boolean {
+  return space.mounts.some((mount) => mount.attached);
 }
 
 function unusedPeers(space: SpaceView): PeerView[] {
@@ -268,6 +266,15 @@ defineExpose({ load });
               >
                 Share
               </button>
+              <button
+                v-if="!hasAttachedMount(space)"
+                type="button"
+                class="rounded-md border border-[var(--color-line)] px-2 py-1"
+                :disabled="busy"
+                @click="confirmDeleteSpace(space)"
+              >
+                Delete
+              </button>
             </div>
           </div>
           <ul v-if="space.mounts.length" class="mt-2 space-y-1">
@@ -286,14 +293,23 @@ defineExpose({ load });
                   <span v-else-if="mount.state && mount.state !== 'OK'"> · {{ mount.state }}</span>
                 </span>
               </div>
-              <button
-                v-if="mount.path"
-                type="button"
-                class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
-                @click="mount.path && openFolder(mount.path)"
-              >
-                Open folder
-              </button>
+              <div v-if="mount.path" class="flex shrink-0 gap-1">
+                <button
+                  type="button"
+                  class="rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+                  @click="mount.path && openFolder(mount.path)"
+                >
+                  Open folder
+                </button>
+                <button
+                  type="button"
+                  class="rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+                  :disabled="busy"
+                  @click="confirmRemoveMount(space.name, mount)"
+                >
+                  Stop syncing
+                </button>
+              </div>
             </li>
           </ul>
           <p v-else class="mt-2 text-[12px] text-[var(--color-muted)]">No local folders yet.</p>
@@ -339,6 +355,21 @@ defineExpose({ load });
           @click="createSpace"
         >
           Create
+        </button>
+      </div>
+    </Modal>
+
+    <Modal :open="!!confirming" :title="confirming?.title ?? ''" @close="confirming = null">
+      <p class="mb-4 text-[var(--color-muted)]">{{ confirming?.body }}</p>
+      <div class="flex justify-end gap-2">
+        <button type="button" class="rounded-md px-2.5 py-1" @click="confirming = null">Cancel</button>
+        <button
+          type="button"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)]"
+          :disabled="busy"
+          @click="runConfirmed"
+        >
+          {{ confirming?.action }}
         </button>
       </div>
     </Modal>
