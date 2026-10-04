@@ -12,26 +12,9 @@ use relay_core::{ConfigApplied, ConfigChange, SpaceId};
 
 use crate::Engine;
 use crate::error::EngineError;
-use crate::sync::{SyncEvent, SyncOutput, Syncer};
+use crate::sync::{Rejected, SyncEvent, SyncOutput, Syncer};
 
-type Reply = mpsc::Sender<Result<ConfigApplied, ConfigRejected>>;
-
-/// Why a change was refused, with [`EngineError::code`] kept across the
-/// loop's reply channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigRejected {
-    pub code: &'static str,
-    pub message: String,
-}
-
-impl From<&EngineError> for ConfigRejected {
-    fn from(err: &EngineError) -> Self {
-        Self {
-            code: err.code(),
-            message: err.to_string(),
-        }
-    }
-}
+type Reply = mpsc::Sender<Result<ConfigApplied, Rejected>>;
 
 /// A change that took effect, for the loop's follow-ups.
 pub(crate) struct Applied {
@@ -164,10 +147,14 @@ impl Syncer {
     ) -> Result<Vec<SyncEvent>, EngineError> {
         let space = applied.space;
         match &applied.change {
-            ConfigChange::CreateSpace { .. }
-            | ConfigChange::MaterializeAdd { .. }
+            ConfigChange::CreateSpace { .. } | ConfigChange::GroupCreate { .. } => {}
+            ConfigChange::MaterializeAdd { .. }
             | ConfigChange::MaterializeRemove { .. }
-            | ConfigChange::GroupCreate { .. } => {}
+            | ConfigChange::SetFolderMode { .. } => {
+                // A path that now wants bytes downloads on the next tick
+                // rather than up to a hydration interval later.
+                self.hydrate_soon();
+            }
             ConfigChange::JoinSpace { .. } => {
                 // Joining adopts the offer's members as peers (D26).
                 out(SyncOutput::SetPeers);

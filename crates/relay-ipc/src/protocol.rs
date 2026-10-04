@@ -244,6 +244,12 @@ pub struct FetchParams {
     pub path: String,
 }
 
+/// `evict` reply: how many files this device dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictResult {
+    pub evicted: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairStartParams {
     #[serde(default)]

@@ -219,7 +219,9 @@ impl Engine {
             std::thread::spawn(move || {
                 while let Ok(input) = sync_inputs.recv() {
                     match input {
-                        input @ (SyncInput::Config { .. } | SyncInput::Fetch { .. }) => {
+                        input @ (SyncInput::Config { .. }
+                        | SyncInput::Fetch { .. }
+                        | SyncInput::Evict { .. }) => {
                             if priority_tx.send(input).is_err() {
                                 break;
                             }
@@ -385,6 +387,15 @@ impl Engine {
                                 }),
                             }
                         }
+                    }
+                    SyncInput::Evict {
+                        space,
+                        mount,
+                        path,
+                        reply,
+                    } => {
+                        let result = self.evict(&space, &mount, &path);
+                        let _ = reply.send(result.map_err(|err| (&err).into()));
                     }
                     SyncInput::Config { change, reply } => {
                         if let Some(applied) = config.submit(self, change, reply) {

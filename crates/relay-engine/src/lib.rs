@@ -4,6 +4,7 @@ mod apply;
 mod clock;
 mod config;
 mod error;
+mod files;
 mod live_config;
 mod materialize;
 mod order;
@@ -33,7 +34,7 @@ use relay_store::StoreError;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::EngineError;
-pub use live_config::ConfigRejected;
+pub use files::{CopyState, FileRow, FolderView};
 pub use materialize::{MaterializationInfo, MaterializationMode};
 pub use peers::{
     AdoptedMembers, ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict,
@@ -61,7 +62,7 @@ pub use reports::{
 pub use resolve::{
     GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
 };
-pub use sync::{PairedPeer, SyncEvent, SyncInput, SyncOutput, Syncer};
+pub use sync::{PairedPeer, Rejected, SyncEvent, SyncInput, SyncOutput, Syncer};
 pub use watch::{RunExit, WatchEvent, WatchOptions};
 
 const DB_FILE: &str = "relay.db";

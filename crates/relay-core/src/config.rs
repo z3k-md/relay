@@ -67,6 +67,15 @@ pub enum ConfigChange {
         space: String,
         name: String,
     },
+    /// What this device keeps for everything in one folder of a mount
+    /// (`path` `""` is the whole mount). `mode` `None` drops the choice so the
+    /// enclosing folder's applies. Replaces choices made inside that folder.
+    SetFolderMode {
+        space: String,
+        mount: String,
+        path: String,
+        mode: Option<String>,
+    },
     /// Trust a device by id (the manual path; pairing adds peers itself).
     AddPeer {
         peer: String,
@@ -139,6 +148,7 @@ impl ConfigChange {
             | Self::Unshare { space, .. }
             | Self::MaterializeAdd { space, .. }
             | Self::MaterializeRemove { space, .. }
+            | Self::SetFolderMode { space, .. }
             | Self::PolicyAdd { space, .. }
             | Self::PolicyRemove { space, .. }
             | Self::DecideDeleteHold { space, .. } => Some(space),

@@ -174,7 +174,7 @@ pub fn suggested_device_name() -> String {
     "this-device".to_owned()
 }
 
-fn open_ro(home: &std::path::Path) -> Result<Engine, String> {
+pub(crate) fn open_ro(home: &std::path::Path) -> Result<Engine, String> {
     Engine::open_read_only(home).map_err(|err| error_chain(&err))
 }
 
@@ -408,7 +408,7 @@ fn pairing_client(app: &AppHandle) -> Result<Client, String> {
 
 /// Prefer the running host's IPC so config writes do not `stop_join` the sync
 /// thread. Returns `Ok(None)` only when nothing is listening on the socket.
-fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
+pub(crate) fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
     let state = app.state::<AppState>();
     match Client::connect(&state.home) {
         Ok(client) => Ok(client),
@@ -614,7 +614,7 @@ pub fn unshare(app: AppHandle, space: String, peer: String) -> Result<(), String
 
 /// Apply a config change through the running host so live sessions survive.
 /// With no host running, write it directly.
-fn apply_config(app: &AppHandle, change: ConfigChange) -> Result<ConfigApplied, String> {
+pub(crate) fn apply_config(app: &AppHandle, change: ConfigChange) -> Result<ConfigApplied, String> {
     if let Some(mut client) = host_client(app)? {
         return client.config(&change).map_err(|err| error_chain(&err));
     }

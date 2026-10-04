@@ -138,9 +138,10 @@ enum Command {
         /// SPACE/MOUNT/PATH
         target: String,
     },
-    /// Drop a demand-mode path's bytes without deleting the index entry
+    /// Drop demand-mode bytes here without deleting the index entry: one file,
+    /// or every downloaded one under SPACE/MOUNT[/FOLDER]
     Evict {
-        /// SPACE/MOUNT/PATH
+        /// SPACE/MOUNT[/PATH]
         target: String,
     },
     /// List live conflict copies, or resolve them
@@ -2092,21 +2093,31 @@ fn cmd_fetch(home: &Path, target: &str, json: bool) -> Result<ExitCode> {
 }
 
 fn cmd_evict(home: &Path, target: &str, json: bool) -> Result<ExitCode> {
-    let (space, mount, path) = require_file_target(target, "evict")?;
-    let mut engine = Engine::open_for_config(home)?;
-    engine.evict_path(&space, &mount, path.as_str())?;
+    let parsed = parse_target(target)?;
+    let mount = parsed
+        .mount
+        .ok_or_else(|| anyhow::anyhow!("evict requires SPACE/MOUNT[/PATH]"))?;
+    let space = parsed.space;
+    let path = parsed
+        .path
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_default();
+    let evicted = match Client::connect(home)? {
+        Some(mut client) => client.evict(&space, &mount, &path)?,
+        None => Engine::open_for_config(home)?.evict(&space, &mount, &path)?,
+    };
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "space": space,
                 "mount": mount,
-                "path": path.as_str(),
-                "materialized": false,
+                "path": path,
+                "evicted": evicted,
             }))?
         );
     } else {
-        println!("evicted {space}/{mount}/{path}");
+        println!("freed {evicted} file(s) under {target}");
     }
     Ok(ExitCode::SUCCESS)
 }

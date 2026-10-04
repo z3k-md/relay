@@ -236,6 +236,60 @@ impl Engine {
         }
     }
 
+    /// Drop this device's copy of one demand-mode file, or of every
+    /// downloaded demand-mode file under a folder (`""` is the whole mount).
+    /// Files whose bytes changed on disk are kept. Returns how many went.
+    pub fn evict(&mut self, space: &str, mount: &str, path: &str) -> Result<usize, EngineError> {
+        let (_, config) = self.lookup_mount(space, mount)?;
+        let folder = if path.is_empty() {
+            None
+        } else {
+            let logical = LogicalPath::new(path)?;
+            let key = EntryKey {
+                space: config.mount.space,
+                mount: config.mount.id,
+                path: logical.clone(),
+            };
+            match self.db.repo().entry(&key)? {
+                Some(entry) if !matches!(entry.content, EntryContent::Directory) => {
+                    self.evict_path(space, mount, path)?;
+                    return Ok(1);
+                }
+                _ => Some(logical),
+            }
+        };
+        let entries = match &folder {
+            Some(prefix) => self.db.repo().entries_under(config.mount.id, prefix)?,
+            None => self.db.repo().entries_for_mount(config.mount.id)?,
+        };
+        let rules = self
+            .db
+            .repo()
+            .list_materialization_rules(config.mount.space)?;
+        let mut evicted = 0;
+        for entry in entries {
+            let is_copy = matches!(
+                entry.content,
+                EntryContent::File { .. } | EntryContent::Symlink { .. }
+            );
+            if !is_copy
+                || !entry.materialized
+                || path_mode(&rules, &config.mount.name, entry.key.path.as_str())?
+                    != MaterializationMode::Demand
+            {
+                continue;
+            }
+            match self.evict_path(space, mount, entry.key.path.as_str()) {
+                Ok(()) => evicted += 1,
+                Err(EngineError::EvictMismatch { path }) => {
+                    tracing::info!(%path, "kept a changed file while freeing space");
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(evicted)
+    }
+
     /// Drop the working-tree copy of a hydrated demand path. The index row stays.
     pub fn evict_path(&mut self, space: &str, mount: &str, path: &str) -> Result<(), EngineError> {
         self.ensure_writable()?;

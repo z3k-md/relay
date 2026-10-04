@@ -874,3 +874,95 @@ fn granted_peer_browses_folders_over_ipc() {
     stop_daemon(session_a);
     stop_daemon(session_b);
 }
+
+/// Online-only files: listed without bytes, fetched over IPC, freed again,
+/// all on the live loop.
+#[test]
+fn online_only_files_fetch_and_free_without_reload() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let mount_a = TempDir::new().unwrap();
+    let mount_b = TempDir::new().unwrap();
+    fs::write(mount_a.path().join("report.docx"), b"quarterly").unwrap();
+    {
+        let mut engine = Engine::init(home_a.path(), "alice").unwrap();
+        engine.create_space("S").unwrap();
+        engine
+            .add_mount("S", "docs", mount_a.path(), &[], &[])
+            .unwrap();
+    }
+    Engine::init(home_b.path(), "bob").unwrap();
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    pair(home_a.path(), addr_a, home_b.path());
+    config(
+        home_a.path(),
+        ConfigChange::Share {
+            space: "S".into(),
+            peer: "bob".into(),
+        },
+    );
+    config(
+        home_b.path(),
+        ConfigChange::JoinSpace {
+            space: "S".into(),
+            from_peer: "alice".into(),
+            wait_ms: 10_000,
+        },
+    );
+    // Online only before attaching, so nothing downloads on its own.
+    config(
+        home_b.path(),
+        ConfigChange::SetFolderMode {
+            space: "S".into(),
+            mount: "docs".into(),
+            path: String::new(),
+            mode: Some("demand".into()),
+        },
+    );
+    config(
+        home_b.path(),
+        ConfigChange::AddMount {
+            space: "S".into(),
+            mount: "docs".into(),
+            path: mount_b.path().to_path_buf(),
+            includes: Vec::new(),
+            excludes: Vec::new(),
+        },
+    );
+    let state = || {
+        Engine::open_read_only(home_b.path())
+            .and_then(|e| e.list_folder("S", "docs", ""))
+            .ok()
+            .and_then(|view| view.entries.into_iter().find(|e| e.name == "report.docx"))
+            .map(|e| e.state)
+    };
+    assert!(
+        wait_until(CONVERGE, || state()
+            == Some(relay_engine::CopyState::OnlineOnly)),
+        "the file was not listed as online only: {:?}",
+        state()
+    );
+    assert!(!mount_b.path().join("report.docx").exists());
+
+    let mut client = wait_ipc(home_b.path());
+    client.fetch("S", "docs", "report.docx").expect("fetch");
+    assert_eq!(
+        fs::read(mount_b.path().join("report.docx")).unwrap(),
+        b"quarterly"
+    );
+    assert_eq!(state(), Some(relay_engine::CopyState::Local));
+
+    assert_eq!(client.evict("S", "docs", "").expect("evict"), 1);
+    assert!(!mount_b.path().join("report.docx").exists());
+    assert_eq!(state(), Some(relay_engine::CopyState::OnlineOnly));
+    assert!(
+        fs::read(mount_a.path().join("report.docx")).is_ok(),
+        "freeing space here leaves alice's copy"
+    );
+    assert_eq!(reload_count(&session_b), 0, "bob reloaded");
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}

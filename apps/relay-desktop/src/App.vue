@@ -5,6 +5,7 @@ import ErrorBanner from "./components/ErrorBanner.vue";
 import UpdateStatus from "./components/UpdateStatus.vue";
 import ActivityView from "./views/ActivityView.vue";
 import BrowseView from "./views/BrowseView.vue";
+import FilesView from "./views/FilesView.vue";
 import ConflictsView from "./views/ConflictsView.vue";
 import OverviewView from "./views/OverviewView.vue";
 import PeersView from "./views/PeersView.vue";
@@ -31,6 +32,7 @@ const pages: { id: Page; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "peers", label: "Peers" },
   { id: "spaces", label: "Spaces" },
+  { id: "files", label: "Files" },
   { id: "browse", label: "Browse" },
   { id: "conflicts", label: "Conflicts" },
   { id: "activity", label: "Activity" },
@@ -236,6 +238,7 @@ onUnmounted(() => {
           />
           <PeersView v-else-if="page === 'peers'" />
           <SpacesView v-else-if="page === 'spaces'" :transfers="transfers" />
+          <FilesView v-else-if="page === 'files'" :transfers="transfers" />
           <BrowseView v-else-if="page === 'browse'" />
           <ConflictsView v-else-if="page === 'conflicts'" />
           <ActivityView v-else-if="page === 'activity'" ref="activityRef" />

@@ -7,11 +7,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use relay_core::remote::RemoteReply;
 use relay_core::{ConfigApplied, ConfigChange, DeviceId, PairingCode, SpaceId};
 use relay_engine::{
-    Engine, ScanReport, SyncInput, TransferDirection, TransferLive as EngineTransfer, WatchEvent,
-    bookends, index_row,
+    Engine, EngineError, Rejected, ScanReport, SyncInput, TransferDirection,
+    TransferLive as EngineTransfer, WatchEvent, bookends, index_row,
 };
 use relay_ipc::{
-    ActivityItem, FetchParams, Handler, Hello, HostKind, HostState, Idle, MountLive,
+    ActivityItem, EvictResult, FetchParams, Handler, Hello, HostKind, HostState, Idle, MountLive,
     PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
     PeerLive, RemoteParams, RescanParams, RpcErrorBody, Status, TransferDirection as IpcDirection,
     TransferLive, Watching,
@@ -283,31 +283,61 @@ impl Host {
         self.sync_tx.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Send an input to the running loop and wait for its reply. `None` when
+    /// no loop runs, so the caller writes directly. `wait` `None` waits as
+    /// long as the loop is alive: the loop always replies, or drops the
+    /// sender when it stops.
+    fn on_loop<T>(
+        &self,
+        input: impl FnOnce(mpsc::Sender<Result<T, Rejected>>) -> SyncInput,
+        wait: Option<Duration>,
+    ) -> Option<Result<T, RpcErrorBody>> {
+        let tx = self.sync_tx()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx.send(input(reply_tx)).is_err() {
+            return Some(Err(RpcErrorBody::new(
+                "unavailable",
+                "sync loop is not running",
+            )));
+        }
+        let reply = match wait {
+            Some(wait) => reply_rx
+                .recv_timeout(wait)
+                .map_err(|_| "timed out on the sync loop"),
+            None => reply_rx.recv().map_err(|_| "the sync loop stopped"),
+        };
+        Some(match reply {
+            Ok(result) => {
+                result.map_err(|rejected| RpcErrorBody::new(rejected.code, rejected.message))
+            }
+            Err(message) => Err(RpcErrorBody::new("unavailable", message)),
+        })
+    }
+
+    fn direct<T>(
+        &self,
+        f: impl FnOnce(&mut Engine) -> Result<T, EngineError>,
+    ) -> Result<T, RpcErrorBody> {
+        let mut engine = Engine::open_for_config(&self.home)
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
+        f(&mut engine).map_err(|err| RpcErrorBody::new(err.code(), err.to_string()))
+    }
+
     /// Apply a config change on the running engine loop when possible;
     /// otherwise write it directly (paused, or between reload cycles).
     fn config(&self, change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
-        let applied = match self.sync_tx() {
-            Some(tx) => {
-                let wait = CONFIG_REPLY_WAIT
-                    + match &change {
-                        ConfigChange::JoinSpace { wait_ms, .. } => Duration::from_millis(*wait_ms),
-                        _ => Duration::ZERO,
-                    };
-                let (reply_tx, reply_rx) = mpsc::channel();
-                tx.send(SyncInput::Config {
-                    change: change.clone(),
-                    reply: reply_tx,
-                })
-                .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
-                reply_rx
-                    .recv_timeout(wait)
-                    .map_err(|_| RpcErrorBody::new("unavailable", "timed out applying change"))?
-                    .map_err(|rejected| RpcErrorBody::new(rejected.code, rejected.message))?
-            }
-            None => Engine::open_for_config(&self.home)
-                .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
-                .apply_config(&change)
-                .map_err(|err| RpcErrorBody::new(err.code(), err.to_string()))?,
+        let wait = CONFIG_REPLY_WAIT
+            + match &change {
+                ConfigChange::JoinSpace { wait_ms, .. } => Duration::from_millis(*wait_ms),
+                _ => Duration::ZERO,
+            };
+        let input = |reply| SyncInput::Config {
+            change: change.clone(),
+            reply,
+        };
+        let applied = match self.on_loop(input, Some(wait)) {
+            Some(result) => result?,
+            None => self.direct(|engine| engine.apply_config(&change))?,
         };
         // Status right after the reply should already show the change; the
         // loop's watch events follow a moment later and are idempotent.
@@ -321,26 +351,37 @@ impl Host {
         Ok(applied)
     }
 
+    /// Write one demand-mode file here. Returns once it is on disk or has
+    /// failed, however long the transfer takes; progress shows in `status`.
     fn fetch(&self, params: FetchParams) -> Result<(), RpcErrorBody> {
-        if let Some(tx) = self.sync_tx() {
-            let (reply_tx, reply_rx) = mpsc::channel();
-            tx.send(SyncInput::Fetch {
-                space: params.space,
-                mount: params.mount,
-                path: params.path,
-                reply: reply_tx,
-            })
-            .map_err(|_| RpcErrorBody::new("unavailable", "sync loop is not running"))?;
-            return reply_rx
-                .recv_timeout(Duration::from_secs(60))
-                .map_err(|_| RpcErrorBody::new("unavailable", "timed out waiting for fetch"))?
-                .map_err(|message| RpcErrorBody::new("failed", message));
+        let input = |reply| SyncInput::Fetch {
+            space: params.space.clone(),
+            mount: params.mount.clone(),
+            path: params.path.clone(),
+            reply,
+        };
+        match self.on_loop(input, None) {
+            Some(result) => result,
+            None => {
+                self.direct(|engine| engine.fetch_path(&params.space, &params.mount, &params.path))
+            }
         }
-        let mut engine = Engine::open_for_config(&self.home)
-            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
-        engine
-            .fetch_path(&params.space, &params.mount, &params.path)
-            .map_err(|err| RpcErrorBody::new("failed", err.to_string()))
+    }
+
+    fn evict(&self, params: FetchParams) -> Result<EvictResult, RpcErrorBody> {
+        let input = |reply| SyncInput::Evict {
+            space: params.space.clone(),
+            mount: params.mount.clone(),
+            path: params.path.clone(),
+            reply,
+        };
+        let evicted = match self.on_loop(input, Some(CONFIG_REPLY_WAIT)) {
+            Some(result) => result?,
+            None => {
+                self.direct(|engine| engine.evict(&params.space, &params.mount, &params.path))?
+            }
+        };
+        Ok(EvictResult { evicted })
     }
 
     fn pair_start(&self, params: PairStartParams) -> Result<PairStartResult, RpcErrorBody> {
@@ -812,6 +853,11 @@ impl Handler for Host {
                     .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
                 self.fetch(params)?;
                 Ok(serde_json::json!({}))
+            }
+            "evict" => {
+                let params: FetchParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(self.evict(params)?).map_err(internal)
             }
             "rescan" => {
                 let state = self.state.lock().map(|g| *g).unwrap_or(HostState::Error);

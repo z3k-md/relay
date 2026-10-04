@@ -38,6 +38,35 @@ export interface PeerView {
   supportsRemote: boolean;
 }
 
+// Files view (remote explorer Stage 1). Engine shapes as-is, so snake_case.
+
+export type MaterializationMode = "full" | "metadata" | "demand" | "exclude";
+
+export interface FileRow {
+  name: string;
+  /** Path inside the mount, `/`-separated. */
+  path: string;
+  kind: "file" | "directory" | "symlink";
+  size: number | null;
+  modified_ms: number;
+  state: "local" | "online_only" | "metadata_only" | "pending";
+  mode: MaterializationMode;
+  conflict_copy: boolean;
+}
+
+export interface FolderView {
+  space: string;
+  mount: string;
+  root: string | null;
+  /** This folder inside the mount; "" is the mount itself. */
+  path: string;
+  /** What a new file here gets. */
+  mode: MaterializationMode;
+  /** A choice made for exactly this folder, if any. */
+  chosen_here: MaterializationMode | null;
+  entries: FileRow[];
+}
+
 // Remote calls (D37). These are relay-core's shapes as-is, so their fields
 // are snake_case like the rest of the IPC protocol.
 
@@ -268,6 +297,7 @@ export type Page =
   | "overview"
   | "peers"
   | "spaces"
+  | "files"
   | "browse"
   | "conflicts"
   | "activity"

@@ -891,7 +891,7 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
   mailbox objects (D30).
 - **Errors keep a code.** `EngineError::code` gives a stable class
   (`not_found`, `already_exists`, `invalid`, `precondition`, `busy`, ...).
-  The loop replies with `ConfigRejected { code, message }`, and IPC errors
+  The loop replies with `Rejected { code, message }`, and IPC errors
   carry the same code. The message alone is what people see.
 - **One decision type.** `DeleteHoldDecision` lives in `relay-core`; the
   database and engine copies are gone.
@@ -941,4 +941,29 @@ set up sync on it later (remote explorer proposal, Stages 2 and 3).
 - **Known limits.** Read-only so far: no remote writes (Stage 3) and no file
   contents (Stage 5). The target must be online. Listings are not logged to
   activity; remote writes will be.
+
+## D38. Files view and folder choices
+
+Remote explorer Stage 1 puts D35 in the desktop app.
+
+- **Listing** is one folder at a time (`Repo::entries_in`, a ranged query
+  plus a depth test), so a large mount never goes to the UI whole. Each row
+  carries one state: `local`, `online_only` (demand, not downloaded),
+  `metadata_only`, or `pending` (full, not written yet).
+- **Folder choices** are materialization rules named `folder-…` with one
+  selector, `mount/path/**`. Choosing for a folder deletes the `folder-`
+  rules at or inside it, then appends its own, so the newest choice for a
+  parent covers everything in it ("apply to enclosed items"). A later choice
+  for a subfolder sits after it and wins there. Hand-written rules are
+  never touched. The live loop re-checks index-only rows on its next tick
+  after any rule change instead of waiting out the hydration interval.
+- **Evict** is a loop input next to `Fetch`, so freeing space does not
+  reload the host. A folder or `""` evicts every downloaded demand-mode file
+  under it and keeps any whose bytes changed on disk.
+- **Fetch** over IPC returns when the file is written or has failed, with no
+  fixed timeout: the loop always replies, or drops the sender when it
+  stops. Errors carry a code (`unavailable` when no source has the bytes).
+- **Opening** a file resolves its OS path in the engine
+  (`local_file_path`, which refuses symlink escapes) and opens it with the
+  system handler.
 

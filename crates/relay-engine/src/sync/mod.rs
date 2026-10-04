@@ -18,7 +18,6 @@ use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
-use crate::live_config::ConfigRejected;
 use crate::materialize::{FetchPrep, MaterializationMode, path_mode};
 use crate::peers::offered_mounts_from_wire;
 use crate::progress::{IncomingFile, ProgressBook, TransferLive};
@@ -47,6 +46,23 @@ const SEEN_INTERVAL: Duration = Duration::from_secs(30);
 /// The watch loop ticks much faster than this; a metadata tree must not be
 /// walked on every poll.
 const HYDRATE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Why the loop refused an input, with [`EngineError::code`] kept across the
+/// reply channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejected {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl From<&EngineError> for Rejected {
+    fn from(err: &EngineError) -> Self {
+        Self {
+            code: err.code(),
+            message: err.to_string(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum SyncInput {
@@ -96,14 +112,22 @@ pub enum SyncInput {
     /// follow-up runs.
     Config {
         change: ConfigChange,
-        reply: mpsc::Sender<Result<ConfigApplied, ConfigRejected>>,
+        reply: mpsc::Sender<Result<ConfigApplied, Rejected>>,
     },
     /// Hydrate one demand-mode path, asking a connected peer when needed.
     Fetch {
         space: String,
         mount: String,
         path: String,
-        reply: mpsc::Sender<Result<(), String>>,
+        reply: mpsc::Sender<Result<(), Rejected>>,
+    },
+    /// Drop this device's copy of a demand-mode file, or of every downloaded
+    /// demand-mode file under a folder. Replies with how many were dropped.
+    Evict {
+        space: String,
+        mount: String,
+        path: String,
+        reply: mpsc::Sender<Result<usize, Rejected>>,
     },
 }
 
@@ -237,7 +261,7 @@ struct DirectFetch {
 
 struct FetchWaiter {
     key: EntryKey,
-    reply: mpsc::Sender<Result<(), String>>,
+    reply: mpsc::Sender<Result<(), Rejected>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -360,7 +384,9 @@ impl Syncer {
             } => {
                 self.on_fetch_request(engine, &space, &mount, &path, reply, out, &mut events)?;
             }
-            SyncInput::Rescan { .. }
+            // Applied by the watch loop, which owns the working tree.
+            SyncInput::Evict { .. }
+            | SyncInput::Rescan { .. }
             | SyncInput::AddPeer(_)
             | SyncInput::PeerAddresses { .. }
             | SyncInput::NatHint { .. }

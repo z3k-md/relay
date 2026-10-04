@@ -11,9 +11,9 @@ use relay_core::{ConfigApplied, ConfigChange};
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, FetchParams, Hello, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
-    PairStartParams, PairStartResult, PairStatus, RemoteParams, Request, RescanParams,
-    RescanResult, Response, Status, decode_line, encode_line,
+    ActivityItem, EvictResult, FetchParams, Hello, PROTOCOL_VERSION, PairJoinParams,
+    PairJoinResult, PairStartParams, PairStartResult, PairStatus, RemoteParams, Request,
+    RescanParams, RescanResult, Response, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -74,6 +74,21 @@ impl Client {
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )?;
         Ok(())
+    }
+
+    /// Drop this device's copy of a demand-mode file, or of every downloaded
+    /// one under a folder (`""` is the whole mount).
+    pub fn evict(&mut self, space: &str, mount: &str, path: &str) -> Result<usize, IpcError> {
+        let params = FetchParams {
+            space: space.to_owned(),
+            mount: mount.to_owned(),
+            path: path.to_owned(),
+        };
+        let result: EvictResult = self.call(
+            "evict",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )?;
+        Ok(result.evicted)
     }
 
     pub fn rescan(

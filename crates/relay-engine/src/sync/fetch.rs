@@ -48,6 +48,11 @@ impl Syncer {
         Ok(())
     }
 
+    /// Consider index-only rows on the next tick, after a rule change.
+    pub(crate) fn hydrate_soon(&mut self) {
+        self.hydrated_at = None;
+    }
+
     pub(super) fn hydration_due(&self, now: Instant) -> bool {
         self.hydrated_at
             .is_none_or(|at| now.saturating_duration_since(at) >= HYDRATE_INTERVAL)
@@ -110,7 +115,7 @@ impl Syncer {
         space: &str,
         mount: &str,
         path: &str,
-        reply: mpsc::Sender<Result<(), String>>,
+        reply: mpsc::Sender<Result<(), Rejected>>,
         out: &mut dyn FnMut(SyncOutput),
         _events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
@@ -120,7 +125,7 @@ impl Syncer {
             }
             Ok(FetchPrep::Need { space, object, key }) => {
                 let Some(peer) = self.peer_for_space(engine, space)? else {
-                    let _ = reply.send(Err(EngineError::ObjectUnavailable.to_string()));
+                    let _ = reply.send(Err((&EngineError::ObjectUnavailable).into()));
                     return Ok(());
                 };
                 self.fetch_waiters
@@ -139,7 +144,7 @@ impl Syncer {
                 }
             }
             Err(err) => {
-                let _ = reply.send(Err(err.to_string()));
+                let _ = reply.send(Err((&err).into()));
             }
         }
         Ok(())
@@ -160,7 +165,7 @@ impl Syncer {
                         let _ = waiter.reply.send(Ok(()));
                     }
                     Err(err) => {
-                        let _ = waiter.reply.send(Err(err.to_string()));
+                        let _ = waiter.reply.send(Err((&err).into()));
                     }
                 }
             }
@@ -284,7 +289,7 @@ impl Syncer {
             for waiter in waiters {
                 let _ = waiter
                     .reply
-                    .send(Err(EngineError::ObjectUnavailable.to_string()));
+                    .send(Err((&EngineError::ObjectUnavailable).into()));
             }
         }
     }

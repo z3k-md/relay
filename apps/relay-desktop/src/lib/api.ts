@@ -10,6 +10,7 @@ import type {
   PairStatus,
   GitResolveReport,
   DeleteHold,
+  FolderView,
   MountView,
   OfferView,
   Overview,
@@ -89,6 +90,16 @@ export const api = {
   share: (space: string, peer: string) => call<void>("share", { space, peer }),
   unshare: (space: string, peer: string) => call<void>("unshare", { space, peer }),
   listOffers: () => call<OfferView[]>("list_offers"),
+  listFolder: (space: string, mount: string, path: string) =>
+    call<FolderView>("list_folder", { space, mount, path }),
+  downloadFile: (space: string, mount: string, path: string) =>
+    call<void>("download_file", { space, mount, path }),
+  openFile: (space: string, mount: string, path: string) =>
+    call<void>("open_file", { space, mount, path }),
+  freeUpSpace: (space: string, mount: string, path: string) =>
+    call<number>("free_up_space", { space, mount, path }),
+  setFolderMode: (space: string, mount: string, path: string, mode: string | null) =>
+    call<void>("set_folder_mode", { space, mount, path, mode }),
   joinSpace: (space: string, fromPeer: string) =>
     call<SpaceView>("join_space", { space, fromPeer }),
   deleteSpace: (space: string) => call<void>("delete_space", { space }),

@@ -629,6 +629,48 @@ impl Repo<'_> {
             .collect()
     }
 
+    /// Live entries directly inside `folder` (the mount root when `None`):
+    /// one level, no tombstones.
+    ///
+    /// The range bounds keep this an index scan of the folder's subtree; the
+    /// `instr` test then drops anything deeper.
+    pub fn entries_in(
+        &self,
+        mount: MountId,
+        folder: Option<&relay_core::LogicalPath>,
+    ) -> Result<Vec<EntryRecord>, DbError> {
+        let mount_blob = mount_bytes(mount);
+        let (lower, upper) = match folder {
+            Some(folder) => (
+                format!("{}/", folder.as_str()),
+                Some(format!("{}0", folder.as_str())),
+            ),
+            None => (String::new(), None),
+        };
+        // SQLite `substr` is 1-based: the first character after `folder/`.
+        let rest_from = i64::try_from(lower.len() + 1).map_err(|_| DbError::IntegerOverflow)?;
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {ENTRY_SELECT}
+             FROM entries e
+             JOIN devices d ON d.ref = e.modified_by
+             JOIN mounts m ON m.id = e.mount_id
+             WHERE e.mount_id = ?1
+               AND e.deleted = 0
+               AND e.path >= ?2
+               AND (?3 IS NULL OR e.path < ?3)
+               AND instr(substr(e.path, ?4), '/') = 0
+             ORDER BY e.path"
+        ))?;
+        let rows = stmt.query_map(
+            params![mount_blob.as_slice(), lower, upper, rest_from],
+            Self::map_raw_entry,
+        )?;
+        let raws = collect_raw_entries(rows)?;
+        raws.into_iter()
+            .map(|raw| self.assemble_record(raw))
+            .collect()
+    }
+
     /// Entries at `prefix` and every path under it (`prefix/...`).
     ///
     /// Uses a range query rather than `LIKE`, so `%` and `_` in names are

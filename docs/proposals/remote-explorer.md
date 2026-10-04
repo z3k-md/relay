@@ -3,7 +3,7 @@
 Build plan for browsing another device's folders, setting up sync from
 either machine, and opening files that are not on this device yet. This does
 not amend [`DESIGN.md`](../DESIGN.md) or [`DECISIONS.md`](../DECISIONS.md).
-Stage 0 is recorded as D36 and Stage 2 as D37.
+Stage 0 is recorded as D36, Stage 1 as D38, and Stage 2 as D37.
 
 The stages are in build order. Each one ships on its own and is useful
 without the next. Stages 0 and 1 change no wire format and no trust rules.
@@ -149,6 +149,10 @@ peer is connected does not log "configuration changed; reloading," and the
 session stays up. Test in `crates/relay-daemon/tests/daemon.rs`.
 
 ## Stage 1. Files view for synced folders
+
+**Shipped (D38).** Fetch keeps answering on completion but without a fixed
+timeout, instead of returning on queue. Evict also takes a folder. Folder
+choices replace the choices inside them.
 
 The OneDrive-style experience for folders that are already synced. Local
 only, no wire change.

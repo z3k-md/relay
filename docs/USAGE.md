@@ -64,6 +64,8 @@ Optional `relay policy` and `relay group` commands limit which subtrees go to wh
 
 Optional `relay materialize` rules are local to this computer. They decide whether a path is a full copy, an index row with no bytes (`metadata`), fetched only when you ask (`demand`), or ignored (`exclude`). Later rules override earlier ones. `relay fetch SPACE/MOUNT/PATH` writes one demand file; `relay evict` removes that copy without deleting it on other machines. With no rules, every file is a full copy.
 
+The desktop app's Files view does the same per folder: "Always keep on this computer" or "Online only", Download, Open (downloads first if needed), and Free up space. Those choices are `materialize` rules named `folder-…`; a choice for a folder replaces the folder choices inside it, and rules you add by hand are left alone.
+
 On macOS, prefer a folder outside `~/Documents`, `~/Desktop`, `~/Downloads`, and iCloud Drive unless the binary has Full Disk Access. See [Platform notes](#platform-notes).
 
 A running Relay applies `space`, `mount`, `share`, `peer`, `group`, `policy`, `materialize`, and `deletes` changes immediately, without dropping its connections. You do not need to restart it.
@@ -154,7 +156,7 @@ relay service logs -f
 | `relay materialize add SPACE NAME --mode full\|metadata\|demand\|exclude --selector GLOB...` | Choose how this device stores matching paths. Last rule wins |
 | `relay materialize remove SPACE NAME` / `materialize list [SPACE]` | Remove a materialization rule or list them |
 | `relay fetch SPACE/MOUNT/PATH` | Write one `demand` file from a peer, the mailbox, or the local store |
-| `relay evict SPACE/MOUNT/PATH` | Remove a fetched `demand` file here. The index row stays, and other devices are unchanged |
+| `relay evict SPACE/MOUNT[/PATH]` | Remove a fetched `demand` file here, or every one under a folder or the whole mount. Files edited since are kept. The index rows stay, and other devices are unchanged |
 | `relay space create NAME` / `space list` | Manage spaces |
 | `relay space delete NAME` | Forget a space on this device. Its mounts must be removed first. Files are not touched |
 | `relay space offers` / `space join NAME --from PEER` | See and accept spaces other devices shared with you |

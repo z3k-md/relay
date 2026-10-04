@@ -14,6 +14,7 @@ use relay_fs::MountMarker;
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::materialize::MaterializationMode;
 
 impl Engine {
     pub fn apply_config(&mut self, change: &ConfigChange) -> Result<ConfigApplied, EngineError> {
@@ -66,6 +67,19 @@ impl Engine {
             }
             ConfigChange::MaterializeRemove { space, name } => {
                 self.materialize_remove(space, name)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::SetFolderMode {
+                space,
+                mount,
+                path,
+                mode,
+            } => {
+                let mode = mode
+                    .as_deref()
+                    .map(MaterializationMode::parse)
+                    .transpose()?;
+                self.set_folder_mode(space, mount, path, mode)?;
                 ConfigApplied::Done
             }
             ConfigChange::AddPeer {
