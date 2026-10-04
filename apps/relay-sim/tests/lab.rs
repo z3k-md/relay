@@ -1,7 +1,10 @@
 //! End-to-end lab: real daemon processes, localhost QUIC, optional mailbox.
 
+use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -19,29 +22,64 @@ impl Lab {
 
 impl Drop for Lab {
     fn drop(&mut self) {
-        let _ = Command::new(bin())
-            .arg("--lab")
-            .arg(self.path())
-            .arg("down")
-            .output();
+        let _ = sim(self.path(), &["down"]);
     }
 }
+
+/// Longest any one `relay-sim` command may take. The slowest waits in these
+/// tests are 30 s; anything past this is stuck.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_relay-sim")
 }
 
 fn run(lab: &Path, args: &[&str]) -> Output {
-    let output = Command::new(bin())
-        .arg("--lab")
-        .arg(lab)
-        .args(args)
-        .output()
-        .expect("spawn relay-sim");
+    let output = sim(lab, args).unwrap_or_else(|output| {
+        fail(&[&["timed out:"], args].concat(), &output);
+    });
     if !output.status.success() {
         fail(args, &output);
     }
     output
+}
+
+/// Run `relay-sim` with its output in files, not pipes, and a deadline.
+///
+/// On Windows a child inherits every inheritable handle its parent holds, so
+/// the daemons `relay-sim up` starts keep the pipes `Command::output` would
+/// make, and reading those pipes waits until the daemons exit, which they
+/// never do on their own. Files have no reader to block. `Err` carries what
+/// was printed before the deadline.
+fn sim(lab: &Path, args: &[&str]) -> Result<Output, Output> {
+    let dir = tempfile::tempdir().expect("output dir");
+    let (out_path, err_path) = (dir.path().join("stdout"), dir.path().join("stderr"));
+    let mut child = Command::new(bin())
+        .arg("--lab")
+        .arg(lab)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&out_path).expect("stdout file"))
+        .stderr(fs::File::create(&err_path).expect("stderr file"))
+        .spawn()
+        .expect("spawn relay-sim");
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let timed_out = loop {
+        if child.try_wait().expect("wait for relay-sim").is_some() {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let output = Output {
+        status: child.wait().expect("reap relay-sim"),
+        stdout: fs::read(&out_path).unwrap_or_default(),
+        stderr: fs::read(&err_path).unwrap_or_default(),
+    };
+    if timed_out { Err(output) } else { Ok(output) }
 }
 
 fn fail(args: &[&str], output: &Output) -> ! {

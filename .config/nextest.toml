@@ -1,0 +1,4 @@
+[profile.default]
+# A test running this long is stuck. Fail it rather than hold CI for hours
+# (Windows CI once sat on two hung lab tests until the 6-hour job limit).
+slow-timeout = { period = "60s", terminate-after = 10 }

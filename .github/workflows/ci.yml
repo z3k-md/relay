@@ -32,6 +32,8 @@ jobs:
   rust:
     name: rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A normal run takes well under this; a hang should fail, not burn 6 hours.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
