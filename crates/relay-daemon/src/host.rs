@@ -12,9 +12,9 @@ use relay_engine::{
 };
 use relay_ipc::{
     ActivityItem, EvictResult, FetchParams, FolderPairParams, Handler, Hello, HostKind, HostState,
-    Idle, MountLive, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams,
-    PairStartResult, PairStatus, PeerLive, RemoteParams, RescanParams, RpcErrorBody, Status,
-    TransferDirection as IpcDirection, TransferLive, Watching,
+    Idle, MountLive, OpenRemoteParams, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
+    PairStartParams, PairStartResult, PairStatus, PeerLive, RemoteParams, RescanParams,
+    RpcErrorBody, Status, TransferDirection as IpcDirection, TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -358,7 +358,7 @@ impl Host {
 
     /// Write one demand-mode file here. Returns once it is on disk or has
     /// failed, however long the transfer takes; progress shows in `status`.
-    fn fetch(&self, params: FetchParams) -> Result<(), RpcErrorBody> {
+    pub(crate) fn fetch(&self, params: FetchParams) -> Result<(), RpcErrorBody> {
         let input = |reply| SyncInput::Fetch {
             space: params.space.clone(),
             mount: params.mount.clone(),
@@ -370,6 +370,30 @@ impl Host {
             None => {
                 self.direct(|engine| engine.fetch_path(&params.space, &params.mount, &params.path))
             }
+        }
+    }
+
+    /// Index one path of a mount ahead of its scans.
+    pub(crate) fn scan_first(
+        &self,
+        space: &str,
+        mount: &str,
+        path: &str,
+    ) -> Result<(), RpcErrorBody> {
+        let path = relay_core::LogicalPath::new(path)
+            .map_err(|err| RpcErrorBody::new("invalid", err.to_string()))?;
+        let input = |reply| SyncInput::ScanFirst {
+            space: space.to_owned(),
+            mount: mount.to_owned(),
+            paths: vec![path.clone()],
+            reply,
+        };
+        match self.on_loop(input, Some(CONFIG_REPLY_WAIT)) {
+            Some(result) => result.map(drop),
+            None => Err(RpcErrorBody::new(
+                "unavailable",
+                "Relay is not syncing right now",
+            )),
         }
     }
 
@@ -902,6 +926,20 @@ impl Handler for Host {
                 serde_json::to_value(self.pair_start(params)?).map_err(internal)
             }
             "pair_status" => serde_json::to_value(self.pair_status()).map_err(internal),
+            "open_remote" => {
+                let params: OpenRemoteParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(crate::quick_open::open(self, &params)?).map_err(internal)
+            }
+            "quick_opens" => serde_json::to_value(crate::quick_open::list(self)?).map_err(internal),
+            "quick_open_remove" => {
+                let space = params
+                    .get("space")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RpcErrorBody::new("invalid_params", "space is required"))?;
+                let note = crate::quick_open::remove(self, space)?;
+                Ok(serde_json::json!({ "note": note }))
+            }
             "folder_pair_preview" => {
                 let params: FolderPairParams = serde_json::from_value(params)
                     .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;

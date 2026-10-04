@@ -20,7 +20,7 @@ use relay_core::remote::{
 use std::sync::Arc;
 
 use relay_core::ConfigChange;
-use relay_core::remote::PathPreview;
+use relay_core::remote::{Located, MountedPath, PathPreview};
 use relay_engine::Engine;
 use relay_ipc::ActivityItem;
 use relay_net::ControlHandler;
@@ -95,6 +95,14 @@ pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, by: &str) -> Re
                 .map_err(|err| RemoteError::new(RemoteErrorCode::parse(&err.code), err.message))?;
             log(host, by, &summary);
             Ok(RemoteReply::Applied { applied })
+        }
+        RemoteCall::Locate { path } => Ok(RemoteReply::Located {
+            located: Context::load(&engine()?, home)?.locate(&path)?,
+        }),
+        RemoteCall::ScanFirst { space, mount, path } => {
+            host.scan_first(&space, &mount, &path)
+                .map_err(|err| RemoteError::new(RemoteErrorCode::parse(&err.code), err.message))?;
+            Ok(RemoteReply::Done)
         }
     }
 }
@@ -357,6 +365,46 @@ impl Context {
                 .map(|(_, mount)| mount.clone()),
             cloud_only: entry.is_some_and(|e| e.cloud_only),
             writable: meta.is_dir() && writable(&path),
+        })
+    }
+
+    /// The folder, name, and mount of one file.
+    fn locate(&self, path: &str) -> Result<Located, RemoteError> {
+        let file = self.resolve(path)?;
+        let meta = fs::metadata(&file).map_err(|err| io_error(&err, &file))?;
+        if !meta.is_file() {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Invalid,
+                format!("{} is not a file", file.display()),
+            ));
+        }
+        let folder = file.parent().unwrap_or(&file);
+        let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            RemoteError::new(RemoteErrorCode::Invalid, "that file has no UTF-8 name")
+        })?;
+        let mount = self
+            .mounts
+            .iter()
+            .find(|(root, _)| file.starts_with(root))
+            .and_then(|(root, mount)| {
+                let inside: Vec<&str> = file
+                    .strip_prefix(root)
+                    .ok()?
+                    .components()
+                    .map(|c| c.as_os_str().to_str())
+                    .collect::<Option<_>>()?;
+                let logical = relay_core::LogicalPath::new(&inside.join("/")).ok()?;
+                Some(MountedPath {
+                    space: mount.space.clone(),
+                    mount: mount.mount.clone(),
+                    path: logical.as_str().to_owned(),
+                })
+            });
+        Ok(Located {
+            folder: utf8(folder)?,
+            name: name.to_owned(),
+            size: meta.len(),
+            mount,
         })
     }
 

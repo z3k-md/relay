@@ -54,6 +54,16 @@ relay pair-folder 'C:\Users\zach\xyz' ~/Code --from desktop --create xyz-foo --e
 
 `--from` and `--to` name the devices (this one when left out), `--create` makes a new folder inside the destination, `--online-only` keeps the destination's files online until opened, and `--check` shows what would happen without changing anything. The app does the same from Browse with "Sync…".
 
+To open one file from there without syncing anything by hand:
+
+```bash
+relay open desktop 'C:\Users\zach\Documents\report.docx'
+relay opened
+relay opened remove Documents
+```
+
+`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. In the app, click a file in Browse.
+
 The first browse form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
 
 ## Share a folder
@@ -154,6 +164,8 @@ relay service logs -f
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
 | `relay peer allow-manage NAME` / `peer deny-manage NAME` | Let a peer browse this device and set up sync on it, or stop |
 | `relay browse PEER [PATH] [--all]` | List a managed device's roots, or one of its folders |
+| `relay open PEER PATH [--into DIR]` | Get a file from a managed device: its folder syncs here online-only and the file downloads. Prints the local path |
+| `relay opened` / `opened remove SPACE` | List folders set up by `relay open`, or remove one |
 | `relay pair-folder SOURCE DEST [--from DEVICE] [--to DEVICE] [--create NAME] [--exclude SUB]... [--online-only] [--check]` | Sync a folder on one device with a folder on another, set up from here |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
 | `relay replica set PATH` / `replica clear` / `replica status` | Durable mailbox directory for offline catch-up |

@@ -298,6 +298,10 @@ pub struct FolderPairParams {
     /// Subfolders of the source to leave out, `/`-separated and relative.
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// File name patterns to leave out anywhere (`~$*`, `.DS_Store`), on
+    /// both devices.
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
     /// The destination downloads files only when opened.
     #[serde(default)]
     pub dest_online_only: bool,
@@ -321,6 +325,42 @@ pub struct FolderPairResult {
     pub space: String,
     pub source_path: String,
     pub dest_path: String,
+}
+
+/// Open a file on a paired device (remote explorer Stage 4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRemoteParams {
+    /// The peer's local name.
+    pub peer: String,
+    /// The file, in that device's path format.
+    pub path: String,
+    /// Where quick-open folders go; `~/Relay` when omitted.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+}
+
+/// A remote file, now here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenedRemote {
+    pub space: String,
+    pub mount: String,
+    /// The local copy, ready to open.
+    pub path: PathBuf,
+}
+
+/// A folder synced only so its files could be opened here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickOpen {
+    pub space: String,
+    pub peer: String,
+    /// The folder on the peer, in its path format.
+    pub folder: String,
+    pub local_path: Option<PathBuf>,
+    pub created_at_ms: u64,
+    pub last_opened_ms: u64,
+    /// Relay set this folder up on the peer; removing it removes it there.
+    /// Otherwise the peer already synced it and only stops sharing it.
+    pub created_on_peer: bool,
 }
 
 /// A remote call on a paired device, by its local peer name.

@@ -12,10 +12,10 @@ pub use client::{Client, Subscribe};
 pub use endpoint::{Endpoint, home_token};
 pub use protocol::{
     ActivityItem, EvictResult, FetchParams, FolderEnd, FolderPairParams, FolderPairPlan,
-    FolderPairResult, Hello, HostKind, HostState, Idle, MountLive, PROTOCOL_VERSION,
-    PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive,
-    RemoteParams, Request, RescanParams, RescanResult, RpcError, RpcErrorBody, Status,
-    TransferDirection, TransferLive, Watching, decode_line, encode_line,
+    FolderPairResult, Hello, HostKind, HostState, Idle, MountLive, OpenRemoteParams, OpenedRemote,
+    PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
+    PeerLive, QuickOpen, RemoteParams, Request, RescanParams, RescanResult, RpcError, RpcErrorBody,
+    Status, TransferDirection, TransferLive, Watching, decode_line, encode_line,
 };
 pub use server::{Handler, Server};
 

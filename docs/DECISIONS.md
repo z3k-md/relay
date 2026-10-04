@@ -874,6 +874,10 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
   incoming entries (D16), and attaching resets the receive watermark (D15).
   The live attach and join now ask connected members for the index from that
   watermark. Before this, a live attach waited for the next reconnect.
+  The other direction needs the same: a peer's first offer of a space this
+  device already shares with it means the peer just joined, so this device
+  requests that peer's index then. Without it, edits on the joining device
+  reached the sharer only after a reconnect.
 - **Join can wait for its offer.** `JoinSpace { wait_ms }` is held on the
   loop and retried after peer frames until the offer arrives or the wait
   ends. A third device setting up a pair sends the join and the share on
@@ -1010,4 +1014,38 @@ others.
 - **Known limits.** The source and destination must already be paired with
   each other. Subfolder choices in the app are one level deep. Both ends
   must be online during setup.
+
+## D40. Opening a file that is not synced here
+
+Remote explorer Stage 4. From Browse or `relay open PEER PATH`, a file on a
+managed device opens here as if it had been synced all along.
+
+- **`Locate`** asks the other device for the file's folder, name, size, and
+  mount (with the path inside it). Paths stay opaque to the asker; the
+  owning device does the arithmetic.
+- **Three cases.** In a mount this device has attached: download it. In a
+  mount this device does not have: the other device shares that space (a
+  remote `Share`), and it is joined here online-only. In no mount: the
+  file's own folder is paired here online-only (D39) under
+  `~/Relay/<device>/<folder>`, numbered if taken.
+- **The file first.** A new mount's full scan commits only when it ends.
+  `ScanFirst` is a priority loop input that indexes one path right away and
+  pushes it, so the opened file's row arrives before the rest of a large
+  folder is hashed. The host waits up to 30 s for the row, then fetches
+  (D38) and returns the local path.
+- **Left out.** Quick-open pairs exclude `~$*`, `.~lock.*#`, `.DS_Store`,
+  and `Thumbs.db` on both sides (`FolderPairParams.exclude_patterns`), so
+  editor lock files do not travel.
+- **Records** live in `<home>/quick-open.json`, written by the host. They
+  are host bookkeeping, and a database write from the host would reload
+  the engine. A record whose space no longer exists is ignored.
+- **Removing** one stops syncing here and deletes the space here; files
+  stay on disk. On the other device it removes the pair if quick-open
+  created it, or only stops sharing a space that existed before. If that
+  device is offline the local part still happens and a note says so.
+- **Overlap.** A folder pair whose source contains a quick-open folder is
+  refused with a pointer to "Opened from other devices".
+- **Known limits.** The quick-open root is `~/Relay` (the CLI takes
+  `--into`; the app has no setting yet). Whole-file transfer, so a large
+  file opens only after it fully downloads; the app asks first above 1 GB.
 

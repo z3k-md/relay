@@ -1,17 +1,26 @@
 <script setup lang="ts">
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { computed, onMounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import PairFolderDialog from "../components/PairFolderDialog.vue";
 import { api } from "../lib/api";
 import { useRemoteFolders } from "../lib/remoteFolders";
-import type { DirEntry, PeerView } from "../lib/types";
+import { describeRemoteError } from "../lib/remoteFolders";
+import type { DirEntry, PeerView, QuickOpen } from "../lib/types";
 
 const peers = ref<PeerView[]>([]);
 const showHidden = ref(false);
 const { device, roots, listing, loading, error, choose, open, loadMore, up } = useRemoteFolders();
 /** The remote folder a "Sync…" dialog is open for. */
 const pairing = ref<{ path: string; name: string } | null>(null);
+/** The remote file being fetched to open. */
+const opening = ref<string | null>(null);
+const quickOpens = ref<QuickOpen[]>([]);
+const notice = ref<string | null>(null);
+
+/** Above this, ask before downloading a file just to open it. */
+const LARGE_FILE = 1024 ** 3;
 
 const browsable = computed(() => peers.value.filter((p) => p.connected && p.canManage));
 const unavailable = computed(() => peers.value.filter((p) => !(p.connected && p.canManage)));
@@ -37,6 +46,47 @@ function lastName(path: string): string {
 
 function syncedSomewhere(entry: DirEntry): boolean {
   return !!entry.mount || entry.contains_mount;
+}
+
+async function openFile(entry: DirEntry) {
+  const name = device.value;
+  if (!name || opening.value) return;
+  if ((entry.size ?? 0) > LARGE_FILE) {
+    const ok = await confirm(
+      `${entry.name} is ${formatSize(entry.size)}. It downloads fully before it opens.`,
+      { title: "Download a large file?", kind: "warning" },
+    );
+    if (!ok) return;
+  }
+  opening.value = entry.path;
+  error.value = null;
+  notice.value = null;
+  try {
+    await api.openRemoteFile(name, entry.path);
+    await loadQuickOpens();
+  } catch (err) {
+    error.value = describeRemoteError(err, name);
+  } finally {
+    opening.value = null;
+  }
+}
+
+async function loadQuickOpens() {
+  try {
+    quickOpens.value = await api.listQuickOpens();
+  } catch {
+    quickOpens.value = [];
+  }
+}
+
+async function removeQuickOpen(space: string) {
+  error.value = null;
+  try {
+    notice.value = (await api.removeQuickOpen(space)) ?? null;
+    await loadQuickOpens();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  }
 }
 
 async function afterPair() {
@@ -70,7 +120,7 @@ async function loadPeers() {
   }
 }
 
-onMounted(loadPeers);
+onMounted(() => Promise.all([loadPeers(), loadQuickOpens()]));
 </script>
 
 <template>
@@ -172,7 +222,19 @@ onMounted(loadPeers);
             >
               📁 {{ entry.name }}
             </button>
-            <span v-else class="min-w-0 flex-1 truncate">📄 {{ entry.name }}</span>
+            <button
+              v-else
+              type="button"
+              class="min-w-0 flex-1 truncate text-left"
+              :disabled="!!opening"
+              :title="`Open ${entry.name} here`"
+              @click="openFile(entry)"
+            >
+              📄 {{ entry.name }}
+              <span v-if="opening === entry.path" class="text-[12px] text-[var(--color-muted)]">
+                Opening…
+              </span>
+            </button>
             <span
               v-if="entry.mount"
               class="shrink-0 rounded-full bg-emerald-100 px-2 text-[11px] text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200"
@@ -218,6 +280,30 @@ onMounted(loadPeers);
       </template>
       <p v-if="loading" class="mt-2 text-[12px] text-[var(--color-muted)]">Loading…</p>
     </template>
+
+    <p v-if="notice" class="mt-3 text-[12px] text-[var(--color-muted)]">{{ notice }}</p>
+    <section v-if="quickOpens.length" class="mt-6">
+      <h3 class="mb-1 text-[13px] font-semibold">Opened from other devices</h3>
+      <p class="mb-2 text-[12px] text-[var(--color-muted)]">
+        Folders synced online-only so their files could open here. Removing one keeps the files
+        already here.
+      </p>
+      <ul class="divide-y divide-[var(--color-line)] rounded-md border border-[var(--color-line)]">
+        <li v-for="q in quickOpens" :key="q.space" class="flex items-center gap-2 px-3 py-1.5">
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-[13px]">{{ q.peer }}: <span class="mono">{{ q.folder }}</span></p>
+            <p class="mono truncate text-[12px] text-[var(--color-muted)]">{{ q.local_path ?? "" }}</p>
+          </div>
+          <button
+            type="button"
+            class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+            @click="removeQuickOpen(q.space)"
+          >
+            Remove
+          </button>
+        </li>
+      </ul>
+    </section>
 
     <PairFolderDialog
       v-if="pairing && device"

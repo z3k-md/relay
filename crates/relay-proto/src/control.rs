@@ -11,8 +11,8 @@
 //! of a second one in protobuf. A change a peer cannot decode is `invalid`.
 
 use relay_core::remote::{
-    DirEntry, DirEntryKind, DirListing, MountRef, PathPreview, RemoteCall, RemoteError,
-    RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult, RemoteRoot, RemoteSpace,
+    DirEntry, DirEntryKind, DirListing, Located, MountRef, MountedPath, PathPreview, RemoteCall,
+    RemoteError, RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult, RemoteRoot, RemoteSpace,
 };
 
 use crate::{Empty, ProtoError, invalid};
@@ -31,7 +31,7 @@ pub struct PeerGrants {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ControlRequest {
-    #[prost(oneof = "control_request::Call", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "control_request::Call", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub call: Option<control_request::Call>,
 }
 
@@ -53,6 +53,10 @@ pub mod control_request {
         /// `ConfigChange` as JSON.
         #[prost(bytes = "vec", tag = "7")]
         Apply(Vec<u8>),
+        #[prost(string, tag = "8")]
+        Locate(String),
+        #[prost(message, tag = "9")]
+        ScanFirst(super::WireMountedPath),
     }
 }
 
@@ -76,7 +80,10 @@ pub struct WireCreateDir {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ControlResponse {
-    #[prost(oneof = "control_response::Reply", tags = "1, 2, 3, 4, 5, 6, 7, 15")]
+    #[prost(
+        oneof = "control_response::Reply",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 15"
+    )]
     pub reply: Option<control_response::Reply>,
 }
 
@@ -98,6 +105,10 @@ pub mod control_response {
         /// `ConfigApplied` as JSON.
         #[prost(bytes = "vec", tag = "7")]
         Applied(Vec<u8>),
+        #[prost(message, tag = "8")]
+        Located(super::WireLocated),
+        #[prost(message, tag = "9")]
+        Done(super::Empty),
         #[prost(message, tag = "15")]
         Error(super::WireRemoteError),
     }
@@ -209,6 +220,28 @@ pub struct WirePreview {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+pub struct WireMountedPath {
+    #[prost(string, tag = "1")]
+    pub space: String,
+    #[prost(string, tag = "2")]
+    pub mount: String,
+    #[prost(string, tag = "3")]
+    pub path: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WireLocated {
+    #[prost(string, tag = "1")]
+    pub folder: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    #[prost(message, optional, tag = "4")]
+    pub mount: Option<WireMountedPath>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 pub struct WireRemoteError {
     #[prost(string, tag = "1")]
     pub code: String,
@@ -239,6 +272,12 @@ pub fn call_to_wire(call: &RemoteCall) -> ControlRequest {
         RemoteCall::Apply { change } => {
             Call::Apply(serde_json::to_vec(change).expect("a ConfigChange always serializes"))
         }
+        RemoteCall::Locate { path } => Call::Locate(path.clone()),
+        RemoteCall::ScanFirst { space, mount, path } => Call::ScanFirst(WireMountedPath {
+            space: space.clone(),
+            mount: mount.clone(),
+            path: path.clone(),
+        }),
     };
     ControlRequest { call: Some(call) }
 }
@@ -263,6 +302,12 @@ pub fn call_from_wire(request: ControlRequest) -> Result<RemoteCall, ProtoError>
             Call::Apply(json) => RemoteCall::Apply {
                 change: serde_json::from_slice(&json)
                     .map_err(|e| invalid("change", e.to_string()))?,
+            },
+            Call::Locate(path) => RemoteCall::Locate { path },
+            Call::ScanFirst(at) => RemoteCall::ScanFirst {
+                space: at.space,
+                mount: at.mount,
+                path: at.path,
             },
         },
     )
@@ -320,6 +365,17 @@ pub fn result_to_wire(result: &RemoteResult) -> ControlResponse {
         Ok(RemoteReply::Applied { applied }) => {
             Reply::Applied(serde_json::to_vec(applied).expect("a ConfigApplied always serializes"))
         }
+        Ok(RemoteReply::Located { located }) => Reply::Located(WireLocated {
+            folder: located.folder.clone(),
+            name: located.name.clone(),
+            size: located.size,
+            mount: located.mount.as_ref().map(|m| WireMountedPath {
+                space: m.space.clone(),
+                mount: m.mount.clone(),
+                path: m.path.clone(),
+            }),
+        }),
+        Ok(RemoteReply::Done) => Reply::Done(Empty {}),
         Err(err) => Reply::Error(WireRemoteError {
             code: err.code.as_str().to_owned(),
             message: err.message.clone(),
@@ -392,6 +448,19 @@ pub fn result_from_wire(response: ControlResponse) -> Result<RemoteResult, Proto
                 applied: serde_json::from_slice(&json)
                     .map_err(|e| invalid("applied", e.to_string()))?,
             }),
+            Reply::Located(found) => Ok(RemoteReply::Located {
+                located: Located {
+                    folder: found.folder,
+                    name: found.name,
+                    size: found.size,
+                    mount: found.mount.map(|m| MountedPath {
+                        space: m.space,
+                        mount: m.mount,
+                        path: m.path,
+                    }),
+                },
+            }),
+            Reply::Done(_) => Ok(RemoteReply::Done),
             Reply::Error(err) => Err(RemoteError::new(
                 RemoteErrorCode::parse(&err.code),
                 err.message,
@@ -515,6 +584,19 @@ mod tests {
                 inside_mount: None,
             },
         }));
+        round_trip(Ok(RemoteReply::Located {
+            located: Located {
+                folder: "C:\\Users\\zach\\Documents".into(),
+                name: "report.docx".into(),
+                size: 42,
+                mount: Some(MountedPath {
+                    space: "Docs".into(),
+                    mount: "docs".into(),
+                    path: "work/report.docx".into(),
+                }),
+            },
+        }));
+        round_trip(Ok(RemoteReply::Done));
         round_trip(Ok(RemoteReply::Applied {
             applied: relay_core::ConfigApplied::Done,
         }));

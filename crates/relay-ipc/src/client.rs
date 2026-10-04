@@ -12,9 +12,9 @@ use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
     ActivityItem, EvictResult, FetchParams, FolderPairParams, FolderPairPlan, FolderPairResult,
-    Hello, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult,
-    PairStatus, RemoteParams, Request, RescanParams, RescanResult, Response, Status, decode_line,
-    encode_line,
+    Hello, OpenRemoteParams, OpenedRemote, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
+    PairStartParams, PairStartResult, PairStatus, QuickOpen, RemoteParams, Request, RescanParams,
+    RescanResult, Response, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -131,6 +131,30 @@ impl Client {
             "pair_join",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
+    }
+
+    /// Open a file on a paired device: sync its folder here online-only if
+    /// needed, download it, and return where it is.
+    pub fn open_remote(&mut self, params: &OpenRemoteParams) -> Result<OpenedRemote, IpcError> {
+        self.call(
+            "open_remote",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    pub fn quick_opens(&mut self) -> Result<Vec<QuickOpen>, IpcError> {
+        self.call("quick_opens", serde_json::json!({}))
+    }
+
+    /// Undo a quick-open folder. Returns a note when the other device could
+    /// not be reached.
+    pub fn quick_open_remove(&mut self, space: &str) -> Result<Option<String>, IpcError> {
+        let reply: serde_json::Value =
+            self.call("quick_open_remove", serde_json::json!({ "space": space }))?;
+        Ok(reply
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned))
     }
 
     /// Check what a folder pair would do. Changes nothing.

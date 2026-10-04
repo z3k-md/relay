@@ -983,6 +983,7 @@ fn folder_pair_params(
         create_dest: create_dest.map(str::to_owned),
         name: None,
         excludes: excludes.iter().map(|s| (*s).to_owned()).collect(),
+        exclude_patterns: Vec::new(),
         dest_online_only: false,
     }
 }
@@ -1104,4 +1105,127 @@ fn manager_sets_up_folder_pairs_both_ways() {
     assert_eq!(reload_count(&session_b), 0, "bob reloaded");
     stop_daemon(session_a);
     stop_daemon(session_b);
+}
+
+/// Remote explorer Stage 4: bob opens alice's files whether or not they sync
+/// anywhere, and removing a quick-open undoes only what it set up.
+#[test]
+fn open_remote_files_and_remove_quick_opens() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let docs = TempDir::new().unwrap();
+    let synced = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    fs::write(docs.path().join("report.docx"), b"quarterly").unwrap();
+    fs::write(docs.path().join("notes.txt"), b"notes").unwrap();
+    fs::write(docs.path().join("~$report.docx"), b"lock").unwrap();
+    fs::write(synced.path().join("plan.md"), b"plan").unwrap();
+    {
+        let mut engine = Engine::init(home_a.path(), "alice").unwrap();
+        engine.create_space("Work").unwrap();
+        engine
+            .add_mount("Work", "work", synced.path(), &[], &[])
+            .unwrap();
+    }
+    Engine::init(home_b.path(), "bob").unwrap();
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    pair_granting(home_a.path(), addr_a, home_b.path(), true);
+    assert!(
+        wait_until(CONVERGE, || wait_ipc(home_b.path()).status().is_ok_and(
+            |s| s.peers.iter().any(|p| p.name == "alice" && p.manageable)
+        )),
+        "bob never learned alice's grant"
+    );
+    let mut bob = wait_ipc(home_b.path());
+    let open = |client: &mut relay_ipc::Client, file: &Path| {
+        client
+            .open_remote(&relay_ipc::OpenRemoteParams {
+                peer: "alice".into(),
+                path: dunce_like(file),
+                root: Some(root.path().to_path_buf()),
+            })
+            .expect("open remote")
+    };
+
+    // Case 3: in no synced folder.
+    let opened = open(&mut bob, &docs.path().join("report.docx"));
+    assert_eq!(fs::read(&opened.path).unwrap(), b"quarterly");
+    assert!(
+        opened
+            .path
+            .starts_with(fs::canonicalize(root.path()).unwrap().join("alice"))
+    );
+    let folder = opened.path.parent().unwrap().to_path_buf();
+    assert!(
+        !folder.join("notes.txt").exists(),
+        "only the opened file downloads"
+    );
+    // A second file in the same folder reuses that pair.
+    let notes = open(&mut bob, &docs.path().join("notes.txt"));
+    assert_eq!(notes.space, opened.space);
+    assert_eq!(fs::read(&notes.path).unwrap(), b"notes");
+    // Edits flow back like any synced file.
+    fs::write(&opened.path, b"edited on bob").unwrap();
+    assert!(
+        wait_until(CONVERGE, || synced_bytes(
+            &docs.path().join("report.docx"),
+            b"edited on bob"
+        )),
+        "bob's edit did not reach alice"
+    );
+
+    // Case 2: inside alice's own space, which bob does not sync.
+    let plan = open(&mut bob, &synced.path().join("plan.md"));
+    assert_eq!(plan.space, "Work");
+    assert_eq!(fs::read(&plan.path).unwrap(), b"plan");
+
+    let quick = bob.quick_opens().expect("list");
+    assert_eq!(quick.len(), 2, "{quick:?}");
+    assert!(
+        quick
+            .iter()
+            .any(|q| q.space == opened.space && q.created_on_peer)
+    );
+    assert!(
+        quick
+            .iter()
+            .any(|q| q.space == "Work" && !q.created_on_peer)
+    );
+
+    // Removing undoes only what quick-open did.
+    assert_eq!(bob.quick_open_remove(&opened.space).expect("remove"), None);
+    assert_eq!(bob.quick_open_remove("Work").expect("remove"), None);
+    assert!(bob.quick_opens().expect("list").is_empty());
+    let alice = Engine::open_read_only(home_a.path()).unwrap();
+    let names: Vec<_> = alice
+        .spaces()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names, ["Work"], "alice keeps her own space only");
+    let work = alice
+        .status()
+        .unwrap()
+        .peers
+        .into_iter()
+        .find(|p| p.name == "bob")
+        .map(|p| p.spaces)
+        .unwrap_or_default();
+    assert!(
+        work.is_empty(),
+        "Work is no longer shared with bob: {work:?}"
+    );
+    assert!(fs::read(&opened.path).is_ok(), "files stay on bob's disk");
+    assert_eq!(reload_count(&session_a), 0, "alice reloaded");
+    assert_eq!(reload_count(&session_b), 0, "bob reloaded");
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}
+
+fn synced_bytes(path: &Path, bytes: &[u8]) -> bool {
+    fs::read(path).ok().as_deref() == Some(bytes)
 }

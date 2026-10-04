@@ -6,6 +6,7 @@
 
 mod folder_pair;
 mod host;
+mod quick_open;
 mod remote;
 
 use std::fs::File;

@@ -221,7 +221,8 @@ impl Engine {
                     match input {
                         input @ (SyncInput::Config { .. }
                         | SyncInput::Fetch { .. }
-                        | SyncInput::Evict { .. }) => {
+                        | SyncInput::Evict { .. }
+                        | SyncInput::ScanFirst { .. }) => {
                             if priority_tx.send(input).is_err() {
                                 break;
                             }
@@ -386,6 +387,35 @@ impl Engine {
                                     reason: err.to_string(),
                                 }),
                             }
+                        }
+                    }
+                    SyncInput::ScanFirst {
+                        space,
+                        mount,
+                        paths,
+                        reply,
+                    } => {
+                        let Some(state) = states
+                            .iter_mut()
+                            .find(|state| state.space == space && state.mount == mount)
+                        else {
+                            let err = EngineError::UnknownMount { space, mount };
+                            let _ = reply.send(Err((&err).into()));
+                            continue;
+                        };
+                        // Not interruptible: this is the command others wait on.
+                        let step =
+                            self.run_watch_scan_paths(state, &paths, on_event, &mut || false);
+                        let committed = matches!(step, ScanStep::Finished { committed: true });
+                        let _ = reply.send(Ok(committed));
+                        if committed {
+                            emit_sync(syncer.push_local_changes(self, &mut output), on_event);
+                            emit_push(
+                                self.push_replica_watch(),
+                                &mut replica_warned,
+                                on_event,
+                                &mut output,
+                            );
                         }
                     }
                     SyncInput::Evict {

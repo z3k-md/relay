@@ -160,6 +160,17 @@ export interface FolderPairResult {
   dest_path: string;
 }
 
+/** A folder synced only so its files could be opened here. */
+export interface QuickOpen {
+  space: string;
+  peer: string;
+  folder: string;
+  local_path: string | null;
+  created_at_ms: number;
+  last_opened_ms: number;
+  created_on_peer: boolean;
+}
+
 export type RemoteErrorCode =
   | "forbidden"
   | "denied"

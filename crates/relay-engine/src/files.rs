@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use relay_core::conflict::is_conflict_copy;
-use relay_core::{EntryContent, EntryKind, LogicalPath, MaterializationRuleId};
+use relay_core::{EntryContent, EntryKind, LogicalPath, MaterializationRuleId, validate_name};
 use relay_fs::resolve_os_path;
 use serde::Serialize;
 
@@ -127,6 +127,9 @@ impl Engine {
     /// Choose what this device keeps for everything in a folder (`""` is the
     /// whole mount). `None` drops the choice so the enclosing folder's
     /// applies. Files already here stay until they are freed (D35).
+    ///
+    /// Needs only the space: rules name mounts by name, so a choice can be
+    /// made before the mount exists, and so before its first scan.
     pub fn set_folder_mode(
         &mut self,
         space: &str,
@@ -135,9 +138,14 @@ impl Engine {
         mode: Option<MaterializationMode>,
     ) -> Result<(), EngineError> {
         self.ensure_writable()?;
-        let (space_rec, config) = self.lookup_mount(space, mount)?;
+        validate_name(mount)?;
+        let space_rec = self
+            .db
+            .repo()
+            .space_by_name(space)?
+            .ok_or_else(|| EngineError::UnknownSpace(space.to_owned()))?;
         folder_path(path)?;
-        let selector = folder_selector(&config.mount.name, path);
+        let selector = folder_selector(mount, path);
         let inside = selector.trim_end_matches("**").to_owned();
         let replaced: Vec<String> = self
             .db
@@ -167,7 +175,7 @@ impl Engine {
                         space_rec.id,
                         &name,
                         mode.as_str(),
-                        &folder_selectors(&config.mount.name, path),
+                        &folder_selectors(mount, path),
                         now,
                     )?;
                 }

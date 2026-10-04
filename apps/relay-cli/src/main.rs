@@ -22,8 +22,8 @@ use relay_engine::{
     resolve_conflict, resolve_git_conflicts,
 };
 use relay_ipc::{
-    ActivityItem, Client, FolderEnd, FolderPairParams, PairJoinParams, PairStartParams, PairStatus,
-    Status as DaemonStatus,
+    ActivityItem, Client, FolderEnd, FolderPairParams, OpenRemoteParams, PairJoinParams,
+    PairStartParams, PairStatus, Status as DaemonStatus,
 };
 
 mod output;
@@ -145,12 +145,31 @@ enum Command {
         /// Leave out a subfolder of the source (repeatable)
         #[arg(long = "exclude")]
         excludes: Vec<String>,
+        /// Leave out files matching a name pattern anywhere, such as `~$*`
+        /// (repeatable)
+        #[arg(long = "exclude-pattern")]
+        exclude_patterns: Vec<String>,
         /// The destination downloads files only when opened
         #[arg(long)]
         online_only: bool,
         /// Show what would happen and change nothing
         #[arg(long)]
         check: bool,
+    },
+    /// Get a file from a paired device: its folder syncs here online-only if
+    /// it does not already, and this file downloads. Prints where it is
+    Open {
+        peer: String,
+        /// The file, in that device's path format
+        path: String,
+        /// Where folders opened this way go (default ~/Relay)
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
+    /// List folders set up by `relay open`, or remove one
+    Opened {
+        #[command(subcommand)]
+        cmd: Option<OpenedCmd>,
     },
     /// List folders on a paired device that lets this one manage it
     Browse {
@@ -395,6 +414,12 @@ enum PeerCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum OpenedCmd {
+    /// Stop syncing a folder opened from another device. Files stay here
+    Remove { space: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum RecoveryCmd {
     /// Print the recovery secret (creates one on first use)
     Show,
@@ -634,6 +659,55 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Policy { cmd } => cmd_policy(&home, cmd, json),
         Command::Materialize { cmd } => cmd_materialize(&home, cmd, json),
         Command::Browse { peer, path, all } => cmd_browse(&home, &peer, path, all, json),
+        Command::Open { peer, path, into } => {
+            let opened = running_host(&home)?.open_remote(&OpenRemoteParams {
+                peer,
+                path,
+                root: into,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&opened)?);
+            } else {
+                println!("{}", opened.path.display());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Opened { cmd: None } => {
+            let opened = running_host(&home)?.quick_opens()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&opened)?);
+            } else if opened.is_empty() {
+                println!("no folders opened from other devices");
+            } else {
+                for q in opened {
+                    let here = q
+                        .local_path
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "-".into());
+                    println!("{}  {}: {}  ->  {here}", q.space, q.peer, q.folder);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Opened {
+            cmd: Some(OpenedCmd::Remove { space }),
+        } => {
+            let note = running_host(&home)?.quick_open_remove(&space)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"removed": space, "note": note})
+                    )?
+                );
+            } else {
+                println!("stopped syncing {space}; files here were not touched");
+                if let Some(note) = note {
+                    println!("note: {note}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::PairFolder {
             source,
             dest,
@@ -641,6 +715,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             to,
             create,
             excludes,
+            exclude_patterns,
             online_only,
             check,
         } => {
@@ -656,6 +731,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 create_dest: create,
                 name: None,
                 excludes,
+                exclude_patterns,
                 dest_online_only: online_only,
             };
             cmd_pair_folder(&home, &params, check, json)
@@ -2055,15 +2131,18 @@ fn cmd_materialize(home: &Path, cmd: MaterializeCmd, json: bool) -> Result<ExitC
     Ok(ExitCode::SUCCESS)
 }
 
+/// A client for commands that only make sense with Relay running.
+fn running_host(home: &Path) -> Result<Client> {
+    Client::connect(home)?.ok_or_else(|| anyhow::anyhow!("Relay is not running; start it first"))
+}
+
 fn cmd_pair_folder(
     home: &Path,
     params: &FolderPairParams,
     check: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let mut client = Client::connect(home)?.ok_or_else(|| {
-        anyhow::anyhow!("Relay is not running; setting up a pair needs a live host")
-    })?;
+    let mut client = running_host(home)?;
     let plan = client.folder_pair_preview(params)?;
     if check || !plan.problems.is_empty() {
         if json {
@@ -2104,8 +2183,7 @@ fn cmd_browse(
     all: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let mut client = Client::connect(home)?
-        .ok_or_else(|| anyhow::anyhow!("Relay is not running; browsing needs a live connection"))?;
+    let mut client = running_host(home)?;
     let reply = match path {
         None => client.remote(peer, &RemoteCall::Roots)?,
         Some(path) => client.remote(

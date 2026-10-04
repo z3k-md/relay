@@ -51,6 +51,18 @@ impl Syncer {
         let mut set_peers = false;
         let mut follow_up: Vec<(DeviceId, SpaceId)> = Vec::new();
         let mut policy_replays: Vec<SpaceId> = Vec::new();
+        // Spaces this peer offered before. One it offers for the first time
+        // and that this device already shares with it is one the peer just
+        // joined: any index request sent earlier found nothing to answer.
+        let known: HashSet<SpaceId> = engine
+            .db
+            .repo()
+            .list_offers()?
+            .into_iter()
+            .filter(|offer| offer.peer.id == peer)
+            .map(|offer| offer.space_id)
+            .collect();
+        let mut newly_joined: Vec<SpaceId> = Vec::new();
         for offer in offers.spaces {
             let Ok(space_id) = space_id_from_bytes(&offer.space_id) else {
                 events.push(SyncEvent::SyncWarning {
@@ -95,6 +107,9 @@ impl Syncer {
                 already_joined: already,
             });
             if already {
+                if !known.contains(&space_id) && engine.db.repo().is_shared(space_id, peer)? {
+                    newly_joined.push(space_id);
+                }
                 let adopted = engine.adopt_offered_members(space_id, &members)?;
                 if adopted.peers_changed {
                     set_peers = true;
@@ -120,6 +135,9 @@ impl Syncer {
         engine.persist_offers(peer, &rows)?;
         if set_peers {
             out(SyncOutput::SetPeers);
+        }
+        for space in newly_joined {
+            resume_index(engine, peer, space, out)?;
         }
         for (member, space) in follow_up {
             self.refresh_offers(engine, member, out)?;

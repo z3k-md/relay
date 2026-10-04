@@ -3,8 +3,8 @@
 Build plan for browsing another device's folders, setting up sync from
 either machine, and opening files that are not on this device yet. This does
 not amend [`DESIGN.md`](../DESIGN.md) or [`DECISIONS.md`](../DECISIONS.md).
-Stage 0 is recorded as D36, Stage 1 as D38, Stage 2 as D37, and Stage 3 as
-D39.
+Stage 0 is recorded as D36, Stage 1 as D38, Stage 2 as D37, Stage 3 as
+D39, and Stage 4 as D40.
 
 The stages are in build order. Each one ships on its own and is useful
 without the next. Stages 0 and 1 change no wire format and no trust rules.
@@ -301,6 +301,11 @@ and from a third paired device. A change on either side syncs, and an
 injected failure at step 3 leaves nothing behind on the source.
 
 ## Stage 4. Open a file that is not synced
+
+**Shipped (D40).** A file inside a mount the other device has but this one
+does not joins that space online-only instead of being refused. Records are
+a host JSON file rather than a migration. The quick-open root is not yet a
+setting in the app.
 
 `open_remote { peer, path }` on the manager's host:
 

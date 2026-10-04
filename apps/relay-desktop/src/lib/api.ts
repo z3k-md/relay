@@ -18,6 +18,7 @@ import type {
   OfferView,
   Overview,
   PeerView,
+  QuickOpen,
   RemoteCall,
   RemoteErrorCode,
   RemoteReply,
@@ -106,6 +107,10 @@ export const api = {
   folderPairPreview: (params: FolderPairParams) =>
     call<FolderPairPlan>("folder_pair_preview", { params }),
   folderPair: (params: FolderPairParams) => call<FolderPairResult>("folder_pair", { params }),
+  openRemoteFile: (peer: string, path: string) =>
+    call<string>("open_remote_file", { peer, path }),
+  listQuickOpens: () => call<QuickOpen[]>("list_quick_opens"),
+  removeQuickOpen: (space: string) => call<string | null>("remove_quick_open", { space }),
   joinSpace: (space: string, fromPeer: string) =>
     call<SpaceView>("join_space", { space, fromPeer }),
   deleteSpace: (space: string) => call<void>("delete_space", { space }),

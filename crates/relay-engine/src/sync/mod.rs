@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use relay_core::version::VectorOrdering;
 use relay_core::{
-    ConfigApplied, ConfigChange, DeleteHoldDecision, DeviceId, EntryContent, EntryKey, MountId,
-    ObjectId, Sequence, SpaceId,
+    ConfigApplied, ConfigChange, DeleteHoldDecision, DeviceId, EntryContent, EntryKey, LogicalPath,
+    MountId, ObjectId, Sequence, SpaceId,
 };
 use relay_db::{OfferedMember, PeerOfferRow};
 use relay_proto::{
@@ -120,6 +120,14 @@ pub enum SyncInput {
         mount: String,
         path: String,
         reply: mpsc::Sender<Result<(), Rejected>>,
+    },
+    /// Index these paths of one mount now, ahead of any scan in progress.
+    /// Replies with whether anything changed.
+    ScanFirst {
+        space: String,
+        mount: String,
+        paths: Vec<LogicalPath>,
+        reply: mpsc::Sender<Result<bool, Rejected>>,
     },
     /// Drop this device's copy of a demand-mode file, or of every downloaded
     /// demand-mode file under a folder. Replies with how many were dropped.
@@ -386,6 +394,7 @@ impl Syncer {
             }
             // Applied by the watch loop, which owns the working tree.
             SyncInput::Evict { .. }
+            | SyncInput::ScanFirst { .. }
             | SyncInput::Rescan { .. }
             | SyncInput::AddPeer(_)
             | SyncInput::PeerAddresses { .. }

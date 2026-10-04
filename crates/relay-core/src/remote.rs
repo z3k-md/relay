@@ -48,6 +48,18 @@ pub enum RemoteCall {
     Apply {
         change: ConfigChange,
     },
+    /// Where a file is: its folder, its name, and the mount it is in, if any.
+    Locate {
+        path: String,
+    },
+    /// Index one path of a mount now, ahead of a full scan of the mount, so
+    /// a file being opened elsewhere gets its index row first.
+    ScanFirst {
+        space: String,
+        mount: String,
+        /// Inside the mount, `/`-separated.
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +72,27 @@ pub enum RemoteReply {
     Preview { preview: PathPreview },
     Created { entry: DirEntry },
     Applied { applied: ConfigApplied },
+    Located { located: Located },
+    Done,
+}
+
+/// A file found by [`RemoteCall::Locate`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Located {
+    /// The folder holding it, canonical, in the answering device's format.
+    pub folder: String,
+    pub name: String,
+    pub size: u64,
+    /// The mount it is in, with its path inside the mount.
+    pub mount: Option<MountedPath>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountedPath {
+    pub space: String,
+    pub mount: String,
+    /// Inside the mount, `/`-separated.
+    pub path: String,
 }
 
 /// What making a folder a mount would mean.

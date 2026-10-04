@@ -7,7 +7,9 @@
 //! destination, or neither. Steps that change something are recorded, and a
 //! failure undoes them in reverse.
 
-use relay_core::remote::{PathPreview, RemoteCall, RemoteError, RemoteReply, RemoteResult};
+use relay_core::remote::{
+    PathPreview, RemoteCall, RemoteError, RemoteErrorCode, RemoteReply, RemoteResult,
+};
 use relay_core::{ConfigApplied, ConfigChange, DeviceId, validate_name};
 use relay_engine::Engine;
 use relay_ipc::{
@@ -170,10 +172,17 @@ fn plan(
         problems.push(format!("That folder is not on {source_name}."));
     }
     if let Some(mount) = &source.overlaps {
-        problems.push(format!(
-            "On {source_name}, that folder is inside or around {}/{}, which already syncs.",
-            mount.space, mount.mount
-        ));
+        problems.push(if crate::quick_open::is_quick_open(host, &mount.space) {
+            format!(
+                "That folder is inside or around {}, which is set up for opening files here. Remove it under Opened from other devices first.",
+                mount.space
+            )
+        } else {
+            format!(
+                "On {source_name}, that folder is inside or around {}/{}, which already syncs.",
+                mount.space, mount.mount
+            )
+        });
     }
     if source.cloud_only {
         warnings.push(format!(
@@ -261,7 +270,7 @@ fn execute(
     )?
     else {
         return Err(RemoteError::new(
-            relay_core::remote::RemoteErrorCode::Failed,
+            RemoteErrorCode::Failed,
             "creating the space returned no space",
         ));
     };
@@ -269,11 +278,11 @@ fn execute(
         space: space.clone(),
     };
     undo.push((source.clone(), delete_space.clone()));
+    // Rules before the folder attaches, so its first scan already skips
+    // what is left out.
+    leave_out(host, source, &space, &mount, params)?;
     source.apply(host, add_mount(&space, &mount, &source_path))?;
     undo.push((source.clone(), remove_mount(&space, &mount)));
-    for excluded in &params.excludes {
-        source.apply(host, folder_mode(&space, &mount, excluded, Some("exclude")))?;
-    }
     source
         .apply(
             host,
@@ -318,9 +327,7 @@ fn execute(
     )?;
     undo.push((dest.clone(), delete_space));
     // Before attaching, so nothing downloads that should not.
-    for excluded in &params.excludes {
-        dest.apply(host, folder_mode(&space, &mount, excluded, Some("exclude")))?;
-    }
+    leave_out(host, dest, &space, &mount, params)?;
     if params.dest_online_only {
         dest.apply(host, folder_mode(&space, &mount, "", Some("demand")))?;
     }
@@ -332,6 +339,35 @@ fn execute(
         source_path,
         dest_path,
     })
+}
+
+/// Excluded subfolders and file patterns, as rules on `target`.
+fn leave_out(
+    host: &Host,
+    target: &Target,
+    space: &str,
+    mount: &str,
+    params: &FolderPairParams,
+) -> Result<(), RemoteError> {
+    for excluded in &params.excludes {
+        target.apply(host, folder_mode(space, mount, excluded, Some("exclude")))?;
+    }
+    if !params.exclude_patterns.is_empty() {
+        target.apply(
+            host,
+            ConfigChange::MaterializeAdd {
+                space: space.to_owned(),
+                name: "left-out-files".to_owned(),
+                mode: "exclude".to_owned(),
+                selectors: params
+                    .exclude_patterns
+                    .iter()
+                    .map(|pattern| format!("{mount}/**/{pattern}"))
+                    .collect(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn add_mount(space: &str, mount: &str, path: &str) -> ConfigChange {
@@ -362,7 +398,7 @@ fn folder_mode(space: &str, mount: &str, path: &str, mode: Option<&str>) -> Conf
 
 /// The last component of a path in either platform's form. For naming only;
 /// paths themselves are never built here.
-fn folder_name(path: &str) -> String {
+pub(crate) fn folder_name(path: &str) -> String {
     let name = path
         .trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
@@ -389,7 +425,7 @@ fn unique_name(wanted: &str, taken: &[String]) -> String {
 }
 
 fn needs_pairing(err: RemoteError, source: &Target, dest: &Target) -> RemoteError {
-    if err.code == relay_core::remote::RemoteErrorCode::NotFound {
+    if err.code == RemoteErrorCode::NotFound {
         RemoteError::new(
             err.code,
             format!(
@@ -405,7 +441,7 @@ fn needs_pairing(err: RemoteError, source: &Target, dest: &Target) -> RemoteErro
 
 fn unexpected(reply: &RemoteReply) -> RemoteError {
     RemoteError::new(
-        relay_core::remote::RemoteErrorCode::Failed,
+        RemoteErrorCode::Failed,
         format!("unexpected reply {reply:?}"),
     )
 }

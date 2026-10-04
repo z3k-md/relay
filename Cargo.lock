@@ -4142,6 +4142,7 @@ dependencies = [
  "relay-engine",
  "relay-ipc",
  "relay-net",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",
