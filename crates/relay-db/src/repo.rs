@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+pub use relay_core::DeleteHoldDecision;
 use relay_core::{
     Device, DeviceId, EntryContent, EntryKey, EntryRecord, MaterializationRuleId, Mount, MountId,
     ObjectId, PolicyId, Sequence, Space, SpaceId, StatHint, VersionVector,
@@ -148,29 +149,9 @@ pub struct PeerPolicySnapshot {
     pub policies: Vec<SnapshotPolicy>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeleteHoldDecision {
-    Apply,
-    Restore,
-}
-
-impl DeleteHoldDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Apply => "apply",
-            Self::Restore => "restore",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, DbError> {
-        match value {
-            "apply" => Ok(Self::Apply),
-            "restore" => Ok(Self::Restore),
-            other => Err(DbError::Corrupt(format!(
-                "unknown delete hold decision {other:?}"
-            ))),
-        }
-    }
+fn parse_decision(value: &str) -> Result<DeleteHoldDecision, DbError> {
+    DeleteHoldDecision::parse(value)
+        .ok_or_else(|| DbError::Corrupt(format!("unknown delete hold decision {value:?}")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1945,10 +1926,7 @@ impl Repo<'_> {
                 deletions: usize::try_from(deletions).map_err(|_| DbError::IntegerOverflow)?,
                 live: usize::try_from(live).map_err(|_| DbError::IntegerOverflow)?,
                 held_at_ms,
-                decision: decision
-                    .as_deref()
-                    .map(DeleteHoldDecision::parse)
-                    .transpose()?,
+                decision: decision.as_deref().map(parse_decision).transpose()?,
                 decided_at_ms,
             });
         }

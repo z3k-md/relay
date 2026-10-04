@@ -661,13 +661,7 @@ fn after_config(
         }
         _ => {}
     }
-    if let Err(err) = syncer.after_config(engine, applied, output) {
-        on_event(&WatchEvent::SyncWarning {
-            peer: String::new(),
-            path: String::new(),
-            reason: err.to_string(),
-        });
-    }
+    emit_sync(syncer.after_config(engine, applied, output), on_event);
 }
 
 /// Start watching a newly attached mount. Its first full scan is due now.

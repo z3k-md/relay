@@ -33,6 +33,7 @@ use relay_store::StoreError;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::EngineError;
+pub use live_config::ConfigRejected;
 pub use materialize::{MaterializationInfo, MaterializationMode};
 pub use peers::{
     AdoptedMembers, ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict,
@@ -44,8 +45,8 @@ pub use progress::{
     summary_line,
 };
 pub use relay_core::{
-    ConfigApplied, ConfigChange, Device, EntryContent, EntryKind, EntryRecord, LogicalPath, Mount,
-    MountId, ObjectId, Sequence, Space, SpaceId, VectorOrdering,
+    ConfigApplied, ConfigChange, DeleteHoldDecision, Device, EntryContent, EntryKind, EntryRecord,
+    LogicalPath, Mount, MountId, ObjectId, Sequence, Space, SpaceId, VectorOrdering,
 };
 pub use relay_crypto::DeviceIdentity;
 pub use relay_db::{HistoryRecord, MountConfig};
@@ -53,9 +54,9 @@ pub use relay_fs::{FsError, ScanWarning};
 pub use relay_store::ObjectStore;
 pub use replica::{ReplicaPull, ReplicaPush, ReplicaSpacePush, ReplicaStatus, TransportStatus};
 pub use reports::{
-    DeleteHold, DeleteHoldDecision, GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT,
-    MASS_DELETE_NUMERATOR, MountStatus, PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport,
-    Status, VerifyReport, Warning,
+    DeleteHold, GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR,
+    MountStatus, PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport, Status, VerifyReport,
+    Warning,
 };
 pub use resolve::{
     GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
@@ -663,7 +664,7 @@ impl Engine {
                 deletions: row.deletions,
                 live: row.live,
                 held_at_ms: row.held_at_ms,
-                decision: row.decision.map(DeleteHoldDecision::from),
+                decision: row.decision,
             })
             .collect())
     }
@@ -708,7 +709,7 @@ impl Engine {
         let now = self.clock.now_ms();
         self.db
             .transaction(|repo| {
-                repo.decide_delete_holds(space_rec.id, mount_id, peer_id, decision.into(), now)
+                repo.decide_delete_holds(space_rec.id, mount_id, peer_id, decision, now)
             })
             .map_err(EngineError::from_db)
     }

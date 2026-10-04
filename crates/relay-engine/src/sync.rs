@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use relay_core::version::VectorOrdering;
 use relay_core::{
-    ConfigApplied, ConfigChange, DeviceId, EntryContent, EntryKey, MountId, ObjectId, Sequence,
-    SpaceId,
+    ConfigApplied, ConfigChange, DeleteHoldDecision, DeviceId, EntryContent, EntryKey, MountId,
+    ObjectId, Sequence, SpaceId,
 };
 use relay_db::{OfferedMember, PeerOfferRow};
 use relay_proto::{
@@ -18,6 +18,7 @@ use serde::Serialize;
 
 use crate::Engine;
 use crate::error::EngineError;
+use crate::live_config::ConfigRejected;
 use crate::materialize::{FetchPrep, MaterializationMode, path_mode};
 use crate::peers::offered_mounts_from_wire;
 use crate::progress::{IncomingFile, ProgressBook, TransferLive};
@@ -91,7 +92,7 @@ pub enum SyncInput {
     /// follow-up runs.
     Config {
         change: ConfigChange,
-        reply: mpsc::Sender<Result<ConfigApplied, String>>,
+        reply: mpsc::Sender<Result<ConfigApplied, ConfigRejected>>,
     },
     /// Hydrate one demand-mode path, asking a connected peer when needed.
     Fetch {
@@ -433,6 +434,22 @@ impl Syncer {
         if let Some(conn) = self.connected.get_mut(&peer) {
             conn.send_cursor.remove(&space);
         }
+    }
+
+    /// Re-run batches held for a mass delete in `space` after a decision
+    /// (D22). Without this the held head waits for a reconnect.
+    pub(crate) fn resume_held(
+        &mut self,
+        engine: &mut Engine,
+        space: SpaceId,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<Vec<SyncEvent>, EngineError> {
+        let mut events = Vec::new();
+        for peer in self.connected_peers() {
+            self.process_head(engine, peer, space, out, &mut events)?;
+        }
+        self.flush_progress(&mut events, false);
+        Ok(events)
     }
 
     pub fn push_local_changes(
@@ -1882,8 +1899,8 @@ impl Syncer {
         for mount in mounts {
             let hold = holds.iter().find(|h| h.mount.id == mount);
             match hold.and_then(|h| h.decision) {
-                Some(relay_db::DeleteHoldDecision::Apply) => {}
-                Some(relay_db::DeleteHoldDecision::Restore) => restore_mounts.push(mount),
+                Some(DeleteHoldDecision::Apply) => {}
+                Some(DeleteHoldDecision::Restore) => restore_mounts.push(mount),
                 None if hold.is_some() => held = true,
                 None => {
                     let batch_n = batch_deletes.get(&mount).map(Vec::len).unwrap_or(0);

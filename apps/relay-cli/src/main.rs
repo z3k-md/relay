@@ -1494,8 +1494,19 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
             addresses,
         } => {
             let id: DeviceId = device_id.parse()?;
-            let mut engine = Engine::open_for_config(home)?;
-            let peer = engine.add_peer(&name, id, &addresses)?;
+            apply_config(
+                home,
+                ConfigChange::AddPeer {
+                    peer: name.clone(),
+                    id,
+                    addresses,
+                },
+            )?;
+            let peer = Engine::open_read_only(home)?
+                .peers()?
+                .into_iter()
+                .find(|peer| peer.id == id)
+                .ok_or_else(|| anyhow::anyhow!("peer {name} was not added"))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&peer)?);
             } else {
@@ -1522,8 +1533,7 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
             }
         }
         PeerCmd::Remove { name } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.remove_peer(&name)?;
+            apply_config(home, ConfigChange::RemovePeer { peer: name.clone() })?;
             if json {
                 println!(
                     "{}",
@@ -1534,8 +1544,7 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
             }
         }
         PeerCmd::Revoke { name } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.revoke_peer(&name)?;
+            apply_config(home, ConfigChange::RevokePeer { peer: name.clone() })?;
             if json {
                 println!(
                     "{}",
@@ -1688,8 +1697,12 @@ fn cmd_replica(home: &Path, cmd: ReplicaCmd, json: bool) -> Result<ExitCode> {
 fn cmd_group(home: &Path, cmd: GroupCmd, json: bool) -> Result<ExitCode> {
     match cmd {
         GroupCmd::Create { name } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.group_create(&name)?;
+            apply_config(
+                home,
+                ConfigChange::GroupCreate {
+                    group: name.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -1700,8 +1713,13 @@ fn cmd_group(home: &Path, cmd: GroupCmd, json: bool) -> Result<ExitCode> {
             }
         }
         GroupCmd::Add { name, peer } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.group_add(&name, &peer)?;
+            apply_config(
+                home,
+                ConfigChange::GroupAdd {
+                    group: name.clone(),
+                    member: peer.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -1714,8 +1732,13 @@ fn cmd_group(home: &Path, cmd: GroupCmd, json: bool) -> Result<ExitCode> {
             }
         }
         GroupCmd::Remove { name, peer } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.group_remove_member(&name, &peer)?;
+            apply_config(
+                home,
+                ConfigChange::GroupRemove {
+                    group: name.clone(),
+                    member: peer.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -1728,8 +1751,12 @@ fn cmd_group(home: &Path, cmd: GroupCmd, json: bool) -> Result<ExitCode> {
             }
         }
         GroupCmd::Delete { name } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.group_delete(&name)?;
+            apply_config(
+                home,
+                ConfigChange::GroupDelete {
+                    group: name.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -1770,8 +1797,21 @@ fn cmd_policy(home: &Path, cmd: PolicyCmd, json: bool) -> Result<ExitCode> {
             peers,
             groups,
         } => {
-            let mut engine = Engine::open_for_config(home)?;
-            let policy = engine.policy_add(&space, &name, &selectors, &peers, &groups)?;
+            apply_config(
+                home,
+                ConfigChange::PolicyAdd {
+                    space: space.clone(),
+                    name: name.clone(),
+                    selectors,
+                    peers,
+                    groups,
+                },
+            )?;
+            let policy = Engine::open_read_only(home)?
+                .policies(Some(&space))?
+                .into_iter()
+                .find(|policy| policy.name == name)
+                .ok_or_else(|| anyhow::anyhow!("policy {name} was not added"))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&policy)?);
             } else {
@@ -1783,8 +1823,13 @@ fn cmd_policy(home: &Path, cmd: PolicyCmd, json: bool) -> Result<ExitCode> {
             }
         }
         PolicyCmd::Remove { space, name } => {
-            let mut engine = Engine::open_for_config(home)?;
-            engine.policy_remove(&space, &name)?;
+            apply_config(
+                home,
+                ConfigChange::PolicyRemove {
+                    space: space.clone(),
+                    name: name.clone(),
+                },
+            )?;
             if json {
                 println!(
                     "{}",
@@ -2244,11 +2289,7 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     if !holds.is_empty() {
         println!("held deletes");
         for hold in &holds {
-            let decision = match hold.decision {
-                Some(DeleteHoldDecision::Apply) => "apply",
-                Some(DeleteHoldDecision::Restore) => "restore",
-                None => "pending",
-            };
+            let decision = hold.decision.map_or("pending", DeleteHoldDecision::as_str);
             println!(
                 "  {} wants to delete {} of {} files in {}/{} (held {}, {decision})",
                 hold.peer_name,
@@ -2594,11 +2635,7 @@ fn cmd_deletes(home: &Path, cmd: Option<DeletesCmd>, json: bool) -> Result<ExitC
                 return Ok(ExitCode::SUCCESS);
             }
             for hold in holds {
-                let decision = match hold.decision {
-                    Some(DeleteHoldDecision::Apply) => "apply",
-                    Some(DeleteHoldDecision::Restore) => "restore",
-                    None => "pending",
-                };
+                let decision = hold.decision.map_or("pending", DeleteHoldDecision::as_str);
                 println!(
                     "{}  {}/{}  wants to delete {} of {} files  held {}  {decision}",
                     hold.peer_name,
@@ -2638,12 +2675,19 @@ fn decide_delete_hold(
     decision: DeleteHoldDecision,
     json: bool,
 ) -> Result<ExitCode> {
-    let mut engine = Engine::open_for_config(home)?;
-    let n = engine.decide_delete_hold(space, mount, peer, decision)?;
-    let word = match decision {
-        DeleteHoldDecision::Apply => "apply",
-        DeleteHoldDecision::Restore => "restore",
+    let applied = apply_config(
+        home,
+        ConfigChange::DecideDeleteHold {
+            space: space.to_owned(),
+            mount: mount.map(str::to_owned),
+            peer: peer.map(str::to_owned),
+            decision,
+        },
+    )?;
+    let ConfigApplied::Holds { decided: n } = applied else {
+        bail!("unexpected result {applied:?}");
     };
+    let word = decision.as_str();
     if json {
         println!(
             "{}",
@@ -2657,9 +2701,6 @@ fn decide_delete_hold(
         );
     } else {
         println!("marked {n} hold(s) as {word}");
-        println!(
-            "a running service or app picks this up automatically; otherwise it takes effect at the next `relay run`"
-        );
     }
     Ok(ExitCode::SUCCESS)
 }

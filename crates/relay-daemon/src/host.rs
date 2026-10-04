@@ -233,12 +233,12 @@ impl Host {
                 reply_rx
                     .recv_timeout(wait)
                     .map_err(|_| RpcErrorBody::new("unavailable", "timed out applying change"))?
-                    .map_err(|message| RpcErrorBody::new("failed", message))?
+                    .map_err(|rejected| RpcErrorBody::new(rejected.code, rejected.message))?
             }
             None => Engine::open_for_config(&self.home)
                 .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
                 .apply_config(&change)
-                .map_err(|err| RpcErrorBody::new("failed", err.to_string()))?,
+                .map_err(|err| RpcErrorBody::new(err.code(), err.to_string()))?,
         };
         // Status right after the reply should already show the change; the
         // loop's watch events follow a moment later and are idempotent.

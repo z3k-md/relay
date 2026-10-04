@@ -176,6 +176,54 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Stable snake_case class for callers across a process boundary (IPC,
+    /// later a managing peer). Messages are for people; codes are for code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownPeer(_)
+            | Self::UnknownGroup(_)
+            | Self::UnknownPolicy(_)
+            | Self::UnknownMaterialization(_)
+            | Self::UnknownEntry(_)
+            | Self::UnknownOffer(_)
+            | Self::UnknownSpace(_)
+            | Self::UnknownMount { .. }
+            | Self::UnknownVersion => "not_found",
+            Self::DuplicatePeer(_)
+            | Self::DuplicateMaterialization(_)
+            | Self::SpaceIdConflict { .. }
+            | Self::MountAlreadyAttached { .. }
+            | Self::MountAlreadyClaimed { .. }
+            | Self::Db(DbError::DuplicateName(_)) => "already_exists",
+            Self::EmptyPolicy
+            | Self::EmptyMaterialization
+            | Self::UnknownMaterializationMode(_)
+            | Self::InvalidName(_)
+            | Self::PathNotADirectory(_)
+            | Self::BadRelayAddress
+            | Self::Policy(_) => "invalid",
+            Self::NotDemand { .. }
+            | Self::EntryDeleted(_)
+            | Self::EvictMismatch { .. }
+            | Self::NotMaterialized(_)
+            | Self::MountNotLocal
+            | Self::SpaceHasAttachedMounts { .. }
+            | Self::OverlappingMount { .. }
+            | Self::OverlapsRelayHome
+            | Self::PeerRevoked(_)
+            | Self::ConcurrentModification { .. }
+            | Self::DestinationChanged(_)
+            | Self::NotAConflictCopy(_)
+            | Self::DirectoryConflict(_)
+            | Self::RestoreUnsupported(_) => "precondition",
+            Self::MassDeleteRefused { .. } => "mass_delete_refused",
+            Self::Busy { .. } | Self::Running { .. } | Self::ReadOnly => "busy",
+            Self::ObjectUnavailable => "unavailable",
+            Self::NotInitialized => "not_initialized",
+            _ => "failed",
+        }
+    }
+
     pub(crate) fn from_db(err: DbError) -> Self {
         match err {
             DbError::AlreadyInitialized => Self::AlreadyInitialized,

@@ -28,7 +28,8 @@ pub enum IpcError {
     Codec(String),
     #[error("host protocol {found} is not supported (this client speaks {expected})")]
     ProtocolMismatch { found: u32, expected: u32 },
-    #[error("{code}: {message}")]
+    /// The host refused the call. `code` is stable; `message` is for people.
+    #[error("{message}")]
     Remote { code: String, message: String },
 }
 

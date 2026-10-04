@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use relay_core::{ConfigApplied, ConfigChange, MOUNT_MARKER, MountId};
+use relay_core::{ConfigApplied, ConfigChange, Device, MOUNT_MARKER, MountId};
 use relay_fs::MountMarker;
 
 use crate::Engine;
@@ -68,6 +68,70 @@ impl Engine {
                 self.materialize_remove(space, name)?;
                 ConfigApplied::Done
             }
+            ConfigChange::AddPeer {
+                peer,
+                id,
+                addresses,
+            } => {
+                let added = self.add_peer(peer, *id, addresses)?;
+                ConfigApplied::Peer {
+                    device: Device {
+                        id: added.id,
+                        name: added.name,
+                    },
+                }
+            }
+            ConfigChange::RemovePeer { peer } => {
+                self.remove_peer(peer)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::RevokePeer { peer } => {
+                self.revoke_peer(peer)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::GroupCreate { group } => {
+                self.group_create(group)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::GroupAdd { group, member } => {
+                self.group_add(group, member)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::GroupRemove { group, member } => {
+                self.group_remove_member(group, member)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::GroupDelete { group } => {
+                self.group_delete(group)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::PolicyAdd {
+                space,
+                name,
+                selectors,
+                peers,
+                groups,
+            } => {
+                self.policy_add(space, name, selectors, peers, groups)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::PolicyRemove { space, name } => {
+                self.policy_remove(space, name)?;
+                ConfigApplied::Done
+            }
+            ConfigChange::DecideDeleteHold {
+                space,
+                mount,
+                peer,
+                decision,
+            } => ConfigApplied::Holds {
+                decided: self.decide_delete_hold(
+                    space,
+                    mount.as_deref(),
+                    peer.as_deref(),
+                    *decision,
+                )?,
+            },
         })
     }
 

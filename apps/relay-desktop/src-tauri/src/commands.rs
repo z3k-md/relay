@@ -105,7 +105,7 @@ pub struct DeleteHoldView {
     pub deletions: u32,
     pub live: u32,
     pub held_at_ms: i64,
-    pub decision: Option<String>,
+    pub decision: Option<DeleteHoldDecision>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -169,21 +169,6 @@ pub fn suggested_device_name() -> String {
 
 fn open_ro(home: &std::path::Path) -> Result<Engine, String> {
     Engine::open_read_only(home).map_err(|err| error_chain(&err))
-}
-
-fn with_write<T>(
-    app: &AppHandle,
-    f: impl FnOnce(&mut Engine) -> anyhow::Result<T>,
-) -> Result<T, String> {
-    let state = app.state::<AppState>();
-    state.runner.stop_join();
-    let home = state.home.clone();
-    let result = (|| {
-        let mut engine = Engine::open_for_config(&home)?;
-        f(&mut engine)
-    })();
-    state.runner.start(app);
-    result.map_err(anyhow_chain)
 }
 
 #[tauri::command]
@@ -286,7 +271,7 @@ pub fn list_peers(app: AppHandle) -> Result<Vec<PeerView>, String> {
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_peer(
     app: AppHandle,
     name: String,
@@ -301,26 +286,31 @@ pub fn add_peer(
     if address.is_empty() {
         return Err("Address is required (for example 192.168.1.20:47321).".to_owned());
     }
-    with_write(&app, |engine| {
-        let peer = engine.add_peer(name.trim(), id, std::slice::from_ref(&address))?;
-        Ok(PeerView {
-            name: peer.name,
-            id: peer.id.to_string(),
-            short_id: peer.id.short(),
-            address,
-            connected: false,
-            connected_since_ms: None,
-            last_seen_ms: peer.last_seen_ms,
-        })
+    let applied = apply_config(
+        &app,
+        ConfigChange::AddPeer {
+            peer: name.trim().to_owned(),
+            id,
+            addresses: vec![address.clone()],
+        },
+    )?;
+    let ConfigApplied::Peer { device } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
+    };
+    Ok(PeerView {
+        name: device.name,
+        id: device.id.to_string(),
+        short_id: device.id.short(),
+        address,
+        connected: false,
+        connected_since_ms: None,
+        last_seen_ms: None,
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_peer(app: AppHandle, name: String) -> Result<(), String> {
-    with_write(&app, |engine| {
-        engine.remove_peer(&name)?;
-        Ok(())
-    })
+    apply_config(&app, ConfigChange::RemovePeer { peer: name }).map(drop)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -553,7 +543,22 @@ fn apply_config(app: &AppHandle, change: ConfigChange) -> Result<ConfigApplied, 
     if let Some(mut client) = host_client(app)? {
         return client.config(&change).map_err(|err| error_chain(&err));
     }
-    with_write(app, |engine| Ok(engine.apply_config(&change)?))
+    write_directly(&app.state::<AppState>().home, &change)
+}
+
+/// Write a change when no host is running to apply it live. Retries briefly
+/// while another process holds the writer lock.
+fn write_directly(home: &std::path::Path, change: &ConfigChange) -> Result<ConfigApplied, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match Engine::open_for_config(home) {
+            Ok(mut engine) => return engine.apply_config(change).map_err(|err| error_chain(&err)),
+            Err(EngineError::Busy { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(err) => return Err(error_chain(&err)),
+        }
+    }
 }
 
 #[tauri::command]
@@ -619,33 +624,32 @@ pub fn list_delete_holds(app: AppHandle) -> Result<Vec<DeleteHoldView>, String> 
             deletions: h.deletions as u32,
             live: h.live as u32,
             held_at_ms: h.held_at_ms,
-            decision: h.decision.map(|d| match d {
-                DeleteHoldDecision::Apply => "apply".to_owned(),
-                DeleteHoldDecision::Restore => "restore".to_owned(),
-            }),
+            decision: h.decision,
         })
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn decide_delete_hold(
     app: AppHandle,
     space: String,
     mount: Option<String>,
     peer: Option<String>,
-    decision: String,
+    decision: DeleteHoldDecision,
 ) -> Result<u32, String> {
-    let decision = match decision.as_str() {
-        "apply" => DeleteHoldDecision::Apply,
-        "restore" => DeleteHoldDecision::Restore,
-        other => return Err(format!("unknown decision {other:?}")),
+    let applied = apply_config(
+        &app,
+        ConfigChange::DecideDeleteHold {
+            space,
+            mount,
+            peer,
+            decision,
+        },
+    )?;
+    let ConfigApplied::Holds { decided } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
     };
-    let state = app.state::<AppState>();
-    let mut engine = Engine::open_for_config(&state.home).map_err(|err| error_chain(&err))?;
-    let n = engine
-        .decide_delete_hold(&space, mount.as_deref(), peer.as_deref(), decision)
-        .map_err(|err| error_chain(&err))?;
-    Ok(n as u32)
+    Ok(decided as u32)
 }
 
 #[tauri::command]

@@ -852,8 +852,8 @@ it wants. Rules are not synced and do not change SpaceOffer.
 
 ## D36. Configuration changes on the running host
 
-Space, mount, share, and materialization edits are data: a
-`relay_core::ConfigChange`. Every caller builds one: the CLI, the desktop
+Space, mount, share, materialization, peer, group, and policy edits, and
+held-delete decisions, are data: a `relay_core::ConfigChange`. Every caller builds one: the CLI, the desktop
 app, and later a peer that manages this device (remote explorer proposal).
 This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
 `add_mount` / `share` IPC methods.
@@ -864,8 +864,12 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
   are the change). The host passes `SyncInput::Config` to the loop on the
   priority channel, so a running scan yields. The loop applies the change,
   replies, and only then runs follow-ups: mount watchers, offers to members,
-  `IndexRequest`s, and dropping send cursors on unshare or delete. Nothing
-  reloads, so sessions stay up. Peer and delete-hold edits still reload (D24).
+  `IndexRequest`s, the trusted set, and dropping send cursors on unshare or
+  delete. Nothing reloads, so sessions stay up. Transport, mailbox,
+  recovery, and key rotation still reload (D24): they rebuild networking or
+  keys, which a reload does honestly.
+- **Decided holds resume.** A decision re-runs the batches held for that
+  space. Before, the held batch waited for a reconnect.
 - **Attach requests the index.** A joined mount with no local path skips
   incoming entries (D16), and attaching resets the receive watermark (D15).
   The live attach and join now ask connected members for the index from that
@@ -885,6 +889,9 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
   progress, policies, rules, and mounts go. Stored offers stay so the space
   can be joined again, and key wraps stay so a rejoin can still open
   mailbox objects (D30).
-- **Errors over IPC are strings.** The CLI keeps typed engine errors and
-  exit codes only on the direct path. A host-applied change fails with exit
-  code 1 and the engine's message.
+- **Errors keep a code.** `EngineError::code` gives a stable class
+  (`not_found`, `already_exists`, `invalid`, `precondition`, `busy`, ...).
+  The loop replies with `ConfigRejected { code, message }`, and IPC errors
+  carry the same code. The message alone is what people see.
+- **One decision type.** `DeleteHoldDecision` lives in `relay-core`; the
+  database and engine copies are gone.

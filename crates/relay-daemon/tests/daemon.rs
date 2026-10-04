@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use relay_core::{ConfigApplied, ConfigChange};
+use relay_core::{ConfigApplied, ConfigChange, DeleteHoldDecision};
 use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
 use relay_engine::{Engine, WatchEvent, WatchOptions};
 use tempfile::TempDir;
@@ -540,6 +540,25 @@ fn reload_count(session: &DaemonSession) -> usize {
         .count()
 }
 
+/// Pair alice (listening on `addr_a`) with bob, sharing nothing yet.
+fn pair(home_a: &Path, addr_a: SocketAddr, home_b: &Path) {
+    let code = wait_ipc(home_a).pair_start(&[]).expect("pair_start").code;
+    wait_ipc(home_b)
+        .pair_join(&code, Some(&addr_a.to_string()))
+        .expect("pair_join");
+    assert!(
+        wait_until(CONVERGE, || has_peer(home_a, "bob")
+            && has_peer(home_b, "alice")),
+        "pairing was not recorded on both sides"
+    );
+}
+
+fn config(home: &Path, change: ConfigChange) -> ConfigApplied {
+    wait_ipc(home)
+        .config(&change)
+        .unwrap_or_else(|err| panic!("{change:?}: {err}"))
+}
+
 fn has_peer(home: &Path, name: &str) -> bool {
     Engine::open_read_only(home)
         .and_then(|engine| engine.peers())
@@ -574,17 +593,8 @@ fn live_config_join_attach_and_remove_without_reload() {
     let addr_a = wait_started(&session_a).expect("alice started");
     assert!(wait_started(&session_b).is_some(), "bob started");
 
-    // Pair without sharing anything yet.
+    pair(home_a.path(), addr_a, home_b.path());
     let mut client_a = wait_ipc(home_a.path());
-    let code = client_a.pair_start(&[]).expect("pair_start").code;
-    wait_ipc(home_b.path())
-        .pair_join(&code, Some(&addr_a.to_string()))
-        .expect("pair_join");
-    assert!(
-        wait_until(CONVERGE, || has_peer(home_a.path(), "bob")
-            && has_peer(home_b.path(), "alice")),
-        "pairing was not recorded on both sides"
-    );
 
     // Bob asks to join before Alice shares; the loop holds the join.
     let home_b_path = home_b.path().to_path_buf();
@@ -651,6 +661,109 @@ fn live_config_join_attach_and_remove_without_reload() {
     assert!(synced(mount_b.path(), "hello.txt", b"from-a"), "files stay");
 
     assert_eq!(reload_count(&session_a), 0, "alice reloaded");
+    assert_eq!(reload_count(&session_b), 0, "bob reloaded");
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}
+
+/// A held mass delete resumes on the live loop once decided over IPC.
+#[test]
+fn live_delete_hold_decision_resumes_without_reload() {
+    const FILES: usize = 30;
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let mount_a = TempDir::new().unwrap();
+    let mount_b = TempDir::new().unwrap();
+    for n in 0..FILES {
+        fs::write(mount_a.path().join(format!("f{n}.txt")), b"x").unwrap();
+    }
+    {
+        let mut engine = Engine::init(home_a.path(), "alice").unwrap();
+        engine.create_space("S").unwrap();
+        engine
+            .add_mount("S", "docs", mount_a.path(), &[], &[])
+            .unwrap();
+    }
+    Engine::init(home_b.path(), "bob").unwrap();
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    pair(home_a.path(), addr_a, home_b.path());
+    config(
+        home_a.path(),
+        ConfigChange::Share {
+            space: "S".into(),
+            peer: "bob".into(),
+        },
+    );
+    config(
+        home_b.path(),
+        ConfigChange::JoinSpace {
+            space: "S".into(),
+            from_peer: "alice".into(),
+            wait_ms: 10_000,
+        },
+    );
+    config(
+        home_b.path(),
+        ConfigChange::AddMount {
+            space: "S".into(),
+            mount: "docs".into(),
+            path: mount_b.path().to_path_buf(),
+            includes: Vec::new(),
+            excludes: Vec::new(),
+        },
+    );
+    let count = |dir: &Path| {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != ".relay-mount")
+            .count()
+    };
+    assert!(
+        wait_until(CONVERGE, || count(mount_b.path()) == FILES),
+        "files did not sync to bob"
+    );
+    drain(&session_b);
+
+    // Alice deletes everything on purpose; bob holds it (D22).
+    for n in 0..FILES {
+        fs::remove_file(mount_a.path().join(format!("f{n}.txt"))).unwrap();
+    }
+    Engine::open_for_config(home_a.path())
+        .unwrap()
+        .scan(
+            "S",
+            "docs",
+            relay_engine::ScanOptions {
+                allow_mass_delete: true,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        wait_until(CONVERGE, || Engine::open_read_only(home_b.path())
+            .and_then(|e| e.delete_holds())
+            .is_ok_and(|holds| !holds.is_empty())),
+        "bob did not hold the mass delete"
+    );
+    assert_eq!(count(mount_b.path()), FILES, "held deletes were applied");
+
+    let decided = config(
+        home_b.path(),
+        ConfigChange::DecideDeleteHold {
+            space: "S".into(),
+            mount: None,
+            peer: None,
+            decision: DeleteHoldDecision::Apply,
+        },
+    );
+    assert_eq!(decided, ConfigApplied::Holds { decided: 1 });
+    assert!(
+        wait_until(CONVERGE, || count(mount_b.path()) == 0),
+        "applied deletes did not go through live"
+    );
     assert_eq!(reload_count(&session_b), 0, "bob reloaded");
     stop_daemon(session_a);
     stop_daemon(session_b);

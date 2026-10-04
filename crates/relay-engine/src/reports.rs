@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use relay_core::{Device, DeviceId, LogicalPath, MountId, ObjectId, Sequence, SpaceId};
+use relay_core::{
+    DeleteHoldDecision, Device, DeviceId, LogicalPath, MountId, ObjectId, Sequence, SpaceId,
+};
 use relay_fs::ScanWarning;
 use serde::Serialize;
 
@@ -144,31 +146,6 @@ pub struct MountStatus {
     pub tombstones: usize,
     pub last_scan_ms: Option<i64>,
     pub last_error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeleteHoldDecision {
-    Apply,
-    Restore,
-}
-
-impl From<relay_db::DeleteHoldDecision> for DeleteHoldDecision {
-    fn from(value: relay_db::DeleteHoldDecision) -> Self {
-        match value {
-            relay_db::DeleteHoldDecision::Apply => Self::Apply,
-            relay_db::DeleteHoldDecision::Restore => Self::Restore,
-        }
-    }
-}
-
-impl From<DeleteHoldDecision> for relay_db::DeleteHoldDecision {
-    fn from(value: DeleteHoldDecision) -> Self {
-        match value {
-            DeleteHoldDecision::Apply => Self::Apply,
-            DeleteHoldDecision::Restore => Self::Restore,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -12,9 +12,26 @@ use relay_core::{ConfigApplied, ConfigChange, SpaceId};
 
 use crate::Engine;
 use crate::error::EngineError;
-use crate::sync::{SyncOutput, Syncer};
+use crate::sync::{SyncEvent, SyncOutput, Syncer};
 
-type Reply = mpsc::Sender<Result<ConfigApplied, String>>;
+type Reply = mpsc::Sender<Result<ConfigApplied, ConfigRejected>>;
+
+/// Why a change was refused, with [`EngineError::code`] kept across the
+/// loop's reply channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigRejected {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl From<&EngineError> for ConfigRejected {
+    fn from(err: &EngineError) -> Self {
+        Self {
+            code: err.code(),
+            message: err.to_string(),
+        }
+    }
+}
 
 /// A change that took effect, for the loop's follow-ups.
 pub(crate) struct Applied {
@@ -82,10 +99,10 @@ impl ConfigQueue {
             if now < join.deadline {
                 return true;
             }
-            let _ = join.reply.send(Err(EngineError::UnknownOffer(
-                join.change.space().to_owned(),
-            )
-            .to_string()));
+            let space = join.change.space().unwrap_or_default().to_owned();
+            let _ = join
+                .reply
+                .send(Err((&EngineError::UnknownOffer(space)).into()));
             false
         });
     }
@@ -107,7 +124,9 @@ fn finish(
             let space = space.or(match &result {
                 ConfigApplied::Space { space } => Some(space.id),
                 ConfigApplied::Mount { mount, .. } => Some(mount.space),
-                ConfigApplied::Done => None,
+                ConfigApplied::Peer { .. } | ConfigApplied::Holds { .. } | ConfigApplied::Done => {
+                    None
+                }
             });
             Some(Applied {
                 change,
@@ -116,63 +135,105 @@ fn finish(
             })
         }
         Err(err) => {
-            let _ = reply.send(Err(err.to_string()));
+            let _ = reply.send(Err((&err).into()));
             None
         }
     }
 }
 
 fn space_id(engine: &Engine, change: &ConfigChange) -> Option<SpaceId> {
+    let name = change.space()?;
     engine
         .db
         .repo()
-        .space_by_name(change.space())
+        .space_by_name(name)
         .ok()
         .flatten()
         .map(|space| space.id)
 }
 
 impl Syncer {
-    /// Bring live sessions in line with an applied change: offers, index
-    /// requests, and which spaces each peer is sent.
+    /// Bring live sessions in line with an applied change: the trusted set,
+    /// offers, index requests, which spaces each peer is sent, and held
+    /// batches waiting on a decision.
     pub(crate) fn after_config(
         &mut self,
-        engine: &Engine,
+        engine: &mut Engine,
         applied: &Applied,
         out: &mut dyn FnMut(SyncOutput),
-    ) -> Result<(), EngineError> {
-        let Some(space) = applied.space else {
-            return Ok(());
-        };
+    ) -> Result<Vec<SyncEvent>, EngineError> {
+        let space = applied.space;
         match &applied.change {
             ConfigChange::CreateSpace { .. }
             | ConfigChange::MaterializeAdd { .. }
-            | ConfigChange::MaterializeRemove { .. } => {}
+            | ConfigChange::MaterializeRemove { .. }
+            | ConfigChange::GroupCreate { .. } => {}
             ConfigChange::JoinSpace { .. } => {
                 // Joining adopts the offer's members as peers (D26).
                 out(SyncOutput::SetPeers);
-                self.refresh_offers_for_space(engine, space, out)?;
-                self.request_index(engine, space, out)?;
+                if let Some(space) = space {
+                    self.refresh_offers_for_space(engine, space, out)?;
+                    self.request_index(engine, space, out)?;
+                }
             }
             ConfigChange::AddMount { .. } | ConfigChange::Share { .. } => {
-                self.refresh_offers_for_space(engine, space, out)?;
-                self.request_index(engine, space, out)?;
+                if let Some(space) = space {
+                    self.refresh_offers_for_space(engine, space, out)?;
+                    self.request_index(engine, space, out)?;
+                }
             }
-            ConfigChange::RemoveMount { .. } => {
-                self.refresh_offers_for_space(engine, space, out)?;
+            ConfigChange::RemoveMount { .. }
+            | ConfigChange::PolicyAdd { .. }
+            | ConfigChange::PolicyRemove { .. } => {
+                // Offers carry the mount list and the policy epoch (D27).
+                if let Some(space) = space {
+                    self.refresh_offers_for_space(engine, space, out)?;
+                }
             }
             ConfigChange::Unshare { peer, .. } => {
-                if let Some(peer) = engine.db.repo().peer_by_name(peer)? {
+                if let (Some(space), Some(peer)) = (space, engine.db.repo().peer_by_name(peer)?) {
                     self.stop_sending(peer.device.id, space);
                     self.refresh_offers(engine, peer.device.id, out)?;
                 }
             }
             ConfigChange::DeleteSpace { .. } => {
                 for peer in self.connected_peers() {
-                    self.stop_sending(peer, space);
+                    if let Some(space) = space {
+                        self.stop_sending(peer, space);
+                    }
                     self.refresh_offers(engine, peer, out)?;
                 }
             }
+            ConfigChange::AddPeer { .. }
+            | ConfigChange::RemovePeer { .. }
+            | ConfigChange::RevokePeer { .. } => {
+                // The network drops sessions of peers that left the trusted
+                // set; members listed on everyone else's offers changed.
+                out(SyncOutput::SetPeers);
+                self.refresh_all_offers(engine, out)?;
+            }
+            ConfigChange::GroupAdd { .. }
+            | ConfigChange::GroupRemove { .. }
+            | ConfigChange::GroupDelete { .. } => {
+                // Groups are expanded into every policy that names them.
+                self.refresh_all_offers(engine, out)?;
+            }
+            ConfigChange::DecideDeleteHold { .. } => {
+                if let Some(space) = space {
+                    return self.resume_held(engine, space, out);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn refresh_all_offers(
+        &self,
+        engine: &Engine,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<(), EngineError> {
+        for peer in self.connected_peers() {
+            self.refresh_offers(engine, peer, out)?;
         }
         Ok(())
     }
