@@ -5,10 +5,14 @@
 //! finishes its side; the answering device writes one [`ControlResponse`].
 //! Calls go only to peers whose [`Hello`](crate::Hello) advertises
 //! [`FEATURE_CONTROL`], so an older peer never sees one.
+//!
+//! A config change and its result travel as their JSON form, the same schema
+//! local IPC uses, so the change has one definition (`ConfigChange`) instead
+//! of a second one in protobuf. A change a peer cannot decode is `invalid`.
 
 use relay_core::remote::{
-    DirEntry, DirEntryKind, DirListing, MountRef, RemoteCall, RemoteError, RemoteErrorCode,
-    RemoteMount, RemoteReply, RemoteResult, RemoteRoot, RemoteSpace,
+    DirEntry, DirEntryKind, DirListing, MountRef, PathPreview, RemoteCall, RemoteError,
+    RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult, RemoteRoot, RemoteSpace,
 };
 
 use crate::{Empty, ProtoError, invalid};
@@ -27,7 +31,7 @@ pub struct PeerGrants {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ControlRequest {
-    #[prost(oneof = "control_request::Call", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "control_request::Call", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub call: Option<control_request::Call>,
 }
 
@@ -42,6 +46,13 @@ pub mod control_request {
         Stat(String),
         #[prost(message, tag = "4")]
         Spaces(super::Empty),
+        #[prost(string, tag = "5")]
+        Preview(String),
+        #[prost(message, tag = "6")]
+        CreateDir(super::WireCreateDir),
+        /// `ConfigChange` as JSON.
+        #[prost(bytes = "vec", tag = "7")]
+        Apply(Vec<u8>),
     }
 }
 
@@ -56,8 +67,16 @@ pub struct WireListDir {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+pub struct WireCreateDir {
+    #[prost(string, tag = "1")]
+    pub parent: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 pub struct ControlResponse {
-    #[prost(oneof = "control_response::Reply", tags = "1, 2, 3, 4, 15")]
+    #[prost(oneof = "control_response::Reply", tags = "1, 2, 3, 4, 5, 6, 7, 15")]
     pub reply: Option<control_response::Reply>,
 }
 
@@ -72,6 +91,13 @@ pub mod control_response {
         Stat(super::WireDirEntry),
         #[prost(message, tag = "4")]
         Spaces(super::WireSpaces),
+        #[prost(message, tag = "5")]
+        Preview(super::WirePreview),
+        #[prost(message, tag = "6")]
+        Created(super::WireDirEntry),
+        /// `ConfigApplied` as JSON.
+        #[prost(bytes = "vec", tag = "7")]
+        Applied(Vec<u8>),
         #[prost(message, tag = "15")]
         Error(super::WireRemoteError),
     }
@@ -161,6 +187,28 @@ pub struct WireMount {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+pub struct WirePreview {
+    #[prost(string, optional, tag = "1")]
+    pub path: Option<String>,
+    #[prost(bool, tag = "2")]
+    pub exists: bool,
+    #[prost(bool, tag = "3")]
+    pub is_dir: bool,
+    #[prost(uint64, tag = "4")]
+    pub files: u64,
+    #[prost(uint64, tag = "5")]
+    pub bytes: u64,
+    #[prost(bool, tag = "6")]
+    pub truncated: bool,
+    #[prost(message, optional, tag = "7")]
+    pub overlaps: Option<WireMountRef>,
+    #[prost(bool, tag = "8")]
+    pub cloud_only: bool,
+    #[prost(bool, tag = "9")]
+    pub writable: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 pub struct WireRemoteError {
     #[prost(string, tag = "1")]
     pub code: String,
@@ -183,6 +231,14 @@ pub fn call_to_wire(call: &RemoteCall) -> ControlRequest {
         }),
         RemoteCall::Stat { path } => Call::Stat(path.clone()),
         RemoteCall::Spaces => Call::Spaces(Empty {}),
+        RemoteCall::Preview { path } => Call::Preview(path.clone()),
+        RemoteCall::CreateDir { parent, name } => Call::CreateDir(WireCreateDir {
+            parent: parent.clone(),
+            name: name.clone(),
+        }),
+        RemoteCall::Apply { change } => {
+            Call::Apply(serde_json::to_vec(change).expect("a ConfigChange always serializes"))
+        }
     };
     ControlRequest { call: Some(call) }
 }
@@ -199,6 +255,15 @@ pub fn call_from_wire(request: ControlRequest) -> Result<RemoteCall, ProtoError>
             },
             Call::Stat(path) => RemoteCall::Stat { path },
             Call::Spaces(_) => RemoteCall::Spaces,
+            Call::Preview(path) => RemoteCall::Preview { path },
+            Call::CreateDir(dir) => RemoteCall::CreateDir {
+                parent: dir.parent,
+                name: dir.name,
+            },
+            Call::Apply(json) => RemoteCall::Apply {
+                change: serde_json::from_slice(&json)
+                    .map_err(|e| invalid("change", e.to_string()))?,
+            },
         },
     )
 }
@@ -240,6 +305,21 @@ pub fn result_to_wire(result: &RemoteResult) -> ControlResponse {
                 })
                 .collect(),
         }),
+        Ok(RemoteReply::Preview { preview }) => Reply::Preview(WirePreview {
+            path: preview.path.clone(),
+            exists: preview.exists,
+            is_dir: preview.is_dir,
+            files: preview.files,
+            bytes: preview.bytes,
+            truncated: preview.truncated,
+            overlaps: preview.overlaps.as_ref().map(mount_ref_to_wire),
+            cloud_only: preview.cloud_only,
+            writable: preview.writable,
+        }),
+        Ok(RemoteReply::Created { entry }) => Reply::Created(entry_to_wire(entry)),
+        Ok(RemoteReply::Applied { applied }) => {
+            Reply::Applied(serde_json::to_vec(applied).expect("a ConfigApplied always serializes"))
+        }
         Err(err) => Reply::Error(WireRemoteError {
             code: err.code.as_str().to_owned(),
             message: err.message.clone(),
@@ -291,6 +371,26 @@ pub fn result_from_wire(response: ControlResponse) -> Result<RemoteResult, Proto
                             .collect(),
                     })
                     .collect(),
+            }),
+            Reply::Preview(p) => Ok(RemoteReply::Preview {
+                preview: PathPreview {
+                    path: p.path,
+                    exists: p.exists,
+                    is_dir: p.is_dir,
+                    files: p.files,
+                    bytes: p.bytes,
+                    truncated: p.truncated,
+                    overlaps: p.overlaps.map(mount_ref_from_wire),
+                    cloud_only: p.cloud_only,
+                    writable: p.writable,
+                },
+            }),
+            Reply::Created(entry) => Ok(RemoteReply::Created {
+                entry: entry_from_wire(entry),
+            }),
+            Reply::Applied(json) => Ok(RemoteReply::Applied {
+                applied: serde_json::from_slice(&json)
+                    .map_err(|e| invalid("applied", e.to_string()))?,
             }),
             Reply::Error(err) => Err(RemoteError::new(
                 RemoteErrorCode::parse(&err.code),
@@ -376,6 +476,19 @@ mod tests {
                 path: "/tmp".into(),
             },
             RemoteCall::Spaces,
+            RemoteCall::Preview {
+                path: "D:\\Games".into(),
+            },
+            RemoteCall::CreateDir {
+                parent: "/Users/zach".into(),
+                name: "xyz-foo".into(),
+            },
+            RemoteCall::Apply {
+                change: relay_core::ConfigChange::Share {
+                    space: "S".into(),
+                    peer: "ab".repeat(32),
+                },
+            },
         ] {
             assert_eq!(call_from_wire(call_to_wire(&call)).unwrap(), call);
         }
@@ -401,6 +514,9 @@ mod tests {
                 total: 1,
                 inside_mount: None,
             },
+        }));
+        round_trip(Ok(RemoteReply::Applied {
+            applied: relay_core::ConfigApplied::Done,
         }));
         round_trip(Err(RemoteError::new(RemoteErrorCode::Forbidden, "no")));
     }

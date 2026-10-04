@@ -119,6 +119,47 @@ export type RemoteReply =
   | { reply: "stat"; entry: DirEntry }
   | { reply: "spaces"; spaces: RemoteSpace[] };
 
+export interface PathPreview {
+  path: string | null;
+  exists: boolean;
+  is_dir: boolean;
+  files: number;
+  bytes: number;
+  truncated: boolean;
+  overlaps: MountRef | null;
+  cloud_only: boolean;
+  writable: boolean;
+}
+
+/** One side of a folder pair. `device` null is this computer. */
+export interface FolderEnd {
+  device: string | null;
+  path: string;
+}
+
+export interface FolderPairParams {
+  source: FolderEnd;
+  dest: FolderEnd;
+  create_dest: string | null;
+  name: string | null;
+  excludes: string[];
+  dest_online_only: boolean;
+}
+
+export interface FolderPairPlan {
+  space: string;
+  source: PathPreview;
+  dest: PathPreview | null;
+  problems: string[];
+  warnings: string[];
+}
+
+export interface FolderPairResult {
+  space: string;
+  source_path: string;
+  dest_path: string;
+}
+
 export type RemoteErrorCode =
   | "forbidden"
   | "denied"
@@ -126,6 +167,7 @@ export type RemoteErrorCode =
   | "timeout"
   | "unsupported"
   | "invalid"
+  | "conflict"
   | "busy"
   | "offline"
   | "failed";

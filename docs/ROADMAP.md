@@ -9,10 +9,10 @@ release", and phase writeups are not a status report. This file is.
 
 ## Next
 
-**Remote explorer** ([proposal](proposals/remote-explorer.md)). Stages 0
-(config changes on the running host, D36), 1 (Files view, D38), and 2
-(manage grant and remote browsing, D37) shipped. Stage 3 (folder pairs set
-up from either device) is next.
+**Remote explorer** ([proposal](proposals/remote-explorer.md)). Stages 0–3
+shipped: config changes on the running host (D36), the Files view (D38),
+the manage grant and remote browsing (D37), and folder pairs set up from
+either device (D39). Stage 4 (open a file that is not synced) is next.
 
 **Phase 14 — Integrations.**
 

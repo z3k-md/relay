@@ -4,17 +4,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use relay_core::remote::RemoteReply;
+use relay_core::remote::{RemoteCall, RemoteError, RemoteErrorCode, RemoteReply, RemoteResult};
 use relay_core::{ConfigApplied, ConfigChange, DeviceId, PairingCode, SpaceId};
 use relay_engine::{
-    Engine, EngineError, Rejected, ScanReport, SyncInput, TransferDirection,
+    Engine, EngineError, PeerInfo, Rejected, ScanReport, SyncInput, TransferDirection,
     TransferLive as EngineTransfer, WatchEvent, bookends, index_row,
 };
 use relay_ipc::{
-    ActivityItem, EvictResult, FetchParams, Handler, Hello, HostKind, HostState, Idle, MountLive,
-    PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
-    PeerLive, RemoteParams, RescanParams, RpcErrorBody, Status, TransferDirection as IpcDirection,
-    TransferLive, Watching,
+    ActivityItem, EvictResult, FetchParams, FolderPairParams, Handler, Hello, HostKind, HostState,
+    Idle, MountLive, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams,
+    PairStartResult, PairStatus, PeerLive, RemoteParams, RescanParams, RpcErrorBody, Status,
+    TransferDirection as IpcDirection, TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -201,24 +201,29 @@ impl Host {
 
     /// Make a remote call on a peer by its local name.
     fn remote(&self, params: RemoteParams) -> Result<RemoteReply, RpcErrorBody> {
-        let peer = Engine::open_read_only(&self.home)
+        let peer = self.peer_named(&params.peer)?;
+        self.call_peer(peer.id, params.call)
+            .map_err(|err| RpcErrorBody::new(err.code.as_str(), err.message))
+    }
+
+    pub(crate) fn peer_named(&self, name: &str) -> Result<PeerInfo, RpcErrorBody> {
+        Engine::open_read_only(&self.home)
             .and_then(|engine| engine.peers())
             .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
             .into_iter()
-            .find(|p| p.name == params.peer)
-            .ok_or_else(|| {
-                RpcErrorBody::new("not_found", format!("unknown peer {:?}", params.peer))
-            })?;
-        let net = self.net_sender()?;
+            .find(|p| p.name == name)
+            .ok_or_else(|| RpcErrorBody::new("not_found", format!("unknown peer {name:?}")))
+    }
+
+    /// Make a remote call on a connected peer and wait for the answer.
+    pub(crate) fn call_peer(&self, peer: DeviceId, call: RemoteCall) -> RemoteResult {
+        let net = self
+            .net_sender()
+            .map_err(|err| RemoteError::new(RemoteErrorCode::Offline, err.message))?;
         let (reply, rx) = mpsc::channel();
-        net.send(NetCommand::Control {
-            peer: peer.id,
-            call: params.call,
-            reply,
-        });
+        net.send(NetCommand::Control { peer, call, reply });
         rx.recv_timeout(REMOTE_CALL_WAIT)
-            .map_err(|_| RpcErrorBody::new("timeout", "no answer from the network"))?
-            .map_err(|err| RpcErrorBody::new(err.code.as_str(), err.message))
+            .map_err(|_| RemoteError::new(RemoteErrorCode::Timeout, "no answer from the network"))?
     }
 
     pub fn finish_pair(&self, result: Result<(String, String), String>) {
@@ -325,7 +330,7 @@ impl Host {
 
     /// Apply a config change on the running engine loop when possible;
     /// otherwise write it directly (paused, or between reload cycles).
-    fn config(&self, change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
+    pub(crate) fn config(&self, change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
         let wait = CONFIG_REPLY_WAIT
             + match &change {
                 ConfigChange::JoinSpace { wait_ms, .. } => Duration::from_millis(*wait_ms),
@@ -897,6 +902,16 @@ impl Handler for Host {
                 serde_json::to_value(self.pair_start(params)?).map_err(internal)
             }
             "pair_status" => serde_json::to_value(self.pair_status()).map_err(internal),
+            "folder_pair_preview" => {
+                let params: FolderPairParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(crate::folder_pair::preview(self, &params)?).map_err(internal)
+            }
+            "folder_pair" => {
+                let params: FolderPairParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(crate::folder_pair::run(self, &params)?).map_err(internal)
+            }
             "remote" => {
                 let params: RemoteParams = serde_json::from_value(params)
                     .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;

@@ -4279,6 +4279,7 @@ version = "0.1.7"
 dependencies = [
  "prost",
  "relay-core",
+ "serde_json",
  "thiserror 2.0.21",
  "uuid",
 ]

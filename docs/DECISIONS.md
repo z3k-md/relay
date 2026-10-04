@@ -950,8 +950,9 @@ Remote explorer Stage 1 puts D35 in the desktop app.
   plus a depth test), so a large mount never goes to the UI whole. Each row
   carries one state: `local`, `online_only` (demand, not downloaded),
   `metadata_only`, or `pending` (full, not written yet).
-- **Folder choices** are materialization rules named `folder-…` with one
-  selector, `mount/path/**`. Choosing for a folder deletes the `folder-`
+- **Folder choices** are materialization rules named `folder-…` with the
+  selectors `mount/path/**` and `mount/path` (the folder itself, so an
+  excluded folder does not arrive empty). Choosing for a folder deletes the `folder-`
   rules at or inside it, then appends its own, so the newest choice for a
   parent covers everything in it ("apply to enclosed items"). A later choice
   for a subfolder sits after it and wins there. Hand-written rules are
@@ -966,4 +967,47 @@ Remote explorer Stage 1 puts D35 in the desktop app.
 - **Opening** a file resolves its OS path in the engine
   (`local_file_path`, which refuses symlink escapes) and opens it with the
   system handler.
+
+## D39. Folder pairs set up from either device
+
+Remote explorer Stage 3: one device sets up sync between a folder on itself
+or a peer and a folder on another device, with nothing done by hand on the
+others.
+
+- **Remote writes are `ConfigChange`s.** `RemoteCall::Apply` carries one,
+  applied on the managed device through the same live path its own app uses
+  (D36). Only setup changes are allowed remotely
+  (`ConfigChange::allowed_remotely`): spaces, mounts, shares, and
+  materialization or folder choices. Peers, grants, groups, policies, and
+  held-delete decisions are refused `forbidden`, so a compromised manager
+  cannot bring in another device or widen its own access.
+- **One schema.** On the wire the change and its result travel as their
+  JSON form inside the protobuf call, the same schema local IPC uses. A
+  change a peer cannot decode answers `invalid`.
+- **Peers by id.** The engine resolves a peer from its local name or its
+  device id (`Engine::find_peer`); remote steps always send ids, because
+  names are local labels.
+- **Two more calls.** `Preview` reports whether a folder exists, is empty
+  (counting at most 100,000 files or 2 s), overlaps a mount, holds cloud
+  placeholders, and is writable (a probe file named like Relay's temp
+  files). `CreateDir { parent, name }` lets the managed device join the
+  path itself.
+- **The manager's host runs the steps** (`folder_pair.rs`). Each step is a
+  remote call on the device it touches; this device answers its own steps
+  through the same handler peers reach, so the code is one path whether the
+  manager is the source, the destination, or a third device. Order: source
+  creates the space, attaches its folder, excludes, and shares with the
+  destination; the destination creates its folder if asked, joins (waiting
+  up to 8 s for the offer, under the 10 s per-call limit), sets excludes and
+  online-only, then attaches. Changes are recorded, and a failure undoes
+  them in reverse.
+- **Plan first.** `folder_pair_preview` changes nothing and returns
+  blocking problems (missing folder, overlap with a mount, not writable)
+  and warnings (files already at the destination become conflict copies;
+  cloud placeholders download). `folder_pair` refuses while problems
+  remain. One space per pair, named after the source folder, numbered if
+  either device already has that name.
+- **Known limits.** The source and destination must already be paired with
+  each other. Subfolder choices in the app are one level deep. Both ends
+  must be online during setup.
 

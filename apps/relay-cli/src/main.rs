@@ -22,7 +22,8 @@ use relay_engine::{
     resolve_conflict, resolve_git_conflicts,
 };
 use relay_ipc::{
-    ActivityItem, Client, PairJoinParams, PairStartParams, PairStatus, Status as DaemonStatus,
+    ActivityItem, Client, FolderEnd, FolderPairParams, PairJoinParams, PairStartParams, PairStatus,
+    Status as DaemonStatus,
 };
 
 mod output;
@@ -123,6 +124,33 @@ enum Command {
     Materialize {
         #[command(subcommand)]
         cmd: MaterializeCmd,
+    },
+    /// Sync a folder on one device with a folder on another, set up from
+    /// here. A device is this one unless named; remote devices must let this
+    /// one manage them
+    PairFolder {
+        /// Folder to sync, in its device's path format
+        source: String,
+        /// Folder to sync into (or to create a folder in, with --create)
+        dest: String,
+        /// Device the source folder is on (default: this one)
+        #[arg(long = "from")]
+        from: Option<String>,
+        /// Device the destination is on (default: this one)
+        #[arg(long = "to")]
+        to: Option<String>,
+        /// Create this folder inside DEST and sync into it
+        #[arg(long)]
+        create: Option<String>,
+        /// Leave out a subfolder of the source (repeatable)
+        #[arg(long = "exclude")]
+        excludes: Vec<String>,
+        /// The destination downloads files only when opened
+        #[arg(long)]
+        online_only: bool,
+        /// Show what would happen and change nothing
+        #[arg(long)]
+        check: bool,
     },
     /// List folders on a paired device that lets this one manage it
     Browse {
@@ -606,6 +634,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Policy { cmd } => cmd_policy(&home, cmd, json),
         Command::Materialize { cmd } => cmd_materialize(&home, cmd, json),
         Command::Browse { peer, path, all } => cmd_browse(&home, &peer, path, all, json),
+        Command::PairFolder {
+            source,
+            dest,
+            from,
+            to,
+            create,
+            excludes,
+            online_only,
+            check,
+        } => {
+            let params = FolderPairParams {
+                source: FolderEnd {
+                    device: from,
+                    path: source,
+                },
+                dest: FolderEnd {
+                    device: to,
+                    path: dest,
+                },
+                create_dest: create,
+                name: None,
+                excludes,
+                dest_online_only: online_only,
+            };
+            cmd_pair_folder(&home, &params, check, json)
+        }
         Command::Fetch { target } => cmd_fetch(&home, &target, json),
         Command::Evict { target } => cmd_evict(&home, &target, json),
         Command::Conflicts { space, cmd } => match cmd {
@@ -1997,6 +2051,48 @@ fn cmd_materialize(home: &Path, cmd: MaterializeCmd, json: bool) -> Result<ExitC
                 }
             }
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_pair_folder(
+    home: &Path,
+    params: &FolderPairParams,
+    check: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut client = Client::connect(home)?.ok_or_else(|| {
+        anyhow::anyhow!("Relay is not running; setting up a pair needs a live host")
+    })?;
+    let plan = client.folder_pair_preview(params)?;
+    if check || !plan.problems.is_empty() {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            for line in plan.problems.iter().chain(&plan.warnings) {
+                println!("{line}");
+            }
+            if plan.problems.is_empty() {
+                println!("ready: the space will be named {}", plan.space);
+            }
+        }
+        return Ok(if plan.problems.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        });
+    }
+    let made = client.folder_pair(params)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&made)?);
+    } else {
+        for warning in &plan.warnings {
+            println!("note: {warning}");
+        }
+        println!(
+            "syncing {} with {} (space {})",
+            made.source_path, made.dest_path, made.space
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

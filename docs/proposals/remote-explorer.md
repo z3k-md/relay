@@ -3,7 +3,8 @@
 Build plan for browsing another device's folders, setting up sync from
 either machine, and opening files that are not on this device yet. This does
 not amend [`DESIGN.md`](../DESIGN.md) or [`DECISIONS.md`](../DECISIONS.md).
-Stage 0 is recorded as D36, Stage 1 as D38, and Stage 2 as D37.
+Stage 0 is recorded as D36, Stage 1 as D38, Stage 2 as D37, and Stage 3 as
+D39.
 
 The stages are in build order. Each one ships on its own and is useful
 without the next. Stages 0 and 1 change no wire format and no trust rules.
@@ -246,6 +247,10 @@ touching the PC. A peer without the grant gets `forbidden`. An old peer keeps
 syncing normally.
 
 ## Stage 3. Folder pairs set up from either device
+
+**Shipped (D39).** Remote writes are one `Apply` call carrying a
+`ConfigChange` (allowlisted) rather than a call per operation, and peers are
+addressed by device id. Subfolder choices are one level deep in the app.
 
 - **Write calls** in `ControlRequest`: `Preview { path }`, `CreateDir`,
   `CreateSpace`, `AddMount`, `Share { space, peer_id }`, `JoinSpace {

@@ -411,9 +411,7 @@ impl Engine {
     pub fn revoke_peer(&mut self, name: &str) -> Result<(), EngineError> {
         self.ensure_writable()?;
         let peer = self
-            .db
-            .repo()
-            .peer_by_name(name)?
+            .find_peer(name)?
             .ok_or_else(|| EngineError::UnknownPeer(name.to_owned()))?;
         let id = peer.device.id;
         let spaces = self.db.repo().list_spaces()?;

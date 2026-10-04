@@ -10,24 +10,33 @@ use std::cmp::Ordering;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use relay_core::DeviceId;
 use relay_core::remote::{
     DEFAULT_LISTING, DirEntry, DirEntryKind, DirListing, MAX_LISTING, MountRef, RemoteCall,
     RemoteError, RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult, RemoteRoot, RemoteSpace,
 };
+use std::sync::Arc;
+
+use relay_core::ConfigChange;
+use relay_core::remote::PathPreview;
 use relay_engine::Engine;
+use relay_ipc::ActivityItem;
 use relay_net::ControlHandler;
+
+use crate::host::{Host, now_ms};
 
 pub(crate) struct Browser {
     home: PathBuf,
+    host: Arc<Host>,
 }
 
 impl Browser {
-    pub(crate) fn new(home: &Path) -> Self {
+    pub(crate) fn new(home: &Path, host: Arc<Host>) -> Self {
         Self {
             home: dunce::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()),
+            host,
         }
     }
 }
@@ -36,45 +45,109 @@ impl ControlHandler for Browser {
     fn handle(&self, peer: DeviceId, call: RemoteCall) -> RemoteResult {
         let engine = Engine::open_read_only(&self.home)
             .map_err(|err| RemoteError::new(RemoteErrorCode::Busy, err.to_string()))?;
-        authorize(&engine, peer)?;
-        match call {
-            RemoteCall::Roots => Ok(RemoteReply::Roots { roots: roots() }),
-            RemoteCall::ListDir {
-                path,
-                cursor,
-                limit,
-            } => {
-                let context = Context::load(&engine, &self.home)?;
-                Ok(RemoteReply::Listing {
-                    listing: context.list(&path, cursor, limit)?,
-                })
+        let name = authorize(&engine, peer)?;
+        drop(engine);
+        answer(&self.host, &self.home, call, &name)
+    }
+}
+
+/// Answer `call` on this device. `by` names who asked, for the activity log.
+/// Peers reach this through [`ControlHandler::handle`] after the grant check;
+/// this device's own folder-pair steps call it directly.
+pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, by: &str) -> RemoteResult {
+    let engine = || {
+        Engine::open_read_only(home)
+            .map_err(|err| RemoteError::new(RemoteErrorCode::Busy, err.to_string()))
+    };
+    match call {
+        RemoteCall::Roots => Ok(RemoteReply::Roots { roots: roots() }),
+        RemoteCall::ListDir {
+            path,
+            cursor,
+            limit,
+        } => Ok(RemoteReply::Listing {
+            listing: Context::load(&engine()?, home)?.list(&path, cursor, limit)?,
+        }),
+        RemoteCall::Stat { path } => Ok(RemoteReply::Stat {
+            entry: Context::load(&engine()?, home)?.stat(&path)?,
+        }),
+        RemoteCall::Spaces => Ok(RemoteReply::Spaces {
+            spaces: spaces(&engine()?)?,
+        }),
+        RemoteCall::Preview { path } => Ok(RemoteReply::Preview {
+            preview: Context::load(&engine()?, home)?.preview(&path)?,
+        }),
+        RemoteCall::CreateDir { parent, name } => {
+            let entry = Context::load(&engine()?, home)?.create_dir(&parent, &name)?;
+            log(host, by, &format!("created folder {}", entry.path));
+            Ok(RemoteReply::Created { entry })
+        }
+        RemoteCall::Apply { change } => {
+            if !change.allowed_remotely() {
+                return Err(RemoteError::new(
+                    RemoteErrorCode::Forbidden,
+                    "a managing device cannot change peers, grants, groups, or policies",
+                ));
             }
-            RemoteCall::Stat { path } => {
-                let context = Context::load(&engine, &self.home)?;
-                Ok(RemoteReply::Stat {
-                    entry: context.stat(&path)?,
-                })
-            }
-            RemoteCall::Spaces => Ok(RemoteReply::Spaces {
-                spaces: spaces(&engine)?,
-            }),
+            let summary = describe(&change);
+            let applied = host
+                .config(change)
+                .map_err(|err| RemoteError::new(RemoteErrorCode::parse(&err.code), err.message))?;
+            log(host, by, &summary);
+            Ok(RemoteReply::Applied { applied })
         }
     }
 }
 
-fn authorize(engine: &Engine, peer: DeviceId) -> Result<(), RemoteError> {
-    let allowed = engine
+fn log(host: &Host, by: &str, summary: &str) {
+    host.push_activity(ActivityItem {
+        at_ms: now_ms(),
+        kind: "remote_change".into(),
+        summary: format!("{by} {summary}"),
+        detail: None,
+    });
+}
+
+/// The name of `peer` if it may manage this device.
+fn authorize(engine: &Engine, peer: DeviceId) -> Result<String, RemoteError> {
+    engine
         .peers()
         .map_err(|err| RemoteError::new(RemoteErrorCode::Failed, err.to_string()))?
-        .iter()
-        .any(|p| p.id == peer && p.may_manage && !p.revoked);
-    if allowed {
-        Ok(())
-    } else {
-        Err(RemoteError::new(
-            RemoteErrorCode::Forbidden,
-            "this device has not allowed yours to manage it",
-        ))
+        .into_iter()
+        .find(|p| p.id == peer && p.may_manage && !p.revoked)
+        .map(|p| p.name)
+        .ok_or_else(|| {
+            RemoteError::new(
+                RemoteErrorCode::Forbidden,
+                "this device has not allowed yours to manage it",
+            )
+        })
+}
+
+/// One line for the activity log of a remote change.
+fn describe(change: &ConfigChange) -> String {
+    match change {
+        ConfigChange::CreateSpace { space } => format!("created space {space}"),
+        ConfigChange::DeleteSpace { space } => format!("deleted space {space}"),
+        ConfigChange::JoinSpace { space, .. } => format!("joined space {space}"),
+        ConfigChange::AddMount {
+            space, mount, path, ..
+        } => {
+            format!("set up sync for {} ({space}/{mount})", path.display())
+        }
+        ConfigChange::RemoveMount { space, mount } => format!("stopped syncing {space}/{mount}"),
+        ConfigChange::Share { space, .. } => format!("shared {space}"),
+        ConfigChange::Unshare { space, .. } => format!("stopped sharing {space}"),
+        ConfigChange::SetFolderMode {
+            space,
+            mount,
+            path,
+            mode,
+        } => format!(
+            "set {space}/{mount}/{path} to {}",
+            mode.as_deref().unwrap_or("follow its parent")
+        ),
+        other => format!("changed {:?}", other.space()),
     }
 }
 
@@ -235,6 +308,80 @@ impl Context {
         })
     }
 
+    /// What making `path` a mount would mean. A missing path is not an
+    /// error: the caller may create it.
+    fn preview(&self, path: &str) -> Result<PathPreview, RemoteError> {
+        let raw = Path::new(path);
+        if !raw.is_absolute() {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Invalid,
+                format!("{path} is not an absolute path"),
+            ));
+        }
+        let canonical = match dunce::canonicalize(raw) {
+            Ok(path) => path,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(PathPreview {
+                    path: None,
+                    exists: false,
+                    is_dir: false,
+                    files: 0,
+                    bytes: 0,
+                    truncated: false,
+                    overlaps: None,
+                    cloud_only: false,
+                    writable: false,
+                });
+            }
+            Err(err) => return Err(io_error(&err, raw)),
+        };
+        let path = self.resolve(path)?;
+        let meta = fs::metadata(&path).map_err(|err| io_error(&err, &path))?;
+        let entry = self.describe(&path, &meta);
+        let (files, bytes, truncated) = if meta.is_dir() {
+            count_files(&path)
+        } else {
+            (0, 0, false)
+        };
+        Ok(PathPreview {
+            path: Some(utf8(&canonical)?),
+            exists: true,
+            is_dir: meta.is_dir(),
+            files,
+            bytes,
+            truncated,
+            overlaps: self
+                .mounts
+                .iter()
+                .find(|(root, _)| root.starts_with(&path) || path.starts_with(root))
+                .map(|(_, mount)| mount.clone()),
+            cloud_only: entry.is_some_and(|e| e.cloud_only),
+            writable: meta.is_dir() && writable(&path),
+        })
+    }
+
+    /// Create folder `name` inside `parent`, or accept one already there.
+    fn create_dir(&self, parent: &str, name: &str) -> Result<DirEntry, RemoteError> {
+        let simple =
+            !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0']);
+        if !simple {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Invalid,
+                format!("{name:?} is not a folder name"),
+            ));
+        }
+        let path = self.resolve(parent)?.join(name);
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(err) => return Err(io_error(&err, &path)),
+        }
+        let meta = fs::metadata(&path).map_err(|err| io_error(&err, &path))?;
+        self.describe(&path, &meta).ok_or_else(|| {
+            RemoteError::new(RemoteErrorCode::Invalid, "that path has no UTF-8 name")
+        })
+    }
+
     /// An absolute path, canonicalized, outside Relay's own folder.
     fn resolve(&self, path: &str) -> Result<PathBuf, RemoteError> {
         let raw = Path::new(path);
@@ -292,6 +439,56 @@ impl Context {
             name,
             kind,
         })
+    }
+}
+
+/// Files counted before a preview stops and reports "at least".
+const PREVIEW_MAX_FILES: u64 = 100_000;
+const PREVIEW_MAX_TIME: Duration = Duration::from_secs(2);
+
+/// Files and bytes under `root`, not following symlinks, within the bounds.
+fn count_files(root: &Path) -> (u64, u64, bool) {
+    let started = Instant::now();
+    let (mut files, mut bytes) = (0u64, 0u64);
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            if files >= PREVIEW_MAX_FILES || started.elapsed() >= PREVIEW_MAX_TIME {
+                return (files, bytes, true);
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                dirs.push(entry.path());
+            } else if file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_none_or(|name| !relay_core::is_bookkeeping_component(name))
+            {
+                files += 1;
+                bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    (files, bytes, false)
+}
+
+/// Whether this device can create files in `dir`: make and remove a probe
+/// named like Relay's temp files, which scans already ignore.
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(
+        "{}probe-{}",
+        relay_core::TEMP_PREFIX,
+        std::process::id()
+    ));
+    match fs::File::create_new(&probe) {
+        Ok(_) => fs::remove_file(&probe).is_ok(),
+        Err(_) => false,
     }
 }
 

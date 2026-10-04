@@ -4,6 +4,7 @@
 //! `NetEvent` / `NetCommand` onto `SyncInput` / `SyncOutput` and reopens
 //! when another process commits to the database.
 
+mod folder_pair;
 mod host;
 mod remote;
 
@@ -223,7 +224,7 @@ fn run_loop(
                 enable_stun: opts.enable_stun,
                 relay: transport_relay.clone(),
                 serve_relay: transport_serve,
-                control: Some(Arc::new(remote::Browser::new(home))),
+                control: Some(Arc::new(remote::Browser::new(home, Arc::clone(host)))),
             },
             Box::new(sink),
         )

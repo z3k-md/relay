@@ -164,6 +164,39 @@ impl ConfigChange {
     }
 }
 
+impl ConfigChange {
+    /// Whether a device that manages this one may apply this change (D37).
+    ///
+    /// A manager sets up sync: spaces, mounts, shares, and what this device
+    /// keeps. It never changes who this device trusts or who may manage it,
+    /// so a compromised manager cannot bring in another device.
+    pub fn allowed_remotely(&self) -> bool {
+        match self {
+            Self::CreateSpace { .. }
+            | Self::DeleteSpace { .. }
+            | Self::JoinSpace { .. }
+            | Self::AddMount { .. }
+            | Self::RemoveMount { .. }
+            | Self::Share { .. }
+            | Self::Unshare { .. }
+            | Self::MaterializeAdd { .. }
+            | Self::MaterializeRemove { .. }
+            | Self::SetFolderMode { .. } => true,
+            Self::AddPeer { .. }
+            | Self::RemovePeer { .. }
+            | Self::RevokePeer { .. }
+            | Self::SetPeerManage { .. }
+            | Self::GroupCreate { .. }
+            | Self::GroupAdd { .. }
+            | Self::GroupRemove { .. }
+            | Self::GroupDelete { .. }
+            | Self::PolicyAdd { .. }
+            | Self::PolicyRemove { .. }
+            | Self::DecideDeleteHold { .. } => false,
+        }
+    }
+}
+
 /// What to do with a held mass delete from a peer (D22).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

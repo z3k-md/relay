@@ -1,6 +1,7 @@
 mod commands;
 mod error;
 mod files;
+mod pairs;
 mod privacy;
 mod runner;
 mod settings;
@@ -73,6 +74,8 @@ pub fn run() {
             files::open_file,
             files::free_up_space,
             files::set_folder_mode,
+            pairs::folder_pair_preview,
+            pairs::folder_pair,
             commands::create_space,
             commands::add_mount,
             commands::remove_mount,

@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{ConfigApplied, ConfigChange};
+
 /// Most entries one listing returns. Larger folders page with a cursor.
 pub const MAX_LISTING: u32 = 5_000;
 /// Entries per page when the caller does not ask for a size.
@@ -31,6 +33,21 @@ pub enum RemoteCall {
     },
     /// Spaces and mounts on the answering device.
     Spaces,
+    /// What making `path` a mount would mean: is it there, empty, writable,
+    /// inside or around a mount, a cloud folder.
+    Preview {
+        path: String,
+    },
+    /// Create folder `name` inside `parent`. The answering device joins them.
+    CreateDir {
+        parent: String,
+        name: String,
+    },
+    /// Apply a config change on the answering device (allowlisted by
+    /// [`ConfigChange::allowed_remotely`]). Peers are named by device id.
+    Apply {
+        change: ConfigChange,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +57,29 @@ pub enum RemoteReply {
     Listing { listing: DirListing },
     Stat { entry: DirEntry },
     Spaces { spaces: Vec<RemoteSpace> },
+    Preview { preview: PathPreview },
+    Created { entry: DirEntry },
+    Applied { applied: ConfigApplied },
+}
+
+/// What making a folder a mount would mean.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathPreview {
+    /// Canonical path, when it exists.
+    pub path: Option<String>,
+    pub exists: bool,
+    pub is_dir: bool,
+    /// Files below it, counted up to a bound.
+    pub files: u64,
+    pub bytes: u64,
+    /// The count stopped at the bound; there are at least `files`.
+    pub truncated: bool,
+    /// The mount it is inside of or contains, which forbids a new one (§33).
+    pub overlaps: Option<MountRef>,
+    pub cloud_only: bool,
+    /// This device could write there (checked by creating and removing a
+    /// probe file).
+    pub writable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +159,9 @@ pub enum RemoteErrorCode {
     /// The other device runs a Relay that does not answer remote calls.
     Unsupported,
     Invalid,
+    /// It already exists, or what is there now does not allow it (an
+    /// overlapping mount, a space still in use).
+    Conflict,
     Busy,
     /// The other device is not connected.
     Offline,
@@ -134,6 +177,7 @@ impl RemoteErrorCode {
             Self::Timeout => "timeout",
             Self::Unsupported => "unsupported",
             Self::Invalid => "invalid",
+            Self::Conflict => "conflict",
             Self::Busy => "busy",
             Self::Offline => "offline",
             Self::Failed => "failed",
@@ -149,6 +193,7 @@ impl RemoteErrorCode {
             "timeout" => Self::Timeout,
             "unsupported" => Self::Unsupported,
             "invalid" => Self::Invalid,
+            "conflict" | "already_exists" | "precondition" => Self::Conflict,
             "busy" => Self::Busy,
             "offline" => Self::Offline,
             _ => Self::Failed,

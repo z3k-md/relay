@@ -698,9 +698,7 @@ impl Engine {
         };
         let peer_id = match peer {
             Some(name) => Some(
-                self.db
-                    .repo()
-                    .peer_by_name(name)?
+                self.find_peer(name)?
                     .ok_or_else(|| EngineError::UnknownPeer(name.to_owned()))?
                     .device
                     .id,

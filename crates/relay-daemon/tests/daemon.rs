@@ -966,3 +966,142 @@ fn online_only_files_fetch_and_free_without_reload() {
     stop_daemon(session_a);
     stop_daemon(session_b);
 }
+
+fn folder_pair_params(
+    source: (Option<&str>, &Path),
+    dest: (Option<&str>, &Path),
+    create_dest: Option<&str>,
+    excludes: &[&str],
+) -> relay_ipc::FolderPairParams {
+    let end = |(device, path): (Option<&str>, &Path)| relay_ipc::FolderEnd {
+        device: device.map(str::to_owned),
+        path: dunce_like(path),
+    };
+    relay_ipc::FolderPairParams {
+        source: end(source),
+        dest: end(dest),
+        create_dest: create_dest.map(str::to_owned),
+        name: None,
+        excludes: excludes.iter().map(|s| (*s).to_owned()).collect(),
+        dest_online_only: false,
+    }
+}
+
+/// Canonical form, so `/var` and `/private/var` on macOS compare equal.
+fn dunce_like(path: &Path) -> String {
+    fs::canonicalize(path).unwrap().to_str().unwrap().to_owned()
+}
+
+/// Remote explorer Stage 3: bob, allowed to manage alice, pairs folders in
+/// both directions from bob alone, and a failed setup leaves nothing behind.
+#[test]
+fn manager_sets_up_folder_pairs_both_ways() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let alice_folder = TempDir::new().unwrap();
+    let bob_parent = TempDir::new().unwrap();
+    let bob_folder = TempDir::new().unwrap();
+    let alice_dest = TempDir::new().unwrap();
+    fs::write(alice_folder.path().join("notes.txt"), b"from alice").unwrap();
+    fs::create_dir(alice_folder.path().join("cache")).unwrap();
+    fs::write(alice_folder.path().join("cache/big.bin"), b"skip me").unwrap();
+    fs::write(bob_folder.path().join("todo.txt"), b"from bob").unwrap();
+    Engine::init(home_a.path(), "alice").unwrap();
+    Engine::init(home_b.path(), "bob").unwrap();
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    pair_granting(home_a.path(), addr_a, home_b.path(), true);
+    assert!(
+        wait_until(CONVERGE, || wait_ipc(home_b.path()).status().is_ok_and(
+            |s| s.peers.iter().any(|p| p.name == "alice" && p.manageable)
+        )),
+        "bob never learned alice's grant"
+    );
+    let mut bob = wait_ipc(home_b.path());
+
+    // A manager cannot change who alice trusts.
+    let refused = bob
+        .remote(
+            "alice",
+            &RemoteCall::Apply {
+                change: ConfigChange::AddPeer {
+                    peer: "mallory".into(),
+                    id: relay_core::DeviceId::random(),
+                    addresses: Vec::new(),
+                },
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(refused, relay_ipc::IpcError::Remote { ref code, .. } if code == "forbidden"),
+        "{refused:?}"
+    );
+
+    // A failure part way through undoes the steps already taken on alice.
+    let broken = folder_pair_params(
+        (Some("alice"), alice_folder.path()),
+        (None, bob_parent.path()),
+        Some("bad/name"),
+        &[],
+    );
+    assert!(bob.folder_pair(&broken).is_err());
+    let alice_spaces = || {
+        Engine::open_read_only(home_a.path())
+            .unwrap()
+            .spaces()
+            .unwrap()
+    };
+    assert!(alice_spaces().is_empty(), "undo left {:?}", alice_spaces());
+    assert!(!alice_folder.path().join(".relay-mount").exists());
+
+    // Alice's folder into a new folder on bob, leaving out cache/.
+    let params = folder_pair_params(
+        (Some("alice"), alice_folder.path()),
+        (None, bob_parent.path()),
+        Some("xyz-foo"),
+        &["cache"],
+    );
+    let plan = bob.folder_pair_preview(&params).expect("preview");
+    assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+    let made = bob.folder_pair(&params).expect("folder pair");
+    let dest = bob_parent.path().join("xyz-foo");
+    assert!(
+        wait_until(CONVERGE, || synced(&dest, "notes.txt", b"from alice")),
+        "alice's file did not reach bob"
+    );
+    assert!(!dest.join("cache").exists(), "excluded folder synced");
+    assert_eq!(made.space, plan.space);
+
+    // Bob's own folder onto alice, set up from bob too.
+    let params = folder_pair_params(
+        (None, bob_folder.path()),
+        (Some("alice"), alice_dest.path()),
+        None,
+        &[],
+    );
+    bob.folder_pair(&params).expect("second folder pair");
+    assert!(
+        wait_until(CONVERGE, || synced(
+            alice_dest.path(),
+            "todo.txt",
+            b"from bob"
+        )),
+        "bob's file did not reach alice"
+    );
+
+    // The same source again is refused before anything changes.
+    let again = bob.folder_pair_preview(&folder_pair_params(
+        (Some("alice"), alice_folder.path()),
+        (None, bob_parent.path()),
+        Some("other"),
+        &[],
+    ));
+    assert!(!again.expect("preview").problems.is_empty());
+
+    assert_eq!(reload_count(&session_a), 0, "alice reloaded");
+    assert_eq!(reload_count(&session_b), 0, "bob reloaded");
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}

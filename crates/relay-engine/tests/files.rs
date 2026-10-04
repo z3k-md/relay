@@ -82,6 +82,15 @@ fn a_parent_choice_replaces_choices_inside_it() {
     assert_eq!(list(&engine, "dir/sub").mode, MaterializationMode::Demand);
     assert_eq!(list(&engine, "dir/sub").chosen_here, None);
 
+    set_mode(&mut engine, "dir", Some("exclude"));
+    let root = list(&engine, "");
+    let dir = root.entries.iter().find(|e| e.name == "dir").unwrap();
+    assert_eq!(
+        dir.mode,
+        MaterializationMode::Exclude,
+        "the folder itself too"
+    );
+
     set_mode(&mut engine, "dir", None);
     assert_eq!(list(&engine, "dir").mode, MaterializationMode::Full);
     let rules = engine.materialization_rules(Some("S")).unwrap();

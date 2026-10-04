@@ -236,9 +236,7 @@ impl Engine {
     pub fn set_peer_manage(&mut self, peer: &str, allowed: bool) -> Result<(), EngineError> {
         self.ensure_writable()?;
         let record = self
-            .db
-            .repo()
-            .peer_by_name(peer)?
+            .find_peer(peer)?
             .ok_or_else(|| EngineError::UnknownPeer(peer.to_owned()))?;
         if allowed && self.db.repo().device_status(record.device.id)?.as_deref() == Some("revoked")
         {
@@ -248,6 +246,21 @@ impl Engine {
             .transaction(|repo| repo.set_peer_manage(record.device.id, allowed))
             .map_err(EngineError::from_db)?;
         Ok(())
+    }
+
+    /// A peer by its local name, or by its device id. Names are local
+    /// labels, so another device refers to a peer by id.
+    pub(crate) fn find_peer(
+        &self,
+        name_or_id: &str,
+    ) -> Result<Option<relay_db::PeerRecord>, EngineError> {
+        if let Some(peer) = self.db.repo().peer_by_name(name_or_id)? {
+            return Ok(Some(peer));
+        }
+        match name_or_id.parse::<DeviceId>() {
+            Ok(id) => Ok(self.db.repo().peer_by_id(id)?),
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn peers(&self) -> Result<Vec<PeerInfo>, EngineError> {
@@ -267,9 +280,7 @@ impl Engine {
             .space_by_name(space)?
             .ok_or_else(|| EngineError::UnknownSpace(space.to_owned()))?;
         let peer_rec = self
-            .db
-            .repo()
-            .peer_by_name(peer)?
+            .find_peer(peer)?
             .ok_or_else(|| EngineError::UnknownPeer(peer.to_owned()))?;
         if self.db.repo().device_status(peer_rec.device.id)?.as_deref() == Some("revoked") {
             return Err(EngineError::PeerRevoked(peer.to_owned()));
@@ -288,9 +299,7 @@ impl Engine {
             .space_by_name(space)?
             .ok_or_else(|| EngineError::UnknownSpace(space.to_owned()))?;
         let peer_rec = self
-            .db
-            .repo()
-            .peer_by_name(peer)?
+            .find_peer(peer)?
             .ok_or_else(|| EngineError::UnknownPeer(peer.to_owned()))?;
         self.db
             .transaction(|repo| repo.unshare_space(space_rec.id, peer_rec.device.id))
@@ -322,9 +331,7 @@ impl Engine {
     pub fn join_space(&mut self, name_or_id: &str, from_peer: &str) -> Result<Space, EngineError> {
         self.ensure_writable()?;
         let peer = self
-            .db
-            .repo()
-            .peer_by_name(from_peer)?
+            .find_peer(from_peer)?
             .ok_or_else(|| EngineError::UnknownPeer(from_peer.to_owned()))?;
         let offer = self
             .db

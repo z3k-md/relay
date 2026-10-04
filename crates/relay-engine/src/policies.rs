@@ -302,9 +302,7 @@ impl Engine {
         if self.device.name == name {
             return Ok(self.device.id);
         }
-        self.db
-            .repo()
-            .peer_by_name(name)?
+        self.find_peer(name)?
             .map(|p| p.device.id)
             .ok_or_else(|| EngineError::UnknownPeer(name.to_owned()))
     }

@@ -11,9 +11,10 @@ use relay_core::{ConfigApplied, ConfigChange};
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, EvictResult, FetchParams, Hello, PROTOCOL_VERSION, PairJoinParams,
-    PairJoinResult, PairStartParams, PairStartResult, PairStatus, RemoteParams, Request,
-    RescanParams, RescanResult, Response, Status, decode_line, encode_line,
+    ActivityItem, EvictResult, FetchParams, FolderPairParams, FolderPairPlan, FolderPairResult,
+    Hello, PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult,
+    PairStatus, RemoteParams, Request, RescanParams, RescanResult, Response, Status, decode_line,
+    encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -128,6 +129,25 @@ impl Client {
     pub fn pair_join(&mut self, params: &PairJoinParams) -> Result<PairJoinResult, IpcError> {
         self.call(
             "pair_join",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    /// Check what a folder pair would do. Changes nothing.
+    pub fn folder_pair_preview(
+        &mut self,
+        params: &FolderPairParams,
+    ) -> Result<FolderPairPlan, IpcError> {
+        self.call(
+            "folder_pair_preview",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    /// Set up a folder pair across devices. Undoes its own steps on failure.
+    pub fn folder_pair(&mut self, params: &FolderPairParams) -> Result<FolderPairResult, IpcError> {
+        self.call(
+            "folder_pair",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
     }

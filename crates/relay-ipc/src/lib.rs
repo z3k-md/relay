@@ -11,9 +11,10 @@ mod server;
 pub use client::{Client, Subscribe};
 pub use endpoint::{Endpoint, home_token};
 pub use protocol::{
-    ActivityItem, EvictResult, FetchParams, Hello, HostKind, HostState, Idle, MountLive,
-    PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
-    PeerLive, RemoteParams, Request, RescanParams, RescanResult, RpcError, RpcErrorBody, Status,
+    ActivityItem, EvictResult, FetchParams, FolderEnd, FolderPairParams, FolderPairPlan,
+    FolderPairResult, Hello, HostKind, HostState, Idle, MountLive, PROTOCOL_VERSION,
+    PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive,
+    RemoteParams, Request, RescanParams, RescanResult, RpcError, RpcErrorBody, Status,
     TransferDirection, TransferLive, Watching, decode_line, encode_line,
 };
 pub use server::{Handler, Server};

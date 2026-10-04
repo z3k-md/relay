@@ -10,6 +10,9 @@ import type {
   PairStatus,
   GitResolveReport,
   DeleteHold,
+  FolderPairParams,
+  FolderPairPlan,
+  FolderPairResult,
   FolderView,
   MountView,
   OfferView,
@@ -100,6 +103,9 @@ export const api = {
     call<number>("free_up_space", { space, mount, path }),
   setFolderMode: (space: string, mount: string, path: string, mode: string | null) =>
     call<void>("set_folder_mode", { space, mount, path, mode }),
+  folderPairPreview: (params: FolderPairParams) =>
+    call<FolderPairPlan>("folder_pair_preview", { params }),
+  folderPair: (params: FolderPairParams) => call<FolderPairResult>("folder_pair", { params }),
   joinSpace: (space: string, fromPeer: string) =>
     call<SpaceView>("join_space", { space, fromPeer }),
   deleteSpace: (space: string) => call<void>("delete_space", { space }),

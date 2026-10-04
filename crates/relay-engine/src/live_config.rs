@@ -178,7 +178,7 @@ impl Syncer {
                 }
             }
             ConfigChange::Unshare { peer, .. } => {
-                if let (Some(space), Some(peer)) = (space, engine.db.repo().peer_by_name(peer)?) {
+                if let (Some(space), Some(peer)) = (space, engine.find_peer(peer)?) {
                     self.stop_sending(peer.device.id, space);
                     self.refresh_offers(engine, peer.device.id, out)?;
                 }

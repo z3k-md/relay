@@ -2,8 +2,9 @@
 //! "keep on this device" / "online only" choice (D35, remote explorer
 //! Stage 1).
 //!
-//! A folder choice is a materialization rule named `folder-…` with one
-//! selector, `mount/path/**`. Choosing for a folder replaces the folder rules
+//! A folder choice is a materialization rule named `folder-…` whose
+//! selectors are `mount/path/**` and the folder itself, `mount/path` (so an
+//! excluded folder does not arrive as an empty one). Choosing for a folder replaces the folder rules
 //! inside it, so the newest choice for a parent covers everything in it, the
 //! way "apply to enclosed items" works in a file manager. Rules a person wrote
 //! with `relay materialize` are never touched.
@@ -145,8 +146,10 @@ impl Engine {
             .into_iter()
             .filter(|rule| {
                 rule.name.starts_with(FOLDER_RULE_PREFIX)
-                    && rule.selectors.len() == 1
-                    && rule.selectors[0].starts_with(&inside)
+                    && rule
+                        .selectors
+                        .first()
+                        .is_some_and(|first| first.starts_with(&inside))
             })
             .map(|rule| rule.name)
             .collect();
@@ -164,7 +167,7 @@ impl Engine {
                         space_rec.id,
                         &name,
                         mode.as_str(),
-                        std::slice::from_ref(&selector),
+                        &folder_selectors(&config.mount.name, path),
                         now,
                     )?;
                 }
@@ -216,6 +219,15 @@ fn folder_selector(mount: &str, path: &str) -> String {
     format!("{}/**", policy_path(mount, path))
 }
 
+/// `mount/path/**` then the folder itself; just `mount/**` for the mount.
+fn folder_selectors(mount: &str, path: &str) -> Vec<String> {
+    let mut selectors = vec![folder_selector(mount, path)];
+    if !path.is_empty() {
+        selectors.push(policy_path(mount, path));
+    }
+    selectors
+}
+
 /// A file directly inside `path`, for asking what mode it would get.
 fn child_probe(path: &str) -> String {
     if path.is_empty() {
@@ -226,5 +238,5 @@ fn child_probe(path: &str) -> String {
 }
 
 fn is_folder_rule(name: &str, selectors: &[String], selector: &str) -> bool {
-    name.starts_with(FOLDER_RULE_PREFIX) && selectors.len() == 1 && selectors[0] == selector
+    name.starts_with(FOLDER_RULE_PREFIX) && selectors.first().is_some_and(|s| s == selector)
 }

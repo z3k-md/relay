@@ -275,6 +275,54 @@ pub struct PairJoinParams {
     pub allow_manage: bool,
 }
 
+/// One side of a folder pair: a device (`None` is this one, else a peer's
+/// local name) and a folder in that device's own path format.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderEnd {
+    #[serde(default)]
+    pub device: Option<String>,
+    pub path: String,
+}
+
+/// Sync `source` with `dest` (remote explorer Stage 3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderPairParams {
+    pub source: FolderEnd,
+    pub dest: FolderEnd,
+    /// Create this folder inside `dest.path` and sync into it.
+    #[serde(default)]
+    pub create_dest: Option<String>,
+    /// Space and mount name; defaults to the source folder's name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Subfolders of the source to leave out, `/`-separated and relative.
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    /// The destination downloads files only when opened.
+    #[serde(default)]
+    pub dest_online_only: bool,
+}
+
+/// What [`FolderPairParams`] would do, before anything changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderPairPlan {
+    pub space: String,
+    pub source: relay_core::remote::PathPreview,
+    /// `None` when the destination folder is to be created.
+    pub dest: Option<relay_core::remote::PathPreview>,
+    /// Reasons it cannot go ahead.
+    pub problems: Vec<String>,
+    /// Things to confirm before going ahead.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderPairResult {
+    pub space: String,
+    pub source_path: String,
+    pub dest_path: String,
+}
+
 /// A remote call on a paired device, by its local peer name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteParams {

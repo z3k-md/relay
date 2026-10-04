@@ -46,7 +46,15 @@ relay browse desktop
 relay browse desktop 'C:\Users\zach'
 ```
 
-The first form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
+To sync a folder there with one here, all from this device:
+
+```bash
+relay pair-folder 'C:\Users\zach\xyz' ~/Code --from desktop --create xyz-foo --exclude cache
+```
+
+`--from` and `--to` name the devices (this one when left out), `--create` makes a new folder inside the destination, `--online-only` keeps the destination's files online until opened, and `--check` shows what would happen without changing anything. The app does the same from Browse with "Sync…".
+
+The first browse form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
 
 ## Share a folder
 
@@ -146,6 +154,7 @@ relay service logs -f
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
 | `relay peer allow-manage NAME` / `peer deny-manage NAME` | Let a peer browse this device and set up sync on it, or stop |
 | `relay browse PEER [PATH] [--all]` | List a managed device's roots, or one of its folders |
+| `relay pair-folder SOURCE DEST [--from DEVICE] [--to DEVICE] [--create NAME] [--exclude SUB]... [--online-only] [--check]` | Sync a folder on one device with a folder on another, set up from here |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
 | `relay replica set PATH` / `replica clear` / `replica status` | Durable mailbox directory for offline catch-up |
 | `relay transport set HOST:PORT [--serve]` / `transport clear` / `transport status` | UDP relay when peers cannot dial each other. `--serve` forwards on this machine |

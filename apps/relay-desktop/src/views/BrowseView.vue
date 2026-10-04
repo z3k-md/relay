@@ -2,17 +2,16 @@
 import { computed, onMounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
-import { api, RemoteCallError } from "../lib/api";
-import type { DirEntry, DirListing, PeerView, RemoteRoot } from "../lib/types";
+import PairFolderDialog from "../components/PairFolderDialog.vue";
+import { api } from "../lib/api";
+import { useRemoteFolders } from "../lib/remoteFolders";
+import type { DirEntry, PeerView } from "../lib/types";
 
 const peers = ref<PeerView[]>([]);
-const device = ref<string | null>(null);
-const roots = ref<RemoteRoot[]>([]);
-/** The folder shown; `null` shows the device's roots. */
-const listing = ref<DirListing | null>(null);
 const showHidden = ref(false);
-const loading = ref(false);
-const error = ref<string | null>(null);
+const { device, roots, listing, loading, error, choose, open, loadMore, up } = useRemoteFolders();
+/** The remote folder a "Sync…" dialog is open for. */
+const pairing = ref<{ path: string; name: string } | null>(null);
 
 const browsable = computed(() => peers.value.filter((p) => p.connected && p.canManage));
 const unavailable = computed(() => peers.value.filter((p) => !(p.connected && p.canManage)));
@@ -27,75 +26,22 @@ function whyNot(peer: PeerView): string {
   return "Has not allowed this computer to manage it";
 }
 
-function describe(err: unknown, name: string): string {
-  if (!(err instanceof RemoteCallError)) {
-    return err instanceof Error ? err.message : String(err);
-  }
-  switch (err.code) {
-    case "denied":
-      return `${name} needs to allow this. ${err.message}`;
-    case "forbidden":
-      return `${name} has not allowed this computer to manage it. Turn it on in Peers on ${name}.`;
-    case "offline":
-      return `${name} is not connected.`;
-    case "unsupported":
-      return `${name} runs an older Relay. Update it to browse it.`;
-    case "timeout":
-      return `${name} did not answer in time. A permission prompt may be waiting on it.`;
-    default:
-      return err.message;
-  }
+function syncFolder(path: string, name: string) {
+  pairing.value = { path, name };
 }
 
-async function run(action: () => Promise<void>) {
-  const name = device.value ?? "";
-  loading.value = true;
-  error.value = null;
-  try {
-    await action();
-  } catch (err) {
-    error.value = describe(err, name);
-  } finally {
-    loading.value = false;
-  }
+/** A folder's own name, for display. Paths are otherwise never split. */
+function lastName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
 }
 
-async function choose(name: string) {
-  device.value = name;
-  listing.value = null;
-  roots.value = [];
-  await run(async () => {
-    const reply = await api.remoteCall(name, { call: "roots" });
-    if (reply.reply === "roots") roots.value = reply.roots;
-  });
+function syncedSomewhere(entry: DirEntry): boolean {
+  return !!entry.mount || entry.contains_mount;
 }
 
-async function open(path: string) {
-  const name = device.value;
-  if (!name) return;
-  await run(async () => {
-    const reply = await api.remoteCall(name, { call: "list_dir", path });
-    if (reply.reply === "listing") listing.value = reply.listing;
-  });
-}
-
-async function loadMore() {
-  const name = device.value;
-  const current = listing.value;
-  if (!name || !current || current.next_cursor == null) return;
-  const cursor = current.next_cursor;
-  await run(async () => {
-    const reply = await api.remoteCall(name, { call: "list_dir", path: current.path, cursor });
-    if (reply.reply === "listing") {
-      listing.value = { ...reply.listing, entries: [...current.entries, ...reply.listing.entries] };
-    }
-  });
-}
-
-function up() {
-  const parent = listing.value?.parent;
-  if (parent) void open(parent);
-  else listing.value = null;
+async function afterPair() {
+  pairing.value = null;
+  if (listing.value) await open(listing.value.path);
 }
 
 function formatSize(bytes: number | null): string {
@@ -189,6 +135,15 @@ onMounted(loadPeers);
       >
         Inside the synced folder {{ listing.inside_mount.space }}/{{ listing.inside_mount.mount }}.
       </p>
+      <div v-else-if="listing && listing.parent" class="mb-2 flex justify-end">
+        <button
+          type="button"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[12px] text-[var(--color-accent-fg)]"
+          @click="syncFolder(listing.path, lastName(listing.path))"
+        >
+          Sync this folder…
+        </button>
+      </div>
 
       <ul v-if="!listing" class="space-y-1">
         <li v-for="root in roots" :key="root.path">
@@ -237,6 +192,14 @@ onMounted(loadPeers);
             >
               Cloud
             </span>
+            <button
+              v-if="isFolder(entry) && !syncedSomewhere(entry) && !listing.inside_mount"
+              type="button"
+              class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+              @click="syncFolder(entry.path, entry.name)"
+            >
+              Sync…
+            </button>
             <span class="w-16 shrink-0 text-right text-[12px] text-[var(--color-muted)]">
               {{ formatSize(entry.size) }}
             </span>
@@ -255,5 +218,15 @@ onMounted(loadPeers);
       </template>
       <p v-if="loading" class="mt-2 text-[12px] text-[var(--color-muted)]">Loading…</p>
     </template>
+
+    <PairFolderDialog
+      v-if="pairing && device"
+      :source-device="device"
+      :source-path="pairing.path"
+      :source-name="pairing.name"
+      :peers="browsable"
+      @close="pairing = null"
+      @paired="afterPair"
+    />
   </div>
 </template>
