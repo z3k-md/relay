@@ -11,6 +11,10 @@ pub enum Topology {
     Star,
     /// Node i is paired only with i-1 and i+1.
     Chain,
+    /// The last node is a home server paired with every other node. The
+    /// others never pair with each other, so every change goes through the
+    /// server. The server joins and attaches by itself (`relay server`).
+    Server,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -282,6 +286,27 @@ impl Scenario {
                     "delete_heavy",
                     "Deletes, folder deletes and renames dominate; mass-delete holds are applied.",
                     3,
+                )
+            },
+            Scenario {
+                topology: Topology::Server,
+                net: NetProfile {
+                    latency_ms: (5, 200),
+                    cut_rate: 0.05,
+                    heal_rate: 0.08,
+                    notice_delay_ms: (0, 20_000),
+                    ..NetProfile::reliable()
+                },
+                faults: FaultProfile {
+                    crash_rate: 0.02,
+                    restart_rate: 0.06,
+                    io_error_rate: 0.0,
+                    crash_on_write_rate: 0.01,
+                },
+                ..Scenario::base(
+                    "home_server",
+                    "Three devices that never pair with each other sync through an always-on server that joined and attached the space by itself; laptops drop off and crash.",
+                    4,
                 )
             },
             Scenario {

@@ -1,0 +1,9 @@
+target/
+**/node_modules/
+apps/relay-desktop/dist/
+.relay-sim/
+.relay-deploy/
+dist/
+*.db
+*.db-wal
+*.db-shm

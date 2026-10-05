@@ -514,3 +514,91 @@ fn run_returns_external_change_when_another_engine_commits() {
     assert_eq!(exit, RunExit::ExternalChange);
     stop.store(true, Ordering::SeqCst);
 }
+
+#[test]
+fn server_joins_offered_space_and_attaches_its_mount() {
+    use relay_engine::{SyncInput, SyncOutput};
+    use relay_proto::frame;
+
+    let client_home = TempDir::new().unwrap();
+    let client_mount = TempDir::new().unwrap();
+    let server_home = TempDir::new().unwrap();
+    let server_data = TempDir::new().unwrap();
+    let mut client = Engine::init(client_home.path(), "alpha").unwrap();
+    let mut server = Engine::init(server_home.path(), "nas").unwrap();
+    let client_id = client.device().id;
+    let server_id = server.device().id;
+    client.create_space("Personal").unwrap();
+    client
+        .add_mount("Personal", "code", client_mount.path(), &[], &[])
+        .unwrap();
+    client.add_peer("nas", server_id, &[]).unwrap();
+    client.share("Personal", "nas").unwrap();
+    server.add_peer("alpha", client_id, &[]).unwrap();
+    server.set_peer_manage("alpha", true).unwrap();
+    let data = server.set_server_data(server_data.path()).unwrap();
+    let offers = client.space_offers_for_peer(server_id).unwrap();
+    drop(server);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let home_path = server_home.path().to_path_buf();
+    let (sync_tx, sync_rx) = mpsc::channel();
+    let (out_tx, out_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut engine = Engine::open(&home_path).unwrap();
+        engine.run(
+            WatchOptions {
+                use_watcher: false,
+                ..WatchOptions::default()
+            },
+            sync_rx,
+            move |output| {
+                let _ = out_tx.send(output);
+            },
+            &stop_thread,
+            &mut |_| {},
+        )
+    });
+    sync_tx
+        .send(SyncInput::PeerConnected {
+            peer: client_id,
+            name: "alpha".into(),
+        })
+        .unwrap();
+    sync_tx
+        .send(SyncInput::Frame {
+            peer: client_id,
+            body: frame::Body::SpaceOffers(offers),
+        })
+        .unwrap();
+
+    let expected = data.join("Personal").join("code");
+    let mut asked_index = false;
+    assert!(
+        wait_until(CONVERGE, || {
+            asked_index |= out_rx.try_iter().any(|out| {
+                matches!(
+                    out,
+                    SyncOutput::Send {
+                        peer,
+                        body: frame::Body::IndexRequest(_),
+                    } if peer == client_id
+                )
+            });
+            let status = Engine::open_read_only(server_home.path())
+                .unwrap()
+                .server_status()
+                .unwrap();
+            asked_index
+                && status.mounts.iter().any(|m| {
+                    m.space == "Personal" && m.mount == "code" && m.path.as_ref() == Some(&expected)
+                })
+        }),
+        "server did not join and attach (index requested: {asked_index})"
+    );
+    assert!(expected.join(MOUNT_MARKER).exists());
+    stop.store(true, Ordering::SeqCst);
+    drop(sync_tx);
+    handle.join().expect("run thread panicked").expect("run");
+}

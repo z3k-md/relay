@@ -17,6 +17,7 @@ mod reports;
 mod resolve;
 mod scan;
 mod secrets;
+mod server;
 mod sync;
 mod watch;
 
@@ -65,6 +66,7 @@ pub use reports::{
 pub use resolve::{
     GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
 };
+pub use server::{ServerMount, ServerStatus};
 pub use sync::{PairedPeer, Rejected, SyncEvent, SyncInput, SyncOutput, Syncer};
 pub use watch::{RunExit, WatchEvent, WatchOptions};
 
