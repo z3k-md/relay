@@ -895,6 +895,12 @@ pub async fn install_update(app: AppHandle) -> Result<UpdateInfo, String> {
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
+pub fn releases_url() -> Option<String> {
+    updates::releases_page()
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
 pub fn restart_app(app: AppHandle) {
     updates::restart_now(&app);
 }
@@ -953,6 +959,12 @@ pub fn pending_update() -> Option<UpdateAvailable> {
 #[tauri::command]
 pub async fn install_update() -> Result<UpdateInfo, String> {
     Err("Updates are not available on Android.".to_owned())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn releases_url() -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "android")]

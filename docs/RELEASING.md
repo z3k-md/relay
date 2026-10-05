@@ -1,8 +1,11 @@
 # Releasing Relay
 
 Desktop builds and signed auto-updates are published to
-[github.com/z3k-md/relay](https://github.com/z3k-md/relay) only when a release
-is cut. A normal commit or push does not publish a new version.
+[github.com/z3k-md/relay](https://github.com/z3k-md/relay). A push to `main`
+that changes shipped code (`crates/`, `apps/relay-cli/`, `apps/relay-desktop/`,
+Cargo files) becomes a patch release automatically once CI passes on it
+(D49). Cut a release by hand for a minor, major or exact version, or to
+rebuild.
 
 Commands below write `OWNER/REPO` as a placeholder.
 `scripts/release.sh` and `scripts/setup-updater-key.sh` fill it from
@@ -77,6 +80,12 @@ The updater endpoint in `tauri.conf.json` already points at this repository.
 
 ## Everyday loop
 
+Merge to `main`. When CI passes, the release workflow's `gate` job decides
+whether the push ships and, if so, cuts the next patch version. Its log
+says why it skipped (CI failed, `main` moved on, nothing shipped changed).
+
+By hand:
+
 ```bash
 git checkout main
 git pull
@@ -125,9 +134,11 @@ and publishes it only after checking that `latest.json` lists
 `darwin-aarch64`, `darwin-x86_64` and `windows-x86_64`. Installed apps never
 see a half-built release.
 
-Watch `https://github.com/OWNER/REPO/actions`. Running desktop apps pick
-the new version up within about 30 minutes, or immediately from the tray
-**Check for updates**. Headless installs can download `relay-macos-universal`
+Watch `https://github.com/OWNER/REPO/actions`. Running desktop apps check
+at startup and every 5 minutes of wall-clock time (a machine waking from
+sleep checks within 30 seconds), or immediately from the tray **Check for
+updates**. Settings → Updates links to the Releases page, derived from the
+updater endpoint. Headless installs can download `relay-macos-universal`
 or `relay-windows-x86_64.exe` from the same Release.
 
 `bump=none`, or a re-run of the failed build jobs, rebuilds the current

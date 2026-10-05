@@ -61,6 +61,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D46 | [What a manage grant reaches](#d46-what-a-manage-grant-reaches) |
 | D47 | [Store mode](#d47-store-mode) |
 | D48 | [Connection test](#d48-connection-test) |
+| D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
 
 <!-- index:end -->
 
@@ -348,9 +349,8 @@ runner is hosted in-process (the same engine the CLI embeds). The `relay`
 CLI is also bundled as a sidecar (`bundle.externalBin`) and placed on PATH
 so terminal workflows keep working.
 
-Releases are produced by GitHub Actions only when the release workflow is
-dispatched (`.github/workflows/release.yml`). A normal push does not
-publish a version. The workflow bumps `[workspace.package] version` (patch
+Releases are produced by GitHub Actions (`.github/workflows/release.yml`),
+started automatically after main CI passes (D49) or by hand. The workflow bumps `[workspace.package] version` (patch
 by default), the Tauri and package.json `"version"` fields, commits, and builds.
 macOS is a universal (`aarch64` + `x86_64`)
 ad-hoc-signed `.dmg` (no notarization yet). Windows is a per-user NSIS
@@ -367,6 +367,11 @@ That URL must be publicly downloadable: if the source repo is private,
 set the `RELEASE_REPO` variable and `RELEASE_TOKEN` secret so artifacts
 go to a public repo and point the endpoint there. Losing the private key
 means existing installs can never auto-update again.
+
+Running apps fetch `latest.json` at startup and every 5 minutes of
+wall-clock time. The file is about 1 KB, so a short interval costs nothing,
+and measuring wall-clock time rather than sleeping a fixed interval means a
+machine that wakes from sleep checks within one 30-second tick.
 
 ## D21. Git repository conflict groups and conflict resolution
 
@@ -1395,3 +1400,26 @@ A user can measure the link to a connected peer from the Peers view or
   low. The upload graph counts what this side handed to QUIC, which runs
   ahead of the receiver by up to the flow-control window; the upload rate
   itself is the receiver's.
+
+## D49. Automatic releases after main CI
+
+A merged change used to reach installed apps only after someone ran
+`scripts/release.sh`, so fixes sat on `main` unshipped. Now the release
+workflow also runs on `workflow_run` of CI completing on `main`, and a
+`gate` job publishes a patch release only when all of these hold:
+
+- CI concluded `success` on a `push` (a cancelled run, superseded by a newer
+  push, never ships);
+- the commit CI tested is still the tip of `main`, so a release never builds
+  an untested commit; a newer push ships from its own CI run;
+- the commit is not itself a `Release v` commit;
+- shipped code changed since the last `Release v` commit: `crates/`,
+  `apps/relay-cli/`, `apps/relay-desktop/`, `Cargo.toml`, `Cargo.lock` or
+  `rust-toolchain.toml`, ignoring `*.md`.
+
+Docs-only pushes do not run CI, so they never reach the gate. Manual
+dispatch still covers minor, major, exact versions and rebuilds, and
+shares the `release-main` concurrency group, so two releases never run at
+once. The `Release v` commit is pushed with `GITHUB_TOKEN`, which starts
+no workflows, so a release cannot trigger another. Release commits still
+skip CI.
