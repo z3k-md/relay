@@ -1,8 +1,11 @@
 # Releasing Relay
 
 Desktop builds and signed auto-updates are published to
-[github.com/z3k-md/relay](https://github.com/z3k-md/relay) only when a release
-is cut. A normal commit or push does not publish a new version.
+[github.com/z3k-md/relay](https://github.com/z3k-md/relay). A push to `main`
+that changes shipped code (`crates/`, `apps/relay-cli/`, `apps/relay-desktop/`,
+Cargo files) becomes a patch release automatically once CI passes on it
+(D49). Cut a release by hand for a minor, major or exact version, or to
+rebuild.
 
 Commands below write `OWNER/REPO` as a placeholder.
 `scripts/release.sh` and `scripts/setup-updater-key.sh` fill it from
@@ -76,6 +79,12 @@ The updater endpoint in `tauri.conf.json` already points at this repository.
    Run anyway.
 
 ## Everyday loop
+
+Merge to `main`. When CI passes, the release workflow's `gate` job decides
+whether the push ships and, if so, cuts the next patch version. Its log
+says why it skipped (CI failed, `main` moved on, nothing shipped changed).
+
+By hand:
 
 ```bash
 git checkout main
