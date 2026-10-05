@@ -1176,8 +1176,10 @@ impl<'a> Simulator<'a> {
                 .into_iter()
                 .find_map(|(_, config)| config.local_path)
                 .ok_or_else(|| "server did not attach the mount".to_owned())?;
-            let expected = fs::canonicalize(&expected).map_err(|e| e.to_string())?;
-            if attached != expected {
+            // Both through the same call: the engine stores dunce paths, which
+            // lack the `\\?\` prefix `fs::canonicalize` adds on Windows.
+            let canonical = |p: &Path| fs::canonicalize(p).map_err(|e| e.to_string());
+            if canonical(&attached)? != canonical(&expected)? {
                 return Err(format!(
                     "server attached {} instead of {}",
                     attached.display(),
