@@ -10,12 +10,20 @@ Plans that are not decisions yet live in [`proposals/`](proposals/).
 optional, self-hosted, always-on Relay device in the sync chain: a durable
 copy, history the other devices cannot erase, and rendezvous. Stage 1, the
 server role (D45), shipped: `relay server enable`, auto-join and attach, a
-container image, and a systemd unit. Store mode is next.
+container image, and a systemd unit. Stage 2, store mode (D47), shipped:
+the server keeps bytes in its object store with an empty data folder.
+Backup semantics (append-only, retention, snapshots) are next.
 
 **Online-only files in the OS file manager**
 ([proposal](proposals/os-integration.md)). Windows Cloud Files placeholders
 shipped (D43). Next: pins and sync status in Explorer, then the macOS File
 Provider extension, then a Linux FUSE view.
+
+**Android background sync** ([proposal](proposals/android.md)). Stage 1, a
+CI debug APK build, shipped. Stage 2 runs the engine in a foreground sync
+service (PR #19); then background catch-up, a DocumentsProvider, and shared
+storage.
+
 
 ## Next
 
@@ -33,8 +41,8 @@ Not in a fixed order.
 
 - **Hosted server** (tier 3, D44). The home server binary, run for people
   without hardware. Blind by default; billing only here.
-- **Android background sync** and a folder picker. iOS, Play Store signing,
-  and photo-library access are out until a decision adds them (D33).
+- **iOS.** Out until a decision adds it (D33).
+
 - **Transfer throughput** for photos and video: resume, larger packets on
   direct paths, streamed mailbox objects, then chunks
   ([proposal](proposals/transfer-throughput.md)).
@@ -56,7 +64,7 @@ Smaller open items:
 | Conflicts | Deterministic conflict copies, Git repository groups, clean three-way text merge, held peer mass deletes | D2, D18, D21, D22, D31 |
 | Hosts | `relay run`, `relay service`, the desktop app; local IPC; live config changes | D19, D24, D36 |
 | Pairing | Short code with SPAKE2, mDNS on the LAN, `--addr` elsewhere | D25 |
-| Selection | Replication policies and device groups; per-device `full` / `metadata` / `demand` / `exclude` | D27, D35 |
+| Selection | Replication policies and device groups; per-device `full` / `metadata` / `demand` / `store` / `exclude` | D27, D35, D47 |
 | Catch-up | Mailbox directory with ack-based GC and mirror mode | D29 |
 | Encryption | Per-space keys for mailbox objects, recovery secret, revoke, rotate | D30 |
 | Networking | Dial ranking, hole punching through the mailbox, user-run UDP relay, multi-source fetch | D32, D34 |
@@ -64,7 +72,7 @@ Smaller open items:
 | Desktop app | macOS and Windows, self-updating; Android foreground shell | D20, D33 |
 | Remote management | Manage grant, Browse another device, folder pairs from either side, open or copy remote files, folder sizes | D37–D42, D46 |
 | Online-only files | Files view choices; Cloud Files placeholders on Windows | D38, D43 |
-| Home server | Server role, container, systemd unit | D45 |
+| Home server | Server role, store mode, container, systemd unit | D45, D47 |
 | Testing | `relay-sim` lab, `relay-vopr` deterministic simulator, tiered CI | [`DEVELOPMENT.md`](DEVELOPMENT.md) |
 
 ## Accepted limits

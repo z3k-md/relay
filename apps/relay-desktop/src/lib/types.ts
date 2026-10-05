@@ -41,7 +41,7 @@ export interface PeerView {
 
 // Files view (D38). Engine shapes as-is, so snake_case.
 
-export type MaterializationMode = "full" | "metadata" | "demand" | "exclude";
+export type MaterializationMode = "full" | "metadata" | "demand" | "exclude" | "store";
 
 export interface FileRow {
   name: string;
@@ -50,7 +50,7 @@ export interface FileRow {
   kind: "file" | "directory" | "symlink";
   size: number | null;
   modified_ms: number;
-  state: "local" | "online_only" | "metadata_only" | "pending";
+  state: "local" | "online_only" | "metadata_only" | "pending" | "stored";
   mode: MaterializationMode;
   conflict_copy: boolean;
 }

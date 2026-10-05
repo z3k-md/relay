@@ -9,6 +9,14 @@ they are never online together. Plan and later stages:
 It is an ordinary peer. It does not decide conflicts, and your devices keep
 syncing with each other when it is off.
 
+Files are kept in Relay's object store, not as files in the data folder
+(`store` mode), so the folders under `<data>` stay empty. To browse a folder
+on the server itself, for example over SMB, switch it to full copies:
+
+```sh
+relay materialize add Photos browse --mode full --selector 'files/**'
+```
+
 ## Linux (systemd)
 
 ```sh

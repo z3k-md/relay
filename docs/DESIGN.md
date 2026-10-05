@@ -56,9 +56,10 @@ Three layers, each narrower than the last:
 2. **Replication policies** (D27). `selector -> devices or groups`. With no
    policies, a shared space syncs everything to every peer it is shared with.
    Overlapping policies union. A policy never grants sync without a share.
-3. **Materialization** (D35, D38). Each device decides what it does with a
-   path it receives: `full`, `metadata`, `demand` (online-only until opened),
-   or `exclude`. Last matching rule wins. On Windows, online-only files are
+3. **Materialization** (D35, D38, D47). Each device decides what it does
+   with a path it receives: `full`, `metadata`, `demand` (online-only until
+   opened), `store` (bytes in the object store, nothing in the folder), or
+   `exclude`. Last matching rule wins. On Windows, online-only files are
    Cloud Files placeholders in Explorer (D43;
    [`proposals/os-integration.md`](proposals/os-integration.md) for macOS and
    Linux).
@@ -113,8 +114,9 @@ Online presence is not durability; acknowledgements are.
   never online together. Acked entries are collected after a grace period;
   `--mirror` keeps the latest copy of every path. Objects are sealed with the
   space key (D30).
-- **Home server** (D44, D45). A Relay device with the server role joins every
-  space its peers share with it and keeps a full copy. Store mode, durability
+- **Home server** (D44, D45, D47). A Relay device with the server role joins
+  every space its peers share with it and keeps every file's bytes in its
+  object store (`store` mode), with an empty data folder. Durability
   targets, server-owned history, and rendezvous are the next stages
   ([`proposals/home-server.md`](proposals/home-server.md)). The server is a
   peer, never the authoritative filesystem.
