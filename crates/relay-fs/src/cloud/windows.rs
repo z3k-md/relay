@@ -98,9 +98,12 @@ pub(super) fn unregister(account: &str) -> Result<(), FsError> {
     let path = Path::new(account);
     guarded(path, || {
         let id = root_id(account).map_err(|err| cloud_err(path, err))?;
-        match id.is_registered() {
-            Ok(false) => Ok(()),
-            _ => id.unregister().map_err(|err| cloud_err(path, err)),
+        // `is_registered` asks the shell, which can miss roots that exist
+        // (CI, services), so always try and judge failure by the registry.
+        match id.unregister() {
+            Ok(()) => Ok(()),
+            Err(_) if !in_registry(&id.to_os_string().to_string_lossy()) => Ok(()),
+            Err(err) => Err(cloud_err(path, err)),
         }
     })
 }
@@ -121,6 +124,12 @@ pub(super) fn registered() -> Vec<RegisteredRoot> {
         }
     }
     found
+}
+
+fn in_registry(id: &str) -> bool {
+    windows_registry::LOCAL_MACHINE
+        .open(format!(r"{SYNC_ROOT_KEY}\{id}"))
+        .is_ok()
 }
 
 fn account_of<'a>(id: &'a str, prefix: &str) -> Option<&'a str> {
