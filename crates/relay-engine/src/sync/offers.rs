@@ -54,7 +54,7 @@ impl Syncer {
         // Spaces this peer offered before. One it offers for the first time
         // and that this device already shares with it is one the peer just
         // joined: any index request sent earlier found nothing to answer.
-        let known: HashSet<SpaceId> = engine
+        let known: BTreeSet<SpaceId> = engine
             .db
             .repo()
             .list_offers()?

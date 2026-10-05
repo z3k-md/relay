@@ -447,6 +447,8 @@ fn durable_install(
     if dest.is_file() {
         return Ok(true);
     }
+    relay_core::faults::check(relay_core::faults::FaultPoint::StorePut, &dest)
+        .map_err(|e| io_err(&dest, e))?;
 
     if let Some(parent) = dest.parent() {
         create_dir(parent)?;

@@ -4370,6 +4370,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-vopr"
+version = "0.1.10"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "rand 0.8.8",
+ "rand_chacha 0.3.1",
+ "relay-core",
+ "relay-crypto",
+ "relay-engine",
+ "relay-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

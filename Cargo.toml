@@ -15,6 +15,7 @@ members = [
     "crates/relay-ipc",
     "apps/relay-cli",
     "apps/relay-sim",
+    "apps/relay-vopr",
     "apps/relay-desktop/src-tauri",
 ]
 # Plain `cargo build` / `cargo test` skip the desktop app: it needs the
@@ -35,6 +36,7 @@ default-members = [
     "crates/relay-ipc",
     "apps/relay-cli",
     "apps/relay-sim",
+    "apps/relay-vopr",
 ]
 
 [workspace.package]
@@ -100,3 +102,9 @@ todo = "warn"
 
 [profile.release]
 strip = "symbols"
+
+# Hashing and SQLite dominate test time; keep them fast in dev builds.
+[profile.dev.package.blake3]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

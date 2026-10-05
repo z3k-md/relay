@@ -8,6 +8,7 @@ pub mod config;
 pub mod conflict;
 pub mod entry;
 pub mod error;
+pub mod faults;
 pub mod git;
 pub mod ids;
 pub mod local;
