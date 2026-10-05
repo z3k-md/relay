@@ -14,7 +14,7 @@ use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use relay_core::conflict::is_conflict_copy;
 use relay_core::faults::{self, FaultPoint};
-use relay_core::{DeleteHoldDecision, DeviceId, LogicalPath, ObjectId};
+use relay_core::{ConfigChange, DeleteHoldDecision, DeviceId, LogicalPath, ObjectId};
 use relay_crypto::DeviceIdentity;
 use relay_engine::{
     Engine, EngineError, EntryContent, ManualClock, ScanOptions, SpaceId, SyncEvent, SyncInput,
@@ -168,6 +168,9 @@ struct Node {
     syncer: Syncer,
     /// Working tree changed since the last scan.
     dirty: bool,
+    /// A home server: joins and attaches through `Engine::server_plan` and
+    /// makes no edits of its own.
+    server: bool,
 }
 
 impl Node {
@@ -253,7 +256,13 @@ impl<'a> Simulator<'a> {
             let name = format!("node{i}");
             let dir = root.path().join(&name);
             let home = dir.join("home");
-            let mount = dir.join("mount");
+            let server = scenario.topology == Topology::Server && i + 1 == scenario.nodes;
+            // A server keeps each mount under `<data>/<space>/<mount>`.
+            let mount = if server {
+                dir.join("data").join(SPACE).join(MOUNT)
+            } else {
+                dir.join("mount")
+            };
             fs::create_dir_all(&mount).expect("create mount dir");
             let mut key_seed = [0u8; 32];
             rng.fill_bytes(&mut key_seed);
@@ -275,6 +284,7 @@ impl<'a> Simulator<'a> {
                 engine: None,
                 syncer: Syncer::new(),
                 dirty: false,
+                server,
             });
         }
         let mut adjacent = BTreeSet::new();
@@ -284,6 +294,7 @@ impl<'a> Simulator<'a> {
                     Topology::Mesh => true,
                     Topology::Star => a == 0,
                     Topology::Chain => b == a + 1,
+                    Topology::Server => b + 1 == scenario.nodes,
                 };
                 if linked {
                     adjacent.insert((a, b));
@@ -1041,6 +1052,12 @@ impl<'a> Simulator<'a> {
                 .map_err(|e| self.fail(format!("init node{i}: {e}")))?;
             self.nodes[i].engine = Some(engine);
             self.nodes[i].syncer = self.new_syncer();
+            if self.nodes[i].server {
+                let data = self.nodes[i].home.with_file_name("data");
+                let engine = self.nodes[i].engine.as_mut().expect("up");
+                let result = engine.set_server_data(&data);
+                result.map_err(|e| self.fail(format!("node{i} server enable: {e}")))?;
+            }
         }
         let edges: Vec<_> = self.adjacent.iter().copied().collect();
         for (a, b) in &edges {
@@ -1053,6 +1070,12 @@ impl<'a> Simulator<'a> {
                     .expect("up")
                     .add_peer(&name, id, &["127.0.0.1:1".into()])
                     .map_err(|e| self.fail(format!("add_peer: {e}")))?;
+                // A server joins only what its managers offer (D45).
+                if self.nodes[me].server {
+                    let engine = self.nodes[me].engine.as_mut().expect("up");
+                    let result = engine.set_peer_manage(&name, true);
+                    result.map_err(|e| self.fail(format!("allow-manage {name}: {e}")))?;
+                }
             }
         }
         // Node 0 owns the space; every other node joins from its BFS parent.
@@ -1092,7 +1115,9 @@ impl<'a> Simulator<'a> {
                 self.settle()?;
                 let parent_name = self.nodes[parent].name.clone();
                 let mount = self.nodes[child].mount.clone();
-                {
+                if self.nodes[child].server {
+                    self.server_join(child)?;
+                } else {
                     let engine = self.nodes[child].engine.as_mut().expect("up");
                     let result = engine
                         .join_space(SPACE, &parent_name)
@@ -1131,6 +1156,48 @@ impl<'a> Simulator<'a> {
         self.trace(format!("setup complete: {}", ids.join(" ")));
         self.faults_enabled = true;
         Ok(())
+    }
+
+    /// What the daemon loop does on a server when offers arrive: apply each
+    /// change `server_plan` returns. The plan must join the space and attach
+    /// its mount where the simulator expects it.
+    fn server_join(&mut self, node: usize) -> Result<(), Failure> {
+        let name = self.nodes[node].name.clone();
+        let expected = self.nodes[node].mount.clone();
+        let engine = self.nodes[node].engine.as_mut().expect("up");
+        let result = (|| {
+            let plan = engine.server_plan().map_err(engine_error)?;
+            if !plan
+                .iter()
+                .any(|c| matches!(c, ConfigChange::JoinSpace { space, .. } if space == SPACE))
+            {
+                return Err(format!("server plan does not join {SPACE}: {plan:?}"));
+            }
+            for change in &plan {
+                engine.apply_config(change).map_err(engine_error)?;
+            }
+            let attached = engine
+                .mounts(Some(SPACE))
+                .map_err(engine_error)?
+                .into_iter()
+                .find_map(|(_, config)| config.local_path)
+                .ok_or_else(|| "server did not attach the mount".to_owned())?;
+            // Both through the same call: the engine stores dunce paths, which
+            // lack the `\\?\` prefix `fs::canonicalize` adds on Windows.
+            let canonical = |p: &Path| fs::canonicalize(p).map_err(|e| e.to_string());
+            if canonical(&attached)? != canonical(&expected)? {
+                return Err(format!(
+                    "server attached {} instead of {}",
+                    attached.display(),
+                    expected.display()
+                ));
+            }
+            if !engine.server_plan().map_err(engine_error)?.is_empty() {
+                return Err("server plan is not empty after applying it".into());
+            }
+            Ok(())
+        })();
+        result.map_err(|m| self.fail(format!("{name} server join: {m}")))
     }
 
     fn share_with_neighbours(&mut self, node: usize) -> Result<(), Failure> {
@@ -1427,7 +1494,7 @@ impl<'a> Simulator<'a> {
 
     fn workload_op(&mut self) -> Result<(), Failure> {
         let up: Vec<usize> = (0..self.nodes.len())
-            .filter(|i| self.nodes[*i].up())
+            .filter(|i| self.nodes[*i].up() && !self.nodes[*i].server)
             .collect();
         let Some(&node) = up.choose(&mut self.rng) else {
             return Ok(());

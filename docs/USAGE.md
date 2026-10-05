@@ -168,6 +168,7 @@ relay service logs -f
 | `relay opened` / `opened remove SPACE` | List folders set up by `relay open`, or remove one |
 | `relay pair-folder SOURCE DEST [--from DEVICE] [--to DEVICE] [--create NAME] [--exclude SUB]... [--online-only] [--check]` | Sync a folder on one device with a folder on another, set up from here |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
+| `relay server enable --data DIR` / `server disable` / `server status` | Home server: join every space shared by a device allowed to manage it, keeping folders under `DIR/<space>/<mount>` ([setup](../packaging/server/README.md)) |
 | `relay replica set PATH` / `replica clear` / `replica status` | Durable mailbox directory for offline catch-up |
 | `relay transport set HOST:PORT [--serve]` / `transport clear` / `transport status` | UDP relay when peers cannot dial each other. `--serve` forwards on this machine |
 | `relay replica gc [--mirror] [--grace-secs N]` | Garbage-collect acked mailbox entries and objects |
@@ -205,7 +206,7 @@ Exit codes: `0` ok, `1` error, `2` mass delete refused, `3` `relay verify` found
 
 `--dev-excludes` adds `**/node_modules/**`, `**/target/**`, `**/dist/**`, `**/build/**`, `**/.venv/**`, and `**/__pycache__/**`. A `.relayignore` file at the mount root adds more exclude globs, one per line. Rules are per device.
 
-A running Relay applies `space`, `mount`, `share` / `unshare`, `peer add` / `remove` / `revoke`, `group`, `policy`, `materialize`, and `deletes apply` / `restore` on its live loop. `transport`, `replica`, `recovery`, and `space rotate` are picked up within about a second by reloading. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
+A running Relay applies `space`, `mount`, `share` / `unshare`, `peer add` / `remove` / `revoke`, `group`, `policy`, `materialize`, and `deletes apply` / `restore` on its live loop. `transport`, `replica`, `server`, `recovery`, and `space rotate` are picked up within about a second by reloading. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
 
 ## Catch-up and hard-to-reach networks
 
