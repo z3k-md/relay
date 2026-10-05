@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use relay_core::DeviceId;
+use relay_core::remote::{RemoteCall, RemoteError, RemoteErrorCode, RemoteReply};
+use relay_core::speed::SpeedReport;
+use relay_core::{ConfigApplied, ConfigChange, DeviceId};
 use relay_engine::{
     ConflictClass, DeleteHoldDecision, Engine, EngineError, Resolution,
     resolve_conflict as engine_resolve_conflict, resolve_git_conflicts as engine_resolve_git,
@@ -19,7 +21,7 @@ use crate::sidecar::{self, CliInstallResult, CliStatus, ShellKind};
 #[cfg(not(target_os = "android"))]
 use crate::updates::{self, UpdateInfo};
 use crate::{AppState, settings};
-use relay_ipc::Client;
+use relay_ipc::{Client, PairJoinParams, PairStartParams, PeerLive, SpeedTestParams};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +53,12 @@ pub struct PeerView {
     /// Last live contact. `None` until this peer has connected once.
     /// While offline, this is when that contact ended.
     pub last_seen_ms: Option<i64>,
+    /// This peer may browse this device and set up sync on it.
+    pub allowed_to_manage: bool,
+    /// This peer lets this device manage it. Known only while connected.
+    pub can_manage: bool,
+    /// This peer's Relay answers remote calls. Known only while connected.
+    pub supports_remote: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,7 +113,7 @@ pub struct DeleteHoldView {
     pub deletions: u32,
     pub live: u32,
     pub held_at_ms: i64,
-    pub decision: Option<String>,
+    pub decision: Option<DeleteHoldDecision>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -167,26 +175,11 @@ pub fn suggested_device_name() -> String {
     "this-device".to_owned()
 }
 
-fn open_ro(home: &std::path::Path) -> Result<Engine, String> {
+pub(crate) fn open_ro(home: &std::path::Path) -> Result<Engine, String> {
     Engine::open_read_only(home).map_err(|err| error_chain(&err))
 }
 
-fn with_write<T>(
-    app: &AppHandle,
-    f: impl FnOnce(&mut Engine) -> anyhow::Result<T>,
-) -> Result<T, String> {
-    let state = app.state::<AppState>();
-    state.runner.stop_join();
-    let home = state.home.clone();
-    let result = (|| {
-        let mut engine = Engine::open_for_config(&home)?;
-        f(&mut engine)
-    })();
-    state.runner.start(app);
-    result.map_err(anyhow_chain)
-}
-
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_overview(app: AppHandle) -> Result<Overview, String> {
     let state = app.state::<AppState>();
     let runner = state.runner.state();
@@ -229,7 +222,7 @@ pub fn get_overview(app: AppHandle) -> Result<Overview, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn init_device(app: AppHandle, name: String) -> Result<Overview, String> {
     let state = app.state::<AppState>();
     let name = name.trim().to_owned();
@@ -246,23 +239,35 @@ pub fn init_device(app: AppHandle, name: String) -> Result<Overview, String> {
 
 /// Live sessions from the running host when one is listening, otherwise the
 /// in-app runner. The host is the source of truth for the background service.
-fn live_sessions(app: &AppHandle) -> HashMap<String, i64> {
+/// Connected peers by device id, from the running host when there is one.
+fn live_sessions(app: &AppHandle) -> HashMap<String, PeerLive> {
     if let Ok(Some(mut client)) = host_client(app)
         && let Ok(status) = client.status()
     {
         return status
             .peers
             .into_iter()
-            .filter_map(|peer| {
-                let since = i64::try_from(peer.connected_at_ms).ok()?;
-                Some((peer.id, since))
-            })
+            .map(|peer| (peer.id.clone(), peer))
             .collect();
     }
-    app.state::<AppState>().runner.connected_since()
+    app.state::<AppState>()
+        .runner
+        .connected_since()
+        .into_iter()
+        .map(|(id, since)| {
+            let peer = PeerLive {
+                id: id.clone(),
+                name: String::new(),
+                connected_at_ms: u64::try_from(since).unwrap_or_default(),
+                supports_remote: false,
+                manageable: false,
+            };
+            (id, peer)
+        })
+        .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_peers(app: AppHandle) -> Result<Vec<PeerView>, String> {
     let sessions = live_sessions(&app);
     let state = app.state::<AppState>();
@@ -272,21 +277,81 @@ pub fn list_peers(app: AppHandle) -> Result<Vec<PeerView>, String> {
         .into_iter()
         .map(|p| {
             let id = p.id.to_string();
-            let since = sessions.get(&id).copied();
+            let live = sessions.get(&id);
             PeerView {
                 name: p.name,
                 short_id: p.id.short(),
-                connected: since.is_some(),
-                connected_since_ms: since,
+                connected: live.is_some(),
+                connected_since_ms: live.and_then(|l| i64::try_from(l.connected_at_ms).ok()),
                 last_seen_ms: p.last_seen_ms,
                 address: p.addresses.first().cloned().unwrap_or_default(),
+                allowed_to_manage: p.may_manage,
+                can_manage: live.is_some_and(|l| l.manageable),
+                supports_remote: live.is_some_and(|l| l.supports_remote),
                 id,
             }
         })
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+pub fn set_peer_manage(app: AppHandle, name: String, allowed: bool) -> Result<(), String> {
+    apply_config(
+        &app,
+        ConfigChange::SetPeerManage {
+            peer: name,
+            allowed,
+        },
+    )
+    .map(drop)
+}
+
+/// A remote call on a paired device. Errors keep their stable code so the UI
+/// can tell "needs permission" from "offline".
+#[tauri::command(async)]
+pub fn remote_call(
+    app: AppHandle,
+    peer: String,
+    call: RemoteCall,
+) -> Result<RemoteReply, RemoteError> {
+    // Not `Offline`: that reads as the other device being down.
+    let mut client = host_client(&app).ok().flatten().ok_or_else(|| {
+        RemoteError::new(
+            RemoteErrorCode::Failed,
+            "Relay is not running on this computer. Resume sync and try again.",
+        )
+    })?;
+    client.remote(&peer, &call).map_err(|err| match err {
+        relay_ipc::IpcError::Remote { code, message } => {
+            RemoteError::new(RemoteErrorCode::parse(&code), message)
+        }
+        other => RemoteError::new(RemoteErrorCode::Failed, error_chain(&other)),
+    })
+}
+
+/// Measure the connection to a connected peer (D48). Blocks for the test,
+/// about ten seconds.
+#[tauri::command(async)]
+pub fn speed_test(app: AppHandle, peer: String) -> Result<SpeedReport, RemoteError> {
+    let mut client = host_client(&app).ok().flatten().ok_or_else(|| {
+        RemoteError::new(
+            RemoteErrorCode::Failed,
+            "Relay is not running on this computer. Resume sync and try again.",
+        )
+    })?;
+    let params = SpeedTestParams {
+        peer,
+        duration_ms: None,
+    };
+    client.speed_test(&params).map_err(|err| match err {
+        relay_ipc::IpcError::Remote { code, message } => {
+            RemoteError::new(RemoteErrorCode::parse(&code), message)
+        }
+        other => RemoteError::new(RemoteErrorCode::Failed, error_chain(&other)),
+    })
+}
+
+#[tauri::command(async)]
 pub fn add_peer(
     app: AppHandle,
     name: String,
@@ -301,26 +366,34 @@ pub fn add_peer(
     if address.is_empty() {
         return Err("Address is required (for example 192.168.1.20:47321).".to_owned());
     }
-    with_write(&app, |engine| {
-        let peer = engine.add_peer(name.trim(), id, std::slice::from_ref(&address))?;
-        Ok(PeerView {
-            name: peer.name,
-            id: peer.id.to_string(),
-            short_id: peer.id.short(),
-            address,
-            connected: false,
-            connected_since_ms: None,
-            last_seen_ms: peer.last_seen_ms,
-        })
+    let applied = apply_config(
+        &app,
+        ConfigChange::AddPeer {
+            peer: name.trim().to_owned(),
+            id,
+            addresses: vec![address.clone()],
+        },
+    )?;
+    let ConfigApplied::Peer { device } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
+    };
+    Ok(PeerView {
+        name: device.name,
+        id: device.id.to_string(),
+        short_id: device.id.short(),
+        address,
+        connected: false,
+        connected_since_ms: None,
+        last_seen_ms: None,
+        allowed_to_manage: false,
+        can_manage: false,
+        supports_remote: false,
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_peer(app: AppHandle, name: String) -> Result<(), String> {
-    with_write(&app, |engine| {
-        engine.remove_peer(&name)?;
-        Ok(())
-    })
+    apply_config(&app, ConfigChange::RemovePeer { peer: name }).map(drop)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -361,7 +434,7 @@ fn pairing_client(app: &AppHandle) -> Result<Client, String> {
 
 /// Prefer the running host's IPC so config writes do not `stop_join` the sync
 /// thread. Returns `Ok(None)` only when nothing is listening on the socket.
-fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
+pub(crate) fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
     let state = app.state::<AppState>();
     match Client::connect(&state.home) {
         Ok(client) => Ok(client),
@@ -369,17 +442,26 @@ fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
     }
 }
 
-#[tauri::command]
-pub fn pair_start(app: AppHandle, share: Vec<String>) -> Result<PairStartView, String> {
+#[tauri::command(async)]
+pub fn pair_start(
+    app: AppHandle,
+    share: Vec<String>,
+    allow_manage: bool,
+) -> Result<PairStartView, String> {
     let mut client = pairing_client(&app)?;
-    let started = client.pair_start(&share).map_err(|err| error_chain(&err))?;
+    let started = client
+        .pair_start(&PairStartParams {
+            share,
+            allow_manage,
+        })
+        .map_err(|err| error_chain(&err))?;
     Ok(PairStartView {
         code: started.code,
         expires_at_ms: started.expires_at_ms,
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_status(app: AppHandle) -> Result<PairStatusView, String> {
     let mut client = pairing_client(&app)?;
     let status = client.pair_status().map_err(|err| error_chain(&err))?;
@@ -394,16 +476,25 @@ pub fn pair_status(app: AppHandle) -> Result<PairStatusView, String> {
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_join(
     app: AppHandle,
     code: String,
     addr: Option<String>,
+    allow_manage: bool,
 ) -> Result<PairJoinView, String> {
     let mut client = pairing_client(&app)?;
-    let addr = addr.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let addr = addr
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let joined = client
-        .pair_join(code.trim(), addr)
+        .pair_join(&PairJoinParams {
+            code: code.trim().to_owned(),
+            addr,
+            allow_manage,
+        })
         .map_err(|err| error_chain(&err))?;
     Ok(PairJoinView {
         peer_name: joined.peer_name,
@@ -411,32 +502,32 @@ pub fn pair_join(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_cancel(app: AppHandle) -> Result<(), String> {
     let mut client = pairing_client(&app)?;
     client.pair_cancel().map_err(|err| error_chain(&err))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_spaces(app: AppHandle) -> Result<Vec<SpaceView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
     let spaces = engine.spaces().map_err(|err| error_chain(&err))?;
     let mounts = engine.mounts(None).map_err(|err| error_chain(&err))?;
-    let status = engine.status().map_err(|err| error_chain(&err))?;
+    // Not `engine.status()`: its entry counts and object store walk grow
+    // with the files synced, and this runs on every visit to Spaces/Peers.
+    let health = engine.mount_health().map_err(|err| error_chain(&err))?;
+    let peer_shares = engine.peer_shares().map_err(|err| error_chain(&err))?;
 
     let mut shared: HashMap<String, Vec<String>> = HashMap::new();
-    for peer in status.peers {
-        for space in peer.spaces {
-            shared
-                .entry(space.space)
-                .or_default()
-                .push(peer.name.clone());
+    for (peer, spaces) in peer_shares {
+        for space in spaces {
+            shared.entry(space).or_default().push(peer.clone());
         }
     }
 
     let mut mount_state: HashMap<(String, String), (Option<String>, String, bool)> = HashMap::new();
-    for m in status.mounts {
+    for m in health {
         mount_state.insert(
             (m.space, m.mount),
             (
@@ -480,36 +571,21 @@ pub fn list_spaces(app: AppHandle) -> Result<Vec<SpaceView>, String> {
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_space(app: AppHandle, name: String) -> Result<SpaceView, String> {
     let name = name.trim().to_owned();
     relay_core::validate_name(&name).map_err(|err| error_chain(&err))?;
-    let home = app.state::<AppState>().home.clone();
-    // `open_for_config` is safe while the sync loop runs: the loop drops its
-    // writer lock and reloads after the commit. Stopping the loop to write
-    // restarts it, which waits on the sync thread and flashes console windows
-    // for `relay service status`.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let space = loop {
-        match Engine::open_for_config(&home) {
-            Ok(mut engine) => {
-                if engine
-                    .spaces()
-                    .map_err(|err| error_chain(&err))?
-                    .iter()
-                    .any(|space| space.name == name)
-                {
-                    return Err(format!("a space named {name:?} already exists"));
-                }
-                break engine
-                    .create_space(&name)
-                    .map_err(|err| error_chain(&err))?;
-            }
-            Err(EngineError::Busy { .. }) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(err) => return Err(error_chain(&err)),
-        }
+    let exists = open_ro(&app.state::<AppState>().home)?
+        .spaces()
+        .map_err(|err| error_chain(&err))?
+        .iter()
+        .any(|space| space.name == name);
+    if exists {
+        return Err(format!("a space named {name:?} already exists"));
+    }
+    let applied = apply_config(&app, ConfigChange::CreateSpace { space: name })?;
+    let ConfigApplied::Space { space } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
     };
     Ok(SpaceView {
         name: space.name,
@@ -526,49 +602,67 @@ pub fn add_mount(
     mount: String,
     path: String,
 ) -> Result<MountView, String> {
-    let path = PathBuf::from(path);
-    if let Some(mut client) = host_client(&app)? {
-        let added = client
-            .add_mount(&space, &mount, &path)
-            .map_err(|err| error_chain(&err))?;
-        return Ok(MountView {
-            name: added.name,
-            path: added.path.as_ref().map(|p| p.display().to_string()),
-            attached: added.path.is_some(),
-            state: "OK".to_owned(),
-        });
-    }
-    with_write(&app, |engine| {
-        let config = engine.add_mount(&space, &mount, &path, &[], &[])?;
-        Ok(MountView {
-            name: config.mount.name,
-            path: config.local_path.as_ref().map(|p| p.display().to_string()),
-            attached: config.local_path.is_some(),
-            state: "OK".to_owned(),
-        })
+    let applied = apply_config(
+        &app,
+        ConfigChange::AddMount {
+            space,
+            mount,
+            path: PathBuf::from(path),
+            includes: Vec::new(),
+            excludes: Vec::new(),
+        },
+    )?;
+    let ConfigApplied::Mount { mount, path } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
+    };
+    Ok(MountView {
+        name: mount.name,
+        attached: path.is_some(),
+        path: path.map(|p| p.display().to_string()),
+        state: "OK".to_owned(),
     })
 }
 
 #[tauri::command(async)]
+pub fn remove_mount(app: AppHandle, space: String, mount: String) -> Result<(), String> {
+    apply_config(&app, ConfigChange::RemoveMount { space, mount }).map(drop)
+}
+
+#[tauri::command(async)]
 pub fn share(app: AppHandle, space: String, peer: String) -> Result<(), String> {
-    if let Some(mut client) = host_client(&app)? {
-        return client.share(&space, &peer).map_err(|err| error_chain(&err));
-    }
-    with_write(&app, |engine| {
-        engine.share(&space, &peer)?;
-        Ok(())
-    })
+    apply_config(&app, ConfigChange::Share { space, peer }).map(drop)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn unshare(app: AppHandle, space: String, peer: String) -> Result<(), String> {
-    with_write(&app, |engine| {
-        engine.unshare(&space, &peer)?;
-        Ok(())
-    })
+    apply_config(&app, ConfigChange::Unshare { space, peer }).map(drop)
 }
 
-#[tauri::command]
+/// Apply a config change through the running host so live sessions survive.
+/// With no host running, write it directly.
+pub(crate) fn apply_config(app: &AppHandle, change: ConfigChange) -> Result<ConfigApplied, String> {
+    if let Some(mut client) = host_client(app)? {
+        return client.config(&change).map_err(|err| error_chain(&err));
+    }
+    write_directly(&app.state::<AppState>().home, &change)
+}
+
+/// Write a change when no host is running to apply it live. Retries briefly
+/// while another process holds the writer lock.
+fn write_directly(home: &std::path::Path, change: &ConfigChange) -> Result<ConfigApplied, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match Engine::open_for_config(home) {
+            Ok(mut engine) => return engine.apply_config(change).map_err(|err| error_chain(&err)),
+            Err(EngineError::Busy { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(err) => return Err(error_chain(&err)),
+        }
+    }
+}
+
+#[tauri::command(async)]
 pub fn list_offers(app: AppHandle) -> Result<Vec<OfferView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
@@ -588,20 +682,33 @@ pub fn list_offers(app: AppHandle) -> Result<Vec<OfferView>, String> {
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn join_space(app: AppHandle, space: String, from_peer: String) -> Result<SpaceView, String> {
-    with_write(&app, |engine| {
-        let created = engine.join_space(&space, &from_peer)?;
-        Ok(SpaceView {
-            name: created.name,
-            id: created.id.to_string(),
-            mounts: Vec::new(),
-            shared_with: vec![from_peer.clone()],
-        })
+    let applied = apply_config(
+        &app,
+        ConfigChange::JoinSpace {
+            space,
+            from_peer: from_peer.clone(),
+            wait_ms: 0,
+        },
+    )?;
+    let ConfigApplied::Space { space } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
+    };
+    Ok(SpaceView {
+        name: space.name,
+        id: space.id.to_string(),
+        mounts: Vec::new(),
+        shared_with: vec![from_peer],
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+pub fn delete_space(app: AppHandle, space: String) -> Result<(), String> {
+    apply_config(&app, ConfigChange::DeleteSpace { space }).map(drop)
+}
+
+#[tauri::command(async)]
 pub fn list_delete_holds(app: AppHandle) -> Result<Vec<DeleteHoldView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
@@ -618,36 +725,35 @@ pub fn list_delete_holds(app: AppHandle) -> Result<Vec<DeleteHoldView>, String> 
             deletions: h.deletions as u32,
             live: h.live as u32,
             held_at_ms: h.held_at_ms,
-            decision: h.decision.map(|d| match d {
-                DeleteHoldDecision::Apply => "apply".to_owned(),
-                DeleteHoldDecision::Restore => "restore".to_owned(),
-            }),
+            decision: h.decision,
         })
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn decide_delete_hold(
     app: AppHandle,
     space: String,
     mount: Option<String>,
     peer: Option<String>,
-    decision: String,
+    decision: DeleteHoldDecision,
 ) -> Result<u32, String> {
-    let decision = match decision.as_str() {
-        "apply" => DeleteHoldDecision::Apply,
-        "restore" => DeleteHoldDecision::Restore,
-        other => return Err(format!("unknown decision {other:?}")),
+    let applied = apply_config(
+        &app,
+        ConfigChange::DecideDeleteHold {
+            space,
+            mount,
+            peer,
+            decision,
+        },
+    )?;
+    let ConfigApplied::Holds { decided } = applied else {
+        return Err(format!("unexpected result {applied:?}"));
     };
-    let state = app.state::<AppState>();
-    let mut engine = Engine::open_for_config(&state.home).map_err(|err| error_chain(&err))?;
-    let n = engine
-        .decide_delete_hold(&space, mount.as_deref(), peer.as_deref(), decision)
-        .map_err(|err| error_chain(&err))?;
-    Ok(n as u32)
+    Ok(decided as u32)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_conflicts(app: AppHandle) -> Result<Vec<ConflictView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
@@ -693,7 +799,7 @@ pub fn list_conflicts(app: AppHandle) -> Result<Vec<ConflictView>, String> {
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resolve_conflict(
     app: AppHandle,
     space: String,
@@ -725,7 +831,7 @@ pub fn resolve_conflict(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resolve_git_conflicts(
     app: AppHandle,
     space: String,
@@ -755,14 +861,14 @@ pub fn get_activity(app: AppHandle) -> Result<Vec<crate::runner::ActivityItem>, 
     Ok(state.runner.activity())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pause_sync(app: AppHandle) -> Result<RunnerState, String> {
     let state = app.state::<AppState>();
     state.runner.pause(&app).map_err(anyhow_chain)?;
     Ok(state.runner.state())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resume_sync(app: AppHandle) -> Result<RunnerState, String> {
     let state = app.state::<AppState>();
     state.runner.resume(&app).map_err(anyhow_chain)?;
@@ -785,6 +891,12 @@ pub fn pending_update() -> Option<updates::UpdateAvailable> {
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<UpdateInfo, String> {
     updates::install(&app).await
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub fn releases_url() -> Option<String> {
+    updates::releases_page()
 }
 
 #[cfg(not(target_os = "android"))]
@@ -851,6 +963,12 @@ pub async fn install_update() -> Result<UpdateInfo, String> {
 
 #[cfg(target_os = "android")]
 #[tauri::command]
+pub fn releases_url() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
 pub fn restart_app() {}
 
 #[tauri::command]
@@ -865,7 +983,7 @@ pub struct SettingsPatch {
     pub auto_update: Option<bool>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_settings(app: AppHandle, patch: SettingsPatch) -> Result<settings::Settings, String> {
     if let Some(value) = patch.start_at_login {
         settings::set_start_at_login(&app, value).map_err(anyhow_chain)?;
@@ -887,8 +1005,29 @@ pub fn open_logs_folder(app: AppHandle) -> Result<(), String> {
         .map_err(|err| anyhow_chain(err.into()))
 }
 
-#[cfg(not(target_os = "android"))]
+/// Whether this Mac lets Relay read every folder. `None` off macOS.
 #[tauri::command]
+pub fn full_disk_access() -> Option<bool> {
+    crate::privacy::full_disk_access()
+}
+
+#[tauri::command]
+pub fn open_full_disk_access(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        app.opener()
+            .open_url(crate::privacy::FULL_DISK_ACCESS_PANE, None::<&str>)
+            .map_err(|err| anyhow_chain(err.into()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("Full Disk Access is a macOS setting".to_owned())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command(async)]
 pub fn cli_status() -> Result<CliStatus, String> {
     Ok(sidecar::cli_status())
 }
@@ -921,7 +1060,7 @@ pub fn cli_status() -> Result<CliStatus, String> {
 }
 
 #[cfg(not(target_os = "android"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn install_cli(app: AppHandle, shell: Option<String>) -> Result<CliInstallResult, String> {
     let shell = match shell.as_deref() {
         None => None,
