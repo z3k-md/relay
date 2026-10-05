@@ -112,7 +112,7 @@ const bars = computed(() => [
     value: sweep.value ? `${sweep.value.avgFps.toFixed(1)} fps, p95 ${sweep.value.p95.toFixed(1)} ms` : "—",
     pass:
       sweep.value && sweep.value.rows >= 200_000
-        ? sweep.value.avgFps >= 57 && sweep.value.p95 <= 20
+        ? sweep.value.avgFps >= 57 && sweep.value.p95 <= 20 && sweep.value.blank <= sweep.value.frames / 100
         : null,
   },
   {
@@ -225,7 +225,7 @@ onBeforeUnmount(() => {
       <div v-for="r in scrollResults" :key="r.mode" class="mt-2 tabular-nums">
         <span class="font-medium">{{ r.mode }}</span>
         {{ r.rows.toLocaleString() }} rows · {{ r.avgFps.toFixed(1) }} fps · p95
-        {{ r.p95.toFixed(1) }} ms · p99 {{ r.p99.toFixed(1) }} ms · dropped {{ r.dropped }}/{{ r.frames }}
+        {{ r.p95.toFixed(1) }} ms · p99 {{ r.p99.toFixed(1) }} ms · dropped {{ r.dropped }}/{{ r.frames }} · blank {{ r.blank }}
       </div>
     </section>
 

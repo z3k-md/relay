@@ -2,10 +2,11 @@
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 /**
- * A thumbnail painted onto a canvas from a bitmap that is closed right after.
- * An <img> per tile leaves each decoded thumbnail in the renderer's image
- * caches after its tile scrolls away (about 200 MB after sweeping 2k images),
- * whereas a canvas keeps decoded pixels to the tiles that exist.
+ * A thumbnail shown by handing its decoded bitmap to a canvas, and released
+ * as soon as the tile unmounts. An <img> per tile leaves every decoded
+ * thumbnail in the renderer's image caches after its tile scrolls away, and
+ * a 2D canvas keeps a (GPU) backing store until garbage collection; both
+ * grew by hundreds of MB over a 2k-image sweep.
  */
 const props = defineProps<{ url: string; size: number }>();
 
@@ -13,31 +14,50 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 const px = Math.round(props.size * window.devicePixelRatio);
 let pending: AbortController | null = null;
 
-async function draw(url: string) {
+function release() {
+  const el = canvas.value;
+  el?.getContext("bitmaprenderer")?.transferFromImageBitmap(null);
+  if (el) el.width = el.height = 0;
+}
+
+async function show(url: string) {
   pending?.abort();
   const ctrl = new AbortController();
   pending = ctrl;
-  const ctx = canvas.value?.getContext("2d");
-  ctx?.clearRect(0, 0, px, px);
+  release();
   try {
-    const bitmap = await createImageBitmap(await encoded(url, ctrl.signal));
-    if (ctrl.signal.aborted || !ctx) {
+    const blob = await encoded(url, ctrl.signal);
+    // Shrink to the tile while decoding; never enlarge.
+    const probe = await createImageBitmap(blob);
+    const scale = Math.min(1, px / probe.width, px / probe.height);
+    const bitmap =
+      scale < 1
+        ? await createImageBitmap(probe, {
+            resizeWidth: Math.max(1, Math.round(probe.width * scale)),
+            resizeHeight: Math.max(1, Math.round(probe.height * scale)),
+            resizeQuality: "high",
+          })
+        : probe;
+    if (bitmap !== probe) probe.close();
+    const el = canvas.value;
+    if (ctrl.signal.aborted || !el) {
       bitmap.close();
       return;
     }
-    // Fit inside the square and centre it, like object-fit: contain.
-    const scale = Math.min(px / bitmap.width, px / bitmap.height);
-    const w = Math.round(bitmap.width * scale);
-    const h = Math.round(bitmap.height * scale);
-    ctx.drawImage(bitmap, (px - w) >> 1, (px - h) >> 1, w, h);
-    bitmap.close();
+    el.width = bitmap.width;
+    el.height = bitmap.height;
+    // Takes ownership of the pixels: no copy, nothing left to close.
+    el.getContext("bitmaprenderer")?.transferFromImageBitmap(bitmap);
   } catch {
     // No thumbnail (or the tile went away): leave the square empty.
   }
 }
 
-onMounted(() => watch(() => props.url, draw, { immediate: true }));
-onBeforeUnmount(() => pending?.abort());
+onMounted(() => watch(() => props.url, show, { immediate: true }));
+onBeforeUnmount(() => {
+  pending?.abort();
+  release();
+});
 </script>
 
 <script lang="ts">
@@ -65,8 +85,9 @@ async function encoded(url: string, signal: AbortSignal): Promise<Blob> {
 <template>
   <canvas
     ref="canvas"
-    :width="px"
-    :height="px"
+    width="0"
+    height="0"
+    class="object-contain"
     :style="{ width: `${size}px`, height: `${size}px` }"
     draggable="false"
   />

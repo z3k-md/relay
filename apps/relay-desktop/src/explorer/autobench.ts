@@ -167,7 +167,7 @@ export async function autobench(host: BenchHost): Promise<string> {
     lines.push(
       "",
       `${mark(medianPaint <= 150)} first paint ≤ 150 ms for 10k items: median ${medianPaint.toFixed(0)} ms (runs ${paints.map((p) => p.toFixed(0)).join(", ")})`,
-      `${mark(sweep.avgFps >= 57 && sweep.p95 <= 20)} 60 fps sweeping 200k items: ${sweep.avgFps.toFixed(1)} fps, p95 ${sweep.p95.toFixed(1)} ms`,
+      `${mark(sweep.avgFps >= 57 && sweep.p95 <= 20 && sweep.blank <= sweep.frames / 100)} 60 fps sweeping 200k items: ${sweep.avgFps.toFixed(1)} fps, p95 ${sweep.p95.toFixed(1)} ms, ${sweep.blank} blank frames`,
       memory
         ? `${mark(memory.workingSetBytes <= 250 * MB)} ≤ 250 MB with ${host.tabs()} tabs: ${(memory.workingSetBytes / MB).toFixed(0)} MB`
         : "n/a memory (Windows only)",
