@@ -493,9 +493,7 @@ fn print_status(status: &ServiceStatus, json: bool) -> Result<()> {
 fn cmd_logs(home: &Path, n: usize, follow: bool) -> Result<ExitCode> {
     let path = log_path(home);
     if path.exists() {
-        let contents =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        for line in last_n_lines(&contents, n) {
+        for line in tail_lines(&path, n).with_context(|| format!("reading {}", path.display()))? {
             println!("{line}");
         }
     }
@@ -532,6 +530,37 @@ fn file_len(path: &Path) -> std::io::Result<u64> {
     Ok(fs::metadata(path)?.len())
 }
 
+/// The last `n` lines, read backwards in chunks so a large log is not
+/// loaded whole.
+fn tail_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut file = File::open(path)?;
+    let mut start = file.metadata()?.len();
+    let mut buf: Vec<u8> = Vec::new();
+    while start > 0 {
+        let from = start.saturating_sub(CHUNK);
+        let mut chunk = vec![0u8; (start - from) as usize];
+        file.seek(SeekFrom::Start(from))?;
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+        start = from;
+        // More newlines than lines wanted means the first (possibly cut)
+        // line in the buffer is not one of them.
+        if bytecount_newlines(&buf) > n {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    Ok(last_n_lines(&text, n)
+        .into_iter()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn bytecount_newlines(buf: &[u8]) -> usize {
+    buf.iter().filter(|b| **b == b'\n').count()
+}
 fn follow_once(path: &Path, pos: &mut u64) -> std::io::Result<String> {
     let len = fs::metadata(path)?.len();
     if len < *pos {
@@ -1112,6 +1141,28 @@ gui/501/dev.relay.agent = {
     fn last_n_lines_takes_tail() {
         assert_eq!(last_n_lines("a\nb\nc\n", 2), ["b", "c"]);
         assert_eq!(last_n_lines("only\n", 50), ["only"]);
+    }
+
+    #[test]
+    fn tail_lines_reads_from_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.log");
+        // Longer than one chunk, so the tail spans a chunk boundary.
+        let mut body = String::new();
+        for i in 1..=5000 {
+            body.push_str(&format!("line-{i} {}\n", "x".repeat(40)));
+        }
+        fs::write(&path, &body).unwrap();
+        let tail = tail_lines(&path, 3).unwrap();
+        assert_eq!(tail.len(), 3);
+        assert!(tail[0].starts_with("line-4998 "), "{tail:?}");
+        assert!(tail[2].starts_with("line-5000 "), "{tail:?}");
+
+        fs::write(&path, "a\nb\nc").unwrap();
+        assert_eq!(tail_lines(&path, 2).unwrap(), ["b", "c"]);
+        assert_eq!(tail_lines(&path, 50).unwrap(), ["a", "b", "c"]);
+        fs::write(&path, "").unwrap();
+        assert!(tail_lines(&path, 5).unwrap().is_empty());
     }
 
     #[test]
