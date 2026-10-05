@@ -647,8 +647,10 @@ impl Repo<'_> {
             ),
             None => (String::new(), None),
         };
-        // SQLite `substr` is 1-based: the first character after `folder/`.
-        let rest_from = i64::try_from(lower.len() + 1).map_err(|_| DbError::IntegerOverflow)?;
+        // SQLite `substr` is 1-based and counts characters, not bytes: the
+        // first character after `folder/`.
+        let rest_from =
+            i64::try_from(lower.chars().count() + 1).map_err(|_| DbError::IntegerOverflow)?;
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {ENTRY_SELECT}
              FROM entries e
@@ -941,6 +943,29 @@ impl Repo<'_> {
             params![id.as_bytes().as_slice(), i64_from_u64(size)?, now_ms],
         )?;
         Ok(())
+    }
+
+    /// Forget stored objects outside `keep`, returning how many rows went.
+    ///
+    /// Run after a store sweep with the same live set, so `verify` stops
+    /// expecting objects the sweep removed.
+    pub fn prune_objects(&self, keep: &HashSet<ObjectId>) -> Result<usize, DbError> {
+        let mut stmt = self.conn.prepare_cached("SELECT id FROM objects")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut stale = Vec::new();
+        for row in rows {
+            let id = object_id_from_blob(&row?)?;
+            if !keep.contains(&id) {
+                stale.push(id);
+            }
+        }
+        let mut delete = self
+            .conn
+            .prepare_cached("DELETE FROM objects WHERE id = ?1")?;
+        for id in &stale {
+            delete.execute(params![id.as_bytes().as_slice()])?;
+        }
+        Ok(stale.len())
     }
 
     /// Every object referenced by current entries or history (GC roots).

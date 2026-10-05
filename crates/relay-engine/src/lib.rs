@@ -647,6 +647,8 @@ impl Engine {
         self.ensure_writable()?;
         let live = self.db.repo().live_objects()?;
         let sweep = self.store.sweep(&live, grace)?;
+        // Swept objects leave the index too, or `verify` reports them missing.
+        self.db.transaction(|repo| repo.prune_objects(&live))?;
         let tmp_cleaned = self.store.clean_tmp(TMP_CLEAN_AGE)?;
         Ok(GcReport {
             removed: sweep.removed,
