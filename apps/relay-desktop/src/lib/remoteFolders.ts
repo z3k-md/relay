@@ -203,6 +203,8 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
       listings.delete(key(name, current));
       sizesSeen.delete(key(name, current));
     }
+    // The device may have updated since it said it cannot count sizes.
+    if (name && noSizes.delete(name)) sizesSupported.value = true;
     return resume();
   }
 
