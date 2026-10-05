@@ -1326,7 +1326,10 @@ impl<'a> Simulator<'a> {
                 report.created,
                 report.modified,
                 report.deleted,
-                report.unchanged,
+                // A file touched inside the racy window is re-read
+                // (`stat_only`) rather than trusted by stat: the split
+                // depends on wall-clock time, so only the sum is traced.
+                report.unchanged + report.stat_only,
                 if unstable {
                     " (unstable paths remain)"
                 } else {
