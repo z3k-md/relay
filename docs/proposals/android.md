@@ -76,7 +76,7 @@ DocumentsProvider ──relay-ipc──► list / open / fetch-on-demand
 
 ## Stages
 
-1. **CI APK build.** A debug `aarch64` APK on every pull request, uploaded
+1. **CI APK build.** A debug `aarch64` APK on path-filtered pull requests and main pushes, uploaded
    as a workflow artifact.
 2. **Service-hosted engine.** JNI entry, foreground service with status
    notification, start on boot, and the UI attaching over IPC.
