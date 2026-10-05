@@ -279,8 +279,7 @@ impl Engine {
             VersionRelation::RemoteNewer if !writing => self.commit_index_only(remote, mounts),
             VersionRelation::RemoteNewer => self.apply_remote_newer(remote, local.as_ref(), mounts),
             VersionRelation::Conflict | VersionRelation::Diverged if !writing => {
-                self.commit_unmaterialized_conflict(remote, local.as_ref(), mounts)?;
-                Ok(TryApply::Done(ApplyResult::Conflict))
+                self.commit_unmaterialized_conflict(remote, local.as_ref(), mounts)
             }
             VersionRelation::Conflict | VersionRelation::Diverged => {
                 self.apply_conflict(remote, local.as_ref(), mounts)
@@ -300,7 +299,7 @@ impl Engine {
         };
         let mode = path_mode(rules, &config.mount.name, remote.key.path.as_str())?;
         let hydrated = local.is_some_and(|entry| entry.materialized);
-        Ok(mode.fetches_bytes(hydrated))
+        Ok(mode.writes_tree(hydrated))
     }
 
     fn commit_index_only(
@@ -322,18 +321,23 @@ impl Engine {
     /// index exactly as a writing device would (D18): the winner's content
     /// under the merged vector, the loser as an index-only row at its
     /// conflict-copy path. Nothing is written to the working tree, and every
-    /// device still reaches the same rows.
+    /// device still reaches the same rows. A copy path already holding other
+    /// content skips the entry, as [`Self::materialize_conflict_copy`] does
+    /// on a writing device.
     fn commit_unmaterialized_conflict(
         &mut self,
         remote: &RemoteEntry,
         local: Option<&EntryRecord>,
         mounts: &mut HashMap<MountId, MountApply>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<TryApply, EngineError> {
         let Some(local) = local else {
             self.commit_remote(remote, None, None, false)?;
             note_live(mounts, remote);
-            return Ok(());
+            return Ok(TryApply::Done(ApplyResult::Conflict));
         };
+        if let Some((base_id, merged)) = self.clean_merge(remote, local)? {
+            return self.commit_unmaterialized_merge(remote, local, base_id, &merged, mounts);
+        }
         let remote_rec = remote.clone().into_record(local.sequence, None, false);
         let (winner_remote, copy_loser) = conflict_outcome(local, &remote_rec);
         let winner = if winner_remote { &remote_rec } else { local };
@@ -359,6 +363,17 @@ impl Engine {
                 stat: None,
                 materialized: false,
             });
+        }
+        if let Some(copy) = &copy
+            && let EntryContent::File { object, .. } = &copy.content
+            && let Some(existing) = self.db.repo().entry(&copy.key)?
+            && !existing.is_deleted()
+            && existing.content.object() != Some(*object)
+        {
+            return Ok(TryApply::Done(ApplyResult::Skipped(
+                copy.key.path.to_string(),
+                "conflict copy path is already taken".into(),
+            )));
         }
         let mut record = winner.clone();
         record.vector = local.vector.merged(&remote.vector);
@@ -395,7 +410,53 @@ impl Engine {
         } else {
             note_live(mounts, remote);
         }
-        Ok(())
+        Ok(TryApply::Done(ApplyResult::Conflict))
+    }
+
+    /// Index-only half of [`Self::try_auto_merge`]: the same merged row,
+    /// with the bytes kept in the store and nothing written to the tree.
+    fn commit_unmaterialized_merge(
+        &mut self,
+        remote: &RemoteEntry,
+        local: &EntryRecord,
+        base_id: ObjectId,
+        merged: &[u8],
+        mounts: &mut HashMap<MountId, MountApply>,
+    ) -> Result<TryApply, EngineError> {
+        let remote_rec = remote.clone().into_record(local.sequence, None, false);
+        let (winner_remote, _) = conflict_outcome(local, &remote_rec);
+        let winner = if winner_remote { &remote_rec } else { local };
+        let executable = match &winner.content {
+            EntryContent::File { executable, .. } => *executable,
+            _ => false,
+        };
+        let merged_id = self.store.put_bytes(merged)?;
+        let size = merged.len() as u64;
+        let now = self.clock.now_ms();
+        let record = EntryRecord {
+            key: remote.key.clone(),
+            content: EntryContent::File {
+                object: merged_id,
+                size,
+                executable,
+            },
+            vector: local.vector.merged(&remote.vector),
+            parent_object: Some(base_id),
+            sequence: relay_core::Sequence(0),
+            modified_by: winner.modified_by,
+            modified_at_unix_ms: winner.modified_at_unix_ms,
+            stat: None,
+            materialized: false,
+        };
+        self.db.transaction(|repo| {
+            repo.record_object(merged_id, size, now)?;
+            let mut record = record;
+            record.sequence = repo.next_sequence()?;
+            repo.put_entry(&record)?;
+            Ok::<(), EngineError>(())
+        })?;
+        note_live(mounts, remote);
+        Ok(TryApply::Done(ApplyResult::Written))
     }
 
     fn store_merged_vector(
@@ -699,16 +760,15 @@ impl Engine {
         Ok(TryApply::Done(ApplyResult::Conflict))
     }
 
-    /// Clean three-way merge of concurrent text edits that share a parent object.
-    /// `None` means fall through to conflict copies (dirty merge, binary, git, or
-    /// no shared base). A clean result is one new object and a merged vector,
-    /// with no bump and no conflict copy, so both peers converge.
-    fn try_auto_merge(
-        &mut self,
+    /// The parent and merged bytes of a clean three-way text merge of
+    /// `local` and `remote`, when every object is here. Writing and
+    /// index-only devices both resolve through this, so they reach the same
+    /// content (D18).
+    fn clean_merge(
+        &self,
         remote: &RemoteEntry,
         local: &EntryRecord,
-        mounts: &mut HashMap<MountId, MountApply>,
-    ) -> Result<Option<TryApply>, EngineError> {
+    ) -> Result<Option<(ObjectId, Vec<u8>)>, EngineError> {
         if local.vector.compare(&remote.vector) != VectorOrdering::Concurrent {
             return Ok(None);
         }
@@ -746,7 +806,22 @@ impl Engine {
         let MergeOutcome::Clean(merged) = merge_text(&base, &left, &right) else {
             return Ok(None);
         };
+        Ok(Some((base_id, merged)))
+    }
 
+    /// Clean three-way merge of concurrent text edits that share a parent object.
+    /// `None` means fall through to conflict copies (dirty merge, binary, git, or
+    /// no shared base). A clean result is one new object and a merged vector,
+    /// with no bump and no conflict copy, so both peers converge.
+    fn try_auto_merge(
+        &mut self,
+        remote: &RemoteEntry,
+        local: &EntryRecord,
+        mounts: &mut HashMap<MountId, MountApply>,
+    ) -> Result<Option<TryApply>, EngineError> {
+        let Some((base_id, merged)) = self.clean_merge(remote, local)? else {
+            return Ok(None);
+        };
         let remote_rec = remote.clone().into_record(local.sequence, None, true);
         let (winner_remote, _) = conflict_outcome(local, &remote_rec);
         let winner = if winner_remote { &remote_rec } else { local };

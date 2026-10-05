@@ -100,7 +100,7 @@ pub(crate) enum Step {
 
 /// The step that brings `disk` in line with `row`, if any.
 pub(crate) fn plan_row(row: &EntryRecord, mode: MaterializationMode, disk: &Probe) -> Option<Step> {
-    use MaterializationMode::{Demand, Exclude, Metadata};
+    use MaterializationMode::{Demand, Exclude, Metadata, Store};
     match (&row.content, mode) {
         (EntryContent::File { object, size, .. }, Demand) => {
             let (object, size, modified_ms) = (*object, *size, row.modified_at_unix_ms);
@@ -146,7 +146,7 @@ pub(crate) fn plan_row(row: &EntryRecord, mode: MaterializationMode, disk: &Prob
                 Probe::Other => None,
             }
         }
-        (EntryContent::File { .. }, Metadata | Exclude) => matches!(
+        (EntryContent::File { .. }, Metadata | Exclude | Store) => matches!(
             disk,
             Probe::Placeholder {
                 dehydrated: true,

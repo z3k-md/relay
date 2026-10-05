@@ -4,8 +4,8 @@ Build plan for an always-on Relay server: a NAS, mini PC, or VPS that joins
 the sync chain, holds a durable copy of every space, keeps history the other
 devices cannot erase, and gives roaming devices one place to meet. This does
 not amend [`DESIGN.md`](../DESIGN.md). The product direction and the account
-model are D44. Stage 1, the server role, is D45. The rest becomes decisions
-as each stage lands.
+model are D44. Stage 1, the server role, is D45; Stage 2, store mode, is
+D47. The rest becomes decisions as each stage lands.
 
 ## Product tiers (D44)
 
@@ -70,11 +70,12 @@ A local setting, `role = server`, set with `relay server enable --data DIR`.
 
 ### Store mode
 
-A fifth materialization mode, `store`: fetch the object into the local store
-and do not write the working tree (§10 `DurableStore`). A server runs every
-space in `store` by default and can use `full` for a subtree that should also
-be browsable over SMB on the NAS. Like `metadata`, an absent file in `store`
-mode is not a delete.
+Shipped (D47). A fifth materialization mode, `store`: fetch the object into
+the local store and do not write the working tree. A server attaches every
+mount in `store` and can use `full` for a subtree that should also be
+browsable over SMB on the NAS. Like `metadata`, an absent file in `store`
+mode is not a delete. Index-only devices now resolve conflicts exactly as
+writers do, including clean text merges.
 
 ### Backup is not sync
 
@@ -129,7 +130,7 @@ Each stage ships on its own.
 
 1. **Server role.** `relay server enable`, auto-join and auto-attach,
    container image and systemd unit, a server peer in `relay-vopr`.
-2. **Store mode.** `store` materialization; the server default.
+2. **Store mode.** `store` materialization; the server default. Shipped (D47).
 3. **Backup semantics.** Append-only enforcement, retention, snapshots,
    whole-space restore, mass-change hold.
 4. **Backed-up state in the app**, from server acks.
