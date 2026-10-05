@@ -133,6 +133,10 @@ pub fn run() {
             explorer::explorer_memory,
             #[cfg(not(target_os = "android"))]
             explorer::explorer_make_bench,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_autobench,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_save_results,
         ])
         .setup(|app| {
             let home = app_home(app)?;
@@ -161,6 +165,11 @@ pub fn run() {
                     settings::load(app.handle()).start_at_login,
                 );
                 commands::maybe_install_cli(app.handle());
+                if explorer::autobench_output().is_some()
+                    && let Err(err) = explorer::open_window(app.handle())
+                {
+                    log::warn!("explorer window: {err}");
+                }
 
                 if let Some(window) = app.get_webview_window("main") {
                     let window_hide = window.clone();

@@ -2,6 +2,7 @@
 import { Channel } from "@tauri-apps/api/core";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { type MemoryInfo, explorer } from "./api";
+import { type ScrollResult, describeScroll, machineLines, runScroll } from "./bench";
 import type { Folder } from "./folder";
 
 const props = defineProps<{
@@ -44,65 +45,15 @@ function tick(now: number) {
 
 // --- scroll benchmark ---------------------------------------------------
 
-interface ScrollResult {
-  mode: string;
-  rows: number;
-  frames: number;
-  avgFps: number;
-  p95: number;
-  p99: number;
-  /** Frames that took over 1.5 refresh intervals. */
-  dropped: number;
-  worst: number;
-}
-
 const running = ref<string | null>(null);
 const scrollResults = ref<ScrollResult[]>([]);
 
-function nextFrame(): Promise<number> {
-  return new Promise((resolve) => requestAnimationFrame(resolve));
-}
-
-/**
- * "smooth" scrolls at 3,000 px/s for 10 s; "sweep" goes top to bottom in
- * 5 s, so every frame shows rows (and icons) it has not shown before.
- */
-async function runScroll(mode: "smooth" | "sweep") {
+async function scroll(mode: "smooth" | "sweep") {
   const el = props.getScroller();
   if (!el || running.value) return;
   running.value = mode;
-  el.scrollTop = 0;
-  await nextFrame();
-  await nextFrame();
-  const max = el.scrollHeight - el.clientHeight;
-  const duration = mode === "sweep" ? 5000 : 10000;
-  const deltas: number[] = [];
-  const start = await nextFrame();
-  let prev = start;
-  for (;;) {
-    const now = await nextFrame();
-    deltas.push(now - prev);
-    prev = now;
-    const t = now - start;
-    if (t >= duration) break;
-    el.scrollTop = mode === "sweep" ? (t / duration) * max : ((t * 3) % (max + 1));
-  }
-  const sorted = [...deltas].sort((a, b) => a - b);
-  const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
-  const interval = at(0.5);
-  scrollResults.value = [
-    {
-      mode,
-      rows: props.folder.rows.value.length,
-      frames: deltas.length,
-      avgFps: (deltas.length * 1000) / (prev - start),
-      p95: at(0.95),
-      p99: at(0.99),
-      dropped: deltas.filter((d) => d > interval * 1.5).length,
-      worst: sorted[sorted.length - 1],
-    },
-    ...scrollResults.value.filter((r) => r.mode !== mode),
-  ];
+  const result = await runScroll(el, mode, props.folder.rows.value.length);
+  scrollResults.value = [result, ...scrollResults.value.filter((r) => r.mode !== mode)];
   running.value = null;
 }
 
@@ -181,8 +132,7 @@ async function copyResults() {
   const s = stats.value;
   const lines = [
     `Relay Explorer P0 results (${new Date().toISOString()})`,
-    `UA: ${navigator.userAgent}`,
-    `Screen: ${screen.width}x${screen.height} @${window.devicePixelRatio}x, cores ${navigator.hardwareConcurrency}`,
+    ...machineLines(),
     `Native shell: ${props.native}; drag and drop: ${props.dnd}`,
     "",
     `Listing ${s.path}`,
@@ -190,10 +140,7 @@ async function copyResults() {
     `  first batch ${fmt(s.firstBatchMs)} ms, first paint ${fmt(s.firstPaintMs)} ms, all ${fmt(s.doneMs)} ms (Rust ${fmt(s.backendMs)} ms)`,
     `  sort/merge ${s.sortMs.toFixed(1)} ms, live changes ${s.changes}`,
     "",
-    ...scrollResults.value.map(
-      (r) =>
-        `Scroll ${r.mode}: ${r.rows} rows, ${r.frames} frames, ${r.avgFps.toFixed(1)} fps, p95 ${r.p95.toFixed(1)} ms, p99 ${r.p99.toFixed(1)} ms, dropped ${r.dropped}, worst ${r.worst.toFixed(1)} ms`,
-    ),
+    ...scrollResults.value.map((r) => `Scroll ${describeScroll(r)}`),
     memory.value
       ? `Memory: working set ${(memory.value.workingSetBytes / MB).toFixed(0)} MB (peak ${(peak.value / MB).toFixed(0)} MB), private ${(memory.value.privateBytes / MB).toFixed(0)} MB, ${memory.value.processes} processes, ${props.tabs} tabs`
       : "Memory: n/a",
@@ -263,14 +210,14 @@ onBeforeUnmount(() => {
         <button
           class="rounded border border-line px-2 py-1 hover:bg-canvas disabled:opacity-50"
           :disabled="running !== null"
-          @click="runScroll('sweep')"
+          @click="scroll('sweep')"
         >
           {{ running === "sweep" ? "Sweeping…" : "Sweep (5 s)" }}
         </button>
         <button
           class="rounded border border-line px-2 py-1 hover:bg-canvas disabled:opacity-50"
           :disabled="running !== null"
-          @click="runScroll('smooth')"
+          @click="scroll('smooth')"
         >
           {{ running === "smooth" ? "Scrolling…" : "Smooth (10 s)" }}
         </button>

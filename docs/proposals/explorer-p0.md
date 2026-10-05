@@ -21,9 +21,32 @@ reconsider the UI layer before P1.
 
 ## How to run it
 
-On Windows, from `apps/relay-desktop`: `bun install`, then `bun run dev`.
-Open the tray menu and pick **Explorer (preview)**. The **Perf** panel on the
-right shows the pass bars live.
+### The numbers, in one command
+
+On Windows, from `apps/relay-desktop` in PowerShell:
+
+```powershell
+bun install
+$env:RELAY_EXPLORER_BENCH = "1"; bun run dev
+```
+
+The explorer window opens by itself and runs every timed bar with no
+clicking:
+- five first-paint runs on 10k items;
+- a sweep and a smooth scroll through 200k items;
+- a thumbnail grid sweep;
+- memory with three tabs open.
+
+It then writes the report to `%TEMP%\relay-explorer-bench\results.txt`,
+prints it, and quits. Set the variable to a file path to write the report
+somewhere else. Leave the window alone while it runs, because the scroll
+timings need it on screen. The first run creates the benchmark folders,
+which takes a while for 200k files.
+
+### By hand, and the checks that need a person
+
+Run `bun run dev`, open the tray menu and pick **Explorer (preview)**. The
+**Perf** panel on the right shows the pass bars live.
 
 1. **Benchmark folders.** Click *10k files*, *200k files* or *2k images*.
    Each is created once under `%TEMP%\relay-explorer-bench` and reused.

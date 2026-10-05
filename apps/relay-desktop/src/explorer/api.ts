@@ -69,6 +69,10 @@ export const explorer = {
   memory: () => invoke<MemoryInfo | null>("explorer_memory"),
   makeBench: (kind: "files" | "images", count: number, onProgress: Channel<number>) =>
     invoke<string>("explorer_make_bench", { kind, count, onProgress }),
+  /** The results file when started with RELAY_EXPLORER_BENCH, else null. */
+  autobench: () => invoke<string | null>("explorer_autobench"),
+  /** Write the benchmark results and quit the app. */
+  saveResults: (text: string) => invoke<void>("explorer_save_results", { text }),
 };
 
 export function separator(path: string): string {

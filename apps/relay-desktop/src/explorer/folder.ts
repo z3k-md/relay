@@ -108,6 +108,8 @@ export function createFolder(initial: string) {
   let frame = 0;
   let started = 0;
   let streaming = false;
+  /** "done" arrived; time it once the last batch is on screen. */
+  let donePending = false;
 
   const visible = (e: Entry) => showHidden.value || !(e[1] & FLAG_HIDDEN);
   const cmp = () => comparator(sortKey.value, sortDesc.value);
@@ -161,6 +163,10 @@ export function createFolder(initial: string) {
       afterPaint(() => {
         if (stats.firstPaintMs === null) stats.firstPaintMs = performance.now() - started;
       });
+    }
+    if (donePending) {
+      donePending = false;
+      afterPaint(() => (stats.doneMs = performance.now() - started));
     }
   }
 
@@ -222,9 +228,9 @@ export function createFolder(initial: string) {
         streaming = false;
         loading.value = false;
         stats.backendMs = event.elapsedMs;
-        // Changes may have queued behind the listing.
+        donePending = true;
+        // Also applies changes that queued behind the listing.
         schedule();
-        afterPaint(() => (stats.doneMs = performance.now() - started));
         break;
       case "error":
         streaming = false;
@@ -246,6 +252,7 @@ export function createFolder(initial: string) {
     rows.value = [];
     pendingBatch = [];
     pendingChanges = [];
+    donePending = false;
     if (resetSelection) {
       selected.value = new Set();
       anchor.value = null;

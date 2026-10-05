@@ -369,6 +369,44 @@ pub async fn explorer_memory() -> Option<MemoryInfo> {
     }
 }
 
+/// Where the one-shot benchmark writes its results, when the app was started
+/// with `RELAY_EXPLORER_BENCH` set (to a file path, or `1` for the default).
+pub fn autobench_output() -> Option<PathBuf> {
+    let value = std::env::var_os("RELAY_EXPLORER_BENCH")?;
+    if value.is_empty() || value == "0" {
+        return None;
+    }
+    Some(if value == "1" {
+        std::env::temp_dir()
+            .join("relay-explorer-bench")
+            .join("results.txt")
+    } else {
+        PathBuf::from(value)
+    })
+}
+
+/// The results file, when the frontend should run the benchmark by itself.
+#[tauri::command]
+pub async fn explorer_autobench() -> Option<String> {
+    autobench_output().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Write the benchmark results and quit. Only in benchmark mode.
+#[tauri::command]
+pub async fn explorer_save_results(app: AppHandle, text: String) -> Result<(), String> {
+    let path = autobench_output().ok_or("not in benchmark mode")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, &text).map_err(|e| e.to_string())?;
+    println!(
+        "{text}\n\nRelay Explorer benchmark results written to {}",
+        path.display()
+    );
+    app.exit(0);
+    Ok(())
+}
+
 /// Create (once) a benchmark folder and return its path. `kind` is "files"
 /// (empty files of mixed types) or "images" (small PNGs for thumbnails).
 #[tauri::command]

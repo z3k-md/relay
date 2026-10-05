@@ -3,6 +3,8 @@ import { Channel } from "@tauri-apps/api/core";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import ItemsView from "./ItemsView.vue";
 import PerfPanel from "./PerfPanel.vue";
+import { autobench } from "./autobench";
+import { nextFrame } from "./bench";
 import {
   type DragEvent,
   EFFECT_COPY,
@@ -32,6 +34,8 @@ const dropTarget = ref<string | null>(null);
 const lastDrag = ref("");
 const lastDrop = ref("");
 const notices = ref<{ id: number; text: string; error: boolean }[]>([]);
+/** Progress of the one-shot benchmark (RELAY_EXPLORER_BENCH). */
+const benchStatus = ref<string | null>(null);
 let noticeId = 0;
 
 function notify(text: string, error = false) {
@@ -48,11 +52,12 @@ watch(
   },
 );
 
-function openTab(path: string) {
+function openTab(path: string): Folder {
   const folder = createFolder(path);
   tabs.value = [...tabs.value, folder];
   active.value = tabs.value.length - 1;
   void folder.load(path);
+  return folder;
 }
 
 function closeTab(index: number) {
@@ -215,7 +220,29 @@ onMounted(async () => {
   await nextTick();
   items.value?.scroller?.focus();
   if (places.value.native) await setUpDragAndDrop();
+  const output = await explorer.autobench().catch(() => null);
+  if (output) await runAutobench(output, places.value.home);
 });
+
+async function runAutobench(output: string, home: string) {
+  const status = (text: string) => (benchStatus.value = `Benchmark → ${output}: ${text}`);
+  status("starting…");
+  const report = await autobench({
+    home,
+    active: () => tabs.value[active.value],
+    openTab: async (path) => {
+      const folder = openTab(path);
+      await nextTick();
+      await nextFrame();
+      return folder;
+    },
+    scroller: () => items.value?.scroller ?? null,
+    tabs: () => tabs.value.length,
+    status,
+  });
+  status("saving results and quitting…");
+  await explorer.saveResults(report);
+}
 
 onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 
@@ -261,6 +288,9 @@ const status = computed(() => {
       </button>
     </nav>
 
+    <p v-if="benchStatus" class="shrink-0 bg-accent px-3 py-1 text-xs text-accent-fg">
+      {{ benchStatus }}
+    </p>
     <header v-if="tab" class="flex shrink-0 items-center gap-1 border-y border-line bg-panel px-2 py-1.5">
       <button
         class="rounded px-2 py-1 hover:bg-canvas disabled:opacity-40"
