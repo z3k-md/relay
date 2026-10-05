@@ -16,6 +16,8 @@ export interface BenchHost {
 
 const MB = 1024 * 1024;
 const SETTLE_MS = 10_000;
+/** Chromium drops decoded images it no longer draws after about 30 s idle. */
+const IDLE_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -134,9 +136,9 @@ export async function autobench(host: BenchHost): Promise<string> {
 
   // V8 and the allocator give memory back a few seconds after the page goes
   // quiet, so each memory reading is taken right away and again once settled.
-  const settled = async (what: string) => {
+  const settled = async (what: string, ms = SETTLE_MS) => {
     host.status(`Letting memory settle (${what})…`);
-    await sleep(SETTLE_MS);
+    await sleep(ms);
     return explorer.memory();
   };
 
@@ -183,6 +185,7 @@ export async function autobench(host: BenchHost): Promise<string> {
     await waitDone(home);
     const memoryNow = await explorer.memory();
     const memory = await settled(`${host.tabs()} tabs`);
+    const idle = await settled(`${host.tabs()} tabs, ${IDLE_MS / 1000} s`, IDLE_MS - SETTLE_MS);
     // What WebView2 gives back when asked to (Relay would ask when its
     // window goes to the tray), and whether it keeps it after going back.
     let low: typeof memory = null;
@@ -201,9 +204,16 @@ export async function autobench(host: BenchHost): Promise<string> {
     const settle = `${SETTLE_MS / 1000} s idle`;
     lines.push(`Memory at start (1 tab, home), after ${settle}: ${mem(atStart)}`);
     lines.push(`Memory after 200k scroll (1 tab): ${mem(afterBigNow)}; after ${settle}: ${mem(afterBig)}`);
-    lines.push(`Memory with ${host.tabs()} tabs: ${mem(memoryNow)}; after ${settle}: ${mem(memory)}`);
+    lines.push(`Memory with ${host.tabs()} tabs: ${mem(memoryNow)}; after ${settle}: ${mem(memory)}; after ${IDLE_MS / 1000} s idle: ${mem(idle)}`);
     lines.push(`Memory with ${host.tabs()} tabs, WebView2 target Low, after ${settle}: ${lowError || mem(low)}`);
-    lines.push(...perProcess({ start: atStart, [`${host.tabs()} tabs`]: memory, "3 tabs, Low": low }));
+    lines.push(
+      ...perProcess({
+        start: atStart,
+        [`${host.tabs()} tabs`]: memory,
+        [`${host.tabs()} tabs, ${IDLE_MS / 1000} s`]: idle,
+        [`${host.tabs()} tabs, Low`]: low,
+      }),
+    );
 
     const mark = (ok: boolean) => (ok ? "PASS" : "FAIL");
     lines.push(

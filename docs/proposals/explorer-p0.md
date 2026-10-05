@@ -52,8 +52,9 @@ files.
 Memory is reported three ways, total and per process: working set (counts
 DLL pages the WebView2 processes share once per process, so it overstates),
 private working set (what Task Manager's Memory column shows) and private
-commit. After the three-tab reading, the run asks WebView2 for its Low
-memory target and reads again. After saving, it closes the window and
+commit. The three-tab reading is taken after 10 s and again after 60 s
+idle, by when Chromium has dropped decoded thumbnails it no longer draws.
+Then the run asks WebView2 for its Low memory target and reads again. After saving, it closes the window and
 reads the app alone. To try Chromium switches on the benchmark window
 only, set `RELAY_EXPLORER_WEBVIEW_ARGS`, for example
 `--in-process-gpu --enable-features=NetworkServiceInProcess2`; the report
