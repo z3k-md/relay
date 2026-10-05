@@ -20,7 +20,9 @@ decision.
 self-hosted, always-on Relay server in the sync chain: durable copy,
 history the other devices cannot erase, and rendezvous. Stage 1, the
 server role (D45), shipped: `relay server enable`, auto-join and attach, a
-container image, and a systemd unit. Store mode is next.
+container image, and a systemd unit. Stage 2, store mode (D47), shipped:
+the server keeps bytes in its object store with an empty data folder.
+Backup semantics (append-only, retention, snapshots) are next.
 
 **Phase 14 — Integrations.**
 

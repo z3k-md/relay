@@ -1229,8 +1229,7 @@ with it, with no one at its keyboard.
   manager could not already ask for remotely (D39). Members adopted from an
   offer (D26) never hold the grant, so a device that reached the server only
   through a shared space cannot make it join others. The server does not
-  share spaces onward by itself. Materialization is `full` until store mode
-  (Stage 2).
+  share spaces onward by itself. Mounts start in `store` mode (D47).
 - **Packaging.** `packaging/server`: a container image (Debian slim, runs as
   a non-root user, UDP 47321, one volume), a compose file that publishes
   host port 47322, and a systemd unit. Linux first; `relay service` stays
@@ -1238,3 +1237,41 @@ with it, with no one at its keyboard.
 - **Simulator.** `relay-vopr` topology `Server` and scenario `home_server`:
   three devices that pair only with the server, which joins and attaches
   through `server_plan` and makes no edits of its own.
+
+## D47. Store mode
+
+Home server Stage 2 ([`proposals/home-server.md`](proposals/home-server.md)).
+A device can keep every file's bytes without a working-tree copy.
+
+- **Mode.** `store` is a fifth materialization mode (D35). It fetches each
+  object into the local store, like `full`, and writes nothing to the
+  working tree, like `metadata`. Rows stay `materialized = 0`; the bytes are
+  recorded in `objects`, so `verify` checks them and `gc` keeps them while
+  the index or history names them. A stored file is served to peers like any
+  other object.
+- **Scanner.** As for `metadata`: an absent file is not a tombstone and a
+  file that appears in the folder is not hashed into a version.
+- **Fetch.** Index batches and mailbox pulls wait for `store` objects as
+  they do for `full`. The periodic tick fetches any store row whose object
+  is not recorded yet (one indexed query), from a peer or the mailbox.
+- **Conflicts on index-only devices.** A device that does not write a path
+  resolves a concurrent edit as a writing device would: a clean text merge
+  when it holds the base and both sides (always, in `store`), else the
+  winner plus a conflict-copy row. A copy path already holding other content
+  skips the entry, as on a writer. Before this, an index-only device never
+  merged, so a writer that merged and a hub that copied reached the same
+  vector with different content and never reconciled.
+- **Server default.** `server_plan` sets `store` on a mount's root before it
+  attaches it, unless the owner already chose a mode for that root, so the
+  data folder stays empty. A later rule (`relay materialize add SPACE NAME
+  --mode full --selector 'MOUNT/sub/**'`) or a manager's folder choice in
+  the app switches a mount or subfolder to `full` to browse it on the server
+  (for example over SMB). Mounts attached before Stage 2 keep `full`.
+- **Rule changes.** As in D35, nothing is deleted. `store` to `full`
+  writes the files on the next tick from the store. `full` to `store` leaves
+  the existing files in place; later versions go to the store only.
+- **Schema.** Migration 14 rebuilds the materialization rule tables to allow
+  `store`; rules and selectors are kept.
+- **Simulator.** In `home_server`, the server's folder must stay empty after
+  quiesce, and its tree is read from its index and store, so a file the
+  server indexed without its bytes fails the run.

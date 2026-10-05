@@ -35,6 +35,9 @@ pub enum CopyState {
     MetadataOnly,
     /// Full mode, not written yet: still syncing, or no device had it.
     Pending,
+    /// Store mode: the bytes stay in this device's object store, with no
+    /// working-tree file (D47).
+    Stored,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -210,6 +213,7 @@ fn copy_state(materialized: bool, mode: MaterializationMode) -> CopyState {
             CopyState::MetadataOnly
         }
         (false, MaterializationMode::Full) => CopyState::Pending,
+        (false, MaterializationMode::Store) => CopyState::Stored,
     }
 }
 

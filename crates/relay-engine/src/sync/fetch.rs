@@ -64,6 +64,30 @@ impl Syncer {
         out: &mut dyn FnMut(SyncOutput),
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
+        for item in engine.store_unfetched()? {
+            let Some(object) = item.object else {
+                continue;
+            };
+            if engine.store.contains(&object) {
+                engine.record_stored_object(object)?;
+                continue;
+            }
+            if self
+                .direct
+                .get(&object)
+                .is_some_and(|state| state.gave_up || state.waiting)
+                || self.batch_pending(object)
+            {
+                continue;
+            }
+            if let Some(peer) = self.peer_for_space(engine, item.space)? {
+                self.request_direct(peer, object, item.space, out);
+            } else if engine.ingest_mailbox_object(item.space, object)? {
+                engine.record_stored_object(object)?;
+            } else {
+                self.give_up_direct(engine, object, item.key.path.as_ref(), events);
+            }
+        }
         let pending = engine.full_unmaterialized()?;
         for item in pending {
             if item.object.is_none() {
@@ -281,7 +305,10 @@ impl Syncer {
         if !engine.store.contains(&object) {
             return Ok(());
         }
-        if let Err(err) = engine.materialize_full_object(object) {
+        if let Err(err) = engine
+            .record_stored_object(object)
+            .and_then(|()| engine.materialize_full_object(object))
+        {
             events.push(SyncEvent::SyncWarning {
                 peer: engine.device().id,
                 path: String::new(),

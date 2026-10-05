@@ -14,6 +14,7 @@ use relay_core::{ConfigChange, SpaceId, validate_name};
 use serde::Serialize;
 
 use crate::Engine;
+use crate::MaterializationMode;
 use crate::error::EngineError;
 
 const SERVER_DATA_KEY: &str = "server_data";
@@ -132,38 +133,55 @@ impl Engine {
                 wait_ms: 0,
             });
             for mount in &offer.mounts {
-                if let Some(change) = attach(&data, &offer.name, &mount.name)? {
-                    changes.push(change);
-                }
+                changes.extend(attach(&data, &offer.name, &mount.name, false)?);
             }
         }
         for space in repo.list_spaces()? {
+            let rules = repo.list_materialization_rules(space.id)?;
             for config in repo.list_mounts(Some(space.id))? {
                 if config.local_path.is_some() {
                     continue;
                 }
-                if let Some(change) = attach(&data, &space.name, &config.mount.name)? {
-                    changes.push(change);
-                }
+                let root = format!("{}/**", config.mount.name);
+                let chosen = rules.iter().any(|rule| rule.selectors.contains(&root));
+                changes.extend(attach(&data, &space.name, &config.mount.name, chosen)?);
             }
         }
         Ok(changes)
     }
 }
 
-fn attach(data: &Path, space: &str, mount: &str) -> Result<Option<ConfigChange>, EngineError> {
+/// Attach `mount` under the data folder. Unless the mount root already has a
+/// mode (`chosen`), set it to `store` first, so nothing is written to the
+/// folder before the rule exists.
+fn attach(
+    data: &Path,
+    space: &str,
+    mount: &str,
+    chosen: bool,
+) -> Result<Vec<ConfigChange>, EngineError> {
     if !safe_component(space) || !safe_component(mount) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let path = data.join(space).join(mount);
     std::fs::create_dir_all(&path)?;
-    Ok(Some(ConfigChange::AddMount {
+    let mut changes = Vec::new();
+    if !chosen {
+        changes.push(ConfigChange::SetFolderMode {
+            space: space.to_owned(),
+            mount: mount.to_owned(),
+            path: String::new(),
+            mode: Some(MaterializationMode::Store.as_str().to_owned()),
+        });
+    }
+    changes.push(ConfigChange::AddMount {
         space: space.to_owned(),
         mount: mount.to_owned(),
         path,
         includes: Vec::new(),
         excludes: Vec::new(),
-    }))
+    });
+    Ok(changes)
 }
 
 /// A valid space or mount name that is also safe as one folder name.

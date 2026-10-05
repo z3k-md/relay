@@ -8,8 +8,8 @@ use std::sync::Arc;
 use relay_core::conflict::conflict_path;
 use relay_core::{DeviceId, EntryContent, LogicalPath, MOUNT_MARKER, ObjectId, SpaceId};
 use relay_engine::{
-    Clock, DeleteHoldDecision, Engine, EngineConfig, ManualClock, ScanOptions, SyncEvent,
-    SyncInput, SyncOutput, Syncer, TransferDirection,
+    Clock, DeleteHoldDecision, Engine, EngineConfig, ManualClock, MaterializationMode, ScanOptions,
+    SyncEvent, SyncInput, SyncOutput, Syncer, TransferDirection,
 };
 use relay_fs::MountMarker;
 use relay_proto::{IndexBatch, entry_to_wire, frame, mount_id_bytes, space_id_bytes};
@@ -1996,6 +1996,78 @@ impl Hub {
     }
 }
 
+/// A store-mode hub (the home server, D47) keeps no working-tree files but
+/// still serves every object to a device the writer never meets.
+#[test]
+fn store_hub_serves_devices_that_never_meet_the_writer() {
+    let mut h = Hub::new();
+    h.engines[0]
+        .add_peer("bravo", h.id(1), &["127.0.0.1:47321".into()])
+        .unwrap();
+    h.engines[1]
+        .add_peer("alpha", h.id(0), &["127.0.0.1:47321".into()])
+        .unwrap();
+    h.engines[1]
+        .add_peer("charlie", h.id(2), &["127.0.0.1:47321".into()])
+        .unwrap();
+    h.engines[2]
+        .add_peer("bravo", h.id(1), &["127.0.0.1:47321".into()])
+        .unwrap();
+
+    h.engines[0].create_space("Personal").unwrap();
+    h.engines[0]
+        .add_mount("Personal", "code", h.mounts[0].path(), &[], &[])
+        .unwrap();
+    write_tree(h.mounts[0].path(), &[("seed.txt", b"seed")]);
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.engines[0].share("Personal", "bravo").unwrap();
+
+    h.connect_pair(0, 1);
+    h.engines[1].join_space("Personal", "alpha").unwrap();
+    h.engines[1]
+        .set_folder_mode("Personal", "code", "", Some(MaterializationMode::Store))
+        .unwrap();
+    h.engines[1]
+        .add_mount("Personal", "code", h.mounts[1].path(), &[], &[])
+        .unwrap();
+    h.engines[1].share("Personal", "charlie").unwrap();
+    h.syncers[0] = Syncer::new();
+    h.syncers[1] = Syncer::new();
+    h.connect_pair(0, 1);
+    h.push_all();
+
+    h.connect_pair(1, 2);
+    h.engines[2].join_space("Personal", "bravo").unwrap();
+    h.engines[2]
+        .add_mount("Personal", "code", h.mounts[2].path(), &[], &[])
+        .unwrap();
+    h.syncers[1] = Syncer::new();
+    h.syncers[2] = Syncer::new();
+    h.connect_pair(1, 2);
+    h.connect_pair(0, 1);
+    h.push_all();
+
+    assert_eq!(
+        fs::read(h.mounts[2].path().join("seed.txt")).unwrap(),
+        b"seed"
+    );
+    assert!(live_files(h.mounts[1].path()).is_empty());
+
+    fs::write(h.mounts[0].path().join("from-a.txt"), b"a-side").unwrap();
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_all();
+    assert_eq!(
+        fs::read(h.mounts[2].path().join("from-a.txt")).unwrap(),
+        b"a-side"
+    );
+    assert!(live_files(h.mounts[1].path()).is_empty());
+    assert!(h.engines[1].store().contains(&ObjectId::of(b"a-side")));
+}
+
 #[test]
 fn hub_forwards_between_devices_that_are_not_directly_connected() {
     let mut h = Hub::new();
@@ -2715,6 +2787,72 @@ fn metadata_rule_keeps_the_index_and_does_not_fetch_or_tombstone() {
         fs::read(h.mount_a.path().join("note.txt")).unwrap(),
         b"hello"
     );
+}
+
+#[test]
+fn store_rule_fetches_bytes_without_writing_or_tombstoning() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "server", "store", &["code/**".into()])
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"hello")]);
+
+    let entry = entry_at(&h.b, "note.txt");
+    assert!(!entry.materialized);
+    assert!(!h.mount_b.path().join("note.txt").exists());
+    assert!(h.fetches.contains(&ObjectId::of(b"hello")));
+    assert!(h.b.store().contains(&ObjectId::of(b"hello")));
+    assert!(h.b.verify_objects().unwrap().missing.is_empty());
+
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert!(!entry_at(&h.b, "note.txt").is_deleted());
+    assert_eq!(
+        fs::read(h.mount_a.path().join("note.txt")).unwrap(),
+        b"hello"
+    );
+
+    // A later edit replaces the stored bytes; a delete reaches the index.
+    publish(
+        &mut h,
+        &[("note.txt", b"hello again"), ("keep.txt", b"keep")],
+    );
+    assert!(h.b.store().contains(&ObjectId::of(b"hello again")));
+    assert!(!h.mount_b.path().join("note.txt").exists());
+    fs::remove_file(h.mount_a.path().join("note.txt")).unwrap();
+    publish(&mut h, &[]);
+    assert!(
+        h.b.entries("Personal", "code", true)
+            .unwrap()
+            .iter()
+            .any(|e| e.key.path.as_str() == "note.txt" && e.is_deleted())
+    );
+}
+
+#[test]
+fn switching_metadata_to_store_fetches_on_tick_without_writing() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "notes", "metadata", &["code/**".into()])
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"hello")]);
+    assert!(!h.b.store().contains(&ObjectId::of(b"hello")));
+
+    h.b.set_folder_mode("Personal", "code", "", Some(MaterializationMode::Store))
+        .unwrap();
+    h.b.materialize_remove("Personal", "notes").unwrap();
+    h.fetches.clear();
+    h.tick_b(std::time::Instant::now());
+    assert!(h.fetches.contains(&ObjectId::of(b"hello")));
+    assert!(h.b.store().contains(&ObjectId::of(b"hello")));
+    assert!(!h.mount_b.path().join("note.txt").exists());
+    assert!(!entry_at(&h.b, "note.txt").materialized);
+
+    // Once stored, the tick has nothing left to ask for.
+    h.fetches.clear();
+    h.tick_b(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    assert!(h.fetches.is_empty(), "{:?}", h.fetches);
 }
 
 #[test]

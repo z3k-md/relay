@@ -32,6 +32,9 @@ pub enum MaterializationMode {
     Metadata,
     Demand,
     Exclude,
+    /// Keep every object in the local store, write no working-tree files
+    /// (D47). The home server's default.
+    Store,
 }
 
 impl MaterializationMode {
@@ -41,6 +44,7 @@ impl MaterializationMode {
             Self::Metadata => "metadata",
             Self::Demand => "demand",
             Self::Exclude => "exclude",
+            Self::Store => "store",
         }
     }
 
@@ -50,20 +54,26 @@ impl MaterializationMode {
             "metadata" => Ok(Self::Metadata),
             "demand" => Ok(Self::Demand),
             "exclude" => Ok(Self::Exclude),
+            "store" => Ok(Self::Store),
             other => Err(EngineError::UnknownMaterializationMode(other.to_owned())),
         }
     }
 
-    /// Whether a remote file's bytes should be fetched and written.
+    /// Whether a remote file's bytes should be fetched into the store.
     ///
     /// `hydrated` is the local entry's `materialized` flag (`false` when there
     /// is no local row). Demand stays index-only until that flag is set.
     pub fn fetches_bytes(self, hydrated: bool) -> bool {
         match self {
-            Self::Full => true,
+            Self::Full | Self::Store => true,
             Self::Metadata | Self::Exclude => false,
             Self::Demand => hydrated,
         }
+    }
+
+    /// Whether a remote file is written into the working tree.
+    pub fn writes_tree(self, hydrated: bool) -> bool {
+        self != Self::Store && self.fetches_bytes(hydrated)
     }
 }
 
@@ -538,6 +548,54 @@ impl Engine {
             });
         }
         Ok(out)
+    }
+
+    /// Store-mode file rows whose object this device does not hold yet.
+    ///
+    /// Reads only index-only rows with no `objects` row, so a store that is
+    /// complete costs one query per hydration tick.
+    pub(crate) fn store_unfetched(&self) -> Result<Vec<FullPending>, EngineError> {
+        use std::collections::HashMap;
+
+        let rows = self.db.repo().list_index_only_unstored()?;
+        let mut rules_by_space: HashMap<SpaceId, Vec<MaterializationRuleRecord>> = HashMap::new();
+        let mut out = Vec::new();
+        for row in rows {
+            let rules = match rules_by_space.get(&row.space) {
+                Some(rules) => rules,
+                None => {
+                    let loaded = self.db.repo().list_materialization_rules(row.space)?;
+                    rules_by_space.insert(row.space, loaded);
+                    rules_by_space.get(&row.space).expect("just inserted")
+                }
+            };
+            if path_mode(rules, &row.mount_name, row.path.as_str())? != MaterializationMode::Store {
+                continue;
+            }
+            out.push(FullPending {
+                object: row.object,
+                key: EntryKey {
+                    space: row.space,
+                    mount: row.mount,
+                    path: row.path,
+                },
+                space: row.space,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Note that `object` is now in the store, so store-mode rows naming it
+    /// stop counting as unfetched.
+    pub(crate) fn record_stored_object(&mut self, object: ObjectId) -> Result<(), EngineError> {
+        if !self.store.contains(&object) {
+            return Ok(());
+        }
+        let size = self.store.size_of(&object)?;
+        let now = self.clock.now_ms();
+        self.db
+            .transaction(|repo| repo.record_object(object, size, now))
+            .map_err(EngineError::from_db)
     }
 
     /// Materialize full-mode index rows that were waiting on `object`.

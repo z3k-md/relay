@@ -147,6 +147,8 @@ function stateLabel(row: FileRow): string {
       return "Not stored here";
     case "pending":
       return "Waiting to sync";
+    case "stored":
+      return "Kept in backup store";
   }
 }
 
@@ -236,7 +238,7 @@ onMounted(async () => {
             type="button"
             class="min-w-0 flex-1 truncate text-left"
             :class="row.kind === 'directory' ? 'font-medium' : ''"
-            :disabled="working.has(row.path) || row.state === 'metadata_only'"
+            :disabled="working.has(row.path) || row.state === 'metadata_only' || row.state === 'stored'"
             @click="openRow(row)"
           >
             {{ row.kind === "directory" ? "📁" : row.state === "local" ? "📄" : "☁️" }}

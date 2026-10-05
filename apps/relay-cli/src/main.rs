@@ -484,6 +484,7 @@ enum MatMode {
     Metadata,
     Demand,
     Exclude,
+    Store,
 }
 
 impl MatMode {
@@ -493,6 +494,7 @@ impl MatMode {
             Self::Metadata => "metadata",
             Self::Demand => "demand",
             Self::Exclude => "exclude",
+            Self::Store => "store",
         }
     }
 }

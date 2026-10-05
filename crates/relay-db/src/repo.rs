@@ -809,6 +809,24 @@ impl Repo<'_> {
         Self::collect_index_only(rows)
     }
 
+    /// Index-only file rows whose object this device has not recorded as
+    /// stored: what store mode still has to fetch.
+    pub fn list_index_only_unstored(&self) -> Result<Vec<IndexOnlyEntry>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.space_id, m.id, m.name, e.path, e.object_id
+             FROM entries e
+             JOIN mounts m ON m.id = e.mount_id
+             JOIN device_mounts dm ON dm.mount_id = m.id
+             JOIN local_device ld ON ld.device_ref = dm.device_ref
+             LEFT JOIN objects o ON o.id = e.object_id
+             WHERE e.materialized = 0 AND e.deleted = 0
+               AND e.object_id IS NOT NULL AND o.id IS NULL
+             ORDER BY m.name, e.path",
+        )?;
+        let rows = stmt.query_map([], Self::map_index_only)?;
+        Self::collect_index_only(rows)
+    }
+
     /// Index-only rows whose file is `object`: the rows a fetched object can
     /// hydrate, without walking every index-only row.
     pub fn list_index_only_by_object(
@@ -2364,7 +2382,7 @@ impl Repo<'_> {
         selectors: &[String],
         now_ms: i64,
     ) -> Result<(), DbError> {
-        if !matches!(mode, "full" | "metadata" | "demand" | "exclude") {
+        if !matches!(mode, "full" | "metadata" | "demand" | "exclude" | "store") {
             return Err(DbError::Corrupt(format!(
                 "unknown materialization mode {mode:?}"
             )));
@@ -2437,7 +2455,10 @@ impl Repo<'_> {
         let mut out = Vec::new();
         for row in rows {
             let (id, space_id, name, mode, position) = row?;
-            if !matches!(mode.as_str(), "full" | "metadata" | "demand" | "exclude") {
+            if !matches!(
+                mode.as_str(),
+                "full" | "metadata" | "demand" | "exclude" | "store"
+            ) {
                 return Err(DbError::Corrupt(format!(
                     "unknown materialization mode {mode:?}"
                 )));

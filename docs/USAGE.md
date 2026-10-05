@@ -80,7 +80,7 @@ Sharing a space tells the other members about that peer, including addresses. A 
 
 Optional `relay policy` and `relay group` commands limit which subtrees go to which devices. Without them, a shared space syncs in full to every peer it is shared with.
 
-Optional `relay materialize` rules are local to this computer. They decide whether a path is a full copy, an index row with no bytes (`metadata`), fetched only when you ask (`demand`), or ignored (`exclude`). Later rules override earlier ones. `relay fetch SPACE/MOUNT/PATH` writes one demand file; `relay evict` removes that copy without deleting it on other machines. With no rules, every file is a full copy.
+Optional `relay materialize` rules are local to this computer. They decide whether a path is a full copy, an index row with no bytes (`metadata`), fetched only when you ask (`demand`), kept in Relay's object store with no file in the folder (`store`, the home server's default), or ignored (`exclude`). Later rules override earlier ones. `relay fetch SPACE/MOUNT/PATH` writes one demand file; `relay evict` removes that copy without deleting it on other machines. With no rules, every file is a full copy.
 
 The desktop app's Files view does the same per folder: "Always keep on this computer" or "Online only", Download, Open (downloads first if needed), and Free up space. Those choices are `materialize` rules named `folder-…`; a choice for a folder replaces the folder choices inside it, and rules you add by hand are left alone.
 
@@ -175,7 +175,7 @@ relay service logs -f
 | `relay group create NAME` / `group add NAME PEER` / `group remove NAME PEER` / `group delete NAME` / `group list` | Device groups for replication policies |
 | `relay policy add SPACE NAME --selector GLOB... [--peer NAME]... [--group NAME]...` | Limit which subtrees sync to which devices |
 | `relay policy remove SPACE NAME` / `policy list [SPACE]` | Remove a policy or list them |
-| `relay materialize add SPACE NAME --mode full\|metadata\|demand\|exclude --selector GLOB...` | Choose how this device stores matching paths. Last rule wins |
+| `relay materialize add SPACE NAME --mode full\|metadata\|demand\|exclude\|store --selector GLOB...` | Choose how this device stores matching paths. Last rule wins |
 | `relay materialize remove SPACE NAME` / `materialize list [SPACE]` | Remove a materialization rule or list them |
 | `relay fetch SPACE/MOUNT/PATH` | Write one `demand` file from a peer, the mailbox, or the local store |
 | `relay evict SPACE/MOUNT[/PATH]` | Remove a fetched `demand` file here, or every one under a folder or the whole mount. Files edited since are kept. The index rows stay, and other devices are unchanged |
