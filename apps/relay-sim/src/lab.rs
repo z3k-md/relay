@@ -30,6 +30,10 @@ struct Node {
     mount_path: PathBuf,
     log: PathBuf,
     pid: u32,
+    /// Start time of `pid` (Linux only), so `down` after a reboot does not
+    /// kill whatever reused the number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started: Option<u64>,
 }
 
 impl Node {
@@ -82,6 +86,23 @@ pub fn up(
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
 
+    let result = start_lab(&dir, json, names, space, mount, mailbox);
+    if result.is_err() {
+        // Best effort: the daemons that did come up are detached, so nothing
+        // else would stop them. The directory stays for a look at the logs.
+        let _ = down(&dir, true);
+    }
+    result
+}
+
+fn start_lab(
+    dir: &Path,
+    json: bool,
+    names: &[String],
+    space: &str,
+    mount: &str,
+    mailbox: Option<String>,
+) -> Result<()> {
     let mailbox = mailbox.map(|value| {
         let path = PathBuf::from(&value);
         if path.is_absolute() {
@@ -108,9 +129,10 @@ pub fn up(
             mount_path: root.join("mount"),
             log: root.join("daemon.log"),
             pid: 0,
+            started: None,
         });
     }
-    save(&dir, &lab)?;
+    save(dir, &lab)?;
 
     for index in 0..lab.nodes.len() {
         let node = lab.nodes[index].clone();
@@ -135,8 +157,8 @@ pub fn up(
                     .with_context(|| format!("mailbox on {}", node.name))?;
             }
         }
-        lab.nodes[index].pid = spawn_daemon(&node)?;
-        save(&dir, &lab)?;
+        spawn_daemon(&mut lab.nodes[index])?;
+        save(dir, &lab)?;
     }
 
     for node in &lab.nodes {
@@ -175,14 +197,21 @@ pub fn up(
 }
 
 pub fn down(dir: &Path, keep: bool) -> Result<()> {
+    let mut failures = Vec::new();
     if let Ok(lab) = load(dir) {
         for node in &lab.nodes {
-            force_kill(node.pid)?;
+            if let Err(err) = force_kill(node) {
+                failures.push(format!("{}: {err:#}", node.name));
+            }
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        while lab.nodes.iter().any(|node| pid_alive(node.pid)) && Instant::now() < deadline {
+        while lab.nodes.iter().any(pid_alive) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
+    }
+    if !failures.is_empty() {
+        // state.json stays: its pids are what a retry needs.
+        bail!("could not stop every daemon: {}", failures.join("; "));
     }
     if !keep && dir.join("state.json").is_file() {
         fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
@@ -205,12 +234,12 @@ pub fn write(dir: &Path, name: &str, spec: &str, content: &str) -> Result<()> {
 pub fn kill(dir: &Path, name: &str) -> Result<()> {
     let lab = load(dir)?;
     let node = node(&lab, name)?;
-    force_kill(node.pid)?;
+    force_kill(node)?;
     let deadline = Instant::now() + Duration::from_secs(2);
-    while pid_alive(node.pid) && Instant::now() < deadline {
+    while pid_alive(node) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    if pid_alive(node.pid) {
+    if pid_alive(node) {
         bail!("pid {} for {} is still running", node.pid, node.name);
     }
     Ok(())
@@ -218,16 +247,15 @@ pub fn kill(dir: &Path, name: &str) -> Result<()> {
 
 pub fn start(dir: &Path, name: &str) -> Result<()> {
     let mut lab = load(dir)?;
-    let existing = node(&lab, name)?.clone();
-    if pid_alive(existing.pid) {
+    let existing = node(&lab, name)?;
+    if pid_alive(existing) {
         bail!(
             "{} is already running as pid {}",
             existing.name,
             existing.pid
         );
     }
-    let pid = spawn_daemon(&existing)?;
-    node_mut(&mut lab, name)?.pid = pid;
+    spawn_daemon(node_mut(&mut lab, name)?)?;
     save(dir, &lab)?;
     let started = node(&lab, name)?;
     wait_running(started)?;
@@ -263,7 +291,7 @@ pub fn wait_stalled(dir: &Path, name: &str, timeout: &str) -> Result<()> {
         if entered.is_file() {
             return Ok(());
         }
-        if !pid_alive(node.pid) {
+        if !pid_alive(node) {
             bail!(
                 "{} exited before the mailbox stall\n{}",
                 node.name,
@@ -358,7 +386,7 @@ fn inspect(lab: &Lab) -> Result<Inspection> {
     let mut nodes = Vec::new();
     let mut trees = Vec::new();
     for node in &lab.nodes {
-        let running = pid_alive(node.pid);
+        let running = pid_alive(node);
         if !running {
             pending.push(format!("{} is not running", node.name));
         }
@@ -564,7 +592,7 @@ fn wait_offer(home: &Path, space: &str) -> Result<()> {
 fn wait_live_mount(node: &Node, mount: &str) -> Result<()> {
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
-        if node.pid != 0 && !pid_alive(node.pid) {
+        if node.pid != 0 && !pid_alive(node) {
             bail!(
                 "{} exited while attaching {mount}\n{}",
                 node.name,
@@ -605,7 +633,7 @@ fn wait_running(node: &Node) -> Result<()> {
     let deadline = Instant::now() + START_TIMEOUT;
     let mut last = "starting".to_owned();
     while Instant::now() < deadline {
-        if node.pid != 0 && !pid_alive(node.pid) {
+        if node.pid != 0 && !pid_alive(node) {
             bail!(
                 "{} exited during startup\n{}",
                 node.name,
@@ -657,7 +685,7 @@ fn connect(home: &Path, timeout: Duration) -> Result<Client> {
     }
 }
 
-fn spawn_daemon(node: &Node) -> Result<u32> {
+fn spawn_daemon(node: &mut Node) -> Result<()> {
     if let Some(parent) = node.log.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -678,7 +706,9 @@ fn spawn_daemon(node: &Node) -> Result<u32> {
     let child = cmd
         .spawn()
         .with_context(|| format!("starting daemon {}", node.name))?;
-    Ok(child.id())
+    node.pid = child.id();
+    node.started = process_start_time(node.pid);
+    Ok(())
 }
 
 fn detach(cmd: &mut Command) {
@@ -695,18 +725,18 @@ fn detach(cmd: &mut Command) {
     }
 }
 
-fn force_kill(pid: u32) -> Result<()> {
-    if pid == 0 || !pid_alive(pid) {
+fn force_kill(node: &Node) -> Result<()> {
+    if !pid_alive(node) {
         return Ok(());
     }
-    let status = kill_command(pid)
+    let status = kill_command(node.pid)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    if status.success() || !pid_alive(pid) {
+    if status.success() || !pid_alive(node) {
         return Ok(());
     }
-    bail!("could not kill pid {pid}")
+    bail!("could not kill pid {}", node.pid)
 }
 
 fn kill_command(pid: u32) -> Command {
@@ -724,10 +754,34 @@ fn kill_command(pid: u32) -> Command {
     }
 }
 
-fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
+/// Whether `node.pid` is still the daemon this lab started. On Linux the
+/// start time recorded at spawn tells a reused pid apart; elsewhere a live
+/// pid is taken to be ours.
+fn pid_alive(node: &Node) -> bool {
+    if node.pid == 0 || !os_pid_alive(node.pid) {
         return false;
     }
+    match (node.started, process_start_time(node.pid)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    // Field 22 of /proc/<pid>/stat, counted from the end of the
+    // parenthesised command name because that name may hold spaces.
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+fn os_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         Command::new("kill")

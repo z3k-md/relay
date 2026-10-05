@@ -20,6 +20,7 @@ mod secrets;
 mod sync;
 mod watch;
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -126,6 +127,8 @@ pub struct Engine {
     lock: Option<File>,
     /// Sync roots for online-only files (D43). Empty unless a host is set.
     placeholders: placeholders::Placeholders,
+    /// Whether each mount root folds case, probed once per path.
+    case_probe: HashMap<MountId, (PathBuf, bool)>,
 }
 
 impl Engine {
@@ -160,6 +163,7 @@ impl Engine {
             box_key: Some(box_key),
             lock: Some(lock),
             placeholders: Default::default(),
+            case_probe: HashMap::new(),
         })
     }
 
@@ -210,6 +214,7 @@ impl Engine {
             box_key: Some(box_key),
             lock: Some(lock),
             placeholders: Default::default(),
+            case_probe: HashMap::new(),
         })
     }
 
@@ -239,6 +244,7 @@ impl Engine {
             box_key,
             lock: None,
             placeholders: Default::default(),
+            case_probe: HashMap::new(),
         })
     }
 
@@ -992,9 +998,7 @@ impl Engine {
         let listed = self.mounts(None)?;
         let mut mounts = Vec::with_capacity(listed.len());
         for (space, config) in listed {
-            let entries = self.db.repo().entries_for_mount(config.mount.id)?;
-            let live_entries = entries.iter().filter(|e| !e.is_deleted()).count();
-            let tombstones = entries.len() - live_entries;
+            let (live_entries, tombstones) = self.db.repo().count_entries(config.mount.id)?;
             let (marker_ok, marker_state) = match &config.local_path {
                 None => (false, "NO_PATH".to_owned()),
                 Some(path) => match MountMarker::verify(path, config.mount.id) {
@@ -1024,7 +1028,7 @@ impl Engine {
                 last_error: state.and_then(|s| s.last_error),
             });
         }
-        let object_count = self.store.list()?.len() as u64;
+        let object_count = self.store.count()?;
         let mut peers = Vec::new();
         for peer in self.db.repo().list_peers()? {
             let mut spaces = Vec::new();

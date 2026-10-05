@@ -247,6 +247,7 @@ impl Engine {
                 let mut to_apply: Vec<RemoteEntry> = Vec::new();
                 let mut through = after.0;
                 let mut objects_fetched = 0usize;
+                let wants = self.wants_resolver(space.id, local)?;
 
                 for wire in wires {
                     let seq = wire.sequence;
@@ -259,7 +260,7 @@ impl Engine {
                     };
 
                     let wanted = match mount_names.get(&entry.key.mount) {
-                        Some(name) => self.wants(space.id, local, name, entry.key.path.as_str())?,
+                        Some(name) => wants.wants(name, entry.key.path.as_str()),
                         None => true,
                     };
                     if !wanted {

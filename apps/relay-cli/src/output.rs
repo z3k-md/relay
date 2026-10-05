@@ -5,14 +5,47 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROTATE_AFTER: u64 = 10 * 1024 * 1024;
+/// Writes between size checks, so a service that runs for months rotates
+/// too, not only the one that restarts.
+const ROTATE_CHECK_EVERY: u32 = 256;
 
-static LOG: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+static LOG: OnceLock<Mutex<Option<Log>>> = OnceLock::new();
 
-fn slot() -> &'static Mutex<Option<File>> {
+struct Log {
+    path: PathBuf,
+    file: File,
+    writes_since_check: u32,
+}
+
+impl Log {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: open_log(path)?,
+            writes_since_check: 0,
+        })
+    }
+
+    /// Every `ROTATE_CHECK_EVERY` writes, rotate and reopen once the file
+    /// has grown past the cap. A reopen that fails keeps the old handle.
+    fn rotate_periodically(&mut self) {
+        self.writes_since_check += 1;
+        if self.writes_since_check < ROTATE_CHECK_EVERY {
+            return;
+        }
+        self.writes_since_check = 0;
+        let oversized = self.file.metadata().is_ok_and(|m| m.len() > ROTATE_AFTER);
+        if oversized && let Ok(file) = open_log(&self.path) {
+            self.file = file;
+        }
+    }
+}
+
+fn slot() -> &'static Mutex<Option<Log>> {
     LOG.get_or_init(|| Mutex::new(None))
 }
 
-fn lock_log() -> std::sync::MutexGuard<'static, Option<File>> {
+fn lock_log() -> std::sync::MutexGuard<'static, Option<Log>> {
     slot().lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -22,9 +55,9 @@ pub fn is_configured() -> bool {
 }
 
 pub fn configure(path: &Path, version: &str) -> anyhow::Result<()> {
-    let mut file = open_log(path)?;
-    write_start_header(&mut file, version)?;
-    *lock_log() = Some(file);
+    let mut log = Log::open(path)?;
+    write_start_header(&mut log.file, version)?;
+    *lock_log() = Some(log);
     Ok(())
 }
 
@@ -54,9 +87,10 @@ pub fn err_line(line: &str) {
 
 pub fn write_line(line: &str) -> io::Result<()> {
     let mut guard = lock_log();
-    if let Some(file) = guard.as_mut() {
-        writeln!(file, "{line}")?;
-        file.flush()?;
+    if let Some(log) = guard.as_mut() {
+        log.rotate_periodically();
+        writeln!(log.file, "{line}")?;
+        log.file.flush()?;
         Ok(())
     } else {
         Err(io::Error::other("log file is not configured"))
@@ -65,9 +99,10 @@ pub fn write_line(line: &str) -> io::Result<()> {
 
 pub fn write_bytes(buf: &[u8]) -> io::Result<()> {
     let mut guard = lock_log();
-    if let Some(file) = guard.as_mut() {
-        file.write_all(buf)?;
-        file.flush()?;
+    if let Some(log) = guard.as_mut() {
+        log.rotate_periodically();
+        log.file.write_all(buf)?;
+        log.file.flush()?;
         Ok(())
     } else {
         io::stderr().write_all(buf)?;
@@ -77,8 +112,8 @@ pub fn write_bytes(buf: &[u8]) -> io::Result<()> {
 
 pub fn flush() -> io::Result<()> {
     let mut guard = lock_log();
-    if let Some(file) = guard.as_mut() {
-        file.flush()
+    if let Some(log) = guard.as_mut() {
+        log.file.flush()
     } else {
         Ok(())
     }
@@ -208,6 +243,37 @@ mod tests {
             fs::metadata(&rotated).unwrap().len(),
             oversized.len() as u64
         );
+    }
+
+    #[test]
+    fn log_rotates_while_open_once_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.log");
+        let mut log = Log::open(&path).unwrap();
+        // Something else (an older handle, say) grows the file past the cap.
+        let oversized = vec![b'x'; (ROTATE_AFTER as usize) + 16];
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&oversized)
+            .unwrap();
+
+        for _ in 0..ROTATE_CHECK_EVERY {
+            log.rotate_periodically();
+            writeln!(log.file, "line").unwrap();
+        }
+        log.file.flush().unwrap();
+
+        let rotated = path.with_file_name("relay.log.1");
+        assert!(rotated.exists(), "log was not rotated");
+        assert!(fs::metadata(&rotated).unwrap().len() > ROTATE_AFTER);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.len() < 64,
+            "fresh log holds only the last writes: {text:?}"
+        );
+        assert!(text.ends_with("line\n"));
     }
 
     #[test]

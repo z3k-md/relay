@@ -40,6 +40,11 @@ function asError(err: unknown): Error {
   return new Error(String(err));
 }
 
+/** What a thrown value says, for showing to the user. */
+export function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /** A refused remote call, with the stable code from the other device. */
 export class RemoteCallError extends Error {
   constructor(
@@ -170,6 +175,8 @@ export function runnerLabel(state: RunnerState): string {
       return "Running";
     case "paused":
       return "Paused";
+    case "stopped":
+      return "Stopped";
     case "error":
       return "Error";
     case "externalService":

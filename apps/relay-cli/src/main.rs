@@ -22,7 +22,7 @@ use relay_engine::{
     resolve_conflict, resolve_git_conflicts,
 };
 use relay_ipc::{
-    ActivityItem, Client, FolderEnd, FolderPairParams, OpenRemoteParams, PairJoinParams,
+    ActivityItem, Client, FolderEnd, FolderPairParams, IpcError, OpenRemoteParams, PairJoinParams,
     PairStartParams, PairStatus, Status as DaemonStatus,
 };
 
@@ -668,10 +668,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
             into,
             read_only,
         } => {
+            // The host joins the folder onto this root in its own working
+            // directory, so make it absolute here.
+            let root = into
+                .map(|dir| {
+                    std::path::absolute(&dir)
+                        .with_context(|| format!("resolving {}", dir.display()))
+                })
+                .transpose()?;
             let opened = running_host(&home)?.open_remote(&OpenRemoteParams {
                 peer,
                 path,
-                root: into,
+                root,
                 read_only,
             })?;
             if json {
@@ -873,6 +881,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 if dev_excludes {
                     excludes.extend(DEV_EXCLUDES.iter().map(|s| (*s).to_owned()));
                 }
+                // A running host would resolve a relative path against its
+                // own working directory, not this one.
+                let path = std::path::absolute(&path)
+                    .with_context(|| format!("resolving {}", path.display()))?;
                 apply_config(
                     &home,
                     ConfigChange::AddMount {
@@ -1109,7 +1121,9 @@ fn cmd_run(
             watch: opts,
             verbose,
             host,
-            enable_stun: true,
+            // A loopback host (tests, local experiments) is unreachable from
+            // outside, so asking STUN for its public address is noise.
+            enable_stun: !listen.ip().is_loopback(),
             loopback_only: false,
             placeholders: true,
         },
@@ -1250,7 +1264,7 @@ fn start_pair_host(home: &Path, listen: SocketAddr) -> Result<PairHost> {
                     watch: WatchOptions::default(),
                     verbose: false,
                     host: HostKind::Cli,
-                    enable_stun: true,
+                    enable_stun: !listen.ip().is_loopback(),
                     loopback_only: false,
                     placeholders: true,
                 },
@@ -1462,10 +1476,7 @@ fn print_watch_event(
             paths,
             report,
         } => {
-            if !*full && !report.has_changes() && !verbose {
-                return;
-            }
-            if *full && !report.has_changes() && !verbose {
+            if !report.has_changes() && !verbose {
                 return;
             }
             if *full && !report.has_changes() {
@@ -2509,22 +2520,12 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     let status = engine.status()?;
     let holds = engine.delete_holds()?;
     let daemon = query_daemon(engine.home());
-    let service = if service::supported() {
-        match service::status_info(engine.home()) {
-            Ok(info) => Some(info),
-            Err(err) => {
-                eprintln!("warning: could not query the background service: {err:#}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let service = service::supported().then(|| service::status_info(engine.home()));
     if json {
         let mut value = serde_json::to_value(&status)?;
         value["delete_holds"] = serde_json::to_value(&holds)?;
         value["daemon"] = match &daemon {
-            Some((hello, live)) => serde_json::json!({
+            DaemonProbe::Running(hello, live) => serde_json::json!({
                 "host": hello.host,
                 "pid": hello.pid,
                 "started_at_ms": hello.started_at_ms,
@@ -2537,10 +2538,19 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
                 "mounts": live.mounts,
                 "transfers": live.transfers,
             }),
-            None => serde_json::Value::Null,
+            DaemonProbe::Incompatible { found, expected } => serde_json::json!({
+                "incompatible": true,
+                "protocol": found,
+                "expected_protocol": expected,
+            }),
+            DaemonProbe::NotRunning => serde_json::Value::Null,
         };
-        if let Some(info) = service {
-            value["service"] = serde_json::to_value(info)?;
+        // Keep stderr quiet under --json: a failed service query is part of
+        // the document.
+        match service {
+            Some(Ok(info)) => value["service"] = serde_json::to_value(info)?,
+            Some(Err(err)) => value["service_error"] = serde_json::json!(format!("{err:#}")),
+            None => {}
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -2621,24 +2631,63 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
             );
         }
     }
-    if let Some(info) = service {
-        println!("{}", service::format_status_line(&info));
+    match service {
+        Some(Ok(info)) => println!("{}", service::format_status_line(&info)),
+        Some(Err(err)) => {
+            eprintln!("warning: could not query the background service: {err:#}");
+        }
+        None => {}
     }
-    print_daemon_human(daemon.as_ref());
+    print_daemon_human(&daemon);
     Ok(())
 }
 
-fn query_daemon(home: &Path) -> Option<(relay_ipc::Hello, DaemonStatus)> {
-    let mut client = Client::connect(home).ok().flatten()?;
-    let hello = client.hello().ok()?;
-    let status = client.status().ok()?;
-    Some((hello, status))
+enum DaemonProbe {
+    NotRunning,
+    /// A host answered but speaks another IPC protocol: typically the old
+    /// service still running after an upgrade.
+    Incompatible {
+        found: u32,
+        expected: u32,
+    },
+    Running(relay_ipc::Hello, DaemonStatus),
 }
 
-fn print_daemon_human(daemon: Option<&(relay_ipc::Hello, DaemonStatus)>) {
-    let Some((hello, live)) = daemon else {
-        println!("daemon: not running");
-        return;
+fn query_daemon(home: &Path) -> DaemonProbe {
+    let Ok(Some(mut client)) = Client::connect(home) else {
+        return DaemonProbe::NotRunning;
+    };
+    let hello = match client.hello() {
+        Ok(hello) => hello,
+        Err(IpcError::ProtocolMismatch { found, expected }) => {
+            return DaemonProbe::Incompatible { found, expected };
+        }
+        Err(_) => return DaemonProbe::NotRunning,
+    };
+    match client.status() {
+        Ok(status) => DaemonProbe::Running(hello, status),
+        Err(_) => DaemonProbe::NotRunning,
+    }
+}
+
+fn print_daemon_human(daemon: &DaemonProbe) {
+    let (hello, live) = match daemon {
+        DaemonProbe::Running(hello, live) => (hello, live),
+        DaemonProbe::Incompatible { found, expected } => {
+            let restart = if service::supported() {
+                "run `relay service restart`"
+            } else {
+                "restart the `relay run` process"
+            };
+            println!(
+                "daemon: running, but it speaks IPC protocol {found} and this relay expects {expected}; {restart} so both are the same version"
+            );
+            return;
+        }
+        DaemonProbe::NotRunning => {
+            println!("daemon: not running");
+            return;
+        }
     };
     let state = live.state.as_str();
     println!("daemon: {state} ({} pid {})", hello.host, hello.pid);
@@ -2864,6 +2913,7 @@ impl RescanWait {
 
 fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
     let deadline = Instant::now() + Duration::from_secs(600);
+    let mut failed: Vec<ActivityItem> = Vec::new();
     while !wait.pending.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2882,12 +2932,27 @@ fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
                 let Some(key) = key else {
                     continue;
                 };
-                if wait.pending.remove(&key) {
-                    if json {
-                        println!("{}", serde_json::to_string(&item)?);
+                if !wait.pending.remove(&key) {
+                    continue;
+                }
+                if json {
+                    println!("{}", serde_json::to_string(&item)?);
+                } else if item.kind == "scan_failed" {
+                    eprintln!("error: {}", item.summary);
+                    // `rescan` has no --allow-mass-delete, and `relay scan`
+                    // refuses to run beside a host: say how to get there.
+                    if item.summary.contains("refusing to delete") {
+                        eprintln!(
+                            "hint: stop Relay (`relay service stop`, or Ctrl-C a `relay run`) and run `relay scan --allow-mass-delete` if the deletion was intentional"
+                        );
                     } else {
-                        println!("{}", item.summary);
+                        print_watch_error_hints(&item.summary);
                     }
+                } else {
+                    println!("{}", item.summary);
+                }
+                if item.kind == "scan_failed" {
+                    failed.push(item);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -2896,7 +2961,22 @@ fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
             }
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(rescan_exit_code(&failed))
+}
+
+/// The host ran the scans; exit as `relay scan` would have: 2 for a refused
+/// mass delete, 1 for any other failure.
+fn rescan_exit_code(failed: &[ActivityItem]) -> ExitCode {
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else if failed
+        .iter()
+        .any(|item| item.summary.contains("refusing to delete"))
+    {
+        ExitCode::from(2)
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 fn cmd_activity(home: &Path, n: usize, follow: bool, json: bool) -> Result<ExitCode> {
@@ -2915,11 +2995,25 @@ fn cmd_activity(home: &Path, n: usize, follow: bool, json: bool) -> Result<ExitC
     let _ = ctrlc::set_handler(move || {
         flag.store(true, Ordering::SeqCst);
     });
+    // The read blocks through Ctrl-C, so a worker reads and this thread
+    // polls the flag between items.
     let mut sub = client.subscribe()?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let next = sub.next_item();
+            let more = matches!(next, Ok(Some(_)));
+            if tx.send(next).is_err() || !more {
+                break;
+            }
+        }
+    });
     while !stop.load(Ordering::Relaxed) {
-        match sub.next_item()? {
-            Some(item) => print_activity_item(&item, json),
-            None => break,
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(Some(item))) => print_activity_item(&item, json),
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -3332,6 +3426,10 @@ struct Target {
 }
 
 fn parse_target(raw: &str) -> Result<Target> {
+    // Windows shells complete paths with backslashes, and no file there can
+    // have one in its name, so they are separators too.
+    #[cfg(windows)]
+    let raw: &str = &raw.replace('\\', "/");
     let raw = raw.strip_suffix('/').unwrap_or(raw);
     let mut parts = raw.split('/');
     let space = parts
@@ -3527,6 +3625,40 @@ mod tests {
         assert_eq!(
             file.path.as_ref().map(LogicalPath::as_str),
             Some("foo/bar.txt")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_target_accepts_backslashes() {
+        let file = parse_target(r"Personal\code\foo\bar.txt").unwrap();
+        assert_eq!(file.space, "Personal");
+        assert_eq!(file.mount.as_deref(), Some("code"));
+        assert_eq!(
+            file.path.as_ref().map(LogicalPath::as_str),
+            Some("foo/bar.txt")
+        );
+    }
+
+    #[test]
+    fn rescan_exit_code_distinguishes_mass_delete() {
+        let item = |summary: &str| ActivityItem {
+            at_ms: 0,
+            kind: "scan_failed".to_owned(),
+            summary: summary.to_owned(),
+            detail: Some("S/m".to_owned()),
+        };
+        assert_eq!(rescan_exit_code(&[]), ExitCode::SUCCESS);
+        assert_eq!(
+            rescan_exit_code(&[item("S/m: mount marker missing at /x")]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            rescan_exit_code(&[
+                item("S/m: mount marker missing at /x"),
+                item("S/n: refusing to delete 30 of 30 live entries"),
+            ]),
+            ExitCode::from(2)
         );
     }
 }

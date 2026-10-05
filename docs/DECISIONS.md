@@ -561,8 +561,11 @@ address. There is no internet rendezvous and no NAT traversal in this phase
   instance name is derived from the device id. TXT: `id`, `name`, `v=1`,
   and `pair=<nameplate>` only while a pairing session is open. Browse is
   continuous. A joiner without `--addr` dials the resolved instance whose
-  `pair` TXT matches its nameplate. For already-trusted peers, newly
-  resolved LAN addresses are merged in front of stored ones (Tailscale
+  `pair` TXT matches its nameplate. For already-trusted peers, resolved LAN
+  addresses are kept in memory as dial hints (at most two per peer) and
+  tried ahead of the stored list. An announcement is unauthenticated, so a
+  hint reaches the stored list only after a dial to it completed the pinned
+  TLS handshake: it is then merged in front of stored ones (Tailscale
   entries stay), capped at 8, written through `SyncInput::PeerAddresses` on
   the engine loop, then pushed live with `NetCommand::SetPeers`. Multicast
   failures are logged and never stop the host.
@@ -797,7 +800,12 @@ remains end to end between the two devices.
   when the session id matches that pair. Data frames are accepted only from a
   bound source address. Quinn's max UDP payload is capped at 1400 bytes so a
   21-byte relay header still fits the receive buffer. Virtual dial addresses
-  use `198.18.0.0/15` and never go on the wire.
+  use `198.18.0.0/15` and never go on the wire. The forwarder keeps at most
+  4,096 sessions and drops one that carried nothing for 60 seconds; a device
+  re-binds on its next dial. Known follow-up: a bind carries no timestamp or
+  nonce, so a captured one replayed from another address moves that slot
+  until the device binds again. Fixing it means a signed timestamp in the
+  bind, which old devices do not send, so it waits for a protocol bump.
 - **Discovery.** When a mailbox is configured, the non-empty local relay
   address is written to `transport/relay`. A device with no local address
   adopts that file. Peer-only mode (no mailbox and no local setting) does not

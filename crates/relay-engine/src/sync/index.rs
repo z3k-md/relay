@@ -114,13 +114,12 @@ impl Syncer {
                 .into_iter()
                 .map(|cfg| (cfg.mount.id, cfg.mount.name))
                 .collect();
+            let wants = engine.wants_resolver(space, peer)?;
             let mut wire_entries = Vec::new();
             let mut objects = Vec::new();
             for entry in &changes {
                 let include = match mount_names.get(&entry.key.mount) {
-                    Some(mount_name) => {
-                        engine.wants(space, peer, mount_name, entry.key.path.as_str())?
-                    }
+                    Some(mount_name) => wants.wants(mount_name, entry.key.path.as_str()),
                     None => true,
                 };
                 if !include {
@@ -207,11 +206,12 @@ impl Syncer {
             .collect();
         let local = engine.device().id;
         let rules = engine.rules_for(space)?;
+        let wants = engine.wants_resolver(space, local)?;
         let mut kept = Vec::with_capacity(entries.len());
         for entry in entries {
             match mount_names.get(&entry.key.mount) {
                 Some(name) => {
-                    if !engine.wants(space, local, name, entry.key.path.as_str())? {
+                    if !wants.wants(name, entry.key.path.as_str()) {
                         continue;
                     }
                     let mode = path_mode(&rules, name, entry.key.path.as_str())?;

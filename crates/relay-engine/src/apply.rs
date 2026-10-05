@@ -50,7 +50,9 @@ struct MountApply {
     config: MountConfig,
     rules: MountRules,
     case_insensitive: bool,
-    live_fold: HashMap<String, LogicalPath>,
+    /// Case-folded live paths, built on first use and only for a mount whose
+    /// filesystem folds case; the collision check is the only reader.
+    live_fold: Option<HashMap<String, LogicalPath>>,
 }
 
 impl Engine {
@@ -61,12 +63,23 @@ impl Engine {
         mut entries: Vec<RemoteEntry>,
         failed_objects: &HashSet<ObjectId>,
     ) -> Result<ApplyOutcome, EngineError> {
+        // One index read per entry, shared by the sort and the loop below.
+        let mut locals: HashMap<EntryKey, Option<EntryRecord>> =
+            HashMap::with_capacity(entries.len());
+        for entry in &entries {
+            if !locals.contains_key(&entry.key) {
+                locals.insert(entry.key.clone(), self.db.repo().entry(&entry.key)?);
+            }
+        }
+        let class_of = |entry: &RemoteEntry| {
+            let previous = locals
+                .get(&entry.key)
+                .and_then(|local| local.as_ref())
+                .and_then(|local| local.content.kind());
+            classify_apply(&entry.content, previous)
+        };
         entries.sort_by(|a, b| {
-            let local_a = self.db.repo().entry(&a.key).ok().flatten();
-            let local_b = self.db.repo().entry(&b.key).ok().flatten();
-            let ca = classify_apply(&a.content, local_a.as_ref().and_then(|l| l.content.kind()));
-            let cb = classify_apply(&b.content, local_b.as_ref().and_then(|l| l.content.kind()));
-            apply_sort_key(&a.key.path, ca).cmp(&apply_sort_key(&b.key.path, cb))
+            apply_sort_key(&a.key.path, class_of(a)).cmp(&apply_sort_key(&b.key.path, class_of(b)))
         });
 
         let mut mounts = self.load_mount_apply(space)?;
@@ -83,10 +96,8 @@ impl Engine {
 
         for entry in entries {
             let sequence = entry.sequence.0;
-            let local = self.db.repo().entry(&entry.key).ok().flatten();
-            let writing = self
-                .writing_remote(&rules, &entry, local.as_ref())
-                .unwrap_or(true);
+            let local = locals.get(&entry.key).and_then(|local| local.as_ref());
+            let writing = self.writing_remote(&rules, &entry, local).unwrap_or(true);
             if writing
                 && let Some(obj) = entry.content.object()
                 && failed_objects.contains(&obj)
@@ -100,6 +111,12 @@ impl Engine {
             }
 
             let mount_id = entry.key.mount;
+            if let Some(ctx) = mounts.get_mut(&mount_id)
+                && ctx.case_insensitive
+                && ctx.live_fold.is_none()
+            {
+                ctx.live_fold = Some(self.live_fold_for(mount_id)?);
+            }
             let Some(ctx) = mounts.get(&mount_id) else {
                 outcome.skipped += 1;
                 outcome.warnings.push(ApplyWarning {
@@ -141,7 +158,7 @@ impl Engine {
     }
 
     fn load_mount_apply(
-        &self,
+        &mut self,
         space: SpaceId,
     ) -> Result<HashMap<MountId, MountApply>, EngineError> {
         let mut out = HashMap::new();
@@ -153,27 +170,43 @@ impl Engine {
             } else {
                 rules
             };
-            let case_insensitive = config
-                .local_path
-                .as_deref()
-                .is_some_and(probe_case_insensitive);
-            let mut live_fold = HashMap::new();
-            for entry in self.db.repo().entries_for_mount(config.mount.id)? {
-                if !entry.is_deleted() {
-                    live_fold.insert(entry.key.path.case_fold_key(), entry.key.path.clone());
-                }
-            }
+            let case_insensitive = match &config.local_path {
+                Some(root) => self.case_insensitive_root(config.mount.id, root),
+                None => false,
+            };
             out.insert(
                 config.mount.id,
                 MountApply {
                     config,
                     rules,
                     case_insensitive,
-                    live_fold,
+                    live_fold: None,
                 },
             );
         }
         Ok(out)
+    }
+
+    /// Whether `root` folds case. Probed once per mount path: the probe
+    /// writes and removes a file in the root, which is not a per-batch cost.
+    fn case_insensitive_root(&mut self, mount: MountId, root: &Path) -> bool {
+        match self.case_probe.get(&mount) {
+            Some((path, answer)) if path == root => *answer,
+            _ => {
+                let answer = probe_case_insensitive(root);
+                self.case_probe.insert(mount, (root.to_path_buf(), answer));
+                answer
+            }
+        }
+    }
+
+    fn live_fold_for(&self, mount: MountId) -> Result<HashMap<String, LogicalPath>, EngineError> {
+        let paths = self.db.repo().live_paths(mount)?;
+        let mut fold = HashMap::with_capacity(paths.len());
+        for path in paths {
+            fold.insert(path.case_fold_key(), path);
+        }
+        Ok(fold)
     }
 
     fn apply_entry_reeval(
@@ -205,13 +238,8 @@ impl Engine {
                         crate::ScanOptions::default(),
                     )?;
                     if let Some(ctx) = mounts.get_mut(&key.mount) {
-                        ctx.live_fold.clear();
-                        for rec in self.db.repo().entries_for_mount(key.mount)? {
-                            if !rec.is_deleted() {
-                                ctx.live_fold
-                                    .insert(rec.key.path.case_fold_key(), rec.key.path.clone());
-                            }
-                        }
+                        // Rebuilt on the next entry of this mount, if needed.
+                        ctx.live_fold = None;
                     }
                 }
             }
@@ -990,7 +1018,10 @@ fn skip_reason(entry: &RemoteEntry, ctx: &MountApply, writing: bool) -> Option<S
         return Some("excluded by local mount rules".into());
     }
     if ctx.case_insensitive
-        && let Some(existing) = ctx.live_fold.get(&entry.key.path.case_fold_key())
+        && let Some(existing) = ctx
+            .live_fold
+            .as_ref()
+            .and_then(|fold| fold.get(&entry.key.path.case_fold_key()))
         && existing != &entry.key.path
     {
         return Some(format!(
@@ -1270,16 +1301,18 @@ fn racy_stat(stat: StatHint, config: &crate::EngineConfig) -> Option<StatHint> {
 
 fn note_live(mounts: &mut HashMap<MountId, MountApply>, remote: &RemoteEntry) {
     if let Some(ctx) = mounts.get_mut(&remote.key.mount)
+        && let Some(fold) = ctx.live_fold.as_mut()
         && !remote.content.is_deleted()
     {
-        ctx.live_fold
-            .insert(remote.key.path.case_fold_key(), remote.key.path.clone());
+        fold.insert(remote.key.path.case_fold_key(), remote.key.path.clone());
     }
 }
 
 fn note_gone(mounts: &mut HashMap<MountId, MountApply>, remote: &RemoteEntry) {
-    if let Some(ctx) = mounts.get_mut(&remote.key.mount) {
-        ctx.live_fold.remove(&remote.key.path.case_fold_key());
+    if let Some(ctx) = mounts.get_mut(&remote.key.mount)
+        && let Some(fold) = ctx.live_fold.as_mut()
+    {
+        fold.remove(&remote.key.path.case_fold_key());
     }
 }
 

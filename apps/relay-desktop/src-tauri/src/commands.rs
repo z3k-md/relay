@@ -178,7 +178,7 @@ pub(crate) fn open_ro(home: &std::path::Path) -> Result<Engine, String> {
     Engine::open_read_only(home).map_err(|err| error_chain(&err))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_overview(app: AppHandle) -> Result<Overview, String> {
     let state = app.state::<AppState>();
     let runner = state.runner.state();
@@ -221,7 +221,7 @@ pub fn get_overview(app: AppHandle) -> Result<Overview, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn init_device(app: AppHandle, name: String) -> Result<Overview, String> {
     let state = app.state::<AppState>();
     let name = name.trim().to_owned();
@@ -266,7 +266,7 @@ fn live_sessions(app: &AppHandle) -> HashMap<String, PeerLive> {
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_peers(app: AppHandle) -> Result<Vec<PeerView>, String> {
     let sessions = live_sessions(&app);
     let state = app.state::<AppState>();
@@ -313,10 +313,13 @@ pub fn remote_call(
     peer: String,
     call: RemoteCall,
 ) -> Result<RemoteReply, RemoteError> {
-    let mut client = host_client(&app)
-        .ok()
-        .flatten()
-        .ok_or_else(|| RemoteError::new(RemoteErrorCode::Offline, "Relay is not running here"))?;
+    // Not `Offline`: that reads as the other device being down.
+    let mut client = host_client(&app).ok().flatten().ok_or_else(|| {
+        RemoteError::new(
+            RemoteErrorCode::Failed,
+            "Relay is not running on this computer. Resume sync and try again.",
+        )
+    })?;
     client.remote(&peer, &call).map_err(|err| match err {
         relay_ipc::IpcError::Remote { code, message } => {
             RemoteError::new(RemoteErrorCode::parse(&code), message)
@@ -416,7 +419,7 @@ pub(crate) fn host_client(app: &AppHandle) -> Result<Option<Client>, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_start(
     app: AppHandle,
     share: Vec<String>,
@@ -435,7 +438,7 @@ pub fn pair_start(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_status(app: AppHandle) -> Result<PairStatusView, String> {
     let mut client = pairing_client(&app)?;
     let status = client.pair_status().map_err(|err| error_chain(&err))?;
@@ -450,7 +453,7 @@ pub fn pair_status(app: AppHandle) -> Result<PairStatusView, String> {
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_join(
     app: AppHandle,
     code: String,
@@ -476,13 +479,13 @@ pub fn pair_join(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_cancel(app: AppHandle) -> Result<(), String> {
     let mut client = pairing_client(&app)?;
     client.pair_cancel().map_err(|err| error_chain(&err))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_spaces(app: AppHandle) -> Result<Vec<SpaceView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
@@ -636,7 +639,7 @@ fn write_directly(home: &std::path::Path, change: &ConfigChange) -> Result<Confi
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_offers(app: AppHandle) -> Result<Vec<OfferView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
@@ -682,7 +685,7 @@ pub fn delete_space(app: AppHandle, space: String) -> Result<(), String> {
     apply_config(&app, ConfigChange::DeleteSpace { space }).map(drop)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_delete_holds(app: AppHandle) -> Result<Vec<DeleteHoldView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
@@ -727,7 +730,7 @@ pub fn decide_delete_hold(
     Ok(decided as u32)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_conflicts(app: AppHandle) -> Result<Vec<ConflictView>, String> {
     let state = app.state::<AppState>();
     let engine = open_ro(&state.home)?;
@@ -773,7 +776,7 @@ pub fn list_conflicts(app: AppHandle) -> Result<Vec<ConflictView>, String> {
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resolve_conflict(
     app: AppHandle,
     space: String,
@@ -805,7 +808,7 @@ pub fn resolve_conflict(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resolve_git_conflicts(
     app: AppHandle,
     space: String,
@@ -835,14 +838,14 @@ pub fn get_activity(app: AppHandle) -> Result<Vec<crate::runner::ActivityItem>, 
     Ok(state.runner.activity())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pause_sync(app: AppHandle) -> Result<RunnerState, String> {
     let state = app.state::<AppState>();
     state.runner.pause(&app).map_err(anyhow_chain)?;
     Ok(state.runner.state())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resume_sync(app: AppHandle) -> Result<RunnerState, String> {
     let state = app.state::<AppState>();
     state.runner.resume(&app).map_err(anyhow_chain)?;
@@ -945,7 +948,7 @@ pub struct SettingsPatch {
     pub auto_update: Option<bool>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_settings(app: AppHandle, patch: SettingsPatch) -> Result<settings::Settings, String> {
     if let Some(value) = patch.start_at_login {
         settings::set_start_at_login(&app, value).map_err(anyhow_chain)?;
@@ -989,7 +992,7 @@ pub fn open_full_disk_access(app: AppHandle) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "android"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cli_status() -> Result<CliStatus, String> {
     Ok(sidecar::cli_status())
 }
@@ -1022,7 +1025,7 @@ pub fn cli_status() -> Result<CliStatus, String> {
 }
 
 #[cfg(not(target_os = "android"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn install_cli(app: AppHandle, shell: Option<String>) -> Result<CliInstallResult, String> {
     let shell = match shell.as_deref() {
         None => None,
