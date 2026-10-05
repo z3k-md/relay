@@ -12,6 +12,7 @@
 //! nat/<device_hex>                             one address per line
 //! transport/relay                              single host:port line
 //! tmp/
+//! lock                                         advisory lock for rewrites and gc
 //! ```
 //!
 //! Each log record is `u64 BE unix_ms || u32 BE prost_len || prost(WireEntry)`.
@@ -19,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,6 +42,7 @@ const NAT_DIR: &str = "nat";
 const TRANSPORT_DIR: &str = "transport";
 const RELAY_FILE: &str = "relay";
 const TMP_DIR: &str = "tmp";
+const LOCK_FILE: &str = "lock";
 
 /// A space-key wrap read from the mailbox.
 #[derive(Clone, Debug)]
@@ -122,6 +124,27 @@ impl FsReplica {
 
     fn tmp_dir(&self) -> PathBuf {
         self.root.join(TMP_DIR)
+    }
+
+    /// Exclusive advisory lock on `<root>/lock`, held while a log or ack
+    /// file is read, changed and rewritten, and for the whole of `gc`, so
+    /// two devices sharing the directory never interleave those rewrites.
+    /// Dropping the file releases it. A filesystem that cannot lock
+    /// (`Unsupported`) proceeds unlocked.
+    fn lock(&self) -> Result<Option<File>, ReplicaError> {
+        let path = self.root.join(LOCK_FILE);
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| ReplicaError::io(&path, e))?;
+        match file.lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(None),
+            Err(err) => Err(ReplicaError::io(&path, err)),
+        }
     }
 
     fn object_path(&self, id: &ObjectId) -> PathBuf {
@@ -528,7 +551,7 @@ impl FsReplica {
         Ok(out)
     }
 
-    fn list_object_ids(&self) -> Result<Vec<(ObjectId, PathBuf, u64)>, ReplicaError> {
+    fn list_object_ids(&self) -> Result<Vec<(ObjectId, PathBuf, fs::Metadata)>, ReplicaError> {
         let root = self.objects_dir();
         if !root.exists() {
             return Ok(Vec::new());
@@ -542,7 +565,7 @@ impl FsReplica {
                 continue;
             };
             let meta = fs::metadata(&entry).map_err(|e| ReplicaError::io(&entry, e))?;
-            out.push((id, entry, meta.len()));
+            out.push((id, entry, meta));
         }
         Ok(out)
     }
@@ -590,6 +613,7 @@ impl DurableReplica for FsReplica {
             return Ok(());
         }
         let path = self.entry_log_path(device, space);
+        let _guard = self.lock()?;
         let mut stored = self.read_log(&path)?;
         let mut last = stored.last().map(|e| e.wire.sequence);
         let now_ms = unix_now_ms();
@@ -682,6 +706,7 @@ impl DurableReplica for FsReplica {
         if let Some(parent) = path.parent() {
             create_dir(parent)?;
         }
+        let _guard = self.lock()?;
         let current = if path.is_file() {
             read_ack_file(&path)?
         } else {
@@ -714,6 +739,8 @@ impl DurableReplica for FsReplica {
         if let Ok(mut cache) = self.log_sig.lock() {
             cache.clear();
         }
+        let _guard = self.lock()?;
+        let now = SystemTime::now();
         let now_ms = unix_now_ms();
         let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
         let acks = self.list_acks()?;
@@ -801,10 +828,16 @@ impl DurableReplica for FsReplica {
             live_objects.extend(mirror_keep.iter().copied());
         }
 
-        for (id, path, len) in self.list_object_ids()? {
+        for (id, path, meta) in self.list_object_ids()? {
             if live_objects.contains(&id) {
                 continue;
             }
+            // A push puts objects before it appends the entry that references
+            // them (D29), so a young object may belong to an append in flight.
+            if is_within_grace(&meta, now, grace) {
+                continue;
+            }
+            let len = meta.len();
             // Only delete objects that were candidates under the ack rule:
             // if no remaining log references them, they were only referenced by
             // removed entries (or were never in a log). Never delete while any
@@ -945,6 +978,19 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn is_within_grace(meta: &fs::Metadata, now: SystemTime, grace: Duration) -> bool {
+    if grace.is_zero() {
+        return false;
+    }
+    match meta.modified() {
+        Ok(mtime) => match now.duration_since(mtime) {
+            Ok(age) => age < grace,
+            Err(_) => true,
+        },
+        Err(_) => false,
+    }
+}
+
 fn walkdir_files(root: &Path) -> Result<Vec<PathBuf>, ReplicaError> {
     let mut out = Vec::new();
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReplicaError> {
@@ -972,6 +1018,13 @@ mod tests {
 
     fn device(n: u8) -> DeviceId {
         DeviceId::from_bytes([n; 32])
+    }
+
+    /// Age a file past any grace window.
+    fn backdate(path: &Path) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
     }
 
     fn file_entry(seq: u64, path: &str, bytes: &[u8]) -> (WireEntry, ObjectId) {
@@ -1066,6 +1119,8 @@ mod tests {
         let (e2, id2) = file_entry(2, "a.txt", b"v2-longer");
         r.put_object(id1, b"v1").unwrap();
         r.put_object(id2, b"v2-longer").unwrap();
+        backdate(&r.object_path(&id1));
+        backdate(&r.object_path(&id2));
         r.append_entries(author, space, &[e1, e2]).unwrap();
 
         // No acks → nothing deleted.
@@ -1116,6 +1171,8 @@ mod tests {
         let (e2, id2) = file_entry(2, "a.txt", b"v2-longer");
         r.put_object(id1, b"v1").unwrap();
         r.put_object(id2, b"v2-longer").unwrap();
+        backdate(&r.object_path(&id1));
+        backdate(&r.object_path(&id2));
         r.append_entries(author, space, &[e1, e2]).unwrap();
         r.put_ack(reader, author, space, 2).unwrap();
         {
@@ -1147,6 +1204,7 @@ mod tests {
         let (e1, id1) = file_entry(1, "a.txt", b"v1");
         let e2 = deleted_entry(2, "a.txt");
         r.put_object(id1, b"v1").unwrap();
+        backdate(&r.object_path(&id1));
         r.append_entries(author, space, &[e1, e2]).unwrap();
         r.put_ack(reader, author, space, 2).unwrap();
         {
@@ -1164,6 +1222,77 @@ mod tests {
         assert_eq!(report.entries_removed, 2);
         assert_eq!(report.objects_removed, 1);
         assert!(r.get_object(&id1).unwrap().is_none());
+    }
+
+    #[test]
+    fn gc_keeps_an_unreferenced_object_within_grace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut r = FsReplica::open(dir.path()).unwrap();
+        let author = device(1);
+        let reader = device(2);
+        let space = SpaceId::new();
+        // Some ack must exist before gc deletes anything at all.
+        r.put_ack(reader, author, space, 1).unwrap();
+        // A push puts the object first; its log entry has not landed yet.
+        let bytes = b"put before its entry";
+        let id = ObjectId::of(bytes);
+        r.put_object(id, bytes).unwrap();
+
+        let members = [(space, author), (space, reader)];
+        let grace = Duration::from_secs(3600);
+        let report = r.gc(ReplicaMode::Mailbox, grace, &members).unwrap();
+        assert_eq!(report.objects_removed, 0);
+        assert!(r.get_object(&id).unwrap().is_some());
+
+        backdate(&r.object_path(&id));
+        let report = r.gc(ReplicaMode::Mailbox, grace, &members).unwrap();
+        assert_eq!(report.objects_removed, 1);
+        assert!(r.get_object(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn gc_waits_for_the_lock_and_sees_the_append_made_under_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut r = FsReplica::open(dir.path()).unwrap();
+        let author = device(1);
+        let reader = device(2);
+        let space = SpaceId::new();
+        let (e1, id1) = file_entry(1, "a.txt", b"v1");
+        r.put_object(id1, b"v1").unwrap();
+        r.append_entries(author, space, &[e1]).unwrap();
+        r.put_ack(reader, author, space, 1).unwrap();
+
+        // Another device holds the lock while it appends sequence 2.
+        let other = FsReplica::open(dir.path()).unwrap();
+        let held = other.lock().unwrap().expect("this filesystem locks");
+        let members = [(space, author), (space, reader)];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let report = r
+                .gc(ReplicaMode::Mailbox, Duration::ZERO, &members)
+                .unwrap();
+            tx.send(report).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "gc ran without the lock"
+        );
+        let log = other.entry_log_path(author, space);
+        let mut stored = other.read_log(&log).unwrap();
+        let (e2, _) = file_entry(2, "b.txt", b"v2");
+        stored.push(StoredEntry {
+            written_ms: unix_now_ms(),
+            wire: e2,
+        });
+        other.write_log_atomic(&log, &stored).unwrap();
+        drop(held);
+
+        worker.join().unwrap();
+        let report = rx.recv().unwrap();
+        assert_eq!(report.entries_removed, 1, "acked sequence 1 is compacted");
+        let got = other.entries_after(author, space, 0).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].sequence, 2, "the append under the lock survives");
     }
 
     #[test]
