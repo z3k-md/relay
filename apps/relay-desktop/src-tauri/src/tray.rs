@@ -14,6 +14,7 @@ pub struct TrayMenu {
 pub fn setup(app: &AppHandle) -> anyhow::Result<()> {
     let status = MenuItem::with_id(app, "status", "Relay — Starting…", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open Relay", true, None::<&str>)?;
+    let explorer = MenuItem::with_id(app, "explorer", "Explorer (preview)", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause sync", true, None::<&str>)?;
     let updates_item = MenuItem::with_id(app, "updates", "Check for updates", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Relay", true, None::<&str>)?;
@@ -21,7 +22,16 @@ pub fn setup(app: &AppHandle) -> anyhow::Result<()> {
 
     let menu = Menu::with_items(
         app,
-        &[&status, &sep, &open, &pause, &updates_item, &sep, &quit],
+        &[
+            &status,
+            &sep,
+            &open,
+            &explorer,
+            &pause,
+            &updates_item,
+            &sep,
+            &quit,
+        ],
     )?;
 
     let icon = app
@@ -36,6 +46,11 @@ pub fn setup(app: &AppHandle) -> anyhow::Result<()> {
         .tooltip("Relay")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            "explorer" => {
+                if let Err(err) = crate::explorer::open_window(app) {
+                    log::warn!("explorer window: {err}");
+                }
+            }
             "pause" => toggle_pause(app),
             "updates" => {
                 show_main_window(app);

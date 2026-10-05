@@ -1,5 +1,7 @@
 mod commands;
 mod error;
+#[cfg(not(target_os = "android"))]
+mod explorer;
 mod files;
 mod pairs;
 mod privacy;
@@ -53,7 +55,10 @@ pub fn run() {
             .plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
                 Some(vec!["--hidden"]),
-            ));
+            ))
+            .manage(explorer::ExplorerState::default())
+            .register_asynchronous_uri_scheme_protocol("relay-icon", explorer::handle_icon)
+            .register_asynchronous_uri_scheme_protocol("relay-thumb", explorer::handle_thumb);
     }
     builder = builder
         .invoke_handler(tauri::generate_handler![
@@ -106,6 +111,28 @@ pub fn run() {
             commands::open_full_disk_access,
             commands::cli_status,
             commands::install_cli,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_open,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_places,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_list,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_close_tab,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_open_item,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_context_menu,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_ready,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_drop_target,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_start_drag,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_memory,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_make_bench,
         ])
         .setup(|app| {
             let home = app_home(app)?;
