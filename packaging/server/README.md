@@ -1,7 +1,7 @@
 # Relay home server
 
-An always-on Relay device with no UI. It joins every space a paired device
-shares with it and keeps each folder under one data directory
+An always-on Relay device with no UI. It joins every space shared with it by
+a device you allowed to manage it and keeps each folder under one data directory
 (`<data>/<space>/<mount>`), so your other devices can catch up from it when
 they are never online together. Plan and later stages:
 [`docs/proposals/home-server.md`](../../docs/proposals/home-server.md).
@@ -36,7 +36,8 @@ LAN discovery does not reach into a container, so pair with an address
 
 ## Pair and share
 
-On the server, start pairing and allow your computer to manage it:
+On the server, start pairing and allow your computer to manage it. The
+server joins only spaces shared by devices allowed to manage it:
 
 ```sh
 # systemd

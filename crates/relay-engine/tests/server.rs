@@ -19,6 +19,7 @@ fn setup(spaces: &[&str]) -> Setup {
     let server_id = server.device().id;
     client.add_peer("nas", server_id, &[]).unwrap();
     server.add_peer("alpha", client.device().id, &[]).unwrap();
+    server.set_peer_manage("alpha", true).unwrap();
     for (i, space) in spaces.iter().enumerate() {
         let mount = dirs[2].path().join(i.to_string());
         std::fs::create_dir_all(&mount).unwrap();
@@ -105,6 +106,13 @@ fn revoked_peer_offers_are_ignored() {
             peer: "alpha".into(),
         })
         .unwrap();
+    assert!(s.server.server_plan().unwrap().is_empty());
+}
+
+#[test]
+fn peer_without_manage_grant_cannot_make_it_join() {
+    let mut s = setup(&["Photos"]);
+    s.server.set_peer_manage("alpha", false).unwrap();
     assert!(s.server.server_plan().unwrap().is_empty());
 }
 

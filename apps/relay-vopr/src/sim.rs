@@ -1070,6 +1070,12 @@ impl<'a> Simulator<'a> {
                     .expect("up")
                     .add_peer(&name, id, &["127.0.0.1:1".into()])
                     .map_err(|e| self.fail(format!("add_peer: {e}")))?;
+                // A server joins only what its managers offer (D45).
+                if self.nodes[me].server {
+                    let engine = self.nodes[me].engine.as_mut().expect("up");
+                    let result = engine.set_peer_manage(&name, true);
+                    result.map_err(|e| self.fail(format!("allow-manage {name}: {e}")))?;
+                }
             }
         }
         // Node 0 owns the space; every other node joins from its BFS parent.

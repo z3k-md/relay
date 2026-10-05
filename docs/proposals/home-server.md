@@ -58,9 +58,10 @@ It differs in four narrow ways:
 
 A local setting, `role = server`, set with `relay server enable --data DIR`.
 
-- **Auto-join.** A server joins every space a trusted peer offers it and
-  attaches each mount under `DIR/<space>/<mount>`. Offers from peers that
-  are not paired, or are revoked or dismissed, are ignored as today.
+- **Auto-join.** A server joins every space offered by a peer allowed to
+  manage it (D37) and attaches each mount under `DIR/<space>/<mount>`.
+  Offers from other peers, including members adopted from offers (D26), wait
+  for a manual join as today.
 - **No UI, no tray.** Linux first: a container image (amd64, arm64) and a
   systemd unit. Windows under WSL2 or Docker is the stand-in until real
   hardware exists.

@@ -347,7 +347,7 @@ enum ReplicaCmd {
 
 #[derive(Subcommand, Debug)]
 enum ServerCmd {
-    /// Join every space a paired peer offers and keep its folders under DIR
+    /// Join every space a managing peer shares and keep its folders under DIR
     Enable {
         #[arg(long)]
         data: PathBuf,

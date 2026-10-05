@@ -1213,7 +1213,8 @@ with it, with no one at its keyboard.
   canonical folder, which may not overlap the Relay home. `disable` clears
   it; spaces, mounts, and files stay. `status` lists each kept mount.
 - **Plan.** `Engine::server_plan` returns `ConfigChange`s: a `JoinSpace` for
-  each stored offer from a peer that is not revoked, and an `AddMount` at
+  each stored offer from a peer that may manage this device (D37) and is not
+  revoked, and an `AddMount` at
   `DIR/<space>/<mount>` for each mount of a joined or planned space with no
   local folder. It creates those folders. A space or mount name that is not
   one safe folder name (`.`, `..`, a `:`) is skipped, as is an offer whose
@@ -1224,8 +1225,10 @@ with it, with no one at its keyboard.
   once. A change that fails warns once and is not retried until the loop
   restarts. A mount removed by hand on a server is attached again on the
   next offer; turn the role off to manage mounts by hand.
-- **Trust is unchanged.** Pairing and sharing still decide what reaches the
-  server: it joins only spaces a paired peer shares with it, and it does not
+- **Only managers.** Auto-join needs the D37 grant, so it adds nothing a
+  manager could not already ask for remotely (D39). Members adopted from an
+  offer (D26) never hold the grant, so a device that reached the server only
+  through a shared space cannot make it join others. The server does not
   share spaces onward by itself. Materialization is `full` until store mode
   (Stage 2).
 - **Packaging.** `packaging/server`: a container image (Debian slim, runs as

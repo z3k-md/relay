@@ -535,6 +535,7 @@ fn server_joins_offered_space_and_attaches_its_mount() {
     client.add_peer("nas", server_id, &[]).unwrap();
     client.share("Personal", "nas").unwrap();
     server.add_peer("alpha", client_id, &[]).unwrap();
+    server.set_peer_manage("alpha", true).unwrap();
     let data = server.set_server_data(server_data.path()).unwrap();
     let offers = client.space_offers_for_peer(server_id).unwrap();
     drop(server);

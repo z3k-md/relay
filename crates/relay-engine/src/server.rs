@@ -1,7 +1,8 @@
 //! Server role: an always-on device that keeps a copy of every space its
 //! peers offer it (home server proposal, Stage 1).
 //!
-//! With a data folder set, the device joins each space a paired peer offers
+//! With a data folder set, the device joins each space offered by a peer
+//! allowed to manage it
 //! and attaches every mount of every joined space under
 //! `<data>/<space>/<mount>`. Those are ordinary [`ConfigChange`]s, applied on
 //! the running loop like a change from the CLI or the app.
@@ -90,8 +91,8 @@ impl Engine {
     }
 
     /// Changes that bring a server up to date with what its peers offer:
-    /// join each offered space, then attach every mount that has no local
-    /// folder. Empty unless this device has the server role. Creates the
+    /// join each space offered by a peer that may manage this device, then
+    /// attach every mount that has no local folder. Empty unless this device has the server role. Creates the
     /// mount folders, since attaching needs them to exist.
     ///
     /// Offered names come from peers, so a name that is not a single safe
@@ -108,7 +109,14 @@ impl Engine {
             if joined.contains(&offer.space_id) || planned.contains(&offer.space_id) {
                 continue;
             }
-            if repo.device_status(offer.peer.id)?.as_deref() == Some("revoked")
+            // Only a peer allowed to manage this device can make it join a
+            // space (D37): a manager could ask for the same join remotely
+            // (D39), and members adopted from offers (D26) never hold it.
+            let may_manage = repo
+                .peer_by_id(offer.peer.id)?
+                .is_some_and(|peer| peer.may_manage);
+            if !may_manage
+                || repo.device_status(offer.peer.id)?.as_deref() == Some("revoked")
                 || !safe_component(&offer.name)
             {
                 continue;
