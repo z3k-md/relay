@@ -1287,28 +1287,37 @@ A device can keep every file's bytes without a working-tree copy.
   working tree, like `metadata`. Rows stay `materialized = 0`; the bytes are
   recorded in `objects`, so `verify` checks them and `gc` keeps them while
   the index or history names them. A stored file is served to peers like any
-  other object.
-- **Scanner.** As for `metadata`: an absent file is not a tombstone and a
-  file that appears in the folder is not hashed into a version.
+  other object. A file already written here (the path was `full` before)
+  is kept current like a demand file that was fetched, so the folder never
+  holds stale bytes.
+- **Scanner.** As for `metadata` for paths not written here: an absent file
+  is not a tombstone and a file that appears in the folder is not hashed
+  into a version. A file written here is scanned like a full copy.
 - **Fetch.** Index batches and mailbox pulls wait for `store` objects as
-  they do for `full`. The periodic tick fetches any store row whose object
-  is not recorded yet (one indexed query), from a peer or the mailbox.
+  they do for `full`. The hydration tick looks for store rows whose object
+  is not in the store only at start, after a rule change or a failed fetch,
+  and when a peer connects after a give-up, so a complete store costs no
+  per-tick walk. It skips mounts whose rules give every path one other
+  mode, so `full` hydration on a server reads no rows either.
 - **Conflicts on index-only devices.** A device that does not write a path
   resolves a concurrent edit as a writing device would: a clean text merge
-  when it holds the base and both sides (always, in `store`), else the
-  winner plus a conflict-copy row. A copy path already holding other content
+  when it holds the base and both sides (usual in `store`, which keeps
+  every version it saw), else the winner plus a conflict-copy row. A copy path already holding other content
   skips the entry, as on a writer. Before this, an index-only device never
   merged, so a writer that merged and a hub that copied reached the same
-  vector with different content and never reconciled.
+  vector with different content and never reconciled. Any device missing
+  the base still copies where others merge; that limit predates D47.
 - **Server default.** `server_plan` sets `store` on a mount's root before it
-  attaches it, unless the owner already chose a mode for that root, so the
-  data folder stays empty. A later rule (`relay materialize add SPACE NAME
+  attaches it, unless a rule already reaches inside that mount (setting the
+  root would replace the owner's folder choices), so the data folder stays
+  empty. A later rule (`relay materialize add SPACE NAME
   --mode full --selector 'MOUNT/sub/**'`) or a manager's folder choice in
   the app switches a mount or subfolder to `full` to browse it on the server
   (for example over SMB). Mounts attached before Stage 2 keep `full`.
 - **Rule changes.** As in D35, nothing is deleted. `store` to `full`
   writes the files on the next tick from the store. `full` to `store` leaves
-  the existing files in place; later versions go to the store only.
+  the existing files in place and keeps them current; new files go to the
+  store only.
 - **Schema.** Migration 14 rebuilds the materialization rule tables to allow
   `store`; rules and selectors are kept.
 - **Simulator.** In `home_server`, the server's folder must stay empty after

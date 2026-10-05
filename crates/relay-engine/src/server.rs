@@ -142,8 +142,13 @@ impl Engine {
                 if config.local_path.is_some() {
                     continue;
                 }
-                let root = format!("{}/**", config.mount.name);
-                let chosen = rules.iter().any(|rule| rule.selectors.contains(&root));
+                // Setting the root would replace the folder choices inside
+                // the mount, so any rule there means the owner has chosen.
+                let inside = format!("{}/", config.mount.name);
+                let chosen = rules
+                    .iter()
+                    .flat_map(|rule| &rule.selectors)
+                    .any(|selector| selector.starts_with(&inside));
                 changes.extend(attach(&data, &space.name, &config.mount.name, chosen)?);
             }
         }
@@ -151,8 +156,8 @@ impl Engine {
     }
 }
 
-/// Attach `mount` under the data folder. Unless the mount root already has a
-/// mode (`chosen`), set it to `store` first, so nothing is written to the
+/// Attach `mount` under the data folder. Unless the owner already chose a
+/// mode inside the mount (`chosen`), set its root to `store` first, so nothing is written to the
 /// folder before the rule exists.
 fn attach(
     data: &Path,

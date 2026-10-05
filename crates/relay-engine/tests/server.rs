@@ -107,6 +107,15 @@ fn reattach_keeps_a_mode_the_owner_chose() {
             space: "Photos".into(),
             mount: "files".into(),
             path: String::new(),
+            mode: None,
+        })
+        .unwrap();
+    // Only a subfolder choice is left; setting the root would drop it.
+    s.server
+        .apply_config(&ConfigChange::SetFolderMode {
+            space: "Photos".into(),
+            mount: "files".into(),
+            path: "raw".into(),
             mode: Some("full".into()),
         })
         .unwrap();
@@ -116,6 +125,9 @@ fn reattach_keeps_a_mode_the_owner_chose() {
         matches!(plan.as_slice(), [ConfigChange::AddMount { .. }]),
         "{plan:?}"
     );
+    let rules = s.server.materialization_rules(Some("Photos")).unwrap();
+    assert_eq!(rules.len(), 1, "{rules:?}");
+    assert_eq!(rules[0].mode, "full");
 }
 
 #[test]

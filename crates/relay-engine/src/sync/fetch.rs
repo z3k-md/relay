@@ -19,6 +19,7 @@ impl Syncer {
                 self.settle_direct(engine, object, events)
             }
             Fetch::Failed { not_found } => {
+                self.store_scan = true;
                 self.on_fetch_failed(engine, peer, object, not_found, out, events)?;
                 self.continue_direct(engine, peer, object, not_found, out, events)
             }
@@ -51,6 +52,7 @@ impl Syncer {
     /// Consider index-only rows on the next tick, after a rule change.
     pub(crate) fn hydrate_soon(&mut self) {
         self.hydrated_at = None;
+        self.store_scan = true;
     }
 
     pub(super) fn hydration_due(&self, now: Instant) -> bool {
@@ -64,14 +66,15 @@ impl Syncer {
         out: &mut dyn FnMut(SyncOutput),
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
-        for item in engine.store_unfetched()? {
+        let store_items = if std::mem::take(&mut self.store_scan) {
+            engine.store_unfetched()?
+        } else {
+            Vec::new()
+        };
+        for item in store_items {
             let Some(object) = item.object else {
                 continue;
             };
-            if engine.store.contains(&object) {
-                engine.record_stored_object(object)?;
-                continue;
-            }
             if self
                 .direct
                 .get(&object)

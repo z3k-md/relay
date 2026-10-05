@@ -2830,6 +2830,32 @@ fn store_rule_fetches_bytes_without_writing_or_tombstoning() {
     );
 }
 
+/// Files written while a path was `full` stay current after it goes to
+/// `store`, so switching back never finds stale bytes to version.
+#[test]
+fn store_keeps_files_written_before_the_switch_current() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("note.txt", b"one"), ("keep.txt", b"keep")]);
+    h.b.set_folder_mode("Personal", "code", "", Some(MaterializationMode::Store))
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"two")]);
+    assert_eq!(fs::read(h.mount_b.path().join("note.txt")).unwrap(), b"two");
+    assert!(entry_at(&h.b, "note.txt").materialized);
+
+    // A new file stays in the store only.
+    publish(&mut h, &[("new.txt", b"new")]);
+    assert!(!h.mount_b.path().join("new.txt").exists());
+
+    h.b.set_folder_mode("Personal", "code", "", None).unwrap();
+    h.tick_b(std::time::Instant::now());
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert_eq!(fs::read(h.mount_a.path().join("note.txt")).unwrap(), b"two");
+    assert_eq!(fs::read(h.mount_b.path().join("new.txt")).unwrap(), b"new");
+    assert_converged(&h);
+}
+
 #[test]
 fn switching_metadata_to_store_fetches_on_tick_without_writing() {
     let mut h = Harness::pair();

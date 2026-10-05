@@ -793,37 +793,18 @@ impl Repo<'_> {
         Ok(())
     }
 
-    /// Live entries this device has not written (`materialized = 0`), on mounts
-    /// attached locally.
-    pub fn list_index_only(&self) -> Result<Vec<IndexOnlyEntry>, DbError> {
+    /// Index-only rows of one mount. Uses the partial index, so a mount
+    /// whose rows are all hydrated costs nothing.
+    pub fn list_index_only_in(&self, mount: MountId) -> Result<Vec<IndexOnlyEntry>, DbError> {
+        let mount = mount_bytes(mount);
         let mut stmt = self.conn.prepare_cached(
             "SELECT m.space_id, m.id, m.name, e.path, e.object_id
              FROM entries e
              JOIN mounts m ON m.id = e.mount_id
-             JOIN device_mounts dm ON dm.mount_id = m.id
-             JOIN local_device ld ON ld.device_ref = dm.device_ref
-             WHERE e.materialized = 0 AND e.deleted = 0
-             ORDER BY m.name, e.path",
+             WHERE e.mount_id = ?1 AND e.materialized = 0 AND e.deleted = 0
+             ORDER BY e.path",
         )?;
-        let rows = stmt.query_map([], Self::map_index_only)?;
-        Self::collect_index_only(rows)
-    }
-
-    /// Index-only file rows whose object this device has not recorded as
-    /// stored: what store mode still has to fetch.
-    pub fn list_index_only_unstored(&self) -> Result<Vec<IndexOnlyEntry>, DbError> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT m.space_id, m.id, m.name, e.path, e.object_id
-             FROM entries e
-             JOIN mounts m ON m.id = e.mount_id
-             JOIN device_mounts dm ON dm.mount_id = m.id
-             JOIN local_device ld ON ld.device_ref = dm.device_ref
-             LEFT JOIN objects o ON o.id = e.object_id
-             WHERE e.materialized = 0 AND e.deleted = 0
-               AND e.object_id IS NOT NULL AND o.id IS NULL
-             ORDER BY m.name, e.path",
-        )?;
-        let rows = stmt.query_map([], Self::map_index_only)?;
+        let rows = stmt.query_map(params![mount.as_slice()], Self::map_index_only)?;
         Self::collect_index_only(rows)
     }
 
