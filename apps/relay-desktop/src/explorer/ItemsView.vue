@@ -12,6 +12,7 @@ import {
   thumbUrl,
 } from "./api";
 import type { Folder, SortKey } from "./folder";
+import Thumb from "./Thumb.vue";
 
 const props = defineProps<{
   folder: Folder;
@@ -361,8 +362,8 @@ defineExpose({ scroller });
             >
               <div class="flex h-24 w-24 items-center justify-center">
                 <img
-                  v-if="native"
-                  :src="thumbUrl(dir, cell.entry, THUMB)"
+                  v-if="native && isDir(cell.entry)"
+                  :src="iconUrl(dir, cell.entry, THUMB)"
                   :width="THUMB"
                   :height="THUMB"
                   alt=""
@@ -371,6 +372,7 @@ defineExpose({ scroller });
                   class="max-h-24 max-w-24 object-contain"
                   @error="hideBroken"
                 />
+                <Thumb v-else-if="native" :url="thumbUrl(dir, cell.entry, THUMB)" :size="THUMB" />
                 <span v-else class="text-3xl text-muted">{{ isDir(cell.entry) ? "▸" : "·" }}</span>
               </div>
               <span class="line-clamp-2 w-full text-center text-xs break-all">{{ cell.entry[0] }}</span>

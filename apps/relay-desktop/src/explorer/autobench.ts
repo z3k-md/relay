@@ -15,6 +15,7 @@ export interface BenchHost {
 }
 
 const MB = 1024 * 1024;
+const SETTLE_MS = 10_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -38,7 +39,8 @@ function listingLine(label: string, f: Folder): string {
 /**
  * The P0 pass bars, end to end, with no clicking: first paint of a 10k
  * folder (5 runs), sweep and smooth scroll of 200k items, a thumbnail grid
- * sweep, then memory with three tabs open. Returns the report.
+ * sweep, then memory with three tabs open (and at the start, for the
+ * WebView2 runtime's fixed cost). Returns the report.
  */
 export async function autobench(host: BenchHost): Promise<string> {
   const lines = [`Relay Explorer P0 benchmark (${new Date().toISOString()})`, ...machineLines(), ""];
@@ -101,8 +103,17 @@ export async function autobench(host: BenchHost): Promise<string> {
     }
   };
 
+  // V8 and the allocator give memory back a few seconds after the page goes
+  // quiet, so each memory reading is taken right away and again once settled.
+  const settled = async (what: string) => {
+    host.status(`Letting memory settle (${what})…`);
+    await sleep(SETTLE_MS);
+    return explorer.memory();
+  };
+
   try {
     const tab = host.active();
+    const atStart = await settled("start");
     const tenK = await make("files", 10_000);
     const paints: number[] = [];
     for (let run = 1, tries = 0; run <= 5 && tries < 15; tries++) {
@@ -128,7 +139,8 @@ export async function autobench(host: BenchHost): Promise<string> {
     const sweep = await scroll(tab, "sweep");
     const smooth = await scroll(tab, "smooth");
     lines.push(`Details ${describeScroll(sweep)}`, `Details ${describeScroll(smooth)}`);
-    const afterBig = await explorer.memory();
+    const afterBigNow = await explorer.memory();
+    const afterBig = await settled("200k");
 
     const images = await make("images", 2_000);
     const grid = await host.openTab(images);
@@ -140,15 +152,16 @@ export async function autobench(host: BenchHost): Promise<string> {
 
     const home = await host.openTab(host.home);
     await waitDone(home);
-    host.status("Letting memory settle…");
-    await sleep(3000);
-    const memory = await explorer.memory();
+    const memoryNow = await explorer.memory();
+    const memory = await settled(`${host.tabs()} tabs`);
     const mem = (m: typeof memory) =>
       m
         ? `working set ${(m.workingSetBytes / MB).toFixed(0)} MB, private ${(m.privateBytes / MB).toFixed(0)} MB, ${m.processes} processes`
         : "n/a";
-    lines.push(`Memory after 200k scroll (1 tab): ${mem(afterBig)}`);
-    lines.push(`Memory with ${host.tabs()} tabs: ${mem(memory)}`);
+    const settle = `${SETTLE_MS / 1000} s idle`;
+    lines.push(`Memory at start (1 tab, home), after ${settle}: ${mem(atStart)}`);
+    lines.push(`Memory after 200k scroll (1 tab): ${mem(afterBigNow)}; after ${settle}: ${mem(afterBig)}`);
+    lines.push(`Memory with ${host.tabs()} tabs: ${mem(memoryNow)}; after ${settle}: ${mem(memory)}`);
 
     const mark = (ok: boolean) => (ok ? "PASS" : "FAIL");
     lines.push(
