@@ -6,14 +6,16 @@ const browser = useRemoteFolders({ sizes: true });
 </script>
 
 <script setup lang="ts">
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import PairFolderDialog from "../components/PairFolderDialog.vue";
-import { api } from "../lib/api";
+import { api, errorText } from "../lib/api";
+import { formatSize } from "../lib/format";
 import { describeRemoteError } from "../lib/remoteFolders";
-import type { DirEntry, DirListing, PeerView, QuickOpen } from "../lib/types";
+import type { ActivityItem, DirEntry, DirListing, PeerView, QuickOpen } from "../lib/types";
 
 const peers = ref<PeerView[]>([]);
 const showHidden = ref(false);
@@ -27,6 +29,7 @@ const {
   sizes,
   sizesDone,
   sizesSupported,
+  sizesFailed,
   canBack,
   canForward,
   choose,
@@ -63,6 +66,7 @@ const editing = ref(false);
 const typedPath = ref("");
 const pathInput = ref<HTMLInputElement | null>(null);
 const crumbBar = ref<HTMLElement | null>(null);
+let stopActivity: UnlistenFn | undefined;
 
 const browsable = computed(() => peers.value.filter((p) => p.connected && p.canManage));
 const unavailable = computed(() => peers.value.filter((p) => !(p.connected && p.canManage)));
@@ -77,10 +81,11 @@ function diskSize(entry: DirEntry): number | null {
   return entry.disk_size ?? entry.size;
 }
 
+/** Folder sizes are still being counted, so there is nothing to sort folders by yet. */
+const counting = computed(() => sizesSupported.value && !sizesFailed.value && !sizesDone.value);
+
 const entries = computed(() => {
   const shown = (listing.value?.entries ?? []).filter((entry) => showHidden.value || !entry.hidden);
-  // The device sends folders first, then by name.
-  if (sortKey.value === "name" && !sortDesc.value) return shown;
   const dir = sortDesc.value ? -1 : 1;
   const foldersFirst = (a: DirEntry, b: DirEntry) => Number(isFolder(b)) - Number(isFolder(a));
   const byName = (a: DirEntry, b: DirEntry) =>
@@ -92,7 +97,9 @@ const entries = computed(() => {
       case "modified":
         return foldersFirst(a, b) || dir * ((a.modified_ms ?? 0) - (b.modified_ms ?? 0)) || byName(a, b);
       case "size":
-        // Mixed, so whatever takes the most space comes first.
+        // Mixed, so whatever takes the most space comes first. Folders keep
+        // their name order while being counted, so rows do not jump around.
+        if (counting.value && (isFolder(a) || isFolder(b))) return foldersFirst(a, b) || byName(a, b);
         return dir * ((diskSize(a) ?? -1) - (diskSize(b) ?? -1)) || byName(a, b);
     }
   });
@@ -138,23 +145,34 @@ const crumbs = computed(() => {
   return list;
 });
 
-watch(crumbs, async () => {
-  await nextTick();
-  const bar = crumbBar.value;
-  if (bar) bar.scrollLeft = bar.scrollWidth;
-});
+// On the path, not the crumbs: a background refresh makes new crumbs too.
+watch(
+  () => listing.value?.path,
+  async () => {
+    await nextTick();
+    const bar = crumbBar.value;
+    if (bar) bar.scrollLeft = bar.scrollWidth;
+  },
+);
 
 const summary = computed(() => {
-  if (!listing.value) return "";
+  const shown = listing.value;
+  if (!shown) return "";
   const folders = entries.value.filter(isFolder);
   const files = entries.value.length - folders.length;
   const parts = [];
-  if (folders.length) parts.push(`${folders.length} ${folders.length === 1 ? "folder" : "folders"}`);
-  if (files) parts.push(`${files} ${files === 1 ? "file" : "files"}`);
+  if (shown.next_cursor != null) {
+    // More pages: the device's count, not how many are loaded.
+    parts.push(`${shown.total.toLocaleString()} items (${entries.value.length.toLocaleString()} shown)`);
+  } else {
+    if (folders.length) parts.push(`${folders.length} ${folders.length === 1 ? "folder" : "folders"}`);
+    if (files) parts.push(`${files} ${files === 1 ? "file" : "files"}`);
+  }
   const counted = folders.every((f) => sizes.value.has(f.path));
   if (!folders.length || (sizesSupported.value && counted)) {
     const total = entries.value.reduce((sum, e) => sum + (diskSize(e) ?? 0), 0);
-    parts.push(`${formatSize(total)} on disk${sizesDone.value || !folders.length ? "" : " so far"}`);
+    const partial = shown.next_cursor != null || (folders.length > 0 && !sizesDone.value);
+    parts.push(`${formatSize(total)} on disk${partial ? " so far" : ""}`);
   }
   return parts.join(" · ");
 });
@@ -184,17 +202,17 @@ function syncedSomewhere(entry: DirEntry): boolean {
 async function openFile(entry: DirEntry) {
   const name = device.value;
   if (!name || opening.value) return;
-  if ((entry.size ?? 0) > LARGE_FILE) {
-    const ok = await confirm(
-      `${entry.name} is ${formatSize(entry.size)}. It downloads fully before it opens.`,
-      { title: "Download a large file?", kind: "warning" },
-    );
-    if (!ok) return;
-  }
-  opening.value = entry.path;
   error.value = null;
   notice.value = null;
   try {
+    if ((entry.size ?? 0) > LARGE_FILE) {
+      const ok = await confirm(
+        `${entry.name} is ${formatSize(entry.size)}. It downloads fully before it opens.`,
+        { title: "Download a large file?", kind: "warning" },
+      );
+      if (!ok) return;
+    }
+    opening.value = entry.path;
     await api.openRemoteFile(name, entry.path);
     await loadQuickOpens();
   } catch (err) {
@@ -241,25 +259,13 @@ async function removeQuickOpen(space: string) {
     notice.value = (await api.removeQuickOpen(space)) ?? null;
     await loadQuickOpens();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   }
 }
 
 async function afterPair() {
   pairing.value = null;
   await refresh();
-}
-
-function formatSize(bytes: number | null | undefined): string {
-  if (bytes == null) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 }
 
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
@@ -271,7 +277,10 @@ function formatModified(ms: number | null): string {
 function sizeTitle(entry: DirEntry): string {
   if (isFolder(entry)) {
     const size = sizes.value.get(entry.path);
-    if (!size) return sizesSupported.value ? "Counting…" : "Update Relay on that device to see folder sizes";
+    if (!size) {
+      if (!sizesSupported.value) return "Update Relay on that device to see folder sizes";
+      return sizesFailed.value ?? "Counting…";
+    }
     const files = `${size.files.toLocaleString()} ${size.files === 1 ? "file" : "files"}`;
     return `${formatSize(size.bytes)} on disk, ${files}${size.done ? "" : " so far (counting)"}`;
   }
@@ -336,21 +345,28 @@ async function loadPeers() {
       if (first) await choose(first.name);
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   window.addEventListener("mousedown", onMouse);
   window.addEventListener("mouseup", onMouse);
   window.addEventListener("keydown", onKey);
-  return Promise.all([loadPeers(), loadQuickOpens()]);
+  const loads = Promise.all([loadPeers(), loadQuickOpens()]);
+  stopActivity = await listen<ActivityItem>("relay://activity", (event) => {
+    if (event.payload.kind === "peerConnected" || event.payload.kind === "peerDisconnected") {
+      void loadPeers();
+    }
+  });
+  await loads;
 });
 
 onUnmounted(() => {
   window.removeEventListener("mousedown", onMouse);
   window.removeEventListener("mouseup", onMouse);
   window.removeEventListener("keydown", onKey);
+  stopActivity?.();
   stopSizes();
 });
 </script>
@@ -595,14 +611,14 @@ onUnmounted(() => {
               <span
                 class="w-20 shrink-0 text-right text-[12px] tabular-nums"
                 :class="
-                  isFolder(entry) && !sizes.get(entry.path)?.done
+                  isFolder(entry) && counting && !sizes.get(entry.path)?.done
                     ? 'animate-pulse text-[var(--color-muted)]'
                     : 'text-[var(--color-muted)]'
                 "
                 :title="sizeTitle(entry)"
               >
                 <template v-if="isFolder(entry)">
-                  {{ sizes.has(entry.path) ? formatSize(sizes.get(entry.path)?.bytes) : sizesSupported ? "…" : "—" }}
+                  {{ sizes.has(entry.path) ? formatSize(sizes.get(entry.path)?.bytes) : counting ? "…" : "—" }}
                 </template>
                 <template v-else>{{ formatSize(diskSize(entry)) }}</template>
               </span>

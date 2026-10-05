@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import Modal from "../components/Modal.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { api, copyText } from "../lib/api";
-import { formatBytes } from "../lib/updateProgress";
+import { formatBytes } from "../lib/format";
 import type { DeleteHold, Overview, RunnerState, TransferLive } from "../lib/types";
 
 const props = defineProps<{

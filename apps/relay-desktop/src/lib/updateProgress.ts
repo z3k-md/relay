@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { computed, ref } from "vue";
-import { api } from "./api";
+import { api, errorText } from "./api";
 import type { UpdateInfo, UpdateProgress } from "./types";
 
 export type UpdatePhase =
@@ -62,17 +62,6 @@ export async function installUpdate(): Promise<void> {
 
 export async function restartNow(): Promise<void> {
   await api.restartApp();
-}
-
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  const kb = bytes / 1024;
-  if (kb < 1024) return `${kb < 10 ? kb.toFixed(1) : Math.round(kb)} KB`;
-  const mb = kb / 1024;
-  if (mb < 1024) return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
-  const gb = mb / 1024;
-  return `${gb < 10 ? gb.toFixed(1) : Math.round(gb)} GB`;
 }
 
 function beginLocal() {
@@ -141,7 +130,7 @@ function finish(info: UpdateInfo) {
 function settleLocalError(err: unknown) {
   opTerminal = true;
   updatePhase.value = { kind: "idle" };
-  updateNote.value = err instanceof Error ? err.message : String(err);
+  updateNote.value = errorText(err);
   updateNoteIsError.value = true;
   stopClock();
 }

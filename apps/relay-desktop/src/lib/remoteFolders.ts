@@ -1,12 +1,10 @@
-import { computed, ref } from "vue";
-import { api, RemoteCallError } from "./api";
+import { computed, ref, shallowRef } from "vue";
+import { api, errorText, RemoteCallError } from "./api";
 import type { DirListing, FolderSize, RemoteRoot } from "./types";
 
 /** Turn a refused remote call into a sentence about `device`. */
 export function describeRemoteError(err: unknown, device: string): string {
-  if (!(err instanceof RemoteCallError)) {
-    return err instanceof Error ? err.message : String(err);
-  }
+  if (!(err instanceof RemoteCallError)) return errorText(err);
   switch (err.code) {
     case "denied":
       return `${device} needs to allow this. ${err.message}`;
@@ -28,6 +26,39 @@ type Place = string | null;
 
 /** How often folder sizes are asked for while they are being counted. */
 const SIZE_POLL_MS = 700;
+/** Folders remembered for instant back and forth, per kind of cache. */
+const CACHE_LIMIT = 64;
+/** The most back/forward steps kept. */
+const HISTORY_LIMIT = 200;
+
+/** The last `limit` entries set; the one untouched longest is dropped first. */
+class Recent<V> {
+  private readonly map = new Map<string, V>();
+
+  constructor(private readonly limit: number) {}
+
+  get(key: string): V | undefined {
+    const value = this.map.get(key);
+    if (value !== undefined) {
+      this.map.delete(key);
+      this.map.set(key, value);
+    }
+    return value;
+  }
+
+  set(key: string, value: V) {
+    this.map.delete(key);
+    this.map.set(key, value);
+    if (this.map.size > this.limit) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+  }
+
+  delete(key: string) {
+    this.map.delete(key);
+  }
+}
 
 /**
  * Browsing state for one paired device: its roots, the folder shown, paging,
@@ -40,7 +71,9 @@ const SIZE_POLL_MS = 700;
 export function useRemoteFolders(options: { sizes?: boolean } = {}) {
   const device = ref<string | null>(null);
   const roots = ref<RemoteRoot[]>([]);
-  const listing = ref<DirListing | null>(null);
+  // Listings and sizes are replaced whole, never edited, so they stay plain:
+  // a long listing is not wrapped entry by entry.
+  const listing = shallowRef<DirListing | null>(null);
   const loading = ref(false);
   const error = ref<string | null>(null);
   /** A folder being opened that has no cached listing yet. */
@@ -48,19 +81,23 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
   const history = ref<Place[]>([null]);
   const index = ref(0);
   /** Folder sizes for the folder shown, by entry path. */
-  const sizes = ref<Map<string, FolderSize>>(new Map());
+  const sizes = shallowRef<Map<string, FolderSize>>(new Map());
   /** All folders inside the folder shown are counted. */
   const sizesDone = ref(false);
   /** The device counts folder sizes (older ones do not). */
   const sizesSupported = ref(true);
+  /** Why the device stopped answering for sizes, if it did. */
+  const sizesFailed = ref<string | null>(null);
 
-  const listings = new Map<string, DirListing>();
+  const listings = new Recent<DirListing>(CACHE_LIMIT);
   const rootsSeen = new Map<string, RemoteRoot[]>();
-  const sizesSeen = new Map<string, { folders: Map<string, FolderSize>; done: boolean }>();
+  const sizesSeen = new Recent<{ folders: Map<string, FolderSize>; done: boolean }>(CACHE_LIMIT);
   /** Devices that answered `folder_sizes` with an error: older Relay. */
   const noSizes = new Set<string>();
   /** Bumped on every navigation; late answers for an older one are dropped. */
   let generation = 0;
+  /** Bumped when size polling stops, so an answer in flight cannot restart it. */
+  let sizesGeneration = 0;
   let sizeTimer: number | undefined;
 
   const canBack = computed(() => index.value > 0);
@@ -103,7 +140,8 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
   /**
    * Show `place`, then record it with `step`, which gets the canonical path.
    * A cached listing shows at once and is refreshed; otherwise the current
-   * folder stays up until the new one arrives, and stays if it fails.
+   * folder stays up until the new one arrives, and stays if it fails. A
+   * cached folder that turns out to be gone gives way to the one above it.
    */
   async function go(place: Place, step: (path: Place) => void) {
     const name = device.value;
@@ -128,17 +166,36 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
     loading.value = true;
     try {
       const reply = await api.remoteCall(name, { call: "list_dir", path: place });
-      if (token !== generation || reply.reply !== "listing") return;
+      if (reply.reply !== "listing") return;
+      // Cached even once browsing has moved on, so coming back is instant.
       const fresh = reply.listing;
       listings.set(key(name, place), fresh);
       listings.set(key(name, fresh.path), fresh);
+      if (token !== generation) return;
       listing.value = fresh;
       if (!cached) {
         step(fresh.path);
         showSizes(name, fresh.path, token);
       }
     } catch (err) {
-      if (token === generation) error.value = describeRemoteError(err, name);
+      const code = err instanceof RemoteCallError ? err.code : null;
+      const gone = code === "not_found" || code === "invalid";
+      if (gone) {
+        listings.delete(key(name, place));
+        if (cached) {
+          listings.delete(key(name, cached.path));
+          sizesSeen.delete(key(name, cached.path));
+        }
+      }
+      if (token !== generation) return;
+      if (gone && cached && listing.value?.path === cached.path) {
+        // go() clears the error first, so the error is set after it.
+        const at = index.value;
+        void go(cached.parent, (path) => {
+          history.value[at] = path;
+        });
+      }
+      error.value = describeRemoteError(err, name);
     } finally {
       if (token === generation) {
         loading.value = false;
@@ -149,7 +206,7 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
 
   function push(path: Place) {
     if (history.value[index.value] === path) return;
-    history.value = [...history.value.slice(0, index.value + 1), path];
+    history.value = [...history.value.slice(0, index.value + 1), path].slice(-HISTORY_LIMIT);
     index.value = history.value.length - 1;
   }
 
@@ -221,8 +278,13 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
         cursor: current.next_cursor,
       });
       if (token !== generation || reply.reply !== "listing") return;
-      const merged = { ...reply.listing, entries: [...current.entries, ...reply.listing.entries] };
-      listings.set(key(name, current.path), merged);
+      // Onto what is shown now, which a refresh may have replaced meanwhile.
+      // The cursor is a position, so a folder that changed can repeat an entry.
+      const shown = listing.value ?? current;
+      const seen = new Set(shown.entries.map((entry) => entry.path));
+      const more = reply.listing.entries.filter((entry) => !seen.has(entry.path));
+      const merged = { ...reply.listing, entries: [...shown.entries, ...more] };
+      listings.set(key(name, shown.path), merged);
       listing.value = merged;
     } catch (err) {
       if (token === generation) error.value = describeRemoteError(err, name);
@@ -234,8 +296,10 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
   function stopSizes() {
     if (sizeTimer !== undefined) window.clearTimeout(sizeTimer);
     sizeTimer = undefined;
+    sizesGeneration += 1;
     sizes.value = new Map();
     sizesDone.value = false;
+    sizesFailed.value = null;
   }
 
   /**
@@ -249,29 +313,35 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
       sizes.value = seen.folders;
       sizesDone.value = seen.done;
     }
+    const round = sizesGeneration;
+    const live = () => token === generation && round === sizesGeneration;
     const ask = async () => {
       sizeTimer = undefined;
-      if (token !== generation) return;
+      if (!live()) return;
       try {
         const reply = await api.remoteCall(name, { call: "folder_sizes", path });
-        if (token !== generation || reply.reply !== "folder_sizes") return;
+        if (!live() || reply.reply !== "folder_sizes") return;
         const folders = new Map(reply.sizes.folders.map((f) => [f.path, f]));
         sizesSeen.set(key(name, path), { folders, done: reply.sizes.done });
         sizes.value = folders;
         sizesDone.value = reply.sizes.done;
         if (reply.sizes.done) return;
       } catch (err) {
-        if (token !== generation) return;
+        if (!live()) return;
         const code = err instanceof RemoteCallError ? err.code : null;
-        // An older device answers `invalid`: it has no such call.
         if (code === "invalid") {
+          // An older device answers `invalid`: it has no such call.
           noSizes.add(name);
           sizesSupported.value = false;
+          return;
         }
         // Busy or slow: ask again. Anything else waits for the next visit.
-        if (code !== "busy" && code !== "timeout") return;
+        if (code !== "busy" && code !== "timeout") {
+          sizesFailed.value = describeRemoteError(err, name);
+          return;
+        }
       }
-      if (token === generation) sizeTimer = window.setTimeout(ask, SIZE_POLL_MS);
+      if (live()) sizeTimer = window.setTimeout(ask, SIZE_POLL_MS);
     };
     void ask();
   }
@@ -286,6 +356,7 @@ export function useRemoteFolders(options: { sizes?: boolean } = {}) {
     sizes,
     sizesDone,
     sizesSupported,
+    sizesFailed,
     canBack,
     canForward,
     choose,
