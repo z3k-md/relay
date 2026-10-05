@@ -58,6 +58,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D43 | [Online-only files in Explorer](#d43-online-only-files-in-explorer) |
 | D44 | [Self-hosted tiers and accounts](#d44-self-hosted-tiers-and-accounts) |
 | D45 | [Server role](#d45-server-role) |
+| D46 | [What a manage grant reaches](#d46-what-a-manage-grant-reaches) |
 
 <!-- index:end -->
 
