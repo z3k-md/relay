@@ -28,6 +28,10 @@ pub struct NetProfile {
     /// Chance that an object fetch is answered "not found" although the
     /// serving store has the bytes.
     pub fetch_not_found_rate: f64,
+    /// How long a surviving side keeps believing in a session after the
+    /// link was cut or the peer died (QUIC idle timeout, missed pings).
+    /// Frames it sends meanwhile are lost and its object fetches fail.
+    pub notice_delay_ms: (u64, u64),
 }
 
 impl NetProfile {
@@ -39,6 +43,7 @@ impl NetProfile {
             heal_rate: 0.0,
             fetch_fail_rate: 0.0,
             fetch_not_found_rate: 0.0,
+            notice_delay_ms: (0, 0),
         }
     }
 }
@@ -181,6 +186,7 @@ impl Scenario {
                     latency_ms: (5, 400),
                     cut_rate: 0.03,
                     heal_rate: 0.05,
+                    notice_delay_ms: (0, 20_000),
                     ..NetProfile::reliable()
                 },
                 workload: WorkloadProfile {
@@ -190,6 +196,22 @@ impl Scenario {
                 ..Scenario::base(
                     "partitions",
                     "Links drop and heal while every device keeps editing; concurrent edits must merge or leave both versions.",
+                    3,
+                )
+            },
+            Scenario {
+                net: NetProfile {
+                    latency_ms: (20, 800),
+                    bytes_per_ms: 64,
+                    cut_rate: 0.12,
+                    heal_rate: 0.25,
+                    notice_delay_ms: (1_000, 30_000),
+                    ..NetProfile::reliable()
+                },
+                index_batch_entries: Some(4),
+                ..Scenario::base(
+                    "flapping_links",
+                    "Slow links that drop every few steps, often mid-batch or mid-transfer, while each side notices late.",
                     3,
                 )
             },
@@ -206,6 +228,10 @@ impl Scenario {
                 )
             },
             Scenario {
+                net: NetProfile {
+                    notice_delay_ms: (0, 30_000),
+                    ..NetProfile::reliable()
+                },
                 faults: FaultProfile {
                     crash_rate: 0.02,
                     restart_rate: 0.06,
@@ -268,6 +294,7 @@ impl Scenario {
                     heal_rate: 0.05,
                     fetch_fail_rate: 0.08,
                     fetch_not_found_rate: 0.02,
+                    notice_delay_ms: (0, 20_000),
                     ..NetProfile::reliable()
                 },
                 faults: FaultProfile {

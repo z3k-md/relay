@@ -24,7 +24,11 @@ pub enum Last {
         /// another node is seen building on an older edit of the run.
         parent: Option<Vec<u8>>,
     },
-    Deleted,
+    Deleted {
+        /// Another node wrote the path without having seen this delete. The
+        /// engine keeps the live side of such a race, so the path may stay.
+        contested: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,8 +106,8 @@ impl Model {
                         run.drain(..=i);
                     }
                 }
-                Some(Last::Deleted) if cur.is_none() => *slot = None,
-                Some(Last::Deleted) | None => {}
+                Some(Last::Deleted { .. }) if cur.is_none() => *slot = None,
+                Some(Last::Deleted { .. }) | None => {}
             }
         }
     }
@@ -131,6 +135,22 @@ impl Model {
                 last: vec![None; nodes],
             });
         Self::supersede(entry, cur, Some(node));
+        // What survives supersession on the other nodes is concurrent with
+        // this write: a delete racing a write there may lose to it.
+        let others_live = entry
+            .last
+            .iter()
+            .enumerate()
+            .any(|(k, l)| k != node && matches!(l, Some(Last::Content { .. })));
+        if new.is_some() && cur.is_some() {
+            for (k, slot) in entry.last.iter_mut().enumerate() {
+                if k != node
+                    && let Some(Last::Deleted { contested }) = slot
+                {
+                    *contested = true;
+                }
+            }
+        }
         match (new, &mut entry.last[node]) {
             (Some(bytes), Some(Last::Content { run, .. }))
                 if cur == run.last().map(Vec::as_slice) =>
@@ -143,7 +163,11 @@ impl Model {
                     parent: cur.map(<[u8]>::to_vec),
                 });
             }
-            (None, slot) => *slot = Some(Last::Deleted),
+            (None, slot) => {
+                *slot = Some(Last::Deleted {
+                    contested: others_live,
+                })
+            }
         }
     }
 
@@ -165,10 +189,14 @@ impl Model {
             }
             let mut any_live = false;
             let mut any_deleted = false;
+            let mut contested = false;
             for (node, last) in model.last.iter().enumerate() {
                 match last {
                     None => {}
-                    Some(Last::Deleted) => any_deleted = true,
+                    Some(Last::Deleted { contested: c }) => {
+                        any_deleted = true;
+                        contested |= c;
+                    }
                     Some(Last::Content { run, parent }) => {
                         let content = run.last().expect("run is never empty");
                         any_live = true;
@@ -195,7 +223,7 @@ impl Model {
                     }
                 }
             }
-            if any_deleted && !any_live && tree.contains_key(path) {
+            if any_deleted && !any_live && !contested && tree.contains_key(path) {
                 return Err(format!(
                     "resurrection: {path} was deleted and nothing wrote it since, but it is in the converged tree:\n{}",
                     tree::describe(tree)

@@ -145,7 +145,7 @@ fn main() -> ExitCode {
 fn print_report(r: &RunReport) {
     let s = &r.stats;
     println!(
-        "{} seed {}: ok in {} ms wall, {} ms virtual; {} steps, {} ops, {} scans, {} frames, {} fetches ({} faulted), {} cuts, {} crashes, {} write crashes, {} io faults, {} quiesces, {} conflict copies, {} holds applied, {} warnings; trace {}",
+        "{} seed {}: ok in {} ms wall, {} ms virtual; {} steps, {} ops, {} scans, {} frames, {} fetches ({} faulted, {} over dead links), {} in flight lost ({} transfers), {} cuts, {} crashes, {} write crashes, {} io faults, {} quiesces, {} conflict copies, {} holds applied, {} warnings; trace {}",
         r.scenario,
         r.seed,
         r.wall_ms,
@@ -156,6 +156,9 @@ fn print_report(r: &RunReport) {
         s.frames,
         s.fetches,
         s.fetch_faults,
+        s.dead_link_fetches,
+        s.lost_in_flight,
+        s.transfers_cut,
         s.cuts,
         s.crashes,
         s.write_crashes,

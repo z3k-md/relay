@@ -48,6 +48,12 @@ pub struct Stats {
     pub frames: u64,
     pub fetches: u64,
     pub fetch_faults: u64,
+    /// Frames and transfers that were in flight when their link dropped.
+    pub lost_in_flight: u64,
+    /// Transfers among those, each reported to its requester as failed.
+    pub transfers_cut: u64,
+    /// Fetches a node issued over a session it had not yet noticed was dead.
+    pub dead_link_fetches: u64,
     pub cuts: u64,
     pub crashes: u64,
     pub io_faults: u64,
@@ -138,6 +144,8 @@ enum Payload {
         object: ObjectId,
         result: FetchResult,
     },
+    /// The transport finally noticed the session is gone.
+    Disconnect,
 }
 
 struct Packet {
@@ -174,6 +182,8 @@ pub struct Simulator<'a> {
     nodes: Vec<Node>,
     adjacent: BTreeSet<(usize, usize)>,
     sessions: BTreeSet<(usize, usize)>,
+    /// `(node, peer)`: the session is gone but `node` has not been told yet.
+    stale: BTreeSet<(usize, usize)>,
     cut: BTreeSet<(usize, usize)>,
     packets: BTreeMap<(u64, u64), Packet>,
     next_seq: u64,
@@ -287,6 +297,7 @@ impl<'a> Simulator<'a> {
             nodes,
             adjacent,
             sessions: BTreeSet::new(),
+            stale: BTreeSet::new(),
             cut: BTreeSet::new(),
             packets: BTreeMap::new(),
             next_seq: 0,
@@ -617,6 +628,23 @@ impl<'a> Simulator<'a> {
     /// store now (as the real transport would) and schedule the reply.
     fn serve_fetch(&mut self, requester: usize, server: usize, object: ObjectId) {
         if !self.sessions.contains(&pair(requester, server)) {
+            if self.stale.contains(&(requester, server)) {
+                // Asked over a connection that is already dead: the
+                // transport reports the failure once it gives up.
+                self.stats.fetches += 1;
+                self.stats.fetch_faults += 1;
+                self.stats.dead_link_fetches += 1;
+                let delay = self.frame_latency() + self.rng.gen_range(500..=5_000);
+                self.send(
+                    server,
+                    requester,
+                    delay,
+                    Payload::Fetched {
+                        object,
+                        result: FetchResult::Transient("connection lost".into()),
+                    },
+                );
+            }
             return;
         }
         self.stats.fetches += 1;
@@ -658,11 +686,37 @@ impl<'a> Simulator<'a> {
 
     fn deliver(&mut self, packet: Packet) -> Result<(), Failure> {
         let Packet { from, to, payload } = packet;
-        if !self.sessions.contains(&pair(from, to)) || !self.nodes[to].up() {
+        if !self.nodes[to].up() {
             return Ok(());
         }
         let peer = self.nodes[from].device;
+        if let Payload::Disconnect = payload {
+            if self.stale.remove(&(to, from)) {
+                self.trace(format!(
+                    "{} noticed {} is gone",
+                    self.nodes[to].name, self.nodes[from].name
+                ));
+                self.call(to, "peer disconnected", |engine, syncer, out| {
+                    syncer.handle(engine, SyncInput::PeerDisconnected { peer }, out)
+                })?;
+            }
+            return Ok(());
+        }
+        let live = self.sessions.contains(&pair(from, to));
+        let failed_fetch = matches!(
+            &payload,
+            Payload::Fetched {
+                result: FetchResult::Transient(_),
+                ..
+            }
+        );
+        // Only a failure report crosses a dead connection the receiver still
+        // believes in.
+        if !live && !(failed_fetch && self.stale.contains(&(to, from))) {
+            return Ok(());
+        }
         match payload {
+            Payload::Disconnect => Ok(()),
             Payload::Frame(body) => {
                 let what = format!("frame {} from {}", frame_name(&body), self.nodes[from].name);
                 self.call(to, &what, |engine, syncer, out| {
@@ -733,6 +787,19 @@ impl<'a> Simulator<'a> {
         {
             return Ok(());
         }
+        // A new connection supersedes a stale one: the transport reports the
+        // old session gone before it reports the new one up.
+        for (me, other) in [(key.0, key.1), (key.1, key.0)] {
+            if self.stale.remove(&(me, other)) {
+                self.packets.retain(|_, p| {
+                    !(matches!(p.payload, Payload::Disconnect) && p.to == me && p.from == other)
+                });
+                let peer = self.nodes[other].device;
+                self.call(me, "peer disconnected", |engine, syncer, out| {
+                    syncer.handle(engine, SyncInput::PeerDisconnected { peer }, out)
+                })?;
+            }
+        }
         self.sessions.insert(key);
         self.trace(format!(
             "session {} <-> {} up",
@@ -757,14 +824,96 @@ impl<'a> Simulator<'a> {
             "session {} <-> {} down ({why})",
             self.nodes[key.0].name, self.nodes[key.1].name
         ));
-        self.packets.retain(|_, p| pair(p.from, p.to) != key);
+        // Everything in flight on the link is lost. A transfer that was
+        // under way fails instead: the transport reports it, before or
+        // after it reports the session gone.
+        let mut in_flight = Vec::new();
+        let before = self.packets.len();
+        self.packets.retain(|_, p| {
+            if pair(p.from, p.to) != key {
+                return true;
+            }
+            if let Payload::Fetched { object, .. } = &p.payload {
+                in_flight.push((p.to, *object));
+            }
+            false
+        });
+        self.stats.lost_in_flight += (before - self.packets.len()) as u64;
+        self.stats.transfers_cut += in_flight.len() as u64;
         self.link_last.remove(&(key.0, key.1));
         self.link_last.remove(&(key.1, key.0));
+        let (lo, hi) = self.scenario.net.notice_delay_ms;
         for (me, other) in [(key.0, key.1), (key.1, key.0)] {
+            if !self.nodes[me].up() {
+                continue;
+            }
+            let delay = if hi > 0 {
+                self.rng.gen_range(lo..=hi.max(lo))
+            } else {
+                0
+            };
+            let mine: Vec<ObjectId> = in_flight
+                .iter()
+                .filter(|(to, _)| *to == me)
+                .map(|(_, object)| *object)
+                .collect();
+            if delay > 0 {
+                // `me` keeps believing in the session until the transport
+                // gives up on it; what it sends meanwhile is lost.
+                self.stale.insert((me, other));
+                for object in mine {
+                    let at = self.rng.gen_range(0..=delay);
+                    self.send(
+                        other,
+                        me,
+                        at,
+                        Payload::Fetched {
+                            object,
+                            result: FetchResult::Transient("connection lost".into()),
+                        },
+                    );
+                }
+                self.send(other, me, delay, Payload::Disconnect);
+                continue;
+            }
             let peer = self.nodes[other].device;
+            let failures_first = self.rng.r#gen::<bool>();
+            if failures_first {
+                self.fail_in_flight(me, peer, &mine)?;
+            }
             self.call(me, "peer disconnected", |engine, syncer, out| {
                 syncer.handle(engine, SyncInput::PeerDisconnected { peer }, out)
             })?;
+            if !failures_first {
+                self.fail_in_flight(me, peer, &mine)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fail_in_flight(
+        &mut self,
+        me: usize,
+        peer: DeviceId,
+        objects: &[ObjectId],
+    ) -> Result<(), Failure> {
+        for &object in objects {
+            self.call(
+                me,
+                "transfer failed: connection lost",
+                |engine, syncer, out| {
+                    syncer.handle(
+                        engine,
+                        SyncInput::ObjectFetchFailed {
+                            peer,
+                            object,
+                            not_found: false,
+                            reason: "connection lost".into(),
+                        },
+                        out,
+                    )
+                },
+            )?;
         }
         Ok(())
     }
@@ -785,6 +934,7 @@ impl<'a> Simulator<'a> {
         self.trace(format!("{} crashed", self.nodes[node].name));
         self.nodes[node].engine = None;
         self.nodes[node].syncer = Syncer::new();
+        self.stale.retain(|(me, _)| *me != node);
         let sessions: Vec<_> = self
             .sessions
             .iter()
@@ -794,7 +944,10 @@ impl<'a> Simulator<'a> {
         for (a, b) in sessions {
             self.disconnect(a, b, "crash")?;
         }
-        self.packets.retain(|_, p| p.from != node && p.to != node);
+        // Peers' delayed disconnect notices about this node stay queued.
+        self.packets.retain(|_, p| {
+            p.to != node && (p.from != node || matches!(p.payload, Payload::Disconnect))
+        });
         Ok(())
     }
 
@@ -1324,8 +1477,16 @@ impl<'a> Simulator<'a> {
             }
             2 => {
                 let path = files.choose(&mut self.rng).expect("non-empty").clone();
+                let was = match tree.get(&path) {
+                    Some(TreeNode::File(bytes)) => tree::hash(bytes).to_string(),
+                    _ => "?".repeat(8),
+                };
                 self.delete_file(node, &mount, &path, &tree)?;
-                self.trace(format!("{}: delete {path}", self.nodes[node].name));
+                self.trace(format!(
+                    "{}: delete {path} ({})",
+                    self.nodes[node].name,
+                    &was[..8]
+                ));
             }
             3 => {
                 let name = self.fresh_name("d", "");
@@ -1353,7 +1514,11 @@ impl<'a> Simulator<'a> {
                     .map_err(|e| self.fail(format!("rename {from} -> {to}: {e}")))?;
                 self.model.write(&from, node, Some(&content), None);
                 self.model.write(&to, node, None, Some(&content));
-                self.trace(format!("{}: rename {from} -> {to}", self.nodes[node].name));
+                self.trace(format!(
+                    "{}: rename {from} -> {to} ({})",
+                    self.nodes[node].name,
+                    &tree::hash(&content).to_string()[..8]
+                ));
             }
             _ => {
                 let dir = dirs.choose(&mut self.rng).expect("non-empty").clone();
@@ -1574,7 +1739,18 @@ impl<'a> Simulator<'a> {
             .keys()
             .filter(|p| LogicalPath::new(p).is_ok_and(|l| is_conflict_copy(&l)))
             .count() as u64;
-        self.model.check(tree).map_err(|m| self.fail(m))?;
+        if let Err(message) = self.model.check(tree) {
+            // Add each node's index row and history for the path named.
+            let path = message
+                .split(" of ")
+                .nth(1)
+                .or_else(|| message.strip_prefix("resurrection: "))
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap_or("")
+                .to_owned();
+            let detail = self.describe_path(&path);
+            return Err(self.fail(format!("{message}\n{detail}")));
+        }
         self.model.reset();
         let n = tree::files(tree).count();
         self.trace(format!(
@@ -1582,6 +1758,44 @@ impl<'a> Simulator<'a> {
             tree.len()
         ));
         Ok(())
+    }
+
+    /// Every node's index row and version history for one path.
+    fn describe_path(&self, path: &str) -> String {
+        let Ok(logical) = LogicalPath::new(path) else {
+            return String::new();
+        };
+        let mut out = format!("history of {path}:\n");
+        for n in &self.nodes {
+            let Some(engine) = n.engine.as_ref() else {
+                continue;
+            };
+            let row = engine
+                .entries(SPACE, MOUNT, true)
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|e| e.key.path == logical))
+                .map(|e| {
+                    format!(
+                        "{:?} {:?} by {:?} seq {}",
+                        e.content, e.vector, e.modified_by, e.sequence.0
+                    )
+                })
+                .unwrap_or_else(|| "no row".into());
+            out.push_str(&format!("  {} ({}): {row}\n", n.name, n.device.short()));
+            if let Ok(history) = engine.history(SPACE, MOUNT, &logical) {
+                for h in history {
+                    out.push_str(&format!(
+                        "      seq {} {:?} {:?} by {:?} parent {:?}\n",
+                        h.sequence.0,
+                        h.content,
+                        h.vector,
+                        h.modified_by,
+                        h.parent_object.map(|o| o.to_string()[..8].to_owned())
+                    ));
+                }
+            }
+        }
+        out
     }
 
     fn check_index_matches_disk(&self, node: usize, tree: &Tree) -> Result<(), Failure> {

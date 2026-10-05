@@ -11,9 +11,18 @@ thread. What is simulated is everything around them:
   retry, resync and presence timers (`Syncer::set_now`). A 30 s resync delay
   costs no real time.
 - **Network.** Frames and object transfers are packets in a priority queue
-  with per-packet latency, FIFO per link (QUIC streams are ordered), link cuts
-  that tear sessions down and heal later, and object fetches that fail or
-  come back "not found".
+  with per-packet latency and bandwidth, FIFO per link (QUIC streams are
+  ordered, so loss or reordering inside a live session cannot happen; a lost
+  frame is a lost connection). Links are cut and healed; a cut or a crash
+  tears the session down and drops every frame in flight; a transfer that
+  was under way is reported to its requester as a failed fetch, before or
+  after the disconnect itself. The surviving side can learn of a cut late
+  (`notice_delay_ms`, the idle timeout): until then its frames are lost and
+  its object fetches come back as transport failures, and a reconnect first
+  reports the stale session gone, as the real transport does. Object
+  fetches can also fail transiently or come back "not found". The run
+  summary counts frames lost in flight, transfers cut and fetches issued
+  over dead links, so a scenario can be checked for exercising them.
 - **Faults.** A node can crash (its process dies; its disk stays) and restart.
   Working-tree writes, renames and object installs can fail with an I/O
   error, or the node can die between a finished temp file and its rename
@@ -43,7 +52,10 @@ checks:
   the previous converged state is still present: as the file, as a conflict
   copy (nested ones included), or, for text, as its changed lines inside a
   merged result. A record is dropped only once another node is seen building
-  on it. A path deleted with nothing written since must stay deleted.
+  on it. A path deleted with nothing written since must stay deleted,
+  unless another node wrote it without having seen the delete: the engine
+  keeps the live side of that race (a delete, or a rename's source, racing
+  an edit elsewhere comes back), which the model accepts.
 
 ## Scenarios
 
@@ -57,9 +69,10 @@ cargo run -p relay-vopr -- list
 | `three_node_mesh` | full mesh, clocks skewed by up to 90 s |
 | `hub_and_spokes` | spokes reach each other only through a hub |
 | `chain` | four devices in a line |
-| `partitions` | links cut and heal mid-edit; merges and conflict copies |
+| `partitions` | links cut and heal mid-edit, late notice; merges and conflict copies |
+| `flapping_links` | slow links dropping every few steps, mid-batch and mid-transfer |
 | `flaky_fetches` | transient and not-found object fetches; re-requests |
-| `crashes` | crash and restart, including mid-materialize |
+| `crashes` | crash and restart, including mid-materialize; peers notice late |
 | `disk_errors` | I/O errors on writes, renames and object installs |
 | `many_small_batches` | index batches of three entries |
 | `delete_heavy` | deletes, folder deletes, renames, mass-delete holds |
