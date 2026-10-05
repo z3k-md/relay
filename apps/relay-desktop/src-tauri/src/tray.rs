@@ -103,7 +103,7 @@ fn toggle_pause(app: &AppHandle) {
     ) {
         state.runner.resume(app)
     } else {
-        state.runner.pause(app)
+        state.runner.pause()
     };
     if let Err(err) = result {
         log::warn!("tray pause/resume: {}", anyhow_chain(err));
@@ -112,7 +112,7 @@ fn toggle_pause(app: &AppHandle) {
 
 pub fn quit_app(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        state.runner.stop_join(app);
+        state.runner.stop_join();
     }
     app.exit(0);
 }

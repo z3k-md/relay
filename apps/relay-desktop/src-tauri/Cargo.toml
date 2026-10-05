@@ -40,6 +40,10 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-store = "2"
 tauri-plugin-updater = "2"
 
+[target.'cfg(target_os = "android")'.dependencies]
+# Same major as Tauri's own Android dependency, so one copy links.
+jni = "0.21"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 
