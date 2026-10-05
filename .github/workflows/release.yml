@@ -69,6 +69,9 @@ jobs:
     name: should this ship
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       ship: ${{ steps.decide.outputs.ship }}
     steps:
@@ -84,6 +87,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          GH_TOKEN: ${{ github.token }}
           RUN_EVENT: ${{ github.event.workflow_run.event }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           REF_NAME: ${{ github.ref_name }}
@@ -94,8 +99,21 @@ jobs:
             ship true "started by hand"
             exit 0
           fi
-          if [ "$CONCLUSION" != "success" ] || [ "$RUN_EVENT" != "push" ]; then
+          if [ "$RUN_EVENT" != "push" ]; then
             ship false "CI ${CONCLUSION} on a ${RUN_EVENT}"
+            exit 0
+          fi
+          # Every job that tests what ships must pass. The Android APK (not
+          # released here) and cache pruning do not gate a release, so a
+          # queue timeout on either does not hold one back.
+          blocking=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs?filter=latest" \
+            --paginate --jq '.jobs[]
+              | select(.name | test("^(android|prune caches)") | not)
+              | select(.conclusion != "success" and .conclusion != "skipped")
+              | "\(.name): \(.conclusion)"')
+          if [ -n "$blocking" ]; then
+            printf '%s\n' "$blocking"
+            ship false "CI jobs that test the release did not pass"
             exit 0
           fi
           # A newer push has its own CI run, which releases it once green.

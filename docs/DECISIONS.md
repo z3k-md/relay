@@ -1408,8 +1408,10 @@ A merged change used to reach installed apps only after someone ran
 workflow also runs on `workflow_run` of CI completing on `main`, and a
 `gate` job publishes a patch release only when all of these hold:
 
-- CI concluded `success` on a `push` (a cancelled run, superseded by a newer
-  push, never ships);
+- CI ran on a `push` and every job that tests what ships passed; the
+  Android APK job (Android is not released here) and cache pruning are
+  ignored, so a queue timeout on either does not hold a release back, and a
+  cancelled run never ships;
 - the commit CI tested is still the tip of `main`, so a release never builds
   an untested commit; a newer push ships from its own CI run;
 - the commit is not itself a `Release v` commit;
