@@ -1238,6 +1238,45 @@ with it, with no one at its keyboard.
   three devices that pair only with the server, which joins and attaches
   through `server_plan` and makes no edits of its own.
 
+## D46. What a manage grant reaches
+
+A managing device (D37) browses and sets up sync; it does not get every byte
+on the managed device. The accounts design hands the grant to every device
+on an account, so the grant has to stop short of credentials.
+
+- **Protected folders.** Credential stores, the operating system's keychains
+  and keyrings, browser profiles, and the system's own secret files are never
+  shown, described, counted, located, or copied for a peer: `~/.ssh`,
+  `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`,
+  `~/.password-store`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`,
+  `~/.pypirc`, Cargo and Terraform credentials, gcloud and 1Password CLI
+  state, GNOME Keyring and KWallet, macOS Keychains and Cookies, Windows
+  Credentials, Protect, and Crypto, Chrome, Chromium, Edge, Brave, Vivaldi,
+  Firefox, and Thunderbird profiles, `/etc/shadow`, `/etc/ssh`,
+  `/etc/ssl/private`, `System32\config`, and `ProgramData\ssh`
+  (`relay_daemon::protected`). Only what exists on disk counts, and paths
+  are compared canonical, so a symlink into one is still inside it. Listings
+  leave them out; naming one answers the new `protected` error code, which
+  an older manager reads as `failed`.
+- **Remote mounts.** A mount a peer adds (`RemoteCall::Apply` with
+  `AddMount`) may be neither inside a protected folder or the Relay home nor
+  contain one, so a manager cannot sync a whole home folder, `/`, or a drive
+  out of a device. The check runs when the mount is added; a folder pair
+  that would is undone and reports why. `Preview` still describes a folder
+  that contains protected ones, because the same call previews the parent of
+  a folder about to be created.
+- **Copies stay in synced folders.** A read-only copy (D41) is answered only
+  for a file inside one of the managed device's mounts. Anything else is
+  reached by syncing its folder (D39, D40), which shows in that device's
+  spaces and activity. The app offers Read-only only inside a synced folder.
+- **This device's own steps are not restricted.** The folder-pair steps a
+  device runs on itself (`remote::answer` as `Asker::ThisDevice`) see
+  everything, as a local request would.
+- **Known limits.** The list is fixed; there is no per-device setting. A
+  credential in an ordinary folder (a `.env`, a token in Downloads) is not
+  protected, and a folder the device's own user already syncs is readable
+  whatever it holds.
+
 ## D47. Store mode
 
 Home server Stage 2 ([`proposals/home-server.md`](proposals/home-server.md)).

@@ -62,7 +62,7 @@ relay opened
 relay opened remove Documents
 ```
 
-`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. `relay open --read-only` instead copies just that file (up to 256 MB) into Relay's folder as read-only and sets nothing up; edits to the copy stay here. In the app, click a file in Browse.
+`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. `relay open --read-only` instead copies just that file (up to 256 MB) into Relay's folder as read-only and sets nothing up; edits to the copy stay here. A copy comes only from a folder that already syncs on the other device; for anything else, open the file or sync its folder. Credential folders such as `~/.ssh`, keychains, and browser profiles are never reachable from another device, and a folder set up for sync from another device may not contain them. In the app, click a file in Browse.
 
 The first browse form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
 
