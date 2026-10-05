@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start a Relay release build by hand (pushes to main that pass CI release
 # automatically, D49). The workflow on main bumps the shared version,
-# commits it, and builds the desktop app and CLI. Ordinary pushes do not.
+# commits it, and builds the desktop app and CLI.
 #
 #   ./scripts/release.sh                 # patch (default)
 #   ./scripts/release.sh minor
