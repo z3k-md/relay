@@ -105,12 +105,58 @@ pub(super) fn unregister(account: &str) -> Result<(), FsError> {
     })
 }
 
+/// Where the system keeps every registered sync root, one key per id.
+const SYNC_ROOT_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager";
+
 pub(super) fn registered() -> Vec<RegisteredRoot> {
     // `Relay!<SID>!`: every id this user registered starts with it.
     let Ok(prefix) = root_id("").map(|id| id.to_os_string()) else {
         return Vec::new();
     };
     let prefix = prefix.to_string_lossy().into_owned();
+    let mut found = registered_in_registry(&prefix);
+    for root in registered_by_shell(&prefix) {
+        if !found.iter().any(|r| r.account == root.account) {
+            found.push(root);
+        }
+    }
+    found
+}
+
+fn account_of<'a>(id: &'a str, prefix: &str) -> Option<&'a str> {
+    let account = id.strip_prefix(prefix)?;
+    (!account.is_empty() && !account.contains('!')).then_some(account)
+}
+
+/// The registry is the system's own record and needs no shell; the shell's
+/// list can come back empty where none runs (services, CI).
+fn registered_in_registry(prefix: &str) -> Vec<RegisteredRoot> {
+    let sid = prefix
+        .trim_end_matches('!')
+        .rsplit('!')
+        .next()
+        .unwrap_or("");
+    let Ok(roots) = windows_registry::LOCAL_MACHINE.open(SYNC_ROOT_KEY) else {
+        return Vec::new();
+    };
+    let Ok(ids) = roots.keys() else {
+        return Vec::new();
+    };
+    ids.filter_map(|id| {
+        let account = account_of(&id, prefix)?.to_owned();
+        let path = roots
+            .open(format!(r"{id}\UserSyncRoots"))
+            .and_then(|key| key.get_string(sid))
+            .ok()?;
+        Some(RegisteredRoot {
+            account,
+            path: path.into(),
+        })
+    })
+    .collect()
+}
+
+fn registered_by_shell(prefix: &str) -> Vec<RegisteredRoot> {
     let roots = catch_unwind(cloud_filter::root::active_roots)
         .ok()
         .and_then(Result::ok)
@@ -122,12 +168,9 @@ pub(super) fn registered() -> Vec<RegisteredRoot> {
         .filter_map(|info| {
             catch_unwind(AssertUnwindSafe(|| {
                 let id = info.id().to_os_string();
-                let account = id.to_str()?.strip_prefix(&prefix)?;
-                if account.is_empty() || account.contains('!') {
-                    return None;
-                }
+                let account = account_of(id.to_str()?, prefix)?.to_owned();
                 Some(RegisteredRoot {
-                    account: account.to_owned(),
+                    account,
                     path: info.path(),
                 })
             }))
