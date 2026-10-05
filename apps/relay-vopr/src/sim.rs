@@ -83,6 +83,9 @@ pub struct Failure {
     pub step: u32,
     pub message: String,
     pub trace_tail: Vec<String>,
+    /// The whole event trace, for a failure that does not reproduce on
+    /// the machine reading it (a platform-specific divergence).
+    pub trace: Vec<String>,
 }
 
 impl std::fmt::Display for Failure {
@@ -239,6 +242,7 @@ impl<'a> Simulator<'a> {
             step: 0,
             message: format!("temp dir: {e}"),
             trace_tail: Vec::new(),
+            trace: Vec::new(),
         })?;
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut nodes = Vec::new();
@@ -346,6 +350,7 @@ impl<'a> Simulator<'a> {
             step: self.step,
             message,
             trace_tail: self.trace[tail..].to_vec(),
+            trace: self.trace.clone(),
         }
     }
 

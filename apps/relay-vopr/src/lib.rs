@@ -47,6 +47,7 @@ pub fn run(scenario: &Scenario, seed: u64, verbose: bool) -> Result<RunReport, F
                 step: 0,
                 message: format!("panic: {message}"),
                 trace_tail: Vec::new(),
+                trace: Vec::new(),
             })
         }
     }

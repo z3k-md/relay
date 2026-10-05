@@ -28,10 +28,26 @@ fn run_scenario(name: &str) {
     for seed in 1..=seeds() {
         match relay_vopr::run(&scenario, seed, false) {
             Ok(report) => eprintln!(
-                "{name} seed {seed}: ok in {} ms ({} ops, {} frames, {} conflict copies)",
-                report.wall_ms, report.stats.ops, report.stats.frames, report.stats.conflict_copies
+                "{name} seed {seed}: ok in {} ms ({} ops, {} frames, {} conflict copies); trace {}",
+                report.wall_ms,
+                report.stats.ops,
+                report.stats.frames,
+                report.stats.conflict_copies,
+                report.trace_digest
             ),
-            Err(failure) => panic!("{failure}"),
+            Err(failure) => {
+                // A seed that fails only on one platform cannot be replayed
+                // elsewhere, so CI logs carry the whole trace.
+                if std::env::var_os("CI").is_some()
+                    || std::env::var_os("RELAY_VOPR_FULL_TRACE").is_some()
+                {
+                    eprintln!("full trace ({} events):", failure.trace.len());
+                    for line in &failure.trace {
+                        eprintln!("  {line}");
+                    }
+                }
+                panic!("{failure}")
+            }
         }
     }
     eprintln!("{name}: {} seeds in {:.1?}", seeds(), started.elapsed());
