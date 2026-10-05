@@ -122,13 +122,24 @@ pub fn open_window(app: &AppHandle) -> tauri::Result<()> {
         window.show()?;
         return window.set_focus();
     }
-    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
+    let mut builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("Relay Explorer (preview)")
         .inner_size(1180.0, 760.0)
         .min_inner_size(640.0, 420.0)
         // Our own IDropTarget replaces wry's path-only handler (Windows).
-        .disable_drag_drop_handler()
-        .build()?;
+        .disable_drag_drop_handler();
+    if autobench_output().is_some() {
+        // WebView2 runs one browser process per profile. An installed Relay
+        // running beside the benchmark owns the default profile, so its
+        // processes would host this window and fall outside the process
+        // tree the memory bar measures. A profile of our own keeps them in.
+        builder = builder.data_directory(
+            std::env::temp_dir()
+                .join("relay-explorer-bench")
+                .join("webview"),
+        );
+    }
+    let window = builder.build()?;
     let app = app.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Destroyed = event {
