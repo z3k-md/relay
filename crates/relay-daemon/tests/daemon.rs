@@ -1176,25 +1176,32 @@ fn open_remote_files_and_remove_quick_opens() {
         "bob never learned alice's grant"
     );
     let mut bob = wait_ipc(home_b.path());
+    let try_open_as = |client: &mut relay_ipc::Client, file: &Path, read_only: bool| {
+        client.open_remote(&relay_ipc::OpenRemoteParams {
+            peer: "alice".into(),
+            path: dunce_like(file),
+            root: Some(root.path().to_path_buf()),
+            read_only,
+        })
+    };
     let open_as = |client: &mut relay_ipc::Client, file: &Path, read_only: bool| {
-        client
-            .open_remote(&relay_ipc::OpenRemoteParams {
-                peer: "alice".into(),
-                path: dunce_like(file),
-                root: Some(root.path().to_path_buf()),
-                read_only,
-            })
-            .expect("open remote")
+        try_open_as(client, file, read_only).expect("open remote")
     };
     let open = |client: &mut relay_ipc::Client, file: &Path| open_as(client, file, false);
     let space = |opened: &relay_ipc::OpenedRemote| opened.synced.clone().unwrap().space;
 
-    // A read-only copy sets nothing up on either device (D41).
-    let copy = open_as(&mut bob, &docs.path().join("report.docx"), true);
+    // A read-only copy sets nothing up on either device (D41) and comes only
+    // from a folder that syncs on alice (D46).
+    let copy = open_as(&mut bob, &synced.path().join("plan.md"), true);
     assert_eq!(copy.synced, None);
-    assert_eq!(fs::read(&copy.path).unwrap(), b"quarterly");
+    assert_eq!(fs::read(&copy.path).unwrap(), b"plan");
     assert!(fs::metadata(&copy.path).unwrap().permissions().readonly());
     assert!(copy.path.starts_with(home_b.path().join("read-only")));
+    let refused = try_open_as(&mut bob, &docs.path().join("report.docx"), true).unwrap_err();
+    assert!(
+        matches!(refused, relay_ipc::IpcError::Remote { ref code, .. } if code == "protected"),
+        "{refused:?}"
+    );
     assert!(
         Engine::open_read_only(home_b.path())
             .unwrap()

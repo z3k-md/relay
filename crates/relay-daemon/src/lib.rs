@@ -7,6 +7,7 @@
 mod folder_pair;
 mod host;
 mod placeholders;
+mod protected;
 mod quick_open;
 mod read_copy;
 mod remote;

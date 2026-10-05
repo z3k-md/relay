@@ -45,7 +45,7 @@ impl Target {
 
     fn call(&self, host: &Host, call: RemoteCall) -> RemoteResult {
         match self {
-            Self::Here { .. } => remote::answer(host, &host.home, call, "this device"),
+            Self::Here { .. } => remote::answer(host, &host.home, call, remote::Asker::ThisDevice),
             Self::Peer { id, .. } => host.call_peer(*id, call),
         }
     }

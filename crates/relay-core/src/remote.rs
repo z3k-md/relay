@@ -234,6 +234,9 @@ pub enum RemoteErrorCode {
     Forbidden,
     /// The operating system refused (permissions, macOS privacy prompts).
     Denied,
+    /// The answering device keeps that from managing devices: a credential
+    /// store, or the contents of a file outside its synced folders (D46).
+    Protected,
     NotFound,
     Timeout,
     /// The other device runs a Relay that does not answer remote calls.
@@ -253,6 +256,7 @@ impl RemoteErrorCode {
         match self {
             Self::Forbidden => "forbidden",
             Self::Denied => "denied",
+            Self::Protected => "protected",
             Self::NotFound => "not_found",
             Self::Timeout => "timeout",
             Self::Unsupported => "unsupported",
@@ -269,6 +273,7 @@ impl RemoteErrorCode {
         match value {
             "forbidden" => Self::Forbidden,
             "denied" => Self::Denied,
+            "protected" => Self::Protected,
             "not_found" => Self::NotFound,
             "timeout" => Self::Timeout,
             "unsupported" => Self::Unsupported,
