@@ -91,9 +91,10 @@ pub fn run(home: &Path, cmd: ServiceCmd, json: bool) -> Result<ExitCode> {
     match cmd {
         ServiceCmd::Install { listen } => {
             require_initialized(home)?;
-            install(home, listen)?;
-            print_install_details(home, listen, json)?;
-            print_status(&status_info(home)?, json)?;
+            let home = service_home(home)?;
+            install(&home, listen)?;
+            print_install_details(&home, listen, json)?;
+            print_status(&status_info(&home)?, json)?;
             Ok(ExitCode::SUCCESS)
         }
         ServiceCmd::Uninstall => {
@@ -257,6 +258,20 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
         Some(s) if s.starts_with(r"\\?\") => PathBuf::from(&s[r"\\?\".len()..]),
         _ => path.to_path_buf(),
     }
+}
+
+/// The home path as the service definition bakes it in: absolute, since
+/// launchd and the task scheduler start the binary in their own directory,
+/// without a trailing separator (`"C:\data\"` would escape the closing quote
+/// of the task's argument string) and without the `\\?\` prefix. The log
+/// path derives from it.
+pub fn service_home(home: &Path) -> Result<PathBuf> {
+    let absolute =
+        std::path::absolute(home).with_context(|| format!("resolving {}", home.display()))?;
+    // Collecting the components drops a trailing separator.
+    Ok(strip_verbatim_prefix(
+        &absolute.components().collect::<PathBuf>(),
+    ))
 }
 
 pub fn encode_powershell_command(script: &str) -> String {
@@ -561,6 +576,7 @@ fn tail_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
 fn bytecount_newlines(buf: &[u8]) -> usize {
     buf.iter().filter(|b| **b == b'\n').count()
 }
+
 fn follow_once(path: &Path, pos: &mut u64) -> std::io::Result<String> {
     let len = fs::metadata(path)?.len();
     if len < *pos {
@@ -1163,6 +1179,35 @@ gui/501/dev.relay.agent = {
         assert_eq!(tail_lines(&path, 50).unwrap(), ["a", "b", "c"]);
         fs::write(&path, "").unwrap();
         assert!(tail_lines(&path, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_home_is_absolute_without_trailing_separator() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            service_home(Path::new("rel/home/")).unwrap(),
+            cwd.join("rel").join("home")
+        );
+        let abs = cwd.join("abs");
+        let with_sep = format!("{}{}", abs.display(), std::path::MAIN_SEPARATOR);
+        assert_eq!(service_home(Path::new(&with_sep)).unwrap(), abs);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_home_feeds_task_arguments_cleanly() {
+        let home = service_home(Path::new(r"\\?\C:\data\")).unwrap();
+        assert_eq!(home, PathBuf::from(r"C:\data"));
+        let log = log_path(&home);
+        let args = windows_task_argument_string(
+            home.to_str().unwrap(),
+            "0.0.0.0:47321",
+            log.to_str().unwrap(),
+        );
+        assert_eq!(
+            args,
+            r#"--home "C:\data" run --listen 0.0.0.0:47321 --log-file "C:\data\logs\relay.log" --host service"#
+        );
     }
 
     #[test]
