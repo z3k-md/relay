@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use relay_core::DeviceId;
 use relay_crypto::DeviceIdentity;
@@ -29,6 +30,17 @@ const BIND_LEN: usize = RELAY_HEADER_LEN + ID_LEN + ID_LEN + SIG_LEN;
 
 /// Largest QUIC packet accepted inside a DATA frame.
 pub(crate) const MAX_RELAY_PAYLOAD: usize = 1400;
+
+/// A session that carried nothing for this long is forgotten; a device
+/// binds again on its next dial. A slot is refreshed only by that bind or
+/// by forwarded data, and a dial cycle for an unreachable peer runs about a
+/// minute (the candidates, the relay dial, then the 30 s backoff), so the
+/// margin covers a slow lookup or a lost bind; `MAX_SESSIONS` bounds memory.
+const SESSION_IDLE: Duration = Duration::from_secs(5 * 60);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+/// Sessions a forwarder keeps at once. Any keypair can bind, so without a
+/// cap the table is a memory sink for a public relay.
+const MAX_SESSIONS: usize = 4096;
 
 /// Quinn sizes its receive buffer from [`quinn::EndpointConfig::max_udp_payload_size`].
 /// Keeping that at 1400 means a wrapped datagram must stay within 1400 bytes,
@@ -208,9 +220,10 @@ fn parse_data(packet: &[u8]) -> Option<([u8; SESSION_LEN], &[u8])> {
     Some((session, payload))
 }
 
-#[derive(Default)]
 struct Session {
     slots: Vec<Slot>,
+    /// Last bind or forwarded datagram.
+    last_seen: Instant,
 }
 
 struct Slot {
@@ -218,13 +231,17 @@ struct Slot {
     addr: SocketAddr,
 }
 
+type Sessions = HashMap<[u8; SESSION_LEN], Session>;
+
 async fn run_relay(sock: tokio::net::UdpSocket, mut shutdown: tokio::sync::mpsc::Receiver<()>) {
-    let mut sessions: HashMap<[u8; SESSION_LEN], Session> = HashMap::new();
+    let mut sessions = Sessions::new();
     let mut buf = vec![0u8; 65535];
+    let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
     loop {
         tokio::select! {
             biased;
             _ = shutdown.recv() => break,
+            _ = sweep.tick() => sweep_sessions(&mut sessions, Instant::now()),
             recv = sock.recv_from(&mut buf) => {
                 match recv {
                     Ok((len, src)) => handle_datagram(&sock, &mut sessions, &buf[..len], src).await,
@@ -239,9 +256,13 @@ async fn run_relay(sock: tokio::net::UdpSocket, mut shutdown: tokio::sync::mpsc:
     }
 }
 
+fn sweep_sessions(sessions: &mut Sessions, now: Instant) {
+    sessions.retain(|_, session| now.duration_since(session.last_seen) < SESSION_IDLE);
+}
+
 async fn handle_datagram(
     sock: &tokio::net::UdpSocket,
-    sessions: &mut HashMap<[u8; SESSION_LEN], Session>,
+    sessions: &mut Sessions,
     packet: &[u8],
     src: SocketAddr,
 ) {
@@ -255,7 +276,11 @@ async fn handle_datagram(
     }
 }
 
-fn apply_bind(sessions: &mut HashMap<[u8; SESSION_LEN], Session>, packet: &[u8], src: SocketAddr) {
+// Follow-up: a bind has no timestamp or nonce, so a captured one replayed
+// from another source address moves the slot there until the device binds
+// again. A signed timestamp in `bind_message` would stop that, but old
+// devices do not send one, so it waits for a protocol bump (see D34).
+fn apply_bind(sessions: &mut Sessions, packet: &[u8], src: SocketAddr) {
     if packet.len() != BIND_LEN {
         return;
     }
@@ -277,7 +302,16 @@ fn apply_bind(sessions: &mut HashMap<[u8; SESSION_LEN], Session>, packet: &[u8],
         tracing::debug!(%src, "relay bind rejected: bad signature");
         return;
     }
-    let entry = sessions.entry(session).or_default();
+    if !sessions.contains_key(&session) && sessions.len() >= MAX_SESSIONS {
+        tracing::debug!(%src, "relay bind ignored: session table is full");
+        return;
+    }
+    let now = Instant::now();
+    let entry = sessions.entry(session).or_insert_with(|| Session {
+        slots: Vec::new(),
+        last_seen: now,
+    });
+    entry.last_seen = now;
     if let Some(slot) = entry.slots.iter_mut().find(|slot| slot.device == sender) {
         slot.addr = src;
         return;
@@ -294,19 +328,20 @@ fn apply_bind(sessions: &mut HashMap<[u8; SESSION_LEN], Session>, packet: &[u8],
 
 async fn forward_data(
     sock: &tokio::net::UdpSocket,
-    sessions: &HashMap<[u8; SESSION_LEN], Session>,
+    sessions: &mut Sessions,
     packet: &[u8],
     src: SocketAddr,
 ) {
     let Some((session, payload)) = parse_data(packet) else {
         return;
     };
-    let Some(state) = sessions.get(&session) else {
+    let Some(state) = sessions.get_mut(&session) else {
         return;
     };
     let Some(from) = state.slots.iter().find(|slot| slot.addr == src) else {
         return;
     };
+    state.last_seen = Instant::now();
     let Some(dest) = state
         .slots
         .iter()
@@ -554,7 +589,49 @@ impl RelaySocket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_sessions_are_swept_and_the_table_is_capped() {
+        let mut sessions = Sessions::new();
+        let bound = |n: u8| {
+            let dir = tempfile::tempdir().unwrap();
+            let identity = DeviceIdentity::generate(dir.path()).unwrap();
+            let peer = DeviceId::from_bytes([n; 32]);
+            encode_bind(identity.device_id(), peer, &identity).unwrap()
+        };
+        let src: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        apply_bind(&mut sessions, &bound(1), src);
+        apply_bind(&mut sessions, &bound(2), src);
+        assert_eq!(sessions.len(), 2);
+
+        // Nothing is swept while sessions are fresh; everything idle goes.
+        sweep_sessions(&mut sessions, Instant::now());
+        assert_eq!(sessions.len(), 2);
+        let later = Instant::now() + SESSION_IDLE + Duration::from_secs(1);
+        sessions.values_mut().next().unwrap().last_seen = later;
+        sweep_sessions(&mut sessions, later);
+        assert_eq!(sessions.len(), 1, "only the touched session survives");
+
+        // A full table takes re-binds for known sessions but no new ones.
+        let kept = *sessions.keys().next().unwrap();
+        for n in 0..MAX_SESSIONS {
+            let mut key = [0u8; SESSION_LEN];
+            key[..2].copy_from_slice(&(n as u16).to_be_bytes());
+            key[2] = 7;
+            sessions.insert(
+                key,
+                Session {
+                    slots: Vec::new(),
+                    last_seen: Instant::now(),
+                },
+            );
+        }
+        let full = sessions.len();
+        assert!(full >= MAX_SESSIONS);
+        apply_bind(&mut sessions, &bound(3), src);
+        assert_eq!(sessions.len(), full, "a bind past the cap is ignored");
+        assert!(sessions.contains_key(&kept));
+    }
 
     #[test]
     fn session_id_ignores_device_order() {

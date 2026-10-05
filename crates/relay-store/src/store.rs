@@ -292,7 +292,15 @@ impl ObjectStore {
                 actual,
             });
         }
+        self.import_prehashed(tmp, expected)
+    }
 
+    /// Fsync `tmp` and atomically publish it as `expected` without reading
+    /// it again: the caller already hashed these exact bytes (the network
+    /// layer hashes an object as it streams in). Bytes from any other source
+    /// go through [`Self::import_verified`]. `tmp` is removed on success and
+    /// when the object is already present.
+    pub fn import_prehashed(&self, tmp: &Path, expected: &ObjectId) -> Result<(), StoreError> {
         if self.contains(expected) {
             let _ = fs::remove_file(tmp);
             return Ok(());
@@ -934,6 +942,25 @@ mod tests {
         assert_corrupt(err, expected, b"other");
         assert!(!store.contains(&expected));
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn import_prehashed_publishes_and_removes_tmp() {
+        let (_dir, store) = setup();
+        let data = b"streamed-and-hashed";
+        let id = ObjectId::of(data);
+        let tmp = store.tmp_path().unwrap();
+        fs::write(&tmp, data).unwrap();
+        store.import_prehashed(&tmp, &id).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(store.read(&id).unwrap(), data);
+        store.verify(&id).unwrap();
+
+        let again = store.tmp_path().unwrap();
+        fs::write(&again, data).unwrap();
+        store.import_prehashed(&again, &id).unwrap();
+        assert!(!again.exists());
+        assert_eq!(object_file_count(&store), 1);
     }
 
     #[test]
