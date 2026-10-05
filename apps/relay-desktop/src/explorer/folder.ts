@@ -110,6 +110,8 @@ export function createFolder(initial: string) {
   let streaming = false;
   /** "done" arrived; time it once the last batch is on screen. */
   let donePending = false;
+  /** Reloads forced by the watcher losing events, for diagnostics. */
+  let rescans = 0;
 
   const visible = (e: Entry) => showHidden.value || !(e[1] & FLAG_HIDDEN);
   const cmp = () => comparator(sortKey.value, sortDesc.value);
@@ -177,6 +179,7 @@ export function createFolder(initial: string) {
       stats.changes++;
       switch (change.kind) {
         case "rescan":
+          rescans++;
           void load(path.value, false);
           return current;
         case "removed":
@@ -338,6 +341,13 @@ export function createFolder(initial: string) {
     stats,
     canBack: () => back.value.length > 0,
     canForward: () => forward.value.length > 0,
+    /** Entries received but not yet applied (applied once per frame). */
+    get pending() {
+      return pendingBatch.length;
+    },
+    get rescans() {
+      return rescans;
+    },
     get scrollTop() {
       return scrollTop;
     },

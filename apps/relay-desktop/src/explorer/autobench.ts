@@ -20,13 +20,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitDone(folder: Folder, timeoutMs = 300_000) {
-  const until = performance.now() + timeoutMs;
-  while (folder.loading.value || folder.stats.doneMs === null) {
-    if (folder.error.value) throw new Error(`listing ${folder.path.value}: ${folder.error.value}`);
-    if (performance.now() > until) throw new Error(`listing ${folder.path.value} timed out`);
-    await sleep(25);
-  }
+/** Where a listing stands, for a report that stops partway. */
+function listingState(f: Folder): string {
+  const s = f.stats;
+  return `loading ${f.loading.value}, batches ${s.batches}, received ${s.total}, unapplied ${f.pending}, rows ${f.rows.value.length}, first paint ${ms(s.firstPaintMs)} ms, Rust ${ms(s.backendMs)} ms, changes ${s.changes}, rescans ${f.rescans}`;
 }
 
 function ms(v: number | null): string {
@@ -45,6 +42,46 @@ function listingLine(label: string, f: Folder): string {
  */
 export async function autobench(host: BenchHost): Promise<string> {
   const lines = [`Relay Explorer P0 benchmark (${new Date().toISOString()})`, ...machineLines(), ""];
+
+  // WebView2 stops animation frames while the window is minimized or fully
+  // covered. Lists apply batches on a frame and every timing here is
+  // frame-based, so the run pauses until the window is visible again.
+  let hiddenMs = 0;
+  let hides = 0;
+  const countHides = () => {
+    if (document.visibilityState !== "visible") hides++;
+  };
+  document.addEventListener("visibilitychange", countHides);
+  const whenVisible = async (doing: string) => {
+    if (document.visibilityState === "visible") return;
+    const t0 = performance.now();
+    host.status(`paused while the window is hidden or covered (${doing}). Bring it to the front to continue.`);
+    await new Promise<void>((resolve) => {
+      const onChange = () => {
+        if (document.visibilityState !== "visible") return;
+        document.removeEventListener("visibilitychange", onChange);
+        resolve();
+      };
+      document.addEventListener("visibilitychange", onChange);
+    });
+    hiddenMs += performance.now() - t0;
+    host.status(`resumed: ${doing}`);
+  };
+  const waitDone = async (folder: Folder, timeoutMs = 300_000) => {
+    let until = performance.now() + timeoutMs;
+    while (folder.loading.value || folder.stats.doneMs === null) {
+      if (folder.error.value) throw new Error(`listing ${folder.path.value}: ${folder.error.value}`);
+      if (document.visibilityState !== "visible") {
+        const t0 = performance.now();
+        await whenVisible(`listing ${folder.path.value}`);
+        until += performance.now() - t0;
+      }
+      if (performance.now() > until) {
+        throw new Error(`listing ${folder.path.value} timed out (${listingState(folder)})`);
+      }
+      await sleep(25);
+    }
+  };
   const make = (kind: "files" | "images", count: number) => {
     const progress = new Channel<number>();
     progress.onmessage = (n) => host.status(`Creating ${kind}-${count}: ${n.toLocaleString()}`);
@@ -52,25 +89,36 @@ export async function autobench(host: BenchHost): Promise<string> {
     return explorer.makeBench(kind, count, progress);
   };
   const scroll = async (folder: Folder, mode: "sweep" | "smooth") => {
-    host.status(`Scrolling (${mode}) ${folder.path.value}…`);
-    const el = host.scroller();
-    if (!el) throw new Error("no list to scroll");
-    return runScroll(el, mode, folder.rows.value.length);
+    // A run the window spent partly hidden measures nothing; redo it.
+    for (let attempt = 1; ; attempt++) {
+      await whenVisible(`${mode} scroll`);
+      host.status(`Scrolling (${mode}) ${folder.path.value}…`);
+      const el = host.scroller();
+      if (!el) throw new Error("no list to scroll");
+      const before = hides;
+      const result = await runScroll(el, mode, folder.rows.value.length);
+      if (hides === before || attempt === 3) return result;
+    }
   };
 
   try {
     const tab = host.active();
     const tenK = await make("files", 10_000);
     const paints: number[] = [];
-    for (let run = 1; run <= 5; run++) {
+    for (let run = 1, tries = 0; run <= 5 && tries < 15; tries++) {
+      await whenVisible("first paint");
       host.status(`First paint, run ${run} of 5…`);
+      const before = hides;
       tab.navigate(tenK);
       await waitDone(tab);
+      await sleep(300);
+      // A run the window spent partly hidden timed the pause; run it again.
+      if (hides !== before) continue;
       paints.push(tab.stats.firstPaintMs ?? Number.NaN);
       lines.push(listingLine(`10k run ${run}`, tab));
-      await sleep(300);
+      run++;
     }
-    const medianPaint = [...paints].sort((a, b) => a - b)[2];
+    const medianPaint = [...paints].sort((a, b) => a - b)[Math.floor((paints.length - 1) / 2)];
 
     const big = await make("files", 200_000);
     tab.navigate(big);
@@ -113,6 +161,11 @@ export async function autobench(host: BenchHost): Promise<string> {
     );
   } catch (err) {
     lines.push("", `Benchmark stopped: ${err}`);
+  } finally {
+    document.removeEventListener("visibilitychange", countHides);
+  }
+  if (hiddenMs > 0) {
+    lines.push(`Paused ${(hiddenMs / 1000).toFixed(0)} s in total while the window was hidden or covered.`);
   }
   return lines.join("\n");
 }

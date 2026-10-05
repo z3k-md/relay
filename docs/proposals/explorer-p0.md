@@ -27,8 +27,12 @@ On Windows, from `apps/relay-desktop` in PowerShell:
 
 ```powershell
 bun install
-$env:RELAY_EXPLORER_BENCH = "1"; bun run dev
+bun run sidecar
+$env:RELAY_EXPLORER_BENCH = "1"; bun run tauri dev --release
 ```
+
+`--release` builds the Rust side optimized, which is what we judge the bars
+on; plain `bun run dev` works too, with a debug build.
 
 The explorer window opens by itself and runs every timed bar with no
 clicking:
@@ -39,17 +43,19 @@ clicking:
 
 It then writes the report to `%TEMP%\relay-explorer-bench\results.txt`,
 prints it, and quits. Set the variable to a file path to write the report
-somewhere else. Leave the window alone while it runs, because the scroll
-timings need it on screen. The first run creates the benchmark folders,
-which takes a while for 200k files.
+somewhere else. Leave the window on screen while it runs. WebView2 stops
+drawing a minimized or fully covered window, so the run pauses until the
+window is visible again, and redoes any timing that overlapped the pause.
+The first run creates the benchmark folders, which takes a while for 200k
+files.
 
 An installed Relay can stay running. In benchmark mode the app opens only
 the explorer window and leaves everything else alone: it doesn't hand off
 to the running copy, and it starts no sync engine or tray icon. It also
 writes no settings and doesn't touch autostart, the CLI or updates.
 
-`bun run dev` runs a bash script first. If `bash` on your PATH is the WSL
-stub with no distro installed, put Git Bash first on PATH for that shell.
+`bun run sidecar` is a bash script. If `bash` on your PATH is the WSL stub
+with no distro installed, put Git Bash first on PATH for that shell.
 
 ### By hand, and the checks that need a person
 
