@@ -55,7 +55,9 @@ setup need a second, explicit grant:
   peer deny-manage NAME` clear it.
 - **One grant, not several.** Reading any file is as sensitive as changing
   config (a manager could mount `~/.ssh`), so browse, read, and setup share
-  one bit in v1.
+  one bit in v1. D46 later put credential stores out of the grant's reach:
+  a manager can neither browse nor mount `~/.ssh` and its kind, and
+  read-only copies come only from folders that already sync.
 - **Writes are visible.** Every remote write lands in the managed device's
   activity log with the manager's name, and the desktop app shows a tray
   notification ("Mac set up sync for C:\Users\zach\xyz").

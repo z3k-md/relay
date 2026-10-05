@@ -1,10 +1,11 @@
 //! Answers remote calls from peers allowed to manage this device (D37).
 //!
 //! The network layer already refused peers without the grant; this checks the
-//! database again, because that is the record the user changes. Everything
-//! here is read-only: listing folders, describing one path, and listing
-//! spaces. Relay's own data folder is never listed, since it holds the
-//! device key.
+//! database again, because that is the record the user changes. A peer
+//! browses, reads copies of files in synced folders, and sets up sync. It
+//! never reaches Relay's own data folder, which holds the device key, or the
+//! protected folders in [`crate::protected`] (D46), and a mount it adds may
+//! neither be inside one nor contain one.
 
 use std::cmp::Ordering;
 use std::fs;
@@ -27,6 +28,7 @@ use relay_ipc::ActivityItem;
 use relay_net::ControlHandler;
 
 use crate::host::{Host, now_ms};
+use crate::protected;
 use crate::sizes::{self, Sizer};
 
 pub(crate) struct Browser {
@@ -49,7 +51,7 @@ impl ControlHandler for Browser {
             .map_err(|err| RemoteError::new(RemoteErrorCode::Busy, err.to_string()))?;
         let name = authorize(&engine, peer)?;
         drop(engine);
-        answer(&self.host, &self.home, call, &name)
+        answer(&self.host, &self.home, call, Asker::Peer { name: &name })
     }
 
     fn open_file(
@@ -61,20 +63,41 @@ impl ControlHandler for Browser {
         let engine = Engine::open_read_only(&self.home)
             .map_err(|err| RemoteError::new(RemoteErrorCode::Busy, err.to_string()))?;
         let name = authorize(&engine, peer)?;
-        let (file, path) = Context::load(&engine, &self.home)?.open_for_copy(path, max_bytes)?;
+        let (file, path) = Context::load(&engine, &self.home, Asker::Peer { name: &name })?
+            .open_for_copy(path, max_bytes)?;
         log(&self.host, &name, &format!("copied {}", path.display()));
         Ok(file)
     }
 }
 
-/// Answer `call` on this device. `by` names who asked, for the activity log.
-/// Peers reach this through [`ControlHandler::handle`] after the grant check;
-/// this device's own folder-pair steps call it directly.
-pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, by: &str) -> RemoteResult {
+/// Who is asking. A peer holds the manage grant and stops at protected
+/// folders (D46); the folder-pair steps this device runs on itself do not.
+#[derive(Clone, Copy)]
+pub(crate) enum Asker<'a> {
+    Peer { name: &'a str },
+    ThisDevice,
+}
+
+impl Asker<'_> {
+    /// Who to name in the activity log.
+    fn name(&self) -> &str {
+        match self {
+            Self::Peer { name } => name,
+            Self::ThisDevice => "this device",
+        }
+    }
+}
+
+/// Answer `call` on this device. Peers reach this through
+/// [`ControlHandler::handle`] after the grant check; this device's own
+/// folder-pair steps call it directly as [`Asker::ThisDevice`].
+pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, asker: Asker) -> RemoteResult {
+    let by = asker.name();
     let engine = || {
         Engine::open_read_only(home)
             .map_err(|err| RemoteError::new(RemoteErrorCode::Busy, err.to_string()))
     };
+    let context = || Context::load(&engine()?, home, asker);
     match call {
         RemoteCall::Roots => Ok(RemoteReply::Roots { roots: roots() }),
         RemoteCall::ListDir {
@@ -82,19 +105,19 @@ pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, by: &str) -> Re
             cursor,
             limit,
         } => Ok(RemoteReply::Listing {
-            listing: Context::load(&engine()?, home)?.list(&path, cursor, limit)?,
+            listing: context()?.list(&path, cursor, limit)?,
         }),
         RemoteCall::Stat { path } => Ok(RemoteReply::Stat {
-            entry: Context::load(&engine()?, home)?.stat(&path)?,
+            entry: context()?.stat(&path)?,
         }),
         RemoteCall::Spaces => Ok(RemoteReply::Spaces {
             spaces: spaces(&engine()?)?,
         }),
         RemoteCall::Preview { path } => Ok(RemoteReply::Preview {
-            preview: Context::load(&engine()?, home)?.preview(&path)?,
+            preview: context()?.preview(&path)?,
         }),
         RemoteCall::CreateDir { parent, name } => {
-            let entry = Context::load(&engine()?, home)?.create_dir(&parent, &name)?;
+            let entry = context()?.create_dir(&parent, &name)?;
             log(host, by, &format!("created folder {}", entry.path));
             Ok(RemoteReply::Created { entry })
         }
@@ -105,6 +128,9 @@ pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, by: &str) -> Re
                     "a managing device cannot change peers, grants, groups, or policies",
                 ));
             }
+            if let ConfigChange::AddMount { path, .. } = &change {
+                context()?.allow_mount(path)?;
+            }
             let summary = describe(&change);
             let applied = host
                 .config(change)
@@ -113,10 +139,10 @@ pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, by: &str) -> Re
             Ok(RemoteReply::Applied { applied })
         }
         RemoteCall::Locate { path } => Ok(RemoteReply::Located {
-            located: Context::load(&engine()?, home)?.locate(&path)?,
+            located: context()?.locate(&path)?,
         }),
         RemoteCall::FolderSizes { path } => Ok(RemoteReply::FolderSizes {
-            sizes: Context::load(&engine()?, home)?.folder_sizes(&host.sizer, &path)?,
+            sizes: context()?.folder_sizes(&host.sizer, &path)?,
         }),
         RemoteCall::ScanFirst { space, mount, path } => {
             host.scan_first(&space, &mount, &path)
@@ -263,10 +289,13 @@ struct Context {
     mounts: Vec<(PathBuf, MountRef)>,
     relay_home: PathBuf,
     cloud_roots: Vec<PathBuf>,
+    /// Folders a peer never reaches (D46), canonical. `None` for this
+    /// device's own steps, which see everything.
+    protected: Option<Vec<PathBuf>>,
 }
 
 impl Context {
-    fn load(engine: &Engine, relay_home: &Path) -> Result<Self, RemoteError> {
+    fn load(engine: &Engine, relay_home: &Path, asker: Asker) -> Result<Self, RemoteError> {
         let mounts = engine
             .mounts(None)
             .map_err(|err| RemoteError::new(RemoteErrorCode::Failed, err.to_string()))?
@@ -285,6 +314,10 @@ impl Context {
             mounts,
             relay_home: relay_home.to_path_buf(),
             cloud_roots: cloud_roots(),
+            protected: match asker {
+                Asker::Peer { .. } => Some(protected::paths()),
+                Asker::ThisDevice => None,
+            },
         })
     }
 
@@ -299,7 +332,7 @@ impl Context {
             .filter_map(|entry| {
                 let name = entry.file_name().to_str()?.to_owned();
                 let path = entry.path();
-                if path == self.relay_home || relay_core::is_bookkeeping_component(&name) {
+                if self.hidden(&path) || relay_core::is_bookkeeping_component(&name) {
                     return None;
                 }
                 let is_dir = entry.file_type().ok()?.is_dir();
@@ -345,7 +378,7 @@ impl Context {
             .flatten()
             .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
             .map(|entry| entry.path())
-            .filter(|path| *path != self.relay_home && path.to_str().is_some())
+            .filter(|path| !self.hidden(path) && path.to_str().is_some())
             .collect();
         let folders: Vec<FolderSize> = sizer
             .sizes(&folders)
@@ -427,13 +460,24 @@ impl Context {
         })
     }
 
-    /// Open one file for a read-only copy, with its canonical path.
+    /// Open one file for a read-only copy, with its canonical path. Only a
+    /// file in a synced folder is handed out (D46); anything else is reached
+    /// by syncing its folder, which shows in this device's spaces.
     fn open_for_copy(
         &self,
         path: &str,
         max_bytes: u64,
     ) -> Result<(fs::File, PathBuf), RemoteError> {
         let path = self.resolve(path)?;
+        if !self.mounts.iter().any(|(root, _)| path.starts_with(root)) {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Protected,
+                format!(
+                    "{} is not in a folder that syncs on this device; open it to sync its folder online-only, or set up sync for its folder",
+                    path.display()
+                ),
+            ));
+        }
         let meta = fs::metadata(&path).map_err(|err| io_error(&err, &path))?;
         if !meta.is_file() {
             return Err(RemoteError::new(
@@ -507,6 +551,7 @@ impl Context {
             ));
         }
         let path = self.resolve(parent)?.join(name);
+        self.check_protected(&path)?;
         match fs::create_dir(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
@@ -534,7 +579,73 @@ impl Context {
                 "Relay's own data folder cannot be browsed",
             ));
         }
+        self.check_protected(&canonical)?;
         Ok(canonical)
+    }
+
+    /// The protected folder `path` is in, when the asker is a peer (D46).
+    fn protected_root(&self, path: &Path) -> Option<&Path> {
+        self.protected
+            .as_deref()?
+            .iter()
+            .find(|root| path.starts_with(root))
+            .map(PathBuf::as_path)
+    }
+
+    fn check_protected(&self, path: &Path) -> Result<(), RemoteError> {
+        match self.protected_root(path) {
+            Some(root) => Err(RemoteError::new(
+                RemoteErrorCode::Protected,
+                format!(
+                    "{} holds credentials or private data and cannot be reached from another device",
+                    root.display()
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Entries a listing leaves out: Relay's own folder and protected ones.
+    fn hidden(&self, path: &Path) -> bool {
+        path == self.relay_home.as_path() || self.protected_root(path).is_some()
+    }
+
+    /// Whether the asker may make `path` a mount: for a peer, neither inside
+    /// a protected folder or the Relay home nor containing one, so a manager
+    /// cannot sync a whole home folder or drive out of this device.
+    fn allow_mount(&self, path: &Path) -> Result<(), RemoteError> {
+        let Some(protected) = &self.protected else {
+            return Ok(());
+        };
+        if !path.is_absolute() {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Invalid,
+                format!("{} is not an absolute path", path.display()),
+            ));
+        }
+        let root = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if root.starts_with(&self.relay_home) {
+            return Err(RemoteError::new(
+                RemoteErrorCode::Protected,
+                "Relay's own data folder cannot be synced from another device",
+            ));
+        }
+        self.check_protected(&root)?;
+        let inside = protected
+            .iter()
+            .chain(std::iter::once(&self.relay_home))
+            .find(|folder| folder.starts_with(&root));
+        match inside {
+            Some(folder) => Err(RemoteError::new(
+                RemoteErrorCode::Protected,
+                format!(
+                    "{} contains {}, which holds credentials or private data; set up sync for a folder inside it, or do it on that device",
+                    root.display(),
+                    folder.display()
+                ),
+            )),
+            None => Ok(()),
+        }
     }
 
     fn describe(&self, path: &Path, meta: &fs::Metadata) -> Option<DirEntry> {
@@ -738,12 +849,24 @@ fn cloud_attribute(_meta: &fs::Metadata) -> bool {
 mod tests {
     use super::*;
 
+    /// What a peer sees on a device with nothing protected.
     fn context(relay_home: &Path, mounts: Vec<(PathBuf, MountRef)>) -> Context {
         Context {
             mounts,
             relay_home: relay_home.to_path_buf(),
             cloud_roots: Vec::new(),
+            protected: Some(Vec::new()),
         }
+    }
+
+    fn mount(root: &Path) -> (PathBuf, MountRef) {
+        (
+            root.to_path_buf(),
+            MountRef {
+                space: "S".into(),
+                mount: "m".into(),
+            },
+        )
     }
 
     #[test]
@@ -837,31 +960,149 @@ mod tests {
     }
 
     #[test]
-    fn copies_only_small_files_outside_the_relay_home() {
+    fn copies_only_small_files_inside_synced_folders() {
         let root = tempfile::TempDir::new().unwrap();
         let root_path = dunce::canonicalize(root.path()).unwrap();
         let home = root_path.join("relay-home");
         fs::create_dir(&home).unwrap();
         fs::write(home.join("device.key"), b"secret").unwrap();
-        fs::write(root_path.join("big.bin"), vec![0u8; 2048]).unwrap();
-        let ctx = context(&home, Vec::new());
+        fs::create_dir(root_path.join("synced")).unwrap();
+        fs::write(root_path.join("synced/big.bin"), vec![0u8; 2048]).unwrap();
+        fs::write(root_path.join("elsewhere.bin"), b"x").unwrap();
+        let ctx = context(&home, vec![mount(&root_path.join("synced"))]);
+        let big = root_path.join("synced/big.bin");
 
-        let (_, path) = ctx
-            .open_for_copy(root_path.join("big.bin").to_str().unwrap(), 4096)
-            .unwrap();
-        assert_eq!(path, root_path.join("big.bin"));
+        let (_, path) = ctx.open_for_copy(big.to_str().unwrap(), 4096).unwrap();
+        assert_eq!(path, big);
         let err = ctx
-            .open_for_copy(root_path.join("big.bin").to_str().unwrap(), 1024)
+            .open_for_copy(root_path.join("elsewhere.bin").to_str().unwrap(), 4096)
             .unwrap_err();
+        assert_eq!(err.code, RemoteErrorCode::Protected, "outside every mount");
+        let err = ctx.open_for_copy(big.to_str().unwrap(), 1024).unwrap_err();
         assert_eq!(err.code, RemoteErrorCode::Invalid);
         let err = ctx
             .open_for_copy(home.join("device.key").to_str().unwrap(), 4096)
             .unwrap_err();
         assert_eq!(err.code, RemoteErrorCode::Denied);
         let err = ctx
-            .open_for_copy(root_path.to_str().unwrap(), 4096)
+            .open_for_copy(root_path.join("synced").to_str().unwrap(), 4096)
             .unwrap_err();
         assert_eq!(err.code, RemoteErrorCode::Invalid, "a folder is not a file");
+    }
+
+    /// A peer never sees, names, counts, or copies a protected folder, even
+    /// inside a synced one; this device's own steps do.
+    #[test]
+    fn peers_never_reach_protected_folders() {
+        let root = tempfile::TempDir::new().unwrap();
+        let root_path = dunce::canonicalize(root.path()).unwrap();
+        let home = root_path.join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/id_ed25519"), b"key").unwrap();
+        fs::create_dir(home.join("Documents")).unwrap();
+        fs::write(home.join("Documents/a.txt"), b"a").unwrap();
+        fs::write(home.join("notes.txt"), b"hi").unwrap();
+        let relay_home = root_path.join("relay-home");
+        fs::create_dir(&relay_home).unwrap();
+        let ssh = home.join(".ssh");
+        let key = ssh.join("id_ed25519");
+        let mut ctx = context(&relay_home, vec![mount(&home)]);
+        ctx.protected = Some(vec![ssh.clone()]);
+        let s = |path: &Path| path.to_str().unwrap().to_owned();
+
+        let listing = ctx.list(&s(&home), 0, 0).unwrap();
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Documents", "notes.txt"],
+            "protected folders are left out"
+        );
+        assert_eq!(listing.total, 2);
+        let sizes = ctx.folder_sizes(&Sizer::default(), &s(&home)).unwrap();
+        assert_eq!(sizes.folders.len(), 1);
+        assert_eq!(sizes.folders[0].path, s(&home.join("Documents")));
+
+        let protected = RemoteErrorCode::Protected;
+        assert_eq!(ctx.list(&s(&ssh), 0, 0).unwrap_err().code, protected);
+        assert_eq!(ctx.stat(&s(&key)).unwrap_err().code, protected);
+        assert_eq!(ctx.preview(&s(&ssh)).unwrap_err().code, protected);
+        assert_eq!(ctx.locate(&s(&key)).unwrap_err().code, protected);
+        assert_eq!(ctx.create_dir(&s(&ssh), "x").unwrap_err().code, protected);
+        assert!(!ssh.join("x").exists());
+        assert_eq!(
+            ctx.open_for_copy(&s(&key), 4096).unwrap_err().code,
+            protected,
+            "being inside a synced folder changes nothing"
+        );
+
+        #[cfg(unix)]
+        {
+            let link = home.join("Documents/key");
+            std::os::unix::fs::symlink(&key, &link).unwrap();
+            assert_eq!(
+                ctx.stat(&s(&link)).unwrap_err().code,
+                protected,
+                "a symlink into it is inside it"
+            );
+        }
+
+        ctx.protected = None;
+        assert!(
+            ctx.list(&s(&ssh), 0, 0).is_ok(),
+            "this device's own steps are not restricted"
+        );
+    }
+
+    /// A mount a peer adds is neither inside a protected folder or the Relay
+    /// home nor contains one.
+    #[test]
+    fn remote_mounts_avoid_protected_folders() {
+        let root = tempfile::TempDir::new().unwrap();
+        let root_path = dunce::canonicalize(root.path()).unwrap();
+        let home = root_path.join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::create_dir_all(home.join("Documents/Taxes")).unwrap();
+        let relay_home = home.join(".local/share/relay");
+        fs::create_dir_all(&relay_home).unwrap();
+        let mut ctx = context(&relay_home, Vec::new());
+        ctx.protected = Some(vec![home.join(".ssh")]);
+        let protected = RemoteErrorCode::Protected;
+
+        assert!(ctx.allow_mount(&home.join("Documents")).is_ok());
+        assert!(ctx.allow_mount(&home.join("Documents/Taxes")).is_ok());
+        assert_eq!(
+            ctx.allow_mount(&home).unwrap_err().code,
+            protected,
+            "contains .ssh"
+        );
+        assert_eq!(ctx.allow_mount(&root_path).unwrap_err().code, protected);
+        assert_eq!(
+            ctx.allow_mount(&home.join(".ssh")).unwrap_err().code,
+            protected
+        );
+        assert_eq!(
+            ctx.allow_mount(&home.join(".ssh/missing"))
+                .unwrap_err()
+                .code,
+            protected,
+            "a path that does not exist yet is still inside"
+        );
+        assert_eq!(
+            ctx.allow_mount(&home.join(".local")).unwrap_err().code,
+            protected,
+            "contains the Relay home"
+        );
+        assert_eq!(ctx.allow_mount(&relay_home).unwrap_err().code, protected);
+        assert_eq!(
+            ctx.allow_mount(Path::new("relative")).unwrap_err().code,
+            RemoteErrorCode::Invalid
+        );
+
+        ctx.protected = None;
+        assert!(
+            ctx.allow_mount(&home).is_ok(),
+            "this device's own steps are not restricted"
+        );
     }
 
     #[test]
