@@ -208,46 +208,33 @@ impl Engine {
         Ok(out)
     }
 
-    /// Whether `device` should receive `mount_name/relative_path` in `space`.
+    /// Whether `device` should receive paths in `space`: the policy
+    /// selectors that route content to it, read once so a whole batch is
+    /// tested without re-reading the policies.
     ///
     /// Share is still required separately. With no effective policies the
     /// answer is always true.
-    pub(crate) fn wants(
+    pub(crate) fn wants_resolver(
         &self,
         space: SpaceId,
         device: DeviceId,
-        mount_name: &str,
-        relative_path: &str,
-    ) -> Result<bool, EngineError> {
-        let path = policy_path(mount_name, relative_path);
+    ) -> Result<WantsResolver, EngineError> {
         let mut any = false;
-
+        let mut selectors = Vec::new();
         for policy in self.db.repo().list_policies(space)? {
             any = true;
             let targets = self.db.repo().expand_policy_targets(&policy)?;
-            if !targets.contains(&device) {
-                continue;
-            }
-            for selector in &policy.selectors {
-                if selector_matches(selector, &path).unwrap_or(false) {
-                    return Ok(true);
-                }
+            if targets.contains(&device) {
+                selectors.extend(policy.selectors);
             }
         }
-
         for snap in self.db.repo().all_peer_policy_snapshots_for_space(space)? {
             any = true;
-            if !snap.targets.contains(&device) {
-                continue;
-            }
-            for selector in &snap.selectors {
-                if selector_matches(selector, &path).unwrap_or(false) {
-                    return Ok(true);
-                }
+            if snap.targets.contains(&device) {
+                selectors.extend(snap.selectors);
             }
         }
-
-        Ok(!any)
+        Ok(WantsResolver { any, selectors })
     }
 
     /// Local policies for a space with targets expanded (for SpaceOffer).
@@ -345,6 +332,26 @@ impl Engine {
             peer_names,
             group_names: policy.group_targets.clone(),
         })
+    }
+}
+
+/// See [`Engine::wants_resolver`].
+pub(crate) struct WantsResolver {
+    /// Whether any policy applies to the space at all; with none, every
+    /// device receives everything.
+    any: bool,
+    selectors: Vec<String>,
+}
+
+impl WantsResolver {
+    pub(crate) fn wants(&self, mount_name: &str, relative_path: &str) -> bool {
+        if !self.any {
+            return true;
+        }
+        let path = policy_path(mount_name, relative_path);
+        self.selectors
+            .iter()
+            .any(|selector| selector_matches(selector, &path).unwrap_or(false))
     }
 }
 

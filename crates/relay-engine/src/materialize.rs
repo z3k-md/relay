@@ -541,19 +541,42 @@ impl Engine {
     }
 
     /// Materialize full-mode index rows that were waiting on `object`.
+    ///
+    /// Reads only the index-only rows that name this object, so a fetch
+    /// does not cost a walk of every index-only row.
     pub(crate) fn materialize_full_object(&mut self, object: ObjectId) -> Result<(), EngineError> {
-        let pending = self.full_unmaterialized()?;
-        for item in pending {
-            if item.object == Some(object) && self.store.contains(&object) {
-                match self.materialize_indexed(&item.key) {
-                    Ok(()) => {}
-                    // An unscanned file at that path: the scan reconciles
-                    // it; the other rows waiting on this object still write.
-                    Err(EngineError::DestinationChanged(path)) => {
-                        tracing::info!(path = %path.display(), "kept an unscanned file during hydration");
-                    }
-                    Err(err) => return Err(err),
+        use std::collections::HashMap;
+
+        if !self.store.contains(&object) {
+            return Ok(());
+        }
+        let rows = self.db.repo().list_index_only_by_object(object)?;
+        let mut rules_by_space: HashMap<SpaceId, Vec<MaterializationRuleRecord>> = HashMap::new();
+        for row in rows {
+            let rules = match rules_by_space.get(&row.space) {
+                Some(rules) => rules,
+                None => {
+                    let loaded = self.db.repo().list_materialization_rules(row.space)?;
+                    rules_by_space.insert(row.space, loaded);
+                    rules_by_space.get(&row.space).expect("just inserted")
                 }
+            };
+            if path_mode(rules, &row.mount_name, row.path.as_str())? != MaterializationMode::Full {
+                continue;
+            }
+            let key = EntryKey {
+                space: row.space,
+                mount: row.mount,
+                path: row.path,
+            };
+            match self.materialize_indexed(&key) {
+                Ok(()) => {}
+                // An unscanned file at that path: the scan reconciles it;
+                // the other rows waiting on this object still write.
+                Err(EngineError::DestinationChanged(path)) => {
+                    tracing::info!(path = %path.display(), "kept an unscanned file during hydration");
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(())
