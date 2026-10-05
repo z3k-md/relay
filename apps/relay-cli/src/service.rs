@@ -707,8 +707,17 @@ pub fn status_info(home: &Path) -> Result<ServiceStatus> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn run_os_command(program: &str, args: &[&str]) -> Result<std::process::Output> {
-    std::process::Command::new(program)
-        .args(args)
+    let mut cmd = std::process::Command::new(program);
+    // Output is captured, so the child never needs a window. Without this, a
+    // `relay` started without a console (by the desktop app) makes Windows
+    // open one for powershell.exe.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.args(args)
         .output()
         .with_context(|| format!("running {program} {}", args.join(" ")))
 }
