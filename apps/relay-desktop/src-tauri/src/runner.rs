@@ -11,7 +11,7 @@ use relay_engine::{
     TransferDirection, TransferLive, WatchEvent, WatchOptions, bookends, index_row, summary_line,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 #[cfg(not(target_os = "android"))]
 use crate::sidecar;
@@ -67,6 +67,10 @@ struct Inner {
 pub struct Runner {
     home: PathBuf,
     inner: Mutex<Inner>,
+    /// Where UI events go. None until the app attaches. On Android the sync
+    /// service can start the runner before any activity exists, and the
+    /// runner outlives the activity, so a recreated one attaches again.
+    app: Mutex<Option<AppHandle>>,
     /// Held for a whole start or stop. Commands run on worker threads, so
     /// without it two starts could both find no thread and spawn two loops.
     lifecycle: Mutex<()>,
@@ -87,6 +91,29 @@ impl Runner {
                 published: Vec::new(),
             }),
             lifecycle: Mutex::new(()),
+            app: Mutex::new(None),
+        }
+    }
+
+    pub fn attach(&self, app: &AppHandle) {
+        if let Ok(mut slot) = self.app.lock() {
+            *slot = Some(app.clone());
+        }
+    }
+
+    fn app(&self) -> Option<AppHandle> {
+        self.app.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) {
+        if let Some(app) = self.app() {
+            let _ = app.emit(event, payload);
+        }
+    }
+
+    fn refresh_tray(&self) {
+        if let Some(app) = self.app() {
+            refresh_tray(&app);
         }
     }
 
@@ -128,37 +155,50 @@ impl Runner {
         self.inner.lock().map(|g| g.connected.len()).unwrap_or(0)
     }
 
-    pub fn start(&self, app: &AppHandle) {
+    pub fn start(self: &Arc<Self>, app: &AppHandle) {
+        self.attach(app);
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        self.start_locked(app);
+        self.start_locked();
     }
 
-    fn start_locked(&self, app: &AppHandle) {
+    /// Start unless a sync thread is already alive. Used by the Android sync
+    /// service, which may find the runner already started by the activity.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn ensure_running(self: &Arc<Self>) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        let alive = self
+            .inner
+            .lock()
+            .map(|g| g.thread.as_ref().is_some_and(|t| !t.is_finished()))
+            .unwrap_or(false);
+        if !alive {
+            self.start_locked();
+        }
+    }
+
+    fn start_locked(self: &Arc<Self>) {
         if external_service_running(&self.home) {
-            self.set_state(
-                app,
-                RunnerState::ExternalService {
-                    message: EXTERNAL_SERVICE_MESSAGE.to_owned(),
-                },
-            );
+            self.set_state(RunnerState::ExternalService {
+                message: EXTERNAL_SERVICE_MESSAGE.to_owned(),
+            });
             return;
         }
         if !is_initialized(&self.home) {
-            self.set_state(app, RunnerState::NotInitialized);
+            self.set_state(RunnerState::NotInitialized);
             return;
         }
-        self.stop_join_locked(app);
-        self.set_state(app, RunnerState::Starting);
+        self.stop_join_locked();
+        self.set_state(RunnerState::Starting);
 
         let home = self.home.clone();
         let stop = Arc::new(AtomicBool::new(false));
         if let Ok(mut inner) = self.inner.lock() {
             inner.stop = Arc::clone(&stop);
         }
-        let app = app.clone();
+        let runner = Arc::clone(self);
         let handle = thread::Builder::new()
             .name("relay-sync".to_owned())
-            .spawn(move || sync_loop(home, stop, app))
+            .spawn(move || sync_loop(home, stop, runner))
             .expect("spawn sync thread");
 
         if let Ok(mut inner) = self.inner.lock() {
@@ -169,12 +209,12 @@ impl Runner {
     /// Stop the sync thread and wait (briefly) for it. Shows as Stopped with
     /// no peers or transfers until the next start, so the UI never says
     /// Running while nothing syncs.
-    pub fn stop_join(&self, app: &AppHandle) {
+    pub fn stop_join(&self) {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        self.stop_join_locked(app);
+        self.stop_join_locked();
     }
 
-    fn stop_join_locked(&self, app: &AppHandle) {
+    fn stop_join_locked(&self) {
         let handle = self.inner.lock().ok().and_then(|mut g| {
             g.stop.store(true, Ordering::SeqCst);
             g.thread.take()
@@ -189,17 +229,11 @@ impl Runner {
             inner.scans.clear();
             inner.published.clear();
         }
-        self.set_state(app, RunnerState::Stopped);
-        let _ = app.emit("relay://transfers", &Vec::<UiTransfer>::new());
+        self.set_state(RunnerState::Stopped);
+        self.emit("relay://transfers", Vec::<UiTransfer>::new());
     }
 
-    pub fn restart(&self, app: &AppHandle) {
-        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        self.stop_join_locked(app);
-        self.start_locked(app);
-    }
-
-    pub fn pause(&self, _app: &AppHandle) -> anyhow::Result<()> {
+    pub fn pause(&self) -> anyhow::Result<()> {
         if matches!(self.state(), RunnerState::ExternalService { .. }) {
             anyhow::bail!("{EXTERNAL_SERVICE_MESSAGE}");
         }
@@ -208,7 +242,8 @@ impl Runner {
         Ok(())
     }
 
-    pub fn resume(&self, app: &AppHandle) -> anyhow::Result<()> {
+    pub fn resume(self: &Arc<Self>, app: &AppHandle) -> anyhow::Result<()> {
+        self.attach(app);
         if matches!(self.state(), RunnerState::ExternalService { .. }) {
             anyhow::bail!("{EXTERNAL_SERVICE_MESSAGE}");
         }
@@ -219,23 +254,23 @@ impl Runner {
             self.state(),
             RunnerState::Starting | RunnerState::Running | RunnerState::Paused
         ) {
-            self.start_locked(app);
+            self.start_locked();
         }
         Ok(())
     }
 
-    fn set_state(&self, app: &AppHandle, state: RunnerState) {
+    fn set_state(&self, state: RunnerState) {
         if let Ok(mut inner) = self.inner.lock() {
             if inner.state == state {
                 return;
             }
             inner.state = state.clone();
         }
-        let _ = app.emit("relay://state", &state);
-        refresh_tray(app);
+        self.emit("relay://state", &state);
+        self.refresh_tray();
     }
 
-    fn push_event(&self, app: &AppHandle, item: ActivityItem) {
+    fn push_event(&self, item: ActivityItem) {
         if let Ok(mut inner) = self.inner.lock() {
             match item.kind.as_str() {
                 "peerConnected" => {
@@ -255,11 +290,11 @@ impl Runner {
                 inner.events.pop_front();
             }
         }
-        let _ = app.emit("relay://activity", &item);
-        refresh_tray(app);
+        self.emit("relay://activity", &item);
+        self.refresh_tray();
     }
 
-    fn apply_progress(&self, app: &AppHandle, event: &WatchEvent) {
+    fn apply_progress(&self, event: &WatchEvent) {
         let update = {
             let Ok(mut inner) = self.inner.lock() else {
                 return;
@@ -309,17 +344,14 @@ impl Runner {
             (next, lines)
         };
         for line in update.1 {
-            self.push_event(
-                app,
-                ActivityItem {
-                    ts_ms: now_ms(),
-                    kind: line.kind,
-                    message: line.summary,
-                },
-            );
+            self.push_event(ActivityItem {
+                ts_ms: now_ms(),
+                kind: line.kind,
+                message: line.summary,
+            });
         }
-        let _ = app.emit("relay://transfers", &ui_transfers(&update.0));
-        refresh_tray(app);
+        self.emit("relay://transfers", ui_transfers(&update.0));
+        self.refresh_tray();
     }
 
     pub fn transfer_summary(&self) -> Option<String> {
@@ -345,18 +377,13 @@ impl Runner {
     }
 }
 
-fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
+fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, runner: Arc<Runner>) {
     let mut backoff = BACKOFF_MIN;
     while !stop.load(Ordering::SeqCst) {
         if external_service_running(&home) {
-            if let Some(runner) = app.try_state::<crate::AppState>() {
-                runner.runner.set_state(
-                    &app,
-                    RunnerState::ExternalService {
-                        message: EXTERNAL_SERVICE_MESSAGE.to_owned(),
-                    },
-                );
-            }
+            runner.set_state(RunnerState::ExternalService {
+                message: EXTERNAL_SERVICE_MESSAGE.to_owned(),
+            });
             return;
         }
 
@@ -376,7 +403,7 @@ fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
         };
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut on_event = |event: &DaemonEvent| handle_daemon_event(&app, event);
+            let mut on_event = |event: &DaemonEvent| handle_daemon_event(&runner, event);
             relay_daemon::run(&home, opts, &stop, &mut on_event)
         }));
 
@@ -384,7 +411,7 @@ fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
             Ok(Ok(())) => return,
             Ok(Err(err)) => {
                 let message = format!("{err:#}");
-                record_error(&app, &message);
+                record_error(&runner, &message);
                 if sleep_backoff(&stop, backoff) {
                     return;
                 }
@@ -392,7 +419,7 @@ fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
             }
             Err(payload) => {
                 let message = panic_message(payload);
-                record_error(&app, &message);
+                record_error(&runner, &message);
                 if sleep_backoff(&stop, backoff) {
                     return;
                 }
@@ -402,34 +429,27 @@ fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
     }
 }
 
-fn handle_daemon_event(app: &AppHandle, event: &DaemonEvent) {
-    let Some(state) = app.try_state::<crate::AppState>() else {
-        return;
-    };
-    let runner = &state.runner;
+fn handle_daemon_event(runner: &Runner, event: &DaemonEvent) {
     let (kind, message) = describe_event(event);
     if let DaemonEvent::Watch(watch) = event {
         runner.apply_watch_peer(watch);
-        runner.apply_progress(app, watch);
+        runner.apply_progress(watch);
     }
     match event {
-        DaemonEvent::Started { .. } => runner.set_state(app, RunnerState::Running),
-        DaemonEvent::Paused => runner.set_state(app, RunnerState::Paused),
-        DaemonEvent::Resumed => runner.set_state(app, RunnerState::Starting),
+        DaemonEvent::Started { .. } => runner.set_state(RunnerState::Running),
+        DaemonEvent::Paused => runner.set_state(RunnerState::Paused),
+        DaemonEvent::Resumed => runner.set_state(RunnerState::Starting),
         DaemonEvent::Reloading => {}
         _ => {}
     }
     if hide_from_activity(event) {
         return;
     }
-    runner.push_event(
-        app,
-        ActivityItem {
-            ts_ms: now_ms(),
-            kind,
-            message,
-        },
-    );
+    runner.push_event(ActivityItem {
+        ts_ms: now_ms(),
+        kind,
+        message,
+    });
 }
 
 fn hide_from_activity(event: &DaemonEvent) -> bool {
@@ -574,23 +594,15 @@ fn describe_watch(event: &WatchEvent) -> (String, String) {
     }
 }
 
-fn record_error(app: &AppHandle, message: &str) {
-    if let Some(state) = app.try_state::<crate::AppState>() {
-        state.runner.set_state(
-            app,
-            RunnerState::Error {
-                message: message.to_owned(),
-            },
-        );
-        state.runner.push_event(
-            app,
-            ActivityItem {
-                ts_ms: now_ms(),
-                kind: "error".to_owned(),
-                message: message.to_owned(),
-            },
-        );
-    }
+fn record_error(runner: &Runner, message: &str) {
+    runner.set_state(RunnerState::Error {
+        message: message.to_owned(),
+    });
+    runner.push_event(ActivityItem {
+        ts_ms: now_ms(),
+        kind: "error".to_owned(),
+        message: message.to_owned(),
+    });
 }
 
 fn sleep_backoff(stop: &AtomicBool, backoff: Duration) -> bool {
@@ -704,7 +716,6 @@ fn refresh_tray(app: &AppHandle) {
     let _ = app;
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn status_line(state: &RunnerState, connected: usize, summary: Option<&str>) -> String {
     match state {
         RunnerState::NotInitialized => "Relay — Not initialized".to_owned(),

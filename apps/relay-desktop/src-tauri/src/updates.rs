@@ -381,7 +381,7 @@ async fn download_with_progress(
             },
             move || {
                 if let Some(state) = done_app.try_state::<AppState>() {
-                    state.runner.stop_join(&done_app);
+                    state.runner.stop_join();
                 }
                 stopped_on_finish.store(true, Ordering::SeqCst);
                 emit_progress(&done_app, &UpdateProgress::Installing { op_id });

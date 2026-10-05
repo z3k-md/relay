@@ -1,6 +1,8 @@
 mod commands;
 mod error;
 mod files;
+#[cfg(target_os = "android")]
+mod mobile;
 mod pairs;
 mod privacy;
 mod runner;
@@ -118,7 +120,11 @@ pub fn run() {
                 log::warn!("paused-flag migration: {err:#}");
             }
 
+            #[cfg(not(target_os = "android"))]
             let runner = Arc::new(Runner::new(home.clone()));
+            // The sync service may already run this process's runner; share it.
+            #[cfg(target_os = "android")]
+            let runner = mobile::runner(home.clone());
             app.manage(AppState {
                 home,
                 runner: Arc::clone(&runner),
@@ -149,9 +155,16 @@ pub fn run() {
                 }
             }
 
-            runner.start(app.handle());
             #[cfg(not(target_os = "android"))]
-            updates::spawn_periodic_checks(app.handle());
+            {
+                runner.start(app.handle());
+                updates::spawn_periodic_checks(app.handle());
+            }
+            #[cfg(target_os = "android")]
+            {
+                runner.attach(app.handle());
+                runner.ensure_running();
+            }
             Ok(())
         });
 
@@ -163,11 +176,13 @@ pub fn run() {
         }
     };
     app.run(|app, event| match event {
+        // On Android the sync service owns the runner's lifetime, not the UI.
+        #[cfg(not(target_os = "android"))]
         tauri::RunEvent::ExitRequested { .. } => {
             // Cmd-Q / dock Quit / app.exit all land here. Tray Quit also calls
             // stop_join first; a second call is a no-op once the thread is gone.
             if let Some(state) = app.try_state::<AppState>() {
-                state.runner.stop_join(app);
+                state.runner.stop_join();
             }
         }
         // Dock click and a notification click both ask the app to reopen.

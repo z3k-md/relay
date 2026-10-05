@@ -841,7 +841,7 @@ pub fn get_activity(app: AppHandle) -> Result<Vec<crate::runner::ActivityItem>, 
 #[tauri::command(async)]
 pub fn pause_sync(app: AppHandle) -> Result<RunnerState, String> {
     let state = app.state::<AppState>();
-    state.runner.pause(&app).map_err(anyhow_chain)?;
+    state.runner.pause().map_err(anyhow_chain)?;
     Ok(state.runner.state())
 }
 
