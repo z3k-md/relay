@@ -22,7 +22,14 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 # Downloaded files carry a "mark of the web"; clear it so the exe can run.
 Unblock-File $source
 
-& $source id 2>&1 | Out-Null
+# `relay id` fails on a device that is not initialized yet. Under Windows
+# PowerShell 5.1, a native command writing to a redirected stderr is an error
+# record, and with ErrorActionPreference Stop that ends the script before the
+# exit code is looked at; probe with it off.
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& $source id *> $null
+$ErrorActionPreference = $previous
 if ($LASTEXITCODE -ne 0) {
     $name = $env:COMPUTERNAME.ToLowerInvariant()
     & $source init --name $name
