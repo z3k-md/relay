@@ -22,7 +22,7 @@ use relay_engine::{
     resolve_conflict, resolve_git_conflicts,
 };
 use relay_ipc::{
-    ActivityItem, Client, FolderEnd, FolderPairParams, OpenRemoteParams, PairJoinParams,
+    ActivityItem, Client, FolderEnd, FolderPairParams, IpcError, OpenRemoteParams, PairJoinParams,
     PairStartParams, PairStatus, Status as DaemonStatus,
 };
 
@@ -2521,22 +2521,12 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
     let status = engine.status()?;
     let holds = engine.delete_holds()?;
     let daemon = query_daemon(engine.home());
-    let service = if service::supported() {
-        match service::status_info(engine.home()) {
-            Ok(info) => Some(info),
-            Err(err) => {
-                eprintln!("warning: could not query the background service: {err:#}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let service = service::supported().then(|| service::status_info(engine.home()));
     if json {
         let mut value = serde_json::to_value(&status)?;
         value["delete_holds"] = serde_json::to_value(&holds)?;
         value["daemon"] = match &daemon {
-            Some((hello, live)) => serde_json::json!({
+            DaemonProbe::Running(hello, live) => serde_json::json!({
                 "host": hello.host,
                 "pid": hello.pid,
                 "started_at_ms": hello.started_at_ms,
@@ -2549,10 +2539,19 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
                 "mounts": live.mounts,
                 "transfers": live.transfers,
             }),
-            None => serde_json::Value::Null,
+            DaemonProbe::Incompatible { found, expected } => serde_json::json!({
+                "incompatible": true,
+                "protocol": found,
+                "expected_protocol": expected,
+            }),
+            DaemonProbe::NotRunning => serde_json::Value::Null,
         };
-        if let Some(info) = service {
-            value["service"] = serde_json::to_value(info)?;
+        // Keep stderr quiet under --json: a failed service query is part of
+        // the document.
+        match service {
+            Some(Ok(info)) => value["service"] = serde_json::to_value(info)?,
+            Some(Err(err)) => value["service_error"] = serde_json::json!(format!("{err:#}")),
+            None => {}
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -2633,24 +2632,58 @@ fn cmd_status(engine: &Engine, json: bool) -> Result<()> {
             );
         }
     }
-    if let Some(info) = service {
-        println!("{}", service::format_status_line(&info));
+    match service {
+        Some(Ok(info)) => println!("{}", service::format_status_line(&info)),
+        Some(Err(err)) => {
+            eprintln!("warning: could not query the background service: {err:#}");
+        }
+        None => {}
     }
-    print_daemon_human(daemon.as_ref());
+    print_daemon_human(&daemon);
     Ok(())
 }
 
-fn query_daemon(home: &Path) -> Option<(relay_ipc::Hello, DaemonStatus)> {
-    let mut client = Client::connect(home).ok().flatten()?;
-    let hello = client.hello().ok()?;
-    let status = client.status().ok()?;
-    Some((hello, status))
+enum DaemonProbe {
+    NotRunning,
+    /// A host answered but speaks another IPC protocol: typically the old
+    /// service still running after an upgrade.
+    Incompatible {
+        found: u32,
+        expected: u32,
+    },
+    Running(relay_ipc::Hello, DaemonStatus),
 }
 
-fn print_daemon_human(daemon: Option<&(relay_ipc::Hello, DaemonStatus)>) {
-    let Some((hello, live)) = daemon else {
-        println!("daemon: not running");
-        return;
+fn query_daemon(home: &Path) -> DaemonProbe {
+    let Ok(Some(mut client)) = Client::connect(home) else {
+        return DaemonProbe::NotRunning;
+    };
+    let hello = match client.hello() {
+        Ok(hello) => hello,
+        Err(IpcError::ProtocolMismatch { found, expected }) => {
+            return DaemonProbe::Incompatible { found, expected };
+        }
+        Err(_) => return DaemonProbe::NotRunning,
+    };
+    match client.status() {
+        Ok(status) => DaemonProbe::Running(hello, status),
+        Err(_) => DaemonProbe::NotRunning,
+    }
+}
+
+fn print_daemon_human(daemon: &DaemonProbe) {
+    let (hello, live) = match daemon {
+        DaemonProbe::Running(hello, live) => (hello, live),
+        DaemonProbe::Incompatible { found, expected } => {
+            println!(
+                "daemon: running, but it speaks IPC protocol {found} and this relay expects {expected}; run `relay service restart` so both are the same version"
+            );
+            return;
+        }
+        DaemonProbe::NotRunning => {
+            println!("daemon: not running");
+            return;
+        }
     };
     let state = live.state.as_str();
     println!("daemon: {state} ({} pid {})", hello.host, hello.pid);
