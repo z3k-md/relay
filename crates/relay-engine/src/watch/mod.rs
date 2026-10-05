@@ -341,6 +341,18 @@ impl Engine {
         );
         emit_pull(self, &mut replica_warned, on_event, &mut output);
         last_replica_pull = Some(Instant::now());
+        // A server catches up on offers stored while it was down.
+        let mut server_failed: Vec<ConfigChange> = Vec::new();
+        run_server_plan(
+            self,
+            &mut syncer,
+            &mut config,
+            &mut states,
+            &mut watcher,
+            &mut server_failed,
+            &mut output,
+            on_event,
+        );
 
         while !stop.load(Ordering::Relaxed) {
             // Apply queued mount/share commands before waiting on watcher input
@@ -465,6 +477,13 @@ impl Engine {
                     other => {
                         // Only a peer frame can carry the offer a waiting join needs.
                         let may_bring_offer = matches!(other, SyncInput::Frame { .. });
+                        let offers = matches!(
+                            other,
+                            SyncInput::Frame {
+                                body: relay_proto::frame::Body::SpaceOffers(_),
+                                ..
+                            }
+                        );
                         if let SyncInput::Frame {
                             body: relay_proto::frame::Body::IndexBatch(batch),
                             ..
@@ -488,6 +507,18 @@ impl Engine {
                                     on_event,
                                 );
                             }
+                        }
+                        if offers {
+                            run_server_plan(
+                                self,
+                                &mut syncer,
+                                &mut config,
+                                &mut states,
+                                &mut watcher,
+                                &mut server_failed,
+                                &mut output,
+                                on_event,
+                            );
                         }
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
                         replica_push_due = true;
@@ -595,6 +626,57 @@ impl Engine {
         on_event(&WatchEvent::Stopped);
         self.try_reacquire_writer_lock()?;
         Ok(RunExit::Stopped)
+    }
+}
+
+/// On a server, join offered spaces and attach their mounts (home server
+/// Stage 1). A change that failed is not retried until the loop restarts,
+/// so a name clash warns once instead of on every offer.
+#[allow(clippy::too_many_arguments)]
+fn run_server_plan(
+    engine: &mut Engine,
+    syncer: &mut Syncer,
+    config: &mut ConfigQueue,
+    states: &mut Vec<MountWatch>,
+    watcher: &mut Option<MountWatcher>,
+    failed: &mut Vec<ConfigChange>,
+    output: &mut dyn FnMut(SyncOutput),
+    on_event: &mut dyn FnMut(&WatchEvent),
+) {
+    let plan = match engine.server_plan() {
+        Ok(plan) => plan,
+        Err(err) => {
+            on_event(&WatchEvent::SyncWarning {
+                peer: String::new(),
+                path: String::new(),
+                reason: format!("server: {err}"),
+            });
+            return;
+        }
+    };
+    for change in plan {
+        if failed.contains(&change) {
+            continue;
+        }
+        let (reply, result) = mpsc::channel();
+        if let Some(applied) = config.submit(engine, change.clone(), reply) {
+            after_config(
+                engine,
+                syncer,
+                states,
+                watcher.as_mut(),
+                &applied,
+                output,
+                on_event,
+            );
+        } else if let Ok(Err(rejected)) = result.try_recv() {
+            on_event(&WatchEvent::SyncWarning {
+                peer: String::new(),
+                path: change.space().unwrap_or_default().to_owned(),
+                reason: format!("server: {}", rejected.message),
+            });
+            failed.push(change);
+        }
     }
 }
 

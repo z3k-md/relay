@@ -4,7 +4,8 @@ Build plan for an always-on Relay server: a NAS, mini PC, or VPS that joins
 the sync chain, holds a durable copy of every space, keeps history the other
 devices cannot erase, and gives roaming devices one place to meet. This does
 not amend [`DESIGN.md`](../DESIGN.md). The product direction and the account
-model are D44. The rest becomes decisions as each stage lands.
+model are D44. Stage 1, the server role, is D45. The rest becomes decisions
+as each stage lands.
 
 ## Product tiers (D44)
 

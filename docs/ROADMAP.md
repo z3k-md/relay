@@ -18,8 +18,9 @@ decision.
 
 **Home server** ([proposal](proposals/home-server.md), D44). An optional,
 self-hosted, always-on Relay server in the sync chain: durable copy,
-history the other devices cannot erase, and rendezvous. Stage 1 is the
-server role: auto-join, a container image, and a systemd unit.
+history the other devices cannot erase, and rendezvous. Stage 1, the
+server role (D45), shipped: `relay server enable`, auto-join and attach, a
+container image, and a systemd unit. Store mode is next.
 
 **Phase 14 — Integrations.**
 

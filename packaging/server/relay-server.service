@@ -1,0 +1,26 @@
+# systemd unit for a Relay home server on Linux.
+#
+#   sudo install -m 0644 packaging/server/relay-server.service /etc/systemd/system/
+#   sudo systemctl enable --now relay-server
+#
+# Assumes /usr/local/bin/relay and a `relay` system user whose home and
+# server data are set up as in packaging/server/README.md.
+[Unit]
+Description=Relay home server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+Environment=RELAY_HOME=/var/lib/relay/home
+ExecStart=/usr/local/bin/relay run --listen 0.0.0.0:47321
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

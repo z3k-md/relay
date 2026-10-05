@@ -100,6 +100,11 @@ enum Command {
         #[command(subcommand)]
         cmd: RecoveryCmd,
     },
+    /// Keep a copy of every space peers offer this device (home server)
+    Server {
+        #[command(subcommand)]
+        cmd: ServerCmd,
+    },
     /// Durable mailbox for offline catch-up
     Replica {
         #[command(subcommand)]
@@ -338,6 +343,19 @@ enum ReplicaCmd {
         #[arg(long, default_value_t = 3600)]
         grace_secs: u64,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServerCmd {
+    /// Join every space a paired peer offers and keep its folders under DIR
+    Enable {
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Stop joining offered spaces. Spaces, folders, and files stay
+    Disable,
+    /// Show the data folder and each kept mount
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -656,6 +674,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Recovery { cmd } => cmd_recovery(&home, cmd, json),
+        Command::Server { cmd } => cmd_server(&home, cmd, json),
         Command::Replica { cmd } => cmd_replica(&home, cmd, json),
         Command::Transport { cmd } => cmd_transport(&home, cmd, json),
         Command::Group { cmd } => cmd_group(&home, cmd, json),
@@ -1840,6 +1859,37 @@ fn print_transport(status: &TransportStatus, json: bool) -> Result<()> {
         None => println!("mailbox not set"),
     }
     Ok(())
+}
+
+fn cmd_server(home: &Path, cmd: ServerCmd, json: bool) -> Result<ExitCode> {
+    let status = match cmd {
+        ServerCmd::Enable { data } => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.set_server_data(&data)?;
+            engine.server_status()?
+        }
+        ServerCmd::Disable => {
+            let mut engine = Engine::open_for_config(home)?;
+            engine.clear_server_data()?;
+            engine.server_status()?
+        }
+        ServerCmd::Status => Engine::open_read_only(home)?.server_status()?,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    match &status.data {
+        Some(data) => println!("server data {}", data.display()),
+        None => println!("server role off"),
+    }
+    for row in &status.mounts {
+        match &row.path {
+            Some(path) => println!("  {}/{} {}", row.space, row.mount, path.display()),
+            None => println!("  {}/{} not attached yet", row.space, row.mount),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_replica(home: &Path, cmd: ReplicaCmd, json: bool) -> Result<ExitCode> {

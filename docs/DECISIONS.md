@@ -1202,3 +1202,36 @@ Phase 8 deliverables. The plan is
 - **Accountless stays.** Code pairing (D25) remains, and the sync engine
   never depends on account authentication (§23.2). §23.1's account-backed
   pairing is this directory.
+
+## D45. Server role
+
+Home server Stage 1 ([`proposals/home-server.md`](proposals/home-server.md)).
+A device with the server role keeps a copy of every space its peers share
+with it, with no one at its keyboard.
+
+- **Setting.** `relay server enable --data DIR` stores `server_data`, the
+  canonical folder, which may not overlap the Relay home. `disable` clears
+  it; spaces, mounts, and files stay. `status` lists each kept mount.
+- **Plan.** `Engine::server_plan` returns `ConfigChange`s: a `JoinSpace` for
+  each stored offer from a peer that is not revoked, and an `AddMount` at
+  `DIR/<space>/<mount>` for each mount of a joined or planned space with no
+  local folder. It creates those folders. A space or mount name that is not
+  one safe folder name (`.`, `..`, a `:`) is skipped, as is an offer whose
+  name another space here already has.
+- **Live.** The loop runs the plan at start and after each `SpaceOffers`
+  frame, through the same `ConfigQueue` and follow-ups as any live change
+  (D36), so sessions stay up and the new mount's index is requested at
+  once. A change that fails warns once and is not retried until the loop
+  restarts. A mount removed by hand on a server is attached again on the
+  next offer; turn the role off to manage mounts by hand.
+- **Trust is unchanged.** Pairing and sharing still decide what reaches the
+  server: it joins only spaces a paired peer shares with it, and it does not
+  share spaces onward by itself. Materialization is `full` until store mode
+  (Stage 2).
+- **Packaging.** `packaging/server`: a container image (Debian slim, runs as
+  a non-root user, UDP 47321, one volume), a compose file that publishes
+  host port 47322, and a systemd unit. Linux first; `relay service` stays
+  macOS and Windows.
+- **Simulator.** `relay-vopr` topology `Server` and scenario `home_server`:
+  three devices that pair only with the server, which joins and attaches
+  through `server_plan` and makes no edits of its own.

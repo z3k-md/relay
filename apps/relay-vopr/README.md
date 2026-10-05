@@ -76,6 +76,7 @@ cargo run -p relay-vopr -- list
 | `disk_errors` | I/O errors on writes, renames and object installs |
 | `many_small_batches` | index batches of three entries |
 | `delete_heavy` | deletes, folder deletes, renames, mass-delete holds |
+| `home_server` | devices that sync only through a server that joined and attached by itself; drops and crashes |
 | `chaos` | all of the above on four devices |
 
 ## Running
