@@ -392,8 +392,19 @@ impl Engine {
             return self.attach_mount(&space_rec, existing, &canonical, includes, excludes);
         }
 
+        // A mount a peer offered under this name keeps the peer's id, so the
+        // two attach to the same entries.
+        let offered_id = self
+            .db
+            .repo()
+            .list_offers()?
+            .into_iter()
+            .filter(|offer| offer.space_id == space_rec.id)
+            .flat_map(|offer| offer.mounts)
+            .find(|offered| offered.name == mount)
+            .map(|offered| offered.id);
         let mount_rec = Mount {
-            id: relay_core::MountId::new(),
+            id: offered_id.unwrap_or_else(relay_core::MountId::new),
             space: space_rec.id,
             name: mount.to_owned(),
         };
