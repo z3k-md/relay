@@ -15,7 +15,7 @@ pub use protocol::{
     FolderPairResult, Hello, HostKind, HostState, Idle, MountLive, OpenRemoteParams, OpenedRemote,
     PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
     PeerLive, QuickOpen, RemoteParams, Request, RescanParams, RescanResult, RpcError, RpcErrorBody,
-    Status, TransferDirection, TransferLive, Watching, decode_line, encode_line,
+    SpeedTestParams, Status, TransferDirection, TransferLive, Watching, decode_line, encode_line,
 };
 pub use server::{Handler, Server};
 

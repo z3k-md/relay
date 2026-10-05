@@ -934,3 +934,45 @@ fn read_only_copy_streams_a_file_and_respects_grant_and_size() {
     assert_eq!(err.code, RemoteErrorCode::Forbidden, "{err}");
     assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+fn speed_test(
+    caller: &Node,
+    peer: DeviceId,
+    duration_ms: u32,
+) -> Result<relay_core::speed::SpeedReport, RemoteError> {
+    let (reply, rx) = std::sync::mpsc::channel();
+    caller.handle.send(NetCommand::SpeedTest {
+        peer,
+        duration_ms,
+        reply,
+    });
+    rx.recv_timeout(TIMEOUT).expect("speed test reply")
+}
+
+#[test]
+fn connection_test_measures_both_directions_without_a_grant() {
+    let (alice, bob, handler) = managed_pair(false);
+    let report = speed_test(&bob, alice.id, 300).expect("speed test");
+    assert_eq!(report.path, relay_core::speed::PathKind::Loopback);
+    for (name, leg) in [("download", &report.download), ("upload", &report.upload)] {
+        assert!(leg.bytes > 0, "{name}: {leg:?}");
+        assert!(leg.bits_per_sec > 0, "{name}: {leg:?}");
+        assert!(!leg.samples.is_empty(), "{name}: {leg:?}");
+        assert!(leg.elapsed_ms <= 2_000, "{name}: {leg:?}");
+    }
+    assert_eq!(
+        report.download.samples.iter().sum::<u64>(),
+        report.download.bytes,
+        "download samples add up to what arrived"
+    );
+    assert!(report.sent_packets > 0);
+    assert!(report.mtu > 0);
+    assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn connection_test_to_a_device_that_is_not_connected_is_offline() {
+    let bob = spawn("bob", vec![]);
+    let err = speed_test(&bob, DeviceId::random(), 100).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Offline);
+}

@@ -64,6 +64,7 @@ pub fn run() {
             commands::remove_peer,
             commands::set_peer_manage,
             commands::remote_call,
+            commands::speed_test,
             commands::pair_start,
             commands::pair_status,
             commands::pair_join,

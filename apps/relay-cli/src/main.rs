@@ -23,7 +23,7 @@ use relay_engine::{
 };
 use relay_ipc::{
     ActivityItem, Client, FolderEnd, FolderPairParams, IpcError, OpenRemoteParams, PairJoinParams,
-    PairStartParams, PairStatus, Status as DaemonStatus,
+    PairStartParams, PairStatus, SpeedTestParams, Status as DaemonStatus,
 };
 
 mod output;
@@ -431,6 +431,13 @@ enum PeerCmd {
     /// Stop letting a peer manage this device
     DenyManage {
         name: String,
+    },
+    /// Measure the connection to a connected peer: download, then upload
+    Test {
+        name: String,
+        /// Total seconds, split evenly between the two directions (max 20)
+        #[arg(long, default_value_t = 10)]
+        seconds: u32,
     },
 }
 
@@ -1751,6 +1758,7 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
         }
         PeerCmd::AllowManage { name } => set_peer_manage(home, name, true, json)?,
         PeerCmd::DenyManage { name } => set_peer_manage(home, name, false, json)?,
+        PeerCmd::Test { name, seconds } => peer_speed_test(home, name, seconds, json)?,
         PeerCmd::Revoke { name } => {
             apply_config(home, ConfigChange::RevokePeer { peer: name.clone() })?;
             if json {
@@ -1764,6 +1772,42 @@ fn cmd_peer(home: &Path, cmd: PeerCmd, json: bool) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn peer_speed_test(home: &Path, peer: String, seconds: u32, json: bool) -> Result<()> {
+    let duration_ms = seconds.saturating_mul(500).max(1);
+    if !json {
+        eprintln!("testing the connection to {peer} for {seconds} s...");
+    }
+    let report = running_host(home)?.speed_test(&SpeedTestParams {
+        peer: peer.clone(),
+        duration_ms: Some(duration_ms),
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let loss = if report.sent_packets == 0 {
+        0.0
+    } else {
+        report.lost_packets as f64 * 100.0 / report.sent_packets as f64
+    };
+    println!(
+        "{peer}  {} {}  rtt {:.1} ms  packet {} B  loss {loss:.2}%",
+        report.path.as_str(),
+        report.address,
+        report.rtt_us as f64 / 1000.0,
+        report.mtu,
+    );
+    for (name, leg) in [("download", &report.download), ("upload", &report.upload)] {
+        println!(
+            "{name:<8}  {:>8.1} Mbit/s  ({} in {:.1} s)",
+            leg.bits_per_sec as f64 / 1e6,
+            human_bytes(leg.bytes),
+            leg.elapsed_ms as f64 / 1000.0,
+        );
+    }
+    Ok(())
 }
 
 fn set_peer_manage(home: &Path, peer: String, allowed: bool, json: bool) -> Result<()> {

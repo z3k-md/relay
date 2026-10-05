@@ -157,6 +157,8 @@ Online presence is not durability; acknowledgements are.
 - When nothing direct works, a user-run UDP forwarder (`relay transport`)
   carries the QUIC packets. The session stays end to end (D34).
 - Pairing still needs a direct UDP path (D25).
+- A connection test measures any connected peer's link over the live
+  session, five seconds each way, with no disk involved (D48).
 
 # 8. Processes
 
