@@ -797,7 +797,12 @@ remains end to end between the two devices.
   when the session id matches that pair. Data frames are accepted only from a
   bound source address. Quinn's max UDP payload is capped at 1400 bytes so a
   21-byte relay header still fits the receive buffer. Virtual dial addresses
-  use `198.18.0.0/15` and never go on the wire.
+  use `198.18.0.0/15` and never go on the wire. The forwarder keeps at most
+  4,096 sessions and drops one that carried nothing for 60 seconds; a device
+  re-binds on its next dial. Known follow-up: a bind carries no timestamp or
+  nonce, so a captured one replayed from another address moves that slot
+  until the device binds again. Fixing it means a signed timestamp in the
+  bind, which old devices do not send, so it waits for a protocol bump.
 - **Discovery.** When a mailbox is configured, the non-empty local relay
   address is written to `transport/relay`. A device with no local address
   adopts that file. Peer-only mode (no mailbox and no local setting) does not
