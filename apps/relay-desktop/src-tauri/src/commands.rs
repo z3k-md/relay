@@ -163,7 +163,7 @@ pub fn suggested_device_name() -> String {
             }
         }
     }
-    if let Ok(output) = std::process::Command::new("hostname").output()
+    if let Ok(output) = sidecar::no_window(&mut std::process::Command::new("hostname")).output()
         && output.status.success()
     {
         let value = String::from_utf8_lossy(&output.stdout);

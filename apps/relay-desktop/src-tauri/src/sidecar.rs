@@ -18,6 +18,19 @@ pub fn sidecar_path() -> PathBuf {
     PathBuf::from(if cfg!(windows) { "relay.exe" } else { "relay" })
 }
 
+/// `relay.exe` and the tools it runs are console programs. Spawned from the
+/// GUI app (which has no console), Windows would open a console window for
+/// each one, so every spawn from the desktop app goes through this.
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 #[derive(Debug, Deserialize)]
 struct ServiceStatusJson {
     running: Option<bool>,
@@ -25,7 +38,7 @@ struct ServiceStatusJson {
 
 pub fn service_is_running(home: &Path) -> bool {
     let bin = sidecar_path();
-    let output = Command::new(&bin)
+    let output = no_window(&mut Command::new(&bin))
         .arg("--home")
         .arg(home)
         .args(["service", "status", "--json"])
