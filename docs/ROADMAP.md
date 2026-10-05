@@ -16,6 +16,11 @@ device (D39), opening files that are not synced (D40), and read-only copies
 (D41). OS placeholder files in Finder and File Explorer are a separate
 decision.
 
+**Home server** ([proposal](proposals/home-server.md), D44). An optional,
+self-hosted, always-on Relay server in the sync chain: durable copy,
+history the other devices cannot erase, and rendezvous. Stage 1 is the
+server role: auto-join, a container image, and a systemd unit.
+
 **Phase 14 — Integrations.**
 
 Editor status, conflict notification, restore, and post-sync automation.
@@ -34,7 +39,7 @@ part of this phase.
 | 5 Device pairing | `relay pair` and the desktop Peers view: short code, mDNS on the LAN, `--addr` off-LAN (D25) | Internet rendezvous |
 | 6 Desktop UI | Tauri 2 + Vue 3 on macOS and Windows: spaces, devices, mounts, status, activity, pairing, conflicts | Policy editing and per-file history are CLI-only |
 | 7 Replication policies | `relay policy` and `relay group` (D27). No policies means the whole shared space syncs | Per-policy durability classes. No GUI policy editor. Removing a policy does not delete files already on disk |
-| 8 Durable replica | Filesystem mailbox directory (D29): offline catch-up without a QUIC session | No hosted backend |
+| 8 Durable replica | Filesystem mailbox directory (D29): offline catch-up without a QUIC session | No server backend. The durable service is the home server (D44) |
 | 9 Encryption and recovery | Mailbox object payloads sealed with a per-space key (D30). `relay recovery`, `relay peer revoke`, `relay space rotate` | Local object store and working tree stay plaintext. Entry logs are not encrypted. Soft revoke: a device that already held a generation can still decrypt those objects until they leave the mailbox |
 | 10 History and restore | `relay history` and `relay restore` | No GUI history browser |
 | 11 Text merge | Clean three-way merge when concurrent edits share a parent and do not overlap (D31) | Overlapping edits, binary files, Git metadata, and diverged vectors stay conflict copies |
@@ -50,9 +55,9 @@ bundled `relay` CLI. Mounts are the app sandbox; there is no folder picker.
 
 In order after Phase 14, unless a decision says otherwise:
 
-1. **Hosted durable replica.** The rest of Phase 8. The client architecture
-   stays backend-independent. The filesystem mailbox is the only backend
-   today.
+1. **Hosted server (tier 3, D44).** The home server binary, hosted and
+   blind by default. Replaces "hosted durable replica": there is no
+   third-party backend.
 2. **Android background sync** and a folder picker. iOS, Play Store signing,
    and photo-library access are out of scope until a decision adds them (D33).
 

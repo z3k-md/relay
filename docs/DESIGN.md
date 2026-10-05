@@ -1396,6 +1396,8 @@ Metadata should also be minimized or encrypted where practical.
 
 # 38. Backend Architecture
 
+> Superseded in part by D44: Relay is self-hosted end to end and does not use Supabase. The durable service is a Relay home server ([`proposals/home-server.md`](proposals/home-server.md)). The `DurableReplica` abstraction and the "not authoritative" rule below still stand.
+
 Initial durable service can be built using:
 
 ```text
@@ -2389,7 +2391,7 @@ Support offline handoff when peers never overlap.
 - Mailbox mode.
 - Mirror mode.
 
-Likely initial backend:
+Likely initial backend (superseded by D44: the filesystem mailbox shipped, and the durable service is a self-hosted Relay server):
 
 ```text
 Supabase Postgres + Storage

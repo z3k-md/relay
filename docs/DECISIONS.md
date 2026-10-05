@@ -1175,3 +1175,30 @@ Plan and later stages: [`proposals/os-integration.md`](proposals/os-integration.
   4 bytes late, which `relay_fs::cloud` reads around, and its callback shims
   abort the process if reporting a failure fails, so callbacks report
   success for everything except a download that could not get its bytes.
+
+## D44. Self-hosted tiers and accounts
+
+Relay is self-hostable end to end. There is no third-party backend: this
+replaces the Supabase Postgres and Storage backend in `DESIGN.md` §38 and the
+Phase 8 deliverables. The plan is
+[`proposals/home-server.md`](proposals/home-server.md).
+
+- **Three tiers.** (1) Sync between your own devices, with no account and no
+  server. (2) An optional home server you run, in the sync chain, holding a
+  durable copy and history. (3) Later, the same server binary hosted for
+  people without hardware. It is blind by default, so it never holds space
+  keys. Billing exists only at tier 3.
+- **The server is a peer.** It has its own identity and the same protocol,
+  and it is not the authoritative filesystem (§38). Its extra duties
+  (durability target, history owner, preferred source, rendezvous) are
+  decided per stage of the proposal.
+- **Accounts are a directory, not a trust root.** Sign-in (OIDC, Google
+  first) finds your devices. The directory stores account email, device
+  names, public keys, and addresses, never file contents or space keys. We
+  run a default instance, and the same component runs inside a home server
+  for self-hosters. A newly signed-in device gets space keys only when an
+  existing device approves it, or from the recovery secret (D30). Approved
+  devices on one account manage each other (D37).
+- **Accountless stays.** Code pairing (D25) remains, and the sync engine
+  never depends on account authentication (§23.2). §23.1's account-backed
+  pairing is this directory.
