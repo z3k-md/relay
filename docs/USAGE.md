@@ -189,7 +189,7 @@ relay service logs -f
 | `relay conflicts resolve-git SPACE/MOUNT/PATH [--branches]` | Delete Git metadata conflict copies |
 | `relay deletes` / `deletes apply SPACE [--mount NAME] [--peer NAME]` / `deletes restore SPACE [--mount] [--peer]` | List held peer mass-deletes, apply them here, or restore the files on the peer |
 | `relay pause` / `relay resume` | Stop watching and networking until resume |
-| `relay rescan [SPACE[/MOUNT]] [--no-wait]` | Ask a running host to scan now |
+| `relay rescan [SPACE[/MOUNT]] [--no-wait]` | Ask a running host to scan now. Exits 2 when a mass delete was refused, 1 on any other scan failure |
 | `relay activity [-n N] [--follow]` | Recent host activity |
 | `relay watch` | Keep the local index live without syncing |
 | `relay scan [SPACE[/MOUNT]] [--allow-mass-delete] [--dry-run]` | Index changes once |

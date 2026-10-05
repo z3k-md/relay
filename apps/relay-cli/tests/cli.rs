@@ -487,15 +487,19 @@ fn rescan_exit_code_follows_the_host_scan() {
     }
     relay()
         .args(["--home", &home_s, "rescan", "Personal/code"])
+        .timeout(Duration::from_secs(60))
         .assert()
         .failure()
         .code(2)
         .stderr(predicate::str::contains("refusing to delete"))
-        .stderr(predicate::str::contains("--allow-mass-delete"));
+        .stderr(predicate::str::contains(
+            "stop Relay (`relay service stop`, or Ctrl-C a `relay run`) and run `relay scan --allow-mass-delete`",
+        ));
 
     fs::remove_file(mount.path().join(".relay-mount")).unwrap();
     relay()
         .args(["--home", &home_s, "rescan"])
+        .timeout(Duration::from_secs(60))
         .assert()
         .failure()
         .code(1)
@@ -533,6 +537,7 @@ fn mount_add_resolves_relative_path_here_not_in_the_host() {
     let out = relay()
         .current_dir(other.path())
         .args(["--home", &home_s, "mount", "add", "Personal", "more", "sub"])
+        .timeout(Duration::from_secs(60))
         .assert()
         .success()
         .stdout(predicate::str::contains("added mount Personal/more at "))

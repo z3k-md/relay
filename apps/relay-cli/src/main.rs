@@ -2674,8 +2674,13 @@ fn print_daemon_human(daemon: &DaemonProbe) {
     let (hello, live) = match daemon {
         DaemonProbe::Running(hello, live) => (hello, live),
         DaemonProbe::Incompatible { found, expected } => {
+            let restart = if service::supported() {
+                "run `relay service restart`"
+            } else {
+                "restart the `relay run` process"
+            };
             println!(
-                "daemon: running, but it speaks IPC protocol {found} and this relay expects {expected}; run `relay service restart` so both are the same version"
+                "daemon: running, but it speaks IPC protocol {found} and this relay expects {expected}; {restart} so both are the same version"
             );
             return;
         }
@@ -2934,7 +2939,15 @@ fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
                     println!("{}", serde_json::to_string(&item)?);
                 } else if item.kind == "scan_failed" {
                     eprintln!("error: {}", item.summary);
-                    print_watch_error_hints(&item.summary);
+                    // `rescan` has no --allow-mass-delete, and `relay scan`
+                    // refuses to run beside a host: say how to get there.
+                    if item.summary.contains("refusing to delete") {
+                        eprintln!(
+                            "hint: stop Relay (`relay service stop`, or Ctrl-C a `relay run`) and run `relay scan --allow-mass-delete` if the deletion was intentional"
+                        );
+                    } else {
+                        print_watch_error_hints(&item.summary);
+                    }
                 } else {
                     println!("{}", item.summary);
                 }
