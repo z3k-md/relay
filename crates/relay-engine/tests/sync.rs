@@ -179,9 +179,12 @@ impl Harness {
 
     fn tick_b(&mut self, now: std::time::Instant) {
         let mut outs = Vec::new();
-        self.sb
+        let events = self
+            .sb
             .tick(&mut self.b, now, &mut |o| outs.push(o))
             .unwrap();
+        assert_no_warnings(&events, self.strict);
+        self.events.extend(events);
         let mut q = VecDeque::new();
         for output in outs {
             match output {
@@ -1845,6 +1848,8 @@ struct Hub {
     syncers: [Syncer; 3],
     strict: bool,
     events: Vec<SyncEvent>,
+    /// Conflict resolutions each engine performed, by hub index.
+    conflicts_by_engine: [usize; 3],
 }
 
 impl Hub {
@@ -1871,7 +1876,20 @@ impl Hub {
             syncers: [Syncer::new(), Syncer::new(), Syncer::new()],
             strict: true,
             events: Vec::new(),
+            conflicts_by_engine: [0; 3],
         }
+    }
+
+    fn record(&mut self, engine: usize, events: Vec<SyncEvent>) {
+        assert_no_warnings(&events, self.strict);
+        self.conflicts_by_engine[engine] += events
+            .iter()
+            .map(|e| match e {
+                SyncEvent::RemoteApplied { conflicts, .. } => *conflicts,
+                _ => 0,
+            })
+            .sum::<usize>();
+        self.events.extend(events);
     }
 
     fn id(&self, i: usize) -> DeviceId {
@@ -1914,8 +1932,7 @@ impl Hub {
             let events = self.syncers[i]
                 .push_local_changes(&mut self.engines[i], &mut |o| outs.push(o))
                 .unwrap();
-            assert_no_warnings(&events, self.strict);
-            self.events.extend(events);
+            self.record(i, events);
             for o in outs {
                 outputs.push_back((i, o));
             }
@@ -1941,15 +1958,13 @@ impl Hub {
                 let events = self.syncers[to]
                     .handle(&mut self.engines[to], input, &mut |o| outs.push(o))
                     .unwrap();
-                assert_no_warnings(&events, self.strict);
-                self.events.extend(events);
+                self.record(to, events);
                 // Mirror the watch loop: after applying, offer local sequences onward.
                 let mut pushed = Vec::new();
                 let push_events = self.syncers[to]
                     .push_local_changes(&mut self.engines[to], &mut |o| pushed.push(o))
                     .unwrap();
-                assert_no_warnings(&push_events, self.strict);
-                self.events.extend(push_events);
+                self.record(to, push_events);
                 for o in outs.into_iter().chain(pushed) {
                     outputs.push_back((to, o));
                 }
@@ -3152,26 +3167,26 @@ fn index_only_hub_resolves_concurrent_edits_without_churn() {
         .scan("Personal", "code", ScanOptions::default())
         .unwrap();
     h.events.clear();
+    h.conflicts_by_engine = [0; 3];
     h.push_all();
 
-    // One resolution per device; the hub's rows match the writers' rows as
+    // At most one resolution per device: the winner carries the merged
+    // vector, so a device that sees the hub's resolution first applies it
+    // without resolving again, and the hub's rows match the writers' rows as
     // soon as the first round goes quiet, so nothing is re-resolved later.
-    let conflicts_resolved = |events: &[SyncEvent]| -> usize {
-        events
-            .iter()
-            .map(|e| match e {
-                SyncEvent::RemoteApplied { conflicts, .. } => *conflicts,
-                _ => 0,
-            })
-            .sum()
-    };
-    assert_eq!(conflicts_resolved(&h.events), 3, "{:?}", h.events);
+    let resolved = h.conflicts_by_engine;
+    assert!(
+        resolved.iter().all(|&n| n <= 1) && resolved.iter().sum::<usize>() >= 1,
+        "{resolved:?} {:?}",
+        h.events
+    );
     let index = index_triples(&h.engines[0], "Personal", "code");
     assert_eq!(index, index_triples(&h.engines[1], "Personal", "code"));
     assert_eq!(index, index_triples(&h.engines[2], "Personal", "code"));
     h.events.clear();
+    h.conflicts_by_engine = [0; 3];
     h.push_all();
-    assert_eq!(conflicts_resolved(&h.events), 0, "{:?}", h.events);
+    assert_eq!(h.conflicts_by_engine, [0; 3], "{:?}", h.events);
     assert_eq!(
         live_files(h.mounts[0].path()),
         live_files(h.mounts[2].path())
