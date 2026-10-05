@@ -4,7 +4,7 @@
 //! database again, because that is the record the user changes. A peer
 //! browses, reads copies of files in synced folders, and sets up sync. It
 //! never reaches Relay's own data folder, which holds the device key, or the
-//! protected folders in [`crate::protected`] (D45), and a mount it adds may
+//! protected folders in [`crate::protected`] (D46), and a mount it adds may
 //! neither be inside one nor contain one.
 
 use std::cmp::Ordering;
@@ -71,7 +71,7 @@ impl ControlHandler for Browser {
 }
 
 /// Who is asking. A peer holds the manage grant and stops at protected
-/// folders (D45); the folder-pair steps this device runs on itself do not.
+/// folders (D46); the folder-pair steps this device runs on itself do not.
 #[derive(Clone, Copy)]
 pub(crate) enum Asker<'a> {
     Peer { name: &'a str },
@@ -289,7 +289,7 @@ struct Context {
     mounts: Vec<(PathBuf, MountRef)>,
     relay_home: PathBuf,
     cloud_roots: Vec<PathBuf>,
-    /// Folders a peer never reaches (D45), canonical. `None` for this
+    /// Folders a peer never reaches (D46), canonical. `None` for this
     /// device's own steps, which see everything.
     protected: Option<Vec<PathBuf>>,
 }
@@ -461,7 +461,7 @@ impl Context {
     }
 
     /// Open one file for a read-only copy, with its canonical path. Only a
-    /// file in a synced folder is handed out (D45); anything else is reached
+    /// file in a synced folder is handed out (D46); anything else is reached
     /// by syncing its folder, which shows in this device's spaces.
     fn open_for_copy(
         &self,
@@ -583,7 +583,7 @@ impl Context {
         Ok(canonical)
     }
 
-    /// The protected folder `path` is in, when the asker is a peer (D45).
+    /// The protected folder `path` is in, when the asker is a peer (D46).
     fn protected_root(&self, path: &Path) -> Option<&Path> {
         self.protected
             .as_deref()?

@@ -1,4 +1,4 @@
-//! Folders a managing device never reaches (D45).
+//! Folders a managing device never reaches (D46).
 //!
 //! A manage grant (D37) lets a peer browse this device and set up sync on
 //! it. It stops at what holds credentials and private state: SSH and GPG
