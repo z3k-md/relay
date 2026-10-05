@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
-import { api } from "../lib/api";
+import SpeedTestDialog from "../components/SpeedTestDialog.vue";
+import { api, errorText } from "../lib/api";
 import type { ActivityItem, PeerView, SpaceView } from "../lib/types";
 
 const peers = ref<PeerView[]>([]);
@@ -18,6 +19,8 @@ const name = ref("");
 const deviceId = ref("");
 const address = ref("");
 const confirmName = ref<string | null>(null);
+/** Peer whose connection test is open. */
+const testing = ref<string | null>(null);
 const busy = ref(false);
 const share = ref<string[]>([]);
 const pairCode = ref("");
@@ -30,7 +33,11 @@ const joinAddr = ref("");
 /** Pairing lets the other device manage this one unless unchecked (D37). */
 const allowManage = ref(true);
 const nowMs = ref(Date.now());
+/** How often the pairing status is asked for while a code is shown. */
+const PAIR_STATUS_MS = 750;
 let statusTimer: number | undefined;
+/** A status check in flight does not ask again once the watch stopped. */
+let watchingPair = false;
 let tickTimer: number | undefined;
 let clockTimer: number | undefined;
 let stopActivity: UnlistenFn | undefined;
@@ -59,7 +66,7 @@ async function load(silent = false) {
     error.value = null;
   } catch (err) {
     if (gen !== loadGen) return;
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     if (gen === loadGen) loading.value = false;
   }
@@ -129,14 +136,38 @@ function sharedLabel(peer: PeerView): string {
 }
 
 function stopPairWatch() {
+  watchingPair = false;
   if (statusTimer !== undefined) {
-    window.clearInterval(statusTimer);
+    window.clearTimeout(statusTimer);
     statusTimer = undefined;
   }
   if (tickTimer !== undefined) {
     window.clearInterval(tickTimer);
     tickTimer = undefined;
   }
+}
+
+/** Ask once, and again after a pause: calls never pile up on a slow host. */
+async function watchPairStatus() {
+  statusTimer = undefined;
+  try {
+    const status = await api.pairStatus();
+    if (status.state === "paired") {
+      pairDone.value = status.peerName;
+      stopPairWatch();
+      await load();
+    } else if (status.state === "failed") {
+      pairFailed.value = status.reason;
+      stopPairWatch();
+    } else if (status.state === "expired") {
+      pairFailed.value = "This code expired. Start a new pairing.";
+      stopPairWatch();
+    }
+  } catch (err) {
+    pairFailed.value = errorText(err);
+    stopPairWatch();
+  }
+  if (watchingPair) statusTimer = window.setTimeout(watchPairStatus, PAIR_STATUS_MS);
 }
 
 async function startPair() {
@@ -153,27 +184,10 @@ async function startPair() {
     tickTimer = window.setInterval(() => {
       pairNow.value = Date.now();
     }, 1000);
-    statusTimer = window.setInterval(async () => {
-      try {
-        const status = await api.pairStatus();
-        if (status.state === "paired") {
-          pairDone.value = status.peerName;
-          stopPairWatch();
-          await load();
-        } else if (status.state === "failed") {
-          pairFailed.value = status.reason;
-          stopPairWatch();
-        } else if (status.state === "expired") {
-          pairFailed.value = "This code expired. Start a new pairing.";
-          stopPairWatch();
-        }
-      } catch (err) {
-        pairFailed.value = err instanceof Error ? err.message : String(err);
-        stopPairWatch();
-      }
-    }, 750);
+    watchingPair = true;
+    statusTimer = window.setTimeout(watchPairStatus, PAIR_STATUS_MS);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
     pairing.value = false;
   } finally {
     busy.value = false;
@@ -209,7 +223,7 @@ async function joinPair() {
     joinAddr.value = "";
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -226,7 +240,7 @@ async function addPeer() {
     address.value = "";
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -239,7 +253,7 @@ async function toggleManage(peer: PeerView) {
     await api.setPeerManage(peer.name, !peer.allowedToManage);
     await load(true);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -254,27 +268,38 @@ async function removePeer() {
     confirmName.value = null;
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
 }
 
+let loaded = false;
+
 onMounted(async () => {
-  nowMs.value = Date.now();
-  clockTimer = window.setInterval(() => {
-    nowMs.value = Date.now();
-  }, 1000);
   stopActivity = await listen<ActivityItem>("relay://activity", (event) => {
     if (event.payload.kind === "peerConnected" || event.payload.kind === "peerDisconnected") {
       void load(true);
     }
   });
-  await load();
+});
+// Kept alive across tab switches: a revisit refreshes in place, and the
+// "online for" clock only ticks while the page shows.
+onActivated(async () => {
+  nowMs.value = Date.now();
+  clockTimer = window.setInterval(() => {
+    nowMs.value = Date.now();
+  }, 1000);
+  const silent = loaded;
+  loaded = true;
+  await load(silent);
+});
+onDeactivated(() => {
+  if (clockTimer !== undefined) window.clearInterval(clockTimer);
+  clockTimer = undefined;
 });
 onUnmounted(() => {
   stopPairWatch();
-  if (clockTimer !== undefined) window.clearInterval(clockTimer);
   stopActivity?.();
   if (pairCode.value && !pairDone.value) {
     api.pairCancel().catch(() => {});
@@ -372,13 +397,24 @@ defineExpose({ load });
             You can browse {{ peer.name }} from Browse.
           </p>
         </div>
-        <button
-          type="button"
-          class="mt-0.5 shrink-0 text-[var(--color-danger)]"
-          @click="confirmName = peer.name"
-        >
-          Remove
-        </button>
+        <div class="mt-0.5 flex shrink-0 flex-col items-end gap-1">
+          <button
+            v-if="peer.connected"
+            type="button"
+            class="text-[var(--color-accent)]"
+            title="Measure download and upload speed to this device"
+            @click="testing = peer.name"
+          >
+            Test connection
+          </button>
+          <button
+            type="button"
+            class="text-[var(--color-danger)]"
+            @click="confirmName = peer.name"
+          >
+            Remove
+          </button>
+        </div>
       </li>
     </ul>
     <p class="mt-3 text-[12px] text-[var(--color-muted)]">
@@ -530,6 +566,8 @@ defineExpose({ load });
         </button>
       </div>
     </Modal>
+
+    <SpeedTestDialog :peer="testing" @close="testing = null" />
 
     <Modal :open="!!confirmName" title="Remove peer?" @close="confirmName = null">
       <p>

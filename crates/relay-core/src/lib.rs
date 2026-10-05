@@ -8,6 +8,7 @@ pub mod config;
 pub mod conflict;
 pub mod entry;
 pub mod error;
+pub mod faults;
 pub mod git;
 pub mod ids;
 pub mod local;
@@ -17,6 +18,7 @@ pub mod pairing;
 pub mod path;
 pub mod remote;
 pub mod reserved;
+pub mod speed;
 pub mod version;
 
 pub use addr::{

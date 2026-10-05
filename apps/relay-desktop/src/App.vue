@@ -12,7 +12,7 @@ import PeersView from "./views/PeersView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import SetupView from "./views/SetupView.vue";
 import SpacesView from "./views/SpacesView.vue";
-import { api } from "./lib/api";
+import { api, errorText } from "./lib/api";
 import {
   installUpdate as runInstallUpdate,
   listenForUpdateProgress,
@@ -48,7 +48,10 @@ const update = ref<UpdateAvailable | null>(null);
 const activityRef = ref<{ prepend: (item: ActivityItem) => void } | null>(null);
 
 const unlistens: UnlistenFn[] = [];
+/** How often the overview is reloaded on its own. */
+const OVERVIEW_POLL_MS = 5000;
 let overviewTimer: number | undefined;
+let polling = false;
 let refreshGen = 0;
 
 const overviewKinds = new Set([
@@ -68,10 +71,17 @@ async function refresh() {
     error.value = null;
   } catch (err) {
     if (gen !== refreshGen) return;
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     if (gen === refreshGen) loading.value = false;
   }
+}
+
+/** Reload, then again after a pause: calls never pile up on a slow load. */
+async function pollOverview() {
+  overviewTimer = undefined;
+  await refresh();
+  if (polling) overviewTimer = window.setTimeout(pollOverview, OVERVIEW_POLL_MS);
 }
 
 async function createDevice(name: string) {
@@ -80,7 +90,7 @@ async function createDevice(name: string) {
   try {
     overview.value = await api.initDevice(name);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     loading.value = false;
   }
@@ -91,7 +101,7 @@ async function pause() {
     const runner = await api.pauseSync();
     if (overview.value) overview.value = { ...overview.value, runner };
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   }
 }
 
@@ -100,7 +110,7 @@ async function resume() {
     const runner = await api.resumeSync();
     if (overview.value) overview.value = { ...overview.value, runner };
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   }
 }
 
@@ -136,9 +146,8 @@ onMounted(async () => {
   const pending = await api.pendingUpdate().catch(() => null);
   if (pending) update.value = pending;
   await listenForUpdateProgress();
-  overviewTimer = window.setInterval(() => {
-    void refresh();
-  }, 5000);
+  polling = true;
+  overviewTimer = window.setTimeout(pollOverview, OVERVIEW_POLL_MS);
   await refresh();
 });
 
@@ -147,7 +156,8 @@ watch(page, (next) => {
 });
 
 onUnmounted(() => {
-  if (overviewTimer !== undefined) window.clearInterval(overviewTimer);
+  polling = false;
+  if (overviewTimer !== undefined) window.clearTimeout(overviewTimer);
   stopUpdateProgressListener();
   for (const off of unlistens) {
     off();
@@ -229,24 +239,28 @@ onUnmounted(() => {
             </div>
           </div>
           <UpdateStatus v-if="page !== 'settings'" class="mb-4" />
-          <OverviewView
-            v-if="page === 'overview'"
-            :overview="overview"
-            :transfers="transfers"
-            @pause="pause"
-            @resume="resume"
-          />
-          <PeersView v-else-if="page === 'peers'" />
-          <SpacesView v-else-if="page === 'spaces'" :transfers="transfers" />
-          <FilesView v-else-if="page === 'files'" :transfers="transfers" />
-          <BrowseView v-else-if="page === 'browse'" />
-          <ConflictsView v-else-if="page === 'conflicts'" />
-          <ActivityView v-else-if="page === 'activity'" ref="activityRef" />
-          <SettingsView
-            v-else-if="page === 'settings'"
-            :version="overview.version"
-            :mobile="overview.mobile"
-          />
+          <!-- Pages stay mounted once visited: switching back shows them at once
+               and each refreshes in place (onActivated) instead of reloading. -->
+          <KeepAlive>
+            <OverviewView
+              v-if="page === 'overview'"
+              :overview="overview"
+              :transfers="transfers"
+              @pause="pause"
+              @resume="resume"
+            />
+            <PeersView v-else-if="page === 'peers'" />
+            <SpacesView v-else-if="page === 'spaces'" :transfers="transfers" />
+            <FilesView v-else-if="page === 'files'" :transfers="transfers" />
+            <BrowseView v-else-if="page === 'browse'" />
+            <ConflictsView v-else-if="page === 'conflicts'" />
+            <ActivityView v-else-if="page === 'activity'" ref="activityRef" />
+            <SettingsView
+              v-else-if="page === 'settings'"
+              :version="overview.version"
+              :mobile="overview.mobile"
+            />
+          </KeepAlive>
         </main>
       </div>
     </template>

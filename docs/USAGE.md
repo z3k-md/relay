@@ -62,7 +62,7 @@ relay opened
 relay opened remove Documents
 ```
 
-`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. `relay open --read-only` instead copies just that file (up to 256 MB) into Relay's folder as read-only and sets nothing up; edits to the copy stay here. In the app, click a file in Browse.
+`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. `relay open --read-only` instead copies just that file (up to 256 MB) into Relay's folder as read-only and sets nothing up; edits to the copy stay here. A copy comes only from a folder that already syncs on the other device; for anything else, open the file or sync its folder. Credential folders such as `~/.ssh`, keychains, and browser profiles are never reachable from another device, and a folder set up for sync from another device may not contain them. In the app, click a file in Browse.
 
 The first browse form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
 
@@ -80,7 +80,7 @@ Sharing a space tells the other members about that peer, including addresses. A 
 
 Optional `relay policy` and `relay group` commands limit which subtrees go to which devices. Without them, a shared space syncs in full to every peer it is shared with.
 
-Optional `relay materialize` rules are local to this computer. They decide whether a path is a full copy, an index row with no bytes (`metadata`), fetched only when you ask (`demand`), or ignored (`exclude`). Later rules override earlier ones. `relay fetch SPACE/MOUNT/PATH` writes one demand file; `relay evict` removes that copy without deleting it on other machines. With no rules, every file is a full copy.
+Optional `relay materialize` rules are local to this computer. They decide whether a path is a full copy, an index row with no bytes (`metadata`), fetched only when you ask (`demand`), kept in Relay's object store with no file in the folder (`store`, the home server's default), or ignored (`exclude`). Later rules override earlier ones. `relay fetch SPACE/MOUNT/PATH` writes one demand file; `relay evict` removes that copy without deleting it on other machines. With no rules, every file is a full copy.
 
 The desktop app's Files view does the same per folder: "Always keep on this computer" or "Online only", Download, Open (downloads first if needed), and Free up space. Those choices are `materialize` rules named `folder-…`; a choice for a folder replaces the folder choices inside it, and rules you add by hand are left alone.
 
@@ -163,18 +163,20 @@ relay service logs -f
 | `relay pair [--share SPACE]... [--allow-manage]` / `relay pair CODE [--addr HOST:PORT] [--allow-manage]` | Pair with another device. `--allow-manage` lets it manage this one |
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
 | `relay peer allow-manage NAME` / `peer deny-manage NAME` | Let a peer browse this device and set up sync on it, or stop |
+| `relay peer test NAME [--seconds N]` | Measure the connection to a connected peer: download, then upload (default 10 s total, max 20) |
 | `relay browse PEER [PATH] [--all]` | List a managed device's roots, or one of its folders |
 | `relay open PEER PATH [--into DIR \| --read-only]` | Get a file from a managed device: its folder syncs here online-only and the file downloads, or with `--read-only` a one-off copy. Prints the local path |
 | `relay opened` / `opened remove SPACE` | List folders set up by `relay open`, or remove one |
 | `relay pair-folder SOURCE DEST [--from DEVICE] [--to DEVICE] [--create NAME] [--exclude SUB]... [--online-only] [--check]` | Sync a folder on one device with a folder on another, set up from here |
 | `relay share SPACE PEER` / `relay unshare SPACE PEER` | Allow a peer to sync a space |
+| `relay server enable --data DIR` / `server disable` / `server status` | Home server: join every space shared by a device allowed to manage it, keeping folders under `DIR/<space>/<mount>` ([setup](../packaging/server/README.md)) |
 | `relay replica set PATH` / `replica clear` / `replica status` | Durable mailbox directory for offline catch-up |
 | `relay transport set HOST:PORT [--serve]` / `transport clear` / `transport status` | UDP relay when peers cannot dial each other. `--serve` forwards on this machine |
 | `relay replica gc [--mirror] [--grace-secs N]` | Garbage-collect acked mailbox entries and objects |
 | `relay group create NAME` / `group add NAME PEER` / `group remove NAME PEER` / `group delete NAME` / `group list` | Device groups for replication policies |
 | `relay policy add SPACE NAME --selector GLOB... [--peer NAME]... [--group NAME]...` | Limit which subtrees sync to which devices |
 | `relay policy remove SPACE NAME` / `policy list [SPACE]` | Remove a policy or list them |
-| `relay materialize add SPACE NAME --mode full\|metadata\|demand\|exclude --selector GLOB...` | Choose how this device stores matching paths. Last rule wins |
+| `relay materialize add SPACE NAME --mode full\|metadata\|demand\|exclude\|store --selector GLOB...` | Choose how this device stores matching paths. Last rule wins |
 | `relay materialize remove SPACE NAME` / `materialize list [SPACE]` | Remove a materialization rule or list them |
 | `relay fetch SPACE/MOUNT/PATH` | Write one `demand` file from a peer, the mailbox, or the local store |
 | `relay evict SPACE/MOUNT[/PATH]` | Remove a fetched `demand` file here, or every one under a folder or the whole mount. Files edited since are kept. The index rows stay, and other devices are unchanged |
@@ -189,7 +191,7 @@ relay service logs -f
 | `relay conflicts resolve-git SPACE/MOUNT/PATH [--branches]` | Delete Git metadata conflict copies |
 | `relay deletes` / `deletes apply SPACE [--mount NAME] [--peer NAME]` / `deletes restore SPACE [--mount] [--peer]` | List held peer mass-deletes, apply them here, or restore the files on the peer |
 | `relay pause` / `relay resume` | Stop watching and networking until resume |
-| `relay rescan [SPACE[/MOUNT]] [--no-wait]` | Ask a running host to scan now |
+| `relay rescan [SPACE[/MOUNT]] [--no-wait]` | Ask a running host to scan now. Exits 2 when a mass delete was refused, 1 on any other scan failure |
 | `relay activity [-n N] [--follow]` | Recent host activity |
 | `relay watch` | Keep the local index live without syncing |
 | `relay scan [SPACE[/MOUNT]] [--allow-mass-delete] [--dry-run]` | Index changes once |
@@ -205,7 +207,7 @@ Exit codes: `0` ok, `1` error, `2` mass delete refused, `3` `relay verify` found
 
 `--dev-excludes` adds `**/node_modules/**`, `**/target/**`, `**/dist/**`, `**/build/**`, `**/.venv/**`, and `**/__pycache__/**`. A `.relayignore` file at the mount root adds more exclude globs, one per line. Rules are per device.
 
-A running Relay applies `space`, `mount`, `share` / `unshare`, `peer add` / `remove` / `revoke`, `group`, `policy`, `materialize`, and `deletes apply` / `restore` on its live loop. `transport`, `replica`, `recovery`, and `space rotate` are picked up within about a second by reloading. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
+A running Relay applies `space`, `mount`, `share` / `unshare`, `peer add` / `remove` / `revoke`, `group`, `policy`, `materialize`, and `deletes apply` / `restore` on its live loop. `transport`, `replica`, `server`, `recovery`, and `space rotate` are picked up within about a second by reloading. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
 
 ## Catch-up and hard-to-reach networks
 

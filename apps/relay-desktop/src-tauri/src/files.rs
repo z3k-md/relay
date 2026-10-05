@@ -1,5 +1,5 @@
 //! Files view: this device's synced folders, with online-only files that
-//! download when opened (remote explorer Stage 1).
+//! download when opened (D38).
 
 use relay_core::ConfigChange;
 use relay_engine::{CopyState, Engine, FolderView};
@@ -12,7 +12,7 @@ use crate::commands::{apply_config, host_client, open_ro};
 use crate::error::error_chain;
 
 /// One folder of a mount. `path` `""` is the mount itself.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_folder(
     app: AppHandle,
     space: String,

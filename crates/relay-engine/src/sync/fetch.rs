@@ -19,6 +19,7 @@ impl Syncer {
                 self.settle_direct(engine, object, events)
             }
             Fetch::Failed { not_found } => {
+                self.store_scan = true;
                 self.on_fetch_failed(engine, peer, object, not_found, out, events)?;
                 self.continue_direct(engine, peer, object, not_found, out, events)
             }
@@ -39,8 +40,8 @@ impl Syncer {
             if !self.clear_pending_object(batch_peer, space, object) {
                 continue;
             }
-            self.progress
-                .note_fetched(batch_peer, object, Instant::now());
+            let now = self.now();
+            self.progress.note_fetched(batch_peer, object, now);
             self.flush_progress(events, true);
             self.process_head(engine, batch_peer, space, out, events)?;
         }
@@ -51,6 +52,7 @@ impl Syncer {
     /// Consider index-only rows on the next tick, after a rule change.
     pub(crate) fn hydrate_soon(&mut self) {
         self.hydrated_at = None;
+        self.store_scan = true;
     }
 
     pub(super) fn hydration_due(&self, now: Instant) -> bool {
@@ -64,6 +66,31 @@ impl Syncer {
         out: &mut dyn FnMut(SyncOutput),
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
+        let store_items = if std::mem::take(&mut self.store_scan) {
+            engine.store_unfetched()?
+        } else {
+            Vec::new()
+        };
+        for item in store_items {
+            let Some(object) = item.object else {
+                continue;
+            };
+            if self
+                .direct
+                .get(&object)
+                .is_some_and(|state| state.gave_up || state.waiting)
+                || self.batch_pending(object)
+            {
+                continue;
+            }
+            if let Some(peer) = self.peer_for_space(engine, item.space)? {
+                self.request_direct(peer, object, item.space, out);
+            } else if engine.ingest_mailbox_object(item.space, object)? {
+                engine.record_stored_object(object)?;
+            } else {
+                self.give_up_direct(engine, object, item.key.path.as_ref(), events);
+            }
+        }
         let pending = engine.full_unmaterialized()?;
         for item in pending {
             if item.object.is_none() {
@@ -281,7 +308,10 @@ impl Syncer {
         if !engine.store.contains(&object) {
             return Ok(());
         }
-        if let Err(err) = engine.materialize_full_object(object) {
+        if let Err(err) = engine
+            .record_stored_object(object)
+            .and_then(|()| engine.materialize_full_object(object))
+        {
             events.push(SyncEvent::SyncWarning {
                 peer: engine.device().id,
                 path: String::new(),
@@ -362,7 +392,7 @@ impl Syncer {
         &self,
         engine: &Engine,
         space: SpaceId,
-        asked: &HashSet<DeviceId>,
+        asked: &BTreeSet<DeviceId>,
     ) -> Result<Option<DeviceId>, EngineError> {
         let mut peers: Vec<DeviceId> = self
             .connected
@@ -390,7 +420,7 @@ impl Syncer {
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
         let targets = self.failure_targets(object, peer);
-        let mut emitted = HashSet::new();
+        let mut emitted = BTreeSet::new();
         for (batch_peer, space, batch_id) in targets {
             if peer == batch_peer && not_found {
                 self.mark_source_missing(batch_peer, space, batch_id, object);
@@ -577,7 +607,7 @@ impl Syncer {
         space: SpaceId,
         batch_id: u64,
         object: ObjectId,
-    ) -> HashSet<DeviceId> {
+    ) -> BTreeSet<DeviceId> {
         self.connected
             .get(&peer)
             .and_then(|conn| conn.incoming.get(&space))
@@ -593,7 +623,7 @@ impl Syncer {
         engine: &Engine,
         space: SpaceId,
         batch_peer: DeviceId,
-        asked: &HashSet<DeviceId>,
+        asked: &BTreeSet<DeviceId>,
     ) -> Result<Option<DeviceId>, EngineError> {
         let mut candidates: Vec<DeviceId> = self
             .connected

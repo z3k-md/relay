@@ -16,6 +16,7 @@ mod io;
 mod pairing;
 mod relay;
 mod session;
+mod speed;
 mod stun;
 mod tls;
 
@@ -29,6 +30,7 @@ use std::time::{Duration, SystemTime};
 
 use quinn::AsyncUdpSocket;
 use relay_core::remote::{CopiedFile, RemoteCall, RemoteError, RemoteResult};
+use relay_core::speed::SpeedReport;
 use relay_core::{DeviceId, ObjectId};
 use relay_crypto::DeviceIdentity;
 use relay_proto::encode_frame;
@@ -37,7 +39,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 pub use addr::advertised_addresses;
-pub use control::ControlHandler;
+pub use control::{ControlHandler, MAX_JOIN_WAIT, call_timeout};
 pub use error::NetError;
 pub use relay::{RelayServer, serve_relay};
 use session::{
@@ -131,7 +133,8 @@ pub enum NetEvent {
     PairFailed {
         reason: String,
     },
-    /// Merged address list for an already-trusted peer (LAN discovery).
+    /// Merged address list for a trusted peer: a LAN address mDNS resolved
+    /// for it just completed the pinned handshake.
     PeerAddresses {
         peer: DeviceId,
         addresses: Vec<String>,
@@ -186,6 +189,13 @@ pub enum NetCommand {
         max_bytes: u64,
         dest: PathBuf,
         reply: std::sync::mpsc::Sender<Result<CopiedFile, RemoteError>>,
+    },
+    /// Measure the link to a connected peer: `duration_ms` receiving, then
+    /// the same sending (D48). Clamped to `SPEED_TEST_MAX_MS` each way.
+    SpeedTest {
+        peer: DeviceId,
+        duration_ms: u32,
+        reply: std::sync::mpsc::Sender<Result<SpeedReport, RemoteError>>,
     },
     Shutdown,
 }
@@ -312,8 +322,11 @@ pub fn start(
         relay_sock: OnceLock::new(),
         pairing: Mutex::new(None),
         pairing_ads: Mutex::new(HashMap::new()),
+        discovered: Mutex::new(HashMap::new()),
         discovery: Mutex::new(None),
         control: config.control,
+        speed_tests_in: Arc::new(tokio::sync::Semaphore::new(1)),
+        speed_tests_out: Arc::new(tokio::sync::Semaphore::new(1)),
     });
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -394,23 +407,36 @@ pub fn start(
     })
 }
 
-async fn prime_relay(inner: &Inner) {
+/// Resolve the configured relay and install it on the socket. DNS can take
+/// seconds on a broken resolver, so this runs as its own task; the command
+/// and accept loop never waits on it.
+fn spawn_relay_resolve(inner: &Arc<Inner>) {
     let target = inner
         .relay_target
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .clone();
-    let Some(target) = target else {
+    let Some(sock) = inner.relay_sock.get().cloned() else {
         return;
     };
-    let prefer_ipv4 = inner
-        .relay_sock
-        .get()
-        .and_then(|sock| sock.local_addr().ok().map(|bound| bound.is_ipv4()));
-    let resolved = relay::resolve_relay(&target, prefer_ipv4).await;
-    if let Some(sock) = inner.relay_sock.get() {
-        sock.set_relay(resolved);
-    }
+    let Some(target) = target else {
+        sock.set_relay(None);
+        return;
+    };
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let prefer_ipv4 = sock.local_addr().ok().map(|bound| bound.is_ipv4());
+        let resolved = relay::resolve_relay(&target, prefer_ipv4).await;
+        // A newer `SetRelay` may have replaced the target meanwhile.
+        let current = inner
+            .relay_target
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if current.as_deref() == Some(target.as_str()) {
+            sock.set_relay(resolved);
+        }
+    });
 }
 
 fn relay_server_for(serve: bool, relay: Option<&str>) -> Result<Option<RelayServer>, NetError> {
@@ -436,7 +462,7 @@ async fn run(
     endpoint: quinn::Endpoint,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<NetCommand>,
 ) {
-    prime_relay(&inner).await;
+    spawn_relay_resolve(&inner);
     let mut dialers = HashMap::new();
     spawn_dialers(&inner, &endpoint, &mut dialers);
     if inner.lan_discovery
@@ -472,6 +498,12 @@ async fn run(
                             let _ = reply.send(copied);
                         });
                     }
+                    Some(NetCommand::SpeedTest { peer, duration_ms, reply }) => {
+                        let inner = inner.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(speed::run(inner, peer, duration_ms).await);
+                        });
+                    }
                     Some(NetCommand::Control { peer, call, reply }) => {
                         let inner = inner.clone();
                         tokio::spawn(async move {
@@ -482,17 +514,8 @@ async fn run(
                         *inner
                             .relay_target
                             .lock()
-                            .unwrap_or_else(|err| err.into_inner()) = addr.clone();
-                        let prefer_ipv4 = inner.relay_sock.get().and_then(|sock| {
-                            sock.local_addr().ok().map(|bound| bound.is_ipv4())
-                        });
-                        let resolved = match addr.as_deref() {
-                            Some(target) => relay::resolve_relay(target, prefer_ipv4).await,
-                            None => None,
-                        };
-                        if let Some(sock) = inner.relay_sock.get() {
-                            sock.set_relay(resolved);
-                        }
+                            .unwrap_or_else(|err| err.into_inner()) = addr;
+                        spawn_relay_resolve(&inner);
                     }
                 }
             }

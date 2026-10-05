@@ -1,5 +1,8 @@
 # Relay Explorer P0: WebView2 go/no-go spike
 
+**Status:** Passed. Go decided on 2026-10-05 (D50). P1, the browsing MVP,
+is next.
+
 The first phase of rebuilding a Files-class file explorer in our Rust/Tauri
 stack, Windows first. P0 answers one question before we build the rest: is a
 WebView2 front end over a Rust shell layer fast enough, and can it take over

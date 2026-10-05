@@ -3,6 +3,7 @@ export type RunnerState =
   | { kind: "starting" }
   | { kind: "running" }
   | { kind: "paused" }
+  | { kind: "stopped" }
   | { kind: "error"; message: string }
   | { kind: "externalService"; message: string };
 
@@ -38,9 +39,9 @@ export interface PeerView {
   supportsRemote: boolean;
 }
 
-// Files view (remote explorer Stage 1). Engine shapes as-is, so snake_case.
+// Files view (D38). Engine shapes as-is, so snake_case.
 
-export type MaterializationMode = "full" | "metadata" | "demand" | "exclude";
+export type MaterializationMode = "full" | "metadata" | "demand" | "exclude" | "store";
 
 export interface FileRow {
   name: string;
@@ -49,7 +50,7 @@ export interface FileRow {
   kind: "file" | "directory" | "symlink";
   size: number | null;
   modified_ms: number;
-  state: "local" | "online_only" | "metadata_only" | "pending";
+  state: "local" | "online_only" | "metadata_only" | "pending" | "stored";
   mode: MaterializationMode;
   conflict_copy: boolean;
 }
@@ -194,6 +195,7 @@ export interface QuickOpen {
 export type RemoteErrorCode =
   | "forbidden"
   | "denied"
+  | "protected"
   | "not_found"
   | "timeout"
   | "unsupported"
@@ -375,3 +377,28 @@ export type Page =
   | "conflicts"
   | "activity"
   | "settings";
+
+/** How a connection reaches the other device (D48). */
+export type PathKind = "loopback" | "lan" | "tailscale" | "internet" | "relayed";
+
+/** One direction of a connection test. */
+export interface SpeedLeg {
+  bytes: number;
+  elapsed_ms: number;
+  bits_per_sec: number;
+  /** Bytes per `sample_ms` window, in order. */
+  samples: number[];
+}
+
+/** Result of a connection test (relay_core::speed::SpeedReport). */
+export interface SpeedReport {
+  path: PathKind;
+  address: string;
+  rtt_us: number;
+  mtu: number;
+  sent_packets: number;
+  lost_packets: number;
+  sample_ms: number;
+  download: SpeedLeg;
+  upload: SpeedLeg;
+}

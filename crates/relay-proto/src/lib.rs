@@ -385,6 +385,37 @@ pub struct ObjectRequest {
     /// peers with [`FEATURE_CONTROL`].
     #[prost(message, optional, tag = "3")]
     pub read_file: Option<ReadFileRequest>,
+    /// Set to run one direction of a connection test (D48). Answered with an
+    /// [`ObjectHeader`] first. Sent only to peers with [`FEATURE_SPEED_TEST`].
+    #[prost(message, optional, tag = "4")]
+    pub speed_test: Option<SpeedTestRequest>,
+}
+
+/// `Hello.features` bit: this device answers [`SpeedTestRequest`]s (D48).
+pub const FEATURE_SPEED_TEST: u64 = 2;
+
+/// One direction of a connection test (D48). After the accepting
+/// [`ObjectHeader`], the sending side writes raw bytes for `duration_ms`
+/// and finishes. For an upload the answering device then writes one
+/// [`SpeedTestDone`] with what it counted.
+#[derive(Clone, Copy, PartialEq, prost::Message)]
+pub struct SpeedTestRequest {
+    /// The requester sends; otherwise the answering device does.
+    #[prost(bool, tag = "1")]
+    pub upload: bool,
+    /// Clamped by the answering device to `SPEED_TEST_MAX_MS`.
+    #[prost(uint32, tag = "2")]
+    pub duration_ms: u32,
+}
+
+/// What the answering device received during an upload test.
+#[derive(Clone, Copy, PartialEq, prost::Message)]
+pub struct SpeedTestDone {
+    #[prost(uint64, tag = "1")]
+    pub bytes: u64,
+    /// From the first byte to the end of the stream.
+    #[prost(uint64, tag = "2")]
+    pub elapsed_us: u64,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

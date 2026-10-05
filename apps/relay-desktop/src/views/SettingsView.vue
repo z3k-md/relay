@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { computed, onActivated, ref, watch } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import UpdateStatus from "../components/UpdateStatus.vue";
-import { api } from "../lib/api";
+import { api, errorText } from "../lib/api";
 import { checkForUpdates, updateActive } from "../lib/updateProgress";
 import type { CliShell, CliStatus, Settings } from "../lib/types";
 
@@ -19,6 +20,8 @@ const cliMessage = ref<string | null>(null);
 const busy = ref(false);
 const checking = computed(() => updateActive.value);
 const selectedShell = ref<CliShell>("zsh");
+/** GitHub Releases page the updater downloads from; null when not configured. */
+const releasesUrl = ref<string | null>(null);
 /** macOS only: whether devices allowed to manage this Mac can read every folder. */
 const fullDiskAccess = ref<boolean | null>(null);
 
@@ -27,12 +30,36 @@ async function openFullDiskAccess() {
   try {
     await api.openFullDiskAccess();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   }
 }
 
 async function recheckFullDiskAccess() {
-  fullDiskAccess.value = await api.fullDiskAccess();
+  error.value = null;
+  try {
+    fullDiskAccess.value = await api.fullDiskAccess();
+  } catch (err) {
+    error.value = errorText(err);
+  }
+}
+
+async function openReleases() {
+  if (!releasesUrl.value) return;
+  error.value = null;
+  try {
+    await openUrl(releasesUrl.value);
+  } catch (err) {
+    error.value = errorText(err);
+  }
+}
+
+async function openLogsFolder() {
+  error.value = null;
+  try {
+    await api.openLogsFolder();
+  } catch (err) {
+    error.value = errorText(err);
+  }
 }
 
 const selectedHint = computed(() => {
@@ -55,29 +82,35 @@ const showShellPicker = computed(
   () => !!cli.value && !cli.value.onPath && (cli.value.shellHints?.length ?? 0) > 0,
 );
 
+let loaded = false;
+
+/** The placeholder shows only until the first load; later loads refresh in place. */
 async function load() {
-  loading.value = true;
+  if (!loaded) loading.value = true;
   error.value = null;
   try {
     if (props.mobile) {
       settings.value = await api.getSettings();
       return;
     }
-    const [s, c, fda] = await Promise.all([
+    const [s, c, fda, releases] = await Promise.all([
       api.getSettings(),
       api.cliStatus(),
       api.fullDiskAccess(),
+      api.releasesUrl(),
     ]);
     settings.value = s;
     cli.value = c;
     fullDiskAccess.value = fda;
+    releasesUrl.value = releases;
     if (c.detectedShell) {
       selectedShell.value = c.detectedShell;
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     loading.value = false;
+    loaded = true;
   }
 }
 
@@ -86,7 +119,7 @@ async function toggle(key: "startAtLogin" | "autoUpdate", value: boolean) {
   try {
     settings.value = await api.setSettings({ [key]: value });
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
     await load();
   }
 }
@@ -113,7 +146,7 @@ async function installCli() {
       selectedShell.value = result.detectedShell;
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -123,7 +156,7 @@ watch(selectedShell, () => {
   cliMessage.value = null;
 });
 
-onMounted(load);
+onActivated(load);
 defineExpose({ load });
 </script>
 
@@ -203,7 +236,14 @@ defineExpose({ load });
           <div>
             <p class="font-medium">Updates</p>
             <p class="text-[12px] text-[var(--color-muted)]">
-              Version {{ props.version }}. Checked at startup and every 15 minutes.
+              Version {{ props.version }}. Checked at startup and every 5 minutes.
+              <a
+                v-if="releasesUrl"
+                :href="releasesUrl"
+                class="text-[var(--color-accent)] underline"
+                @click.prevent="openReleases"
+                >All releases</a
+              >
             </p>
           </div>
           <button
@@ -267,7 +307,7 @@ defineExpose({ load });
         v-if="!mobile"
         type="button"
         class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
-        @click="api.openLogsFolder()"
+        @click="openLogsFolder"
       >
         Open logs folder
       </button>

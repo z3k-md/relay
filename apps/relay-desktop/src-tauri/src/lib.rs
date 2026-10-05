@@ -75,6 +75,7 @@ pub fn run() {
             commands::remove_peer,
             commands::set_peer_manage,
             commands::remote_call,
+            commands::speed_test,
             commands::pair_start,
             commands::pair_status,
             commands::pair_join,
@@ -109,6 +110,7 @@ pub fn run() {
             commands::check_for_updates,
             commands::pending_update,
             commands::install_update,
+            commands::releases_url,
             commands::restart_app,
             commands::get_settings,
             commands::set_settings,
@@ -225,7 +227,7 @@ pub fn run() {
             // Cmd-Q / dock Quit / app.exit all land here. Tray Quit also calls
             // stop_join first; a second call is a no-op once the thread is gone.
             if let Some(state) = app.try_state::<AppState>() {
-                state.runner.stop_join();
+                state.runner.stop_join(app);
             }
         }
         // Dock click and a notification click both ask the app to reopen.

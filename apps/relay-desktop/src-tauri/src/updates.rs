@@ -18,7 +18,14 @@ const PLACEHOLDER_ENDPOINT: &str = "OWNER/REPO";
 const RESTART_DELAY: Duration = Duration::from_secs(5);
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 const STARTUP_DELAY: Duration = Duration::from_secs(3);
-const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// latest.json is about 1 KB, so checking often costs nothing and a new
+/// release reaches running apps within minutes.
+const CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The loop wakes this often and checks once CHECK_INTERVAL of wall-clock
+/// time has passed. A monotonic sleep pauses while the machine sleeps, so a
+/// laptop opened after a night away checks within a tick instead of a full
+/// interval later.
+const CHECK_TICK: Duration = Duration::from_secs(30);
 
 struct UpdateWatch {
     pending: Option<UpdateAvailable>,
@@ -219,7 +226,7 @@ pub async fn check_and_maybe_install(
         if !interactive {
             emit_progress(app, &UpdateProgress::Checking { op_id: install_op });
         }
-        let info = install_downloaded(app, update, install_op, true).await?;
+        let info = install_downloaded(app, update, install_op).await?;
         if !interactive && info.error {
             publish_available(app, &version, &notes);
         }
@@ -290,7 +297,7 @@ pub async fn install(app: &AppHandle) -> Result<UpdateInfo, String> {
             ));
         }
     };
-    let info = install_downloaded(app, update, op_id, true).await?;
+    let info = install_downloaded(app, update, op_id).await?;
     if info.restart_at_ms.is_some() {
         guard.hold_until_restart();
     }
@@ -307,66 +314,46 @@ async fn install_downloaded(
     app: &AppHandle,
     update: tauri_plugin_updater::Update,
     op_id: u64,
-    prompt_restart: bool,
 ) -> Result<UpdateInfo, String> {
-    if let Some(state) = app.try_state::<AppState>() {
-        state.runner.stop_join();
-    }
     let version = update.version.clone();
     let notes = update.body.clone();
 
-    if prompt_restart {
-        emit_progress(
-            app,
-            &UpdateProgress::Downloading {
-                op_id,
-                downloaded: 0,
-                total: None,
-            },
-        );
-        if let Err(err) = download_with_progress(app, &update, op_id).await {
-            return Ok(finish_interactive(app, true, failed(op_id, err)));
-        }
-        let restart_at_ms = schedule_restart(app);
-        emit_progress(
-            app,
-            &UpdateProgress::Ready {
-                op_id,
-                version: version.clone(),
-                restart_at_ms,
-            },
-        );
-        return Ok(UpdateInfo {
+    emit_progress(
+        app,
+        &UpdateProgress::Downloading {
             op_id,
-            configured: true,
-            available: true,
-            version: Some(version.clone()),
-            notes,
-            message: format!("Relay {version} installed. Restarting shortly."),
-            installing: true,
-            restart_at_ms: Some(restart_at_ms),
-            error: false,
-        });
+            downloaded: 0,
+            total: None,
+        },
+    );
+    if let Err(err) = download_with_progress(app, &update, op_id).await {
+        return Ok(finish_interactive(app, true, failed(op_id, err)));
     }
-
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|err| anyhow_chain(err.into()))?;
-    app.request_restart();
+    let restart_at_ms = schedule_restart(app);
+    emit_progress(
+        app,
+        &UpdateProgress::Ready {
+            op_id,
+            version: version.clone(),
+            restart_at_ms,
+        },
+    );
     Ok(UpdateInfo {
         op_id,
         configured: true,
         available: true,
         version: Some(version.clone()),
         notes,
-        message: format!("Installing Relay {version}…"),
+        message: format!("Relay {version} installed. Restarting shortly."),
         installing: true,
-        restart_at_ms: None,
+        restart_at_ms: Some(restart_at_ms),
         error: false,
     })
 }
 
+/// Download and install `update`. Sync stops only once the download is
+/// complete, so a failed download leaves it running; if the install then
+/// fails, sync starts again.
 async fn download_with_progress(
     app: &AppHandle,
     update: &tauri_plugin_updater::Update,
@@ -378,8 +365,10 @@ async fn download_with_progress(
     let mut last_emit = Instant::now()
         .checked_sub(PROGRESS_EMIT_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let stopped = AtomicBool::new(false);
+    let stopped_on_finish = &stopped;
 
-    update
+    let result = update
         .download_and_install(
             move |chunk, total| {
                 downloaded = downloaded.saturating_add(chunk as u64);
@@ -398,11 +387,22 @@ async fn download_with_progress(
                 }
             },
             move || {
+                if let Some(state) = done_app.try_state::<AppState>() {
+                    state.runner.stop_join(&done_app);
+                }
+                stopped_on_finish.store(true, Ordering::SeqCst);
                 emit_progress(&done_app, &UpdateProgress::Installing { op_id });
             },
         )
         .await
-        .map_err(|err| anyhow_chain(err.into()))
+        .map_err(|err| anyhow_chain(err.into()));
+    if result.is_err()
+        && stopped.load(Ordering::SeqCst)
+        && let Some(state) = app.try_state::<AppState>()
+    {
+        state.runner.start(app);
+    }
+    result
 }
 
 fn schedule_restart(app: &AppHandle) -> u64 {
@@ -534,12 +534,39 @@ pub fn spawn_periodic_checks(app: &AppHandle) {
                     Ok(Err(err)) => log::warn!("update check failed: {err}"),
                     Err(_) => log::warn!("update check task ended before it finished"),
                 }
-                std::thread::sleep(CHECK_INTERVAL);
+                let last_check = SystemTime::now();
+                while !check_due(last_check, SystemTime::now()) {
+                    std::thread::sleep(CHECK_TICK);
+                }
             }
         });
     if spawned.is_err() {
         log::warn!("could not start update checks");
     }
+}
+
+/// Whether CHECK_INTERVAL of wall-clock time has passed since `last`. A clock
+/// set backwards also counts as due, so a bad clock cannot stop checks.
+fn check_due(last: SystemTime, now: SystemTime) -> bool {
+    !matches!(now.duration_since(last), Ok(elapsed) if elapsed < CHECK_INTERVAL)
+}
+
+/// The GitHub Releases page for the repository the updater downloads from,
+/// derived from the updater endpoint in tauri.conf.json.
+pub fn releases_page() -> Option<String> {
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).ok()?;
+    let endpoints = config.pointer("/plugins/updater/endpoints")?.as_array()?;
+    endpoints
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find_map(releases_page_from_endpoint)
+}
+
+fn releases_page_from_endpoint(endpoint: &str) -> Option<String> {
+    let page = endpoint.strip_suffix("/latest/download/latest.json")?;
+    (page.starts_with("https://github.com/") && !page.contains(PLACEHOLDER_ENDPOINT))
+        .then(|| page.to_owned())
 }
 
 fn watch() -> std::sync::MutexGuard<'static, UpdateWatch> {
@@ -586,4 +613,45 @@ fn notify_available(app: &AppHandle, version: &str, installing: bool) {
         return;
     }
     watch().notified_version = Some(version.to_owned());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_after_interval_or_backwards_clock() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(!check_due(t0, t0));
+        assert!(!check_due(t0, t0 + CHECK_INTERVAL - CHECK_TICK));
+        assert!(check_due(t0, t0 + CHECK_INTERVAL));
+        // A machine that slept for hours checks on its first tick awake.
+        assert!(check_due(t0, t0 + Duration::from_secs(8 * 3600)));
+        assert!(check_due(t0, t0 - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn releases_page_comes_from_updater_endpoint() {
+        assert_eq!(
+            releases_page_from_endpoint(
+                "https://github.com/z3k-md/relay/releases/latest/download/latest.json"
+            )
+            .as_deref(),
+            Some("https://github.com/z3k-md/relay/releases"),
+        );
+        assert_eq!(
+            releases_page_from_endpoint(
+                "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+            ),
+            None,
+        );
+        assert_eq!(
+            releases_page_from_endpoint("https://example.com/latest.json"),
+            None
+        );
+        assert_eq!(
+            releases_page().as_deref(),
+            Some("https://github.com/z3k-md/relay/releases"),
+        );
+    }
 }

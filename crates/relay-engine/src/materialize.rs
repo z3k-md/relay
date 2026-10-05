@@ -32,6 +32,9 @@ pub enum MaterializationMode {
     Metadata,
     Demand,
     Exclude,
+    /// Keep every object in the local store, write no working-tree files
+    /// (D47). The home server's default.
+    Store,
 }
 
 impl MaterializationMode {
@@ -41,6 +44,7 @@ impl MaterializationMode {
             Self::Metadata => "metadata",
             Self::Demand => "demand",
             Self::Exclude => "exclude",
+            Self::Store => "store",
         }
     }
 
@@ -50,19 +54,30 @@ impl MaterializationMode {
             "metadata" => Ok(Self::Metadata),
             "demand" => Ok(Self::Demand),
             "exclude" => Ok(Self::Exclude),
+            "store" => Ok(Self::Store),
             other => Err(EngineError::UnknownMaterializationMode(other.to_owned())),
         }
     }
 
-    /// Whether a remote file's bytes should be fetched and written.
+    /// Whether a remote file's bytes should be fetched into the store.
     ///
     /// `hydrated` is the local entry's `materialized` flag (`false` when there
     /// is no local row). Demand stays index-only until that flag is set.
     pub fn fetches_bytes(self, hydrated: bool) -> bool {
         match self {
-            Self::Full => true,
+            Self::Full | Self::Store => true,
             Self::Metadata | Self::Exclude => false,
             Self::Demand => hydrated,
+        }
+    }
+
+    /// Whether a remote file is written into the working tree. A store
+    /// path keeps a file already written here (from an earlier `full`)
+    /// current, so the folder never holds a stale copy.
+    pub fn writes_tree(self, hydrated: bool) -> bool {
+        match self {
+            Self::Store => hydrated,
+            other => other.fetches_bytes(hydrated),
         }
     }
 }
@@ -116,6 +131,37 @@ pub(crate) fn path_mode(
         }
     }
     Ok(mode)
+}
+
+/// The mode every path of `mount_name` gets, when the rules settle it
+/// without looking at paths: no rule reaches inside the mount (`Full`), or
+/// the last rule naming `mount/**` is followed by none that could match
+/// inside it. `None` means paths may differ.
+pub(crate) fn mount_mode(
+    rules: &[MaterializationRuleRecord],
+    mount_name: &str,
+) -> Option<MaterializationMode> {
+    let whole = format!("{mount_name}/**");
+    let mut mode = Some(MaterializationMode::Full);
+    for rule in rules {
+        if rule.selectors.contains(&whole) {
+            mode = MaterializationMode::parse(&rule.mode).ok();
+        } else if rule
+            .selectors
+            .iter()
+            .any(|selector| may_reach(selector, mount_name))
+        {
+            mode = None;
+        }
+    }
+    mode
+}
+
+/// Whether `selector` could match a path in `mount_name`: its first
+/// component is the mount or holds a glob character.
+fn may_reach(selector: &str, mount_name: &str) -> bool {
+    let first = selector.split('/').next().unwrap_or_default();
+    first == mount_name || first.contains(['*', '?', '[', '{', '\\'])
 }
 
 impl Engine {
@@ -506,14 +552,85 @@ impl Engine {
 
     /// Full-mode entries that are still index-only.
     ///
-    /// Reads only `materialized = 0` rows. A metadata mount does not pull the
-    /// rest of the index into this check.
+    /// Skips mounts whose rules give every path another mode, so a server
+    /// whose mounts are all `store` reads no rows here.
     pub(crate) fn full_unmaterialized(&self) -> Result<Vec<FullPending>, EngineError> {
+        self.index_only_in_mode(MaterializationMode::Full)
+    }
+
+    /// Store-mode file rows whose object is not in the local store.
+    pub(crate) fn store_unfetched(&self) -> Result<Vec<FullPending>, EngineError> {
+        let mut out = self.index_only_in_mode(MaterializationMode::Store)?;
+        out.retain(|item| {
+            item.object
+                .is_some_and(|object| !self.store.contains(&object))
+        });
+        Ok(out)
+    }
+
+    /// Index-only rows of attached mounts whose path is in `mode`.
+    fn index_only_in_mode(
+        &self,
+        mode: MaterializationMode,
+    ) -> Result<Vec<FullPending>, EngineError> {
+        let repo = self.db.repo();
+        let mut out = Vec::new();
+        for space in repo.list_spaces()? {
+            let rules = repo.list_materialization_rules(space.id)?;
+            for config in repo.list_mounts(Some(space.id))? {
+                if config.local_path.is_none() {
+                    continue;
+                }
+                let uniform = mount_mode(&rules, &config.mount.name);
+                if uniform.is_some_and(|m| m != mode) {
+                    continue;
+                }
+                for row in repo.list_index_only_in(config.mount.id)? {
+                    if uniform.is_none()
+                        && path_mode(&rules, &row.mount_name, row.path.as_str())? != mode
+                    {
+                        continue;
+                    }
+                    out.push(FullPending {
+                        object: row.object,
+                        key: EntryKey {
+                            space: row.space,
+                            mount: row.mount,
+                            path: row.path,
+                        },
+                        space: row.space,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Note that `object` is now in the store, so store-mode rows naming it
+    /// stop counting as unfetched.
+    pub(crate) fn record_stored_object(&mut self, object: ObjectId) -> Result<(), EngineError> {
+        if !self.store.contains(&object) {
+            return Ok(());
+        }
+        let size = self.store.size_of(&object)?;
+        let now = self.clock.now_ms();
+        self.db
+            .transaction(|repo| repo.record_object(object, size, now))
+            .map_err(EngineError::from_db)
+    }
+
+    /// Materialize full-mode index rows that were waiting on `object`.
+    ///
+    /// Reads only the index-only rows that name this object, so a fetch
+    /// does not cost a walk of every index-only row.
+    pub(crate) fn materialize_full_object(&mut self, object: ObjectId) -> Result<(), EngineError> {
         use std::collections::HashMap;
 
-        let rows = self.db.repo().list_index_only()?;
+        if !self.store.contains(&object) {
+            return Ok(());
+        }
+        let rows = self.db.repo().list_index_only_by_object(object)?;
         let mut rules_by_space: HashMap<SpaceId, Vec<MaterializationRuleRecord>> = HashMap::new();
-        let mut out = Vec::new();
         for row in rows {
             let rules = match rules_by_space.get(&row.space) {
                 Some(rules) => rules,
@@ -523,29 +640,22 @@ impl Engine {
                     rules_by_space.get(&row.space).expect("just inserted")
                 }
             };
-            let mode = path_mode(rules, &row.mount_name, row.path.as_str())?;
-            if mode != MaterializationMode::Full {
+            if path_mode(rules, &row.mount_name, row.path.as_str())? != MaterializationMode::Full {
                 continue;
             }
-            out.push(FullPending {
-                object: row.object,
-                key: EntryKey {
-                    space: row.space,
-                    mount: row.mount,
-                    path: row.path,
-                },
+            let key = EntryKey {
                 space: row.space,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Materialize full-mode index rows that were waiting on `object`.
-    pub(crate) fn materialize_full_object(&mut self, object: ObjectId) -> Result<(), EngineError> {
-        let pending = self.full_unmaterialized()?;
-        for item in pending {
-            if item.object == Some(object) && self.store.contains(&object) {
-                self.materialize_indexed(&item.key)?;
+                mount: row.mount,
+                path: row.path,
+            };
+            match self.materialize_indexed(&key) {
+                Ok(()) => {}
+                // An unscanned file at that path: the scan reconciles it;
+                // the other rows waiting on this object still write.
+                Err(EngineError::DestinationChanged(path)) => {
+                    tracing::info!(path = %path.display(), "kept an unscanned file during hydration");
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(())
@@ -627,12 +737,15 @@ impl Engine {
                 Ok(outcome) if outcome.id == object => {
                     return Ok(observed_stat(dest, &self.config));
                 }
-                Ok(_) => {
-                    let stat = StatHint::from_metadata(&meta);
-                    return self.materialize_over(root, dest, object, executable, Some(stat));
-                }
+                // Other bytes under an index-only row are an edit the scanner
+                // has not seen; overwriting them would lose it. The scan
+                // records the edit, after which no hydration is needed.
+                Ok(_) => return Err(EngineError::DestinationChanged(dest.to_path_buf())),
                 Err(err) => return Err(err.into()),
             }
+        }
+        if fs::symlink_metadata(dest).is_ok() {
+            return Err(EngineError::DestinationChanged(dest.to_path_buf()));
         }
         self.materialize_over(root, dest, object, executable, None)
     }
@@ -681,4 +794,42 @@ fn observed_stat(dest: &Path, config: &crate::EngineConfig) -> Option<StatHint> 
         wall_clock_now_ns(),
         config.racy_window,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MaterializationMode, mount_mode};
+    use relay_core::{MaterializationRuleId, SpaceId};
+    use relay_db::MaterializationRuleRecord;
+
+    fn rule(mode: &str, selectors: &[&str]) -> MaterializationRuleRecord {
+        MaterializationRuleRecord {
+            id: MaterializationRuleId::new(),
+            space_id: SpaceId::new(),
+            name: "r".into(),
+            mode: mode.into(),
+            position: 0,
+            selectors: selectors.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn mount_mode_is_known_only_when_no_rule_reaches_inside() {
+        use MaterializationMode::{Full, Store};
+        assert_eq!(mount_mode(&[], "files"), Some(Full));
+        let store = rule("store", &["files/**"]);
+        assert_eq!(
+            mount_mode(std::slice::from_ref(&store), "files"),
+            Some(Store)
+        );
+        assert_eq!(
+            mount_mode(std::slice::from_ref(&store), "other"),
+            Some(Full)
+        );
+        let sub = rule("full", &["files/raw/**"]);
+        assert_eq!(mount_mode(&[store.clone(), sub.clone()], "files"), None);
+        assert_eq!(mount_mode(&[sub, store.clone()], "files"), Some(Store));
+        let glob = rule("metadata", &["**/*.iso"]);
+        assert_eq!(mount_mode(&[store, glob], "files"), None);
+    }
 }

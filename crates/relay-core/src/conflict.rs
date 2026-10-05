@@ -4,7 +4,7 @@
 //! "resolved" entry stays divergent. Nothing here may depend on which device is
 //! doing the computing or on local wall-clock time.
 
-use crate::entry::EntryRecord;
+use crate::entry::{EntryContent, EntryRecord};
 use crate::error::CoreError;
 use crate::ids::DeviceId;
 use crate::path::LogicalPath;
@@ -24,12 +24,32 @@ pub enum ConflictWinner {
 /// The version whose writing device holds the higher counter wins, with the
 /// device id as a tiebreak. Both inputs are symmetric, so any device computes
 /// the same answer.
+///
+/// Two versions from the same device with the same counter (`Diverged`, D2:
+/// a reused counter after a database restore) rank by content, so both
+/// devices still keep the same version at the path and copy the other.
 pub fn choose_winner(a: &EntryRecord, b: &EntryRecord) -> ConflictWinner {
-    let rank = |r: &EntryRecord| (r.vector.get(&r.modified_by), r.modified_by);
+    let rank = |r: &EntryRecord| {
+        (
+            r.vector.get(&r.modified_by),
+            r.modified_by,
+            content_rank(&r.content),
+        )
+    };
     if rank(a) >= rank(b) {
         ConflictWinner::A
     } else {
         ConflictWinner::B
+    }
+}
+
+/// A total order over content, used only to break otherwise equal ranks.
+fn content_rank(content: &EntryContent) -> (u8, Vec<u8>) {
+    match content {
+        EntryContent::Deleted => (0, Vec::new()),
+        EntryContent::Symlink { target } => (1, target.as_bytes().to_vec()),
+        EntryContent::File { object, .. } => (2, object.as_bytes().to_vec()),
+        EntryContent::Directory => (3, Vec::new()),
     }
 }
 
@@ -166,6 +186,23 @@ mod tests {
             "swapping inputs must swap the label, not the outcome"
         );
         assert_eq!(ab, ConflictWinner::B);
+    }
+
+    #[test]
+    fn diverged_same_writer_is_symmetric() {
+        // Same device, same counter, different bytes: a reused counter.
+        let a = record(7, b"a", 5_000);
+        let mut b = record(7, b"b", 5_000);
+        b.modified_by = a.modified_by;
+        b.vector = a.vector.clone();
+        let ab = choose_winner(&a, &b);
+        let ba = choose_winner(&b, &a);
+        assert_ne!(
+            ab, ba,
+            "swapping inputs must swap the label, not the outcome"
+        );
+        assert_eq!(choose_group_winner(&a, &b), ab);
+        assert_eq!(choose_group_winner(&b, &a), ba);
     }
 
     #[test]

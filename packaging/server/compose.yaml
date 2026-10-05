@@ -1,0 +1,19 @@
+# docker compose -f packaging/server/compose.yaml up -d --build
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: packaging/server/Dockerfile
+    image: relay-server
+    container_name: relay-server
+    restart: unless-stopped
+    environment:
+      RELAY_NAME: relay-server
+    ports:
+      # Host port 47322, so a Relay app on the same machine keeps 47321.
+      - "47322:47321/udp"
+    volumes:
+      - relay:/var/lib/relay
+
+volumes:
+  relay:

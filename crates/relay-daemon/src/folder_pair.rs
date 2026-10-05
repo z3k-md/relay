@@ -1,5 +1,4 @@
-//! Set up a folder pair across devices from this one (remote explorer
-//! Stage 3).
+//! Set up a folder pair across devices from this one (D39).
 //!
 //! Each step is a remote call on the device it touches: this device answers
 //! its own steps through [`remote::answer`], a peer answers through the
@@ -46,7 +45,7 @@ impl Target {
 
     fn call(&self, host: &Host, call: RemoteCall) -> RemoteResult {
         match self {
-            Self::Here { .. } => remote::answer(host, &host.home, call, "this device"),
+            Self::Here { .. } => remote::answer(host, &host.home, call, remote::Asker::ThisDevice),
             Self::Peer { id, .. } => host.call_peer(*id, call),
         }
     }

@@ -29,6 +29,9 @@ use scans::ScanStep;
 const STOP_POLL: Duration = Duration::from_millis(100);
 const RELOAD_POLL: Duration = Duration::from_secs(1);
 const REPLICA_PULL_INTERVAL: Duration = Duration::from_secs(5);
+/// A mailbox push opens the replica and signs; one per input during a large
+/// transfer is thousands a minute, so pushes after sync inputs are coalesced.
+const REPLICA_PUSH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Least time between placeholder passes while index batches stream in. A
 /// mount about to be scanned gets its pass first regardless (D43).
 const PLACEHOLDER_INTERVAL: Duration = Duration::from_secs(1);
@@ -209,6 +212,8 @@ impl Engine {
         };
         let mut last_reload_check = Instant::now();
         let mut last_replica_pull: Option<Instant>;
+        let mut last_replica_push: Option<Instant> = None;
+        let mut replica_push_due = false;
         let mut replica_warned = false;
         let mut syncer = Syncer::new();
         let mut config = ConfigQueue::default();
@@ -336,6 +341,18 @@ impl Engine {
         );
         emit_pull(self, &mut replica_warned, on_event, &mut output);
         last_replica_pull = Some(Instant::now());
+        // A server catches up on offers stored while it was down.
+        let mut server_failed: Vec<ConfigChange> = Vec::new();
+        run_server_plan(
+            self,
+            &mut syncer,
+            &mut config,
+            &mut states,
+            &mut watcher,
+            &mut server_failed,
+            &mut output,
+            on_event,
+        );
 
         while !stop.load(Ordering::Relaxed) {
             // Apply queued mount/share commands before waiting on watcher input
@@ -460,6 +477,13 @@ impl Engine {
                     other => {
                         // Only a peer frame can carry the offer a waiting join needs.
                         let may_bring_offer = matches!(other, SyncInput::Frame { .. });
+                        let offers = matches!(
+                            other,
+                            SyncInput::Frame {
+                                body: relay_proto::frame::Body::SpaceOffers(_),
+                                ..
+                            }
+                        );
                         if let SyncInput::Frame {
                             body: relay_proto::frame::Body::IndexBatch(batch),
                             ..
@@ -484,17 +508,36 @@ impl Engine {
                                 );
                             }
                         }
+                        if offers {
+                            run_server_plan(
+                                self,
+                                &mut syncer,
+                                &mut config,
+                                &mut states,
+                                &mut watcher,
+                                &mut server_failed,
+                                &mut output,
+                                on_event,
+                            );
+                        }
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
-                        emit_push(
-                            self.push_replica_watch(),
-                            &mut replica_warned,
-                            on_event,
-                            &mut output,
-                        );
+                        replica_push_due = true;
                     }
                 },
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {}
+            }
+            if replica_push_due
+                && last_replica_push.is_none_or(|at| at.elapsed() >= REPLICA_PUSH_MIN_INTERVAL)
+            {
+                replica_push_due = false;
+                last_replica_push = Some(Instant::now());
+                emit_push(
+                    self.push_replica_watch(),
+                    &mut replica_warned,
+                    on_event,
+                    &mut output,
+                );
             }
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -583,6 +626,57 @@ impl Engine {
         on_event(&WatchEvent::Stopped);
         self.try_reacquire_writer_lock()?;
         Ok(RunExit::Stopped)
+    }
+}
+
+/// On a server, join offered spaces and attach their mounts (home server
+/// Stage 1). A change that failed is not retried until the loop restarts,
+/// so a name clash warns once instead of on every offer.
+#[allow(clippy::too_many_arguments)]
+fn run_server_plan(
+    engine: &mut Engine,
+    syncer: &mut Syncer,
+    config: &mut ConfigQueue,
+    states: &mut Vec<MountWatch>,
+    watcher: &mut Option<MountWatcher>,
+    failed: &mut Vec<ConfigChange>,
+    output: &mut dyn FnMut(SyncOutput),
+    on_event: &mut dyn FnMut(&WatchEvent),
+) {
+    let plan = match engine.server_plan() {
+        Ok(plan) => plan,
+        Err(err) => {
+            on_event(&WatchEvent::SyncWarning {
+                peer: String::new(),
+                path: String::new(),
+                reason: format!("server: {err}"),
+            });
+            return;
+        }
+    };
+    for change in plan {
+        if failed.contains(&change) {
+            continue;
+        }
+        let (reply, result) = mpsc::channel();
+        if let Some(applied) = config.submit(engine, change.clone(), reply) {
+            after_config(
+                engine,
+                syncer,
+                states,
+                watcher.as_mut(),
+                &applied,
+                output,
+                on_event,
+            );
+        } else if let Ok(Err(rejected)) = result.try_recv() {
+            on_event(&WatchEvent::SyncWarning {
+                peer: String::new(),
+                path: change.space().unwrap_or_default().to_owned(),
+                reason: format!("server: {}", rejected.message),
+            });
+            failed.push(change);
+        }
     }
 }
 

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onActivated, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
-import { api } from "../lib/api";
+import { api, errorText } from "../lib/api";
+import { formatSize } from "../lib/format";
 import type { FileRow, FolderView, SpaceView, TransferLive } from "../lib/types";
 
 const props = defineProps<{
@@ -19,6 +20,10 @@ const working = ref(new Set<string>());
 const busy = ref(false);
 const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
+/** Set once spaces are listed, so the empty state doesn't flash first. */
+const loaded = ref(false);
+/** Bumped on every folder opened; a late listing for an older one is dropped. */
+let generation = 0;
 
 const mounts = computed<Mount[]>(() =>
   spaces.value.flatMap((space) =>
@@ -45,18 +50,16 @@ function mountKey(m: Mount): string {
   return `${m.space}/${m.mount}`;
 }
 
-function message(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 async function open(path: string) {
   const m = current.value;
   if (!m) return;
+  const token = ++generation;
   error.value = null;
   try {
-    folder.value = await api.listFolder(m.space, m.mount, path);
+    const next = await api.listFolder(m.space, m.mount, path);
+    if (token === generation) folder.value = next;
   } catch (err) {
-    error.value = message(err);
+    if (token === generation) error.value = errorText(err);
   }
 }
 
@@ -72,7 +75,7 @@ async function withPath(path: string, action: () => Promise<unknown>) {
   try {
     await action();
   } catch (err) {
-    error.value = message(err);
+    error.value = errorText(err);
   } finally {
     const next = new Set(working.value);
     next.delete(path);
@@ -115,7 +118,7 @@ async function setChoice(choice: string) {
     await api.setFolderMode(m.space, m.mount, view.path, choice === "inherit" ? null : choice);
     await open(view.path);
   } catch (err) {
-    error.value = message(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -146,28 +149,27 @@ function stateLabel(row: FileRow): string {
       return "Not stored here";
     case "pending":
       return "Waiting to sync";
+    case "stored":
+      return "Kept in backup store";
   }
 }
 
-function formatSize(bytes: number | null): string {
-  if (bytes == null) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
-}
-
-onMounted(async () => {
+// Kept alive across tab switches: a revisit keeps the open folder and
+// refreshes it in place.
+onActivated(async () => {
   try {
     spaces.value = await api.listSpaces();
+    loaded.value = true;
+    const shown = current.value;
+    if (shown && mounts.value.some((m) => mountKey(m) === mountKey(shown))) {
+      await open(folder.value?.path ?? "");
+      return;
+    }
     const first = mounts.value[0];
     if (first) await chooseMount(mountKey(first));
+    else current.value = null;
   } catch (err) {
-    error.value = message(err);
+    error.value = errorText(err);
   }
 });
 </script>
@@ -191,7 +193,7 @@ onMounted(async () => {
     <p v-if="notice" class="mb-2 text-[12px] text-[var(--color-muted)]">{{ notice }}</p>
 
     <EmptyState
-      v-if="!mounts.length"
+      v-if="loaded && !mounts.length"
       title="No synced folders on this computer"
       body="Add a folder to a space, or join one a peer shared, and its files show up here."
     />
@@ -247,7 +249,7 @@ onMounted(async () => {
             type="button"
             class="min-w-0 flex-1 truncate text-left"
             :class="row.kind === 'directory' ? 'font-medium' : ''"
-            :disabled="working.has(row.path) || row.state === 'metadata_only'"
+            :disabled="working.has(row.path) || row.state === 'metadata_only' || row.state === 'stored'"
             @click="openRow(row)"
           >
             {{ row.kind === "directory" ? "📁" : row.state === "local" ? "📄" : "☁️" }}

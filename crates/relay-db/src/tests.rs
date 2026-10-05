@@ -990,6 +990,57 @@ fn entries_under_is_a_range_not_like() {
 }
 
 #[test]
+fn entries_in_lists_direct_children_of_a_non_ascii_folder() {
+    let h = Harness::new();
+    let vv = vector(&[(1, 1)]);
+    let paths = ["日本/a", "日本/ab/c", "日本/b", "日本-x", "other"];
+    for (i, p) in paths.iter().enumerate() {
+        let rec = h.record(p, file(b"x", false), (i + 1) as u64, vv.clone(), None, None);
+        h.db.repo().put_entry(&rec).unwrap();
+    }
+    let dir = h.record(
+        "日本/ab",
+        EntryContent::Directory,
+        6,
+        vv.clone(),
+        None,
+        None,
+    );
+    h.db.repo().put_entry(&dir).unwrap();
+    let dir = h.record("日本", EntryContent::Directory, 7, vv, None, None);
+    h.db.repo().put_entry(&dir).unwrap();
+
+    let inside =
+        h.db.repo()
+            .entries_in(h.mount.id, Some(&path("日本")))
+            .unwrap();
+    let got: Vec<_> = inside.iter().map(|e| e.key.path.as_str()).collect();
+    assert_eq!(got, vec!["日本/a", "日本/ab", "日本/b"]);
+
+    let top = h.db.repo().entries_in(h.mount.id, None).unwrap();
+    let got: Vec<_> = top.iter().map(|e| e.key.path.as_str()).collect();
+    assert_eq!(got, vec!["other", "日本", "日本-x"]);
+}
+
+#[test]
+fn prune_objects_forgets_ids_outside_keep() {
+    let h = Harness::new();
+    let repo = h.db.repo();
+    let kept = ObjectId::of(b"kept");
+    let swept = ObjectId::of(b"swept");
+    repo.record_object(kept, 4, 1).unwrap();
+    repo.record_object(swept, 5, 2).unwrap();
+
+    let keep: std::collections::HashSet<ObjectId> = [kept].into_iter().collect();
+    assert_eq!(repo.prune_objects(&keep).unwrap(), 1);
+    assert_eq!(repo.object_count().unwrap(), 1);
+    let objects = repo.verification_objects().unwrap();
+    assert!(objects.contains(&kept));
+    assert!(!objects.contains(&swept));
+    assert_eq!(repo.prune_objects(&keep).unwrap(), 0);
+}
+
+#[test]
 fn catchup_plan_counts_entries_and_only_live_file_bytes() {
     let h = Harness::new();
     let vv = vector(&[(1, 1)]);
@@ -1288,4 +1339,118 @@ fn peers_start_without_the_manage_grant() {
     assert!(db.repo().peer_by_id(peer.id).unwrap().unwrap().may_manage);
 
     assert!(!db.repo().set_peer_manage(device(8, "x").id, true).unwrap());
+}
+
+#[test]
+fn multi_row_reads_load_every_vector_across_chunks() {
+    // More rows than one vector-load chunk, each with its own vector, and
+    // one row with no versions at all: every record must come back with
+    // exactly the vector it was written with.
+    let h = Harness::new();
+    let repo = h.db.repo();
+    let total = 600u64;
+    let mut written = Vec::new();
+    for i in 1..=total {
+        let vv = if i % 7 == 0 {
+            VersionVector::new()
+        } else {
+            vector(&[(1, i), (2, i * 2), (3, i % 5)])
+        };
+        let record = h.record(
+            &format!("dir/file{i:04}.txt"),
+            file(format!("body{i}").as_bytes(), false),
+            i,
+            vv,
+            None,
+            None,
+        );
+        repo.put_entry(&record).unwrap();
+        written.push(record);
+    }
+    let read = repo.entries_for_mount(h.mount.id).unwrap();
+    assert_eq!(read.len(), written.len());
+    for (got, want) in read.iter().zip(written.iter()) {
+        assert_eq!(got.key.path, want.key.path);
+        assert_eq!(got.vector, want.vector, "vector for {}", want.key.path);
+    }
+    let since = repo
+        .changes_since_in_space(h.space.id, Sequence(300), 1000)
+        .unwrap();
+    assert_eq!(since.len(), 300);
+    assert!(since.iter().all(|e| {
+        written
+            .iter()
+            .find(|w| w.key.path == e.key.path)
+            .is_some_and(|w| w.vector == e.vector)
+    }));
+    let only: Vec<_> = repo
+        .list_index_only_by_object(ObjectId::of(b"body5"))
+        .unwrap();
+    assert!(only.is_empty(), "materialized rows are not index-only");
+    assert_eq!(repo.count_entries(h.mount.id).unwrap(), (600, 0));
+    assert_eq!(
+        repo.live_paths(h.mount.id).unwrap().len(),
+        600,
+        "live_paths lists every live row"
+    );
+}
+
+#[test]
+fn store_mode_migration_keeps_rules_and_selectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    let space = space("Photos");
+    let rule = relay_core::MaterializationRuleId::new();
+    {
+        let db = Database::open(&path).unwrap();
+        db.repo().init_local_device(&device(1, "nas"), 1).unwrap();
+        db.repo().create_space(&space, 1).unwrap();
+        db.repo()
+            .create_materialization_rule(
+                rule,
+                space.id,
+                "raw",
+                "demand",
+                &["files/raw/**".to_owned(), "files/raw".to_owned()],
+                1,
+            )
+            .unwrap();
+    }
+    {
+        // Rerun 0014 over the rows above.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 13u32).unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    let rules = db.repo().list_materialization_rules(space.id).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, rule);
+    assert_eq!(rules[0].mode, "demand");
+    assert_eq!(rules[0].selectors, ["files/raw/**", "files/raw"]);
+    db.repo()
+        .create_materialization_rule(
+            relay_core::MaterializationRuleId::new(),
+            space.id,
+            "all",
+            "store",
+            &["files/**".to_owned()],
+            2,
+        )
+        .unwrap();
+    db.repo()
+        .delete_materialization_rule(space.id, "raw")
+        .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let selectors: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM materialization_selectors",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        selectors, 1,
+        "deleting a rule still cascades to its selectors"
+    );
 }

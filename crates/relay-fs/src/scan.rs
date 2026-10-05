@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,7 @@ use relay_policy::{MountRules, PolicyError, parse_relayignore};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::error::FsError;
-use crate::paths::{resolve_os_path, to_logical_path};
+use crate::paths::{Resolved, resolve_os_path, resolve_os_path_detailed, to_logical_path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannedEntry {
@@ -145,17 +145,27 @@ pub fn scan_paths(
 
     let mut scopes = Vec::new();
     let mut entries = Vec::new();
+    let mut sink = PartialSink {
+        scopes: &mut scopes,
+        entries: &mut entries,
+        warnings: &mut warnings,
+    };
+    // On-disk spellings that differ from a request only in case: the
+    // request is reported missing, so index the real name too unless the
+    // burst already asks for it (or for an ancestor that covers it).
+    let mut case_variants = Vec::new();
     for path in &requested {
-        examine_requested(
-            root,
-            path,
-            &rules,
-            &mut PartialSink {
-                scopes: &mut scopes,
-                entries: &mut entries,
-                warnings: &mut warnings,
-            },
-        )?;
+        if let Some(variant) = examine_requested(root, path, &rules, &mut sink)?
+            && requested.binary_search(&variant).is_err()
+            && !requested
+                .iter()
+                .any(|other| other != &variant && variant.starts_with(other))
+        {
+            case_variants.push(variant);
+        }
+    }
+    for path in coalesce_requests(root, &case_variants) {
+        examine_requested(root, &path, &rules, &mut sink)?;
     }
     emit_ancestor_directories(root, &rules, &mut scopes, &mut entries);
 
@@ -250,28 +260,42 @@ fn walk_tree(
                 if let Some(scanned) = collect_entry(root, &entry, rules, warnings)? {
                     entries.push(scanned);
                     if !on_entry() {
-                        return Ok(());
+                        break;
                     }
                 }
             }
         }
     }
 
+    // Also after an early stop: the engine protects these paths from
+    // tombstoning, whether or not the walk finished.
     warnings.append(&mut early.into_inner().warnings);
     Ok(())
 }
 
+/// Sort, dedup, and drop every request that lies under another request
+/// which covers its subtree (a directory, or a missing path). Sorted output.
 fn coalesce_requests(root: &Path, paths: &[LogicalPath]) -> Vec<LogicalPath> {
     let mut requested: Vec<LogicalPath> = paths.to_vec();
-    requested.sort();
+    // Component order puts a path's descendants right after it (`a`, `a/b`,
+    // `a-b`), so one pass with the current cover replaces a pairwise check.
+    requested.sort_by(|a, b| a.components().cmp(b.components()));
     requested.dedup();
-    let candidates = requested.clone();
-    requested.retain(|path| {
-        !candidates
-            .iter()
-            .any(|other| other != path && path.starts_with(other) && covers_as_subtree(root, other))
-    });
-    requested
+
+    let mut kept: Vec<LogicalPath> = Vec::with_capacity(requested.len());
+    let mut cover: Option<LogicalPath> = None;
+    let mut remaining = requested.into_iter().peekable();
+    while let Some(path) = remaining.next() {
+        if cover.as_ref().is_some_and(|cover| path.starts_with(cover)) {
+            continue;
+        }
+        // Only a path with a descendant in the burst needs the stat.
+        let has_descendant = remaining.peek().is_some_and(|next| next.starts_with(&path));
+        cover = (has_descendant && covers_as_subtree(root, &path)).then(|| path.clone());
+        kept.push(path);
+    }
+    kept.sort();
+    kept
 }
 
 fn covers_as_subtree(root: &Path, path: &LogicalPath) -> bool {
@@ -292,25 +316,36 @@ struct PartialSink<'a> {
     warnings: &'a mut Vec<ScanWarning>,
 }
 
+/// Examine one requested path. Returns the logical path of an on-disk name
+/// that differs from `path` only in case, which the caller examines too.
 fn examine_requested(
     root: &Path,
     path: &LogicalPath,
     rules: &MountRules,
     sink: &mut PartialSink<'_>,
-) -> Result<(), FsError> {
+) -> Result<Option<LogicalPath>, FsError> {
     if skip_requested_path(root, path, rules) {
-        return Ok(());
+        return Ok(None);
     }
 
-    let os_path = match resolve_os_path(root, path) {
-        Ok(None) => {
+    let os_path = match resolve_os_path_detailed(root, path) {
+        Ok(Resolved::Missing) => {
             sink.scopes.push(ScanScope {
                 path: path.clone(),
                 kind: ScopeKind::Subtree,
             });
-            return Ok(());
+            return Ok(None);
         }
-        Ok(Some(os_path)) => os_path,
+        Ok(Resolved::CaseMismatch(on_disk)) => {
+            // The requested spelling is gone (a case-only rename); the full
+            // scan would tombstone it and index the on-disk name.
+            sink.scopes.push(ScanScope {
+                path: path.clone(),
+                kind: ScopeKind::Subtree,
+            });
+            return Ok(to_logical_path(root, &on_disk).ok());
+        }
+        Ok(Resolved::Found(os_path)) => os_path,
         Err(FsError::Io {
             path: os_path,
             source,
@@ -319,7 +354,7 @@ fn examine_requested(
                 os_path,
                 error: source.to_string(),
             });
-            return Ok(());
+            return Ok(None);
         }
         Err(err) => return Err(err),
     };
@@ -338,7 +373,7 @@ fn examine_requested(
         }
         Ok(meta) => examine_existing(root, path, &os_path, &meta, rules, sink)?,
     }
-    Ok(())
+    Ok(None)
 }
 
 fn skip_requested_path(root: &Path, path: &LogicalPath, rules: &MountRules) -> bool {
@@ -416,9 +451,12 @@ fn examine_existing(
 
     if let Some(scanned) = collect_from_metadata(root, os_path, meta, rules, sink.warnings)? {
         sink.entries.push(scanned);
+        // Nothing can live beneath a file or a (never descended) symlink, so
+        // the subtree is exact: a directory replaced by a file loses its
+        // indexed children here, as it would in a full scan.
         sink.scopes.push(ScanScope {
             path: path.clone(),
-            kind: ScopeKind::Exact,
+            kind: ScopeKind::Subtree,
         });
     }
     Ok(())
@@ -436,10 +474,18 @@ fn emit_ancestor_directories(
         .map(|scope| scope.path.clone())
         .collect();
 
+    // Membership by set: a burst of thousands of siblings shares ancestors,
+    // and each is decided once.
+    let mut scoped: HashSet<LogicalPath> = scopes.iter().map(|scope| scope.path.clone()).collect();
+    let mut indexed: HashSet<LogicalPath> =
+        entries.iter().map(|entry| entry.path.clone()).collect();
     for path in existing {
         let mut current = path.parent();
         while let Some(ancestor) = current {
-            maybe_emit_ancestor_dir(root, &ancestor, rules, scopes, entries);
+            if !scoped.insert(ancestor.clone()) {
+                break;
+            }
+            maybe_emit_ancestor_dir(root, &ancestor, rules, scopes, entries, &mut indexed);
             current = ancestor.parent();
         }
     }
@@ -451,10 +497,8 @@ fn maybe_emit_ancestor_dir(
     rules: &MountRules,
     scopes: &mut Vec<ScanScope>,
     entries: &mut Vec<ScannedEntry>,
+    indexed: &mut HashSet<LogicalPath>,
 ) {
-    if scopes.iter().any(|scope| scope.path == *ancestor) {
-        return;
-    }
     let Ok(Some(os_path)) = resolve_os_path(root, ancestor) else {
         return;
     };
@@ -464,7 +508,7 @@ fn maybe_emit_ancestor_dir(
     if !is_real_directory(&meta) || !rules.is_selected(ancestor, EntryKind::Directory) {
         return;
     }
-    if !entries.iter().any(|entry| entry.path == *ancestor) {
+    if indexed.insert(ancestor.clone()) {
         let mut stat = StatHint::from_metadata(&meta);
         stat.size = 0;
         entries.push(ScannedEntry {
@@ -1275,7 +1319,7 @@ mod tests {
         assert!(has_scope(&partial, "a", ScopeKind::Subtree));
         assert!(!has_scope(&partial, "a/b", ScopeKind::Subtree));
         assert!(!has_scope(&partial, "a/b/c.txt", ScopeKind::Exact));
-        assert!(has_scope(&partial, "keep.txt", ScopeKind::Exact));
+        assert!(has_scope(&partial, "keep.txt", ScopeKind::Subtree));
         assert!(
             partial
                 .entries
@@ -1344,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_paths_file_exact_and_not_selected() {
+    fn scan_paths_file_is_a_subtree_scope_and_not_selected() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         write_marker(root);
@@ -1353,7 +1397,8 @@ mod tests {
         fs::write(root.join("ignored.txt"), b"no").unwrap();
 
         let selected = scan_paths(root, &default_rules(), &[lp("keep.txt")]).unwrap();
-        assert!(has_scope(&selected, "keep.txt", ScopeKind::Exact));
+        assert!(has_scope(&selected, "keep.txt", ScopeKind::Subtree));
+        assert!(!has_scope(&selected, "keep.txt", ScopeKind::Exact));
         assert_eq!(selected.entries.len(), 1);
         assert_eq!(selected.entries[0].path.as_str(), "keep.txt");
         assert_eq!(selected.entries[0].kind, EntryKind::File);
@@ -1386,7 +1431,7 @@ mod tests {
         fs::create_dir_all(root.join("a/b")).unwrap();
         fs::write(root.join("a/b/c.txt"), b"x").unwrap();
         let partial = scan_paths(root, &default_rules(), &[lp("a/b/c.txt")]).unwrap();
-        assert!(has_scope(&partial, "a/b/c.txt", ScopeKind::Exact));
+        assert!(has_scope(&partial, "a/b/c.txt", ScopeKind::Subtree));
         assert!(has_scope(&partial, "a", ScopeKind::Exact));
         assert!(has_scope(&partial, "a/b", ScopeKind::Exact));
         let listed: Vec<_> = partial.entries.iter().map(|e| e.path.as_str()).collect();
@@ -1418,7 +1463,7 @@ mod tests {
         assert!(through_link.entries.is_empty());
 
         let link_itself = scan_paths(root, &default_rules(), &[lp("link")]).unwrap();
-        assert!(has_scope(&link_itself, "link", ScopeKind::Exact));
+        assert!(has_scope(&link_itself, "link", ScopeKind::Subtree));
         assert_eq!(link_itself.entries.len(), 1);
         assert_eq!(link_itself.entries[0].kind, EntryKind::Symlink);
     }
@@ -1506,7 +1551,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn scan_paths_nfd_file_via_nfc_logical_is_exact() {
+    fn scan_paths_nfd_file_via_nfc_logical_is_found() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         write_marker(root);
@@ -1514,11 +1559,162 @@ mod tests {
         fs::write(&nfd, b"nfd").unwrap();
         let logical = lp("caf\u{e9}.txt");
         let partial = scan_paths(root, &default_rules(), std::slice::from_ref(&logical)).unwrap();
-        assert!(has_scope(&partial, "caf\u{e9}.txt", ScopeKind::Exact));
-        assert!(!has_scope(&partial, "caf\u{e9}.txt", ScopeKind::Subtree));
+        assert!(has_scope(&partial, "caf\u{e9}.txt", ScopeKind::Subtree));
+        assert_eq!(partial.scopes.len(), 1);
         assert_eq!(partial.entries.len(), 1);
         assert_eq!(partial.entries[0].path.as_str(), "caf\u{e9}.txt");
         assert_eq!(partial.entries[0].os_path, nfd);
         assert_eq!(partial.entries[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn scan_paths_file_replacing_directory_is_a_subtree_scope() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_marker(root);
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("d/child.txt"), b"x").unwrap();
+        fs::remove_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("d"), b"now a file").unwrap();
+
+        let partial = scan_paths(root, &default_rules(), &[lp("d")]).unwrap();
+        assert!(has_scope(&partial, "d", ScopeKind::Subtree));
+        assert!(!has_scope(&partial, "d", ScopeKind::Exact));
+        assert_eq!(partial.entries.len(), 1);
+        assert_eq!(partial.entries[0].path.as_str(), "d");
+        assert_eq!(partial.entries[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn early_stop_keeps_warnings_seen_before_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_marker(root);
+        // Depth-first: whichever top-level directory comes first has its
+        // nested mount filtered (and warned about) before the second one
+        // is collected, where the walk is stopped.
+        for name in ["d1", "d2"] {
+            let nested = root.join(name).join("inner-mount");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join(MOUNT_MARKER), "nested").unwrap();
+        }
+        let mut seen = 0;
+        let result = scan_mount_with(root, &default_rules(), &mut || {
+            seen += 1;
+            seen < 2
+        })
+        .unwrap();
+        assert_eq!(result.entries.len(), 2);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, ScanWarning::NestedMount(_))),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_paths_other_case_is_missing_on_a_case_sensitive_filesystem() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_marker(root);
+        fs::write(root.join("Foo.txt"), b"x").unwrap();
+        let partial = scan_paths(root, &default_rules(), &[lp("foo.txt")]).unwrap();
+        assert_eq!(partial.scopes.len(), 1);
+        assert!(has_scope(&partial, "foo.txt", ScopeKind::Subtree));
+        assert!(partial.entries.is_empty());
+    }
+
+    /// True when `root` ignores case; macOS and Windows volumes usually do,
+    /// but a case-sensitive APFS or `ext4` volume would make the case-only
+    /// rename below a plain rename.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn root_is_case_insensitive(root: &Path) -> bool {
+        fs::write(root.join("case-probe"), b"").unwrap();
+        let hit = root.join("CASE-PROBE").exists();
+        fs::remove_file(root.join("case-probe")).unwrap();
+        hit
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn scan_paths_case_only_rename_reports_old_spelling_missing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_marker(root);
+        if !root_is_case_insensitive(root) {
+            eprintln!("skipping: the temp volume is case-sensitive");
+            return;
+        }
+        fs::create_dir(root.join("foo")).unwrap();
+        fs::write(root.join("foo/a.txt"), b"a").unwrap();
+        fs::write(root.join("file.txt"), b"f").unwrap();
+        fs::rename(root.join("foo"), root.join("Foo")).unwrap();
+        fs::rename(root.join("file.txt"), root.join("File.txt")).unwrap();
+
+        // The watcher reported only the old spellings: they are gone, and
+        // the on-disk names are indexed anyway.
+        let partial = scan_paths(root, &default_rules(), &[lp("foo"), lp("file.txt")]).unwrap();
+        assert!(has_scope(&partial, "foo", ScopeKind::Subtree));
+        assert!(has_scope(&partial, "Foo", ScopeKind::Subtree));
+        assert!(has_scope(&partial, "file.txt", ScopeKind::Subtree));
+        assert!(has_scope(&partial, "File.txt", ScopeKind::Subtree));
+        let listed: Vec<_> = partial.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(listed, ["File.txt", "Foo", "Foo/a.txt"]);
+
+        // Both spellings in one burst: the same result, nothing examined twice.
+        let both = scan_paths(
+            root,
+            &default_rules(),
+            &[
+                lp("foo"),
+                lp("Foo"),
+                lp("foo/a.txt"),
+                lp("File.txt"),
+                lp("file.txt"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(both.scopes, partial.scopes);
+        let listed: Vec<_> = both.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(listed, ["File.txt", "Foo", "Foo/a.txt"]);
+
+        // A component below the renamed directory.
+        let below = scan_paths(root, &default_rules(), &[lp("foo/a.txt")]).unwrap();
+        assert!(has_scope(&below, "foo/a.txt", ScopeKind::Subtree));
+        assert!(has_scope(&below, "Foo/a.txt", ScopeKind::Subtree));
+        assert!(has_scope(&below, "Foo", ScopeKind::Exact));
+        let listed: Vec<_> = below.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(listed, ["Foo", "Foo/a.txt"]);
+    }
+
+    #[test]
+    fn scan_paths_large_burst_is_not_quadratic() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_marker(root);
+        // Eight thousand requests: the pairwise coalescing this replaced was
+        // quadratic in that count. No timing bound, which would flake on a
+        // loaded CI runner; the counts check that every request was seen.
+        let present = 2_000;
+        let missing = 6_000;
+        let mut paths = Vec::new();
+        for i in 0..present {
+            let sub = format!("d{}", i % 40);
+            fs::create_dir_all(root.join(&sub)).unwrap();
+            let path = format!("{sub}/f{i}.txt");
+            fs::write(root.join(&path), b"x").unwrap();
+            paths.push(lp(&path));
+        }
+        for i in 0..missing {
+            paths.push(lp(&format!("gone/g{i}.txt")));
+        }
+
+        let partial = scan_paths(root, &default_rules(), &paths).unwrap();
+        assert_eq!(partial.entries.len(), present + 40);
+        assert_eq!(partial.scopes.len(), present + missing + 40);
     }
 }

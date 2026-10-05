@@ -7,6 +7,7 @@ cargo build --release
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+python3 scripts/check-docs.py   # doc links, D-numbers, DESIGN § references
 ```
 
 The release binary is `target/release/relay`. Plain `cargo build` skips the desktop app. See [the desktop README](../apps/relay-desktop/README.md) for the Tauri dev loop, and [RELEASING.md](RELEASING.md) for signed desktop builds.
@@ -23,7 +24,7 @@ crates/
   relay-store    BLAKE3 content-addressed object store
   relay-db       SQLite schema, migrations, local index
   relay-replica  durable mailbox (a filesystem directory)
-  relay-crypto  Ed25519 device identity and certificate
+  relay-crypto   device identity, certificates, space keys, sealing
   relay-proto    peer wire protocol
   relay-net      QUIC transport, pinned mutual TLS, pairing, LAN discovery
   relay-engine   scan, watch, sync, conflicts, history
@@ -33,14 +34,17 @@ apps/
   relay-cli      the relay binary
   relay-desktop  menu bar / tray app
   relay-sim      local multi-process lab
-scripts/        install, cross-build, deploy, release
+  relay-vopr     deterministic single-process sync simulator
+scripts/        install, cross-build, deploy, release, check-docs
+packaging/
+  server/       home server container image, compose file, systemd unit
 docs/
   USAGE.md       commands and safety rules
   ROADMAP.md     what is built and what is next
-  DESIGN.md      original specification
-  DECISIONS.md   amendments adopted during implementation
+  DESIGN.md      how Relay works and the rules it keeps
+  DECISIONS.md   numbered decisions (cited in code as D-numbers)
   RELEASING.md   desktop release and updater signing
-  proposals/     notes that are not decisions yet
+  proposals/     plans that are not decisions yet
 ```
 
 ## Lab
@@ -56,6 +60,21 @@ cargo run -p relay-sim -- down
 ```
 
 `sim/scripts/pair-and-sync.sh` and `sim/scripts/kill-during-mailbox-push.sh` are the same flow as scripts. The lab defaults to `./.relay-sim`, or `RELAY_SIM_LAB` / `--lab`.
+
+## Simulator
+
+`relay-vopr` runs many engines in one process on one thread, on a virtual clock, over a virtual network, in the style of TigerBeetle's VOPR. It is the fast way to test sync scenarios: a seed fixes the workload, the message schedule and every injected fault, and a failing seed replays exactly. See [`apps/relay-vopr/README.md`](../apps/relay-vopr/README.md).
+
+```bash
+cargo run -p relay-vopr -- list
+cargo run -p relay-vopr -- run --scenario chaos --seed 7 --trace
+cargo run -p relay-vopr -- sweep --seeds 100            # every scenario, all cores
+RELAY_VOPR_SEEDS=20 cargo nextest run -p relay-vopr      # the CI test, wider
+```
+
+CI runs a one-seed smoke on every pull request, the full suite on Linux when
+the engine changes (or on the `ci:full-sim` label) and on pushes to `main`,
+and every OS plus a wide seed sweep nightly.
 
 ## Install from source
 

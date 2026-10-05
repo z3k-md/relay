@@ -284,7 +284,7 @@ pub struct FolderEnd {
     pub path: String,
 }
 
-/// Sync `source` with `dest` (remote explorer Stage 3).
+/// Sync `source` with `dest` (D39).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderPairParams {
     pub source: FolderEnd,
@@ -327,7 +327,7 @@ pub struct FolderPairResult {
     pub dest_path: String,
 }
 
-/// Open a file on a paired device (remote explorer Stage 4).
+/// Open a file on a paired device (D40).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRemoteParams {
     /// The peer's local name.
@@ -371,6 +371,16 @@ pub struct QuickOpen {
 pub struct RemoteParams {
     pub peer: String,
     pub call: relay_core::remote::RemoteCall,
+}
+
+/// Run a connection test against a connected peer (D48).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedTestParams {
+    /// The peer's local name.
+    pub peer: String,
+    /// Milliseconds each way; `SPEED_TEST_DEFAULT_MS` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

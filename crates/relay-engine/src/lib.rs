@@ -17,9 +17,11 @@ mod reports;
 mod resolve;
 mod scan;
 mod secrets;
+mod server;
 mod sync;
 mod watch;
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,12 +60,13 @@ pub use relay_store::ObjectStore;
 pub use replica::{ReplicaPull, ReplicaPush, ReplicaSpacePush, ReplicaStatus, TransportStatus};
 pub use reports::{
     DeleteHold, GcReport, MASS_DELETE_DENOMINATOR, MASS_DELETE_MIN_COUNT, MASS_DELETE_NUMERATOR,
-    MountStatus, PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport, Status, VerifyReport,
-    Warning,
+    MountHealth, MountStatus, PeerSpaceStatus, PeerStatus, ScanOptions, ScanReport, Status,
+    VerifyReport, Warning,
 };
 pub use resolve::{
     GitResolveReport, Resolution, ResolveReport, resolve_conflict, resolve_git_conflicts,
 };
+pub use server::{ServerMount, ServerStatus};
 pub use sync::{PairedPeer, Rejected, SyncEvent, SyncInput, SyncOutput, Syncer};
 pub use watch::{RunExit, WatchEvent, WatchOptions};
 
@@ -126,6 +129,8 @@ pub struct Engine {
     lock: Option<File>,
     /// Sync roots for online-only files (D43). Empty unless a host is set.
     placeholders: placeholders::Placeholders,
+    /// Whether each mount root folds case, probed once per path.
+    case_probe: HashMap<MountId, (PathBuf, bool)>,
 }
 
 impl Engine {
@@ -160,6 +165,7 @@ impl Engine {
             box_key: Some(box_key),
             lock: Some(lock),
             placeholders: Default::default(),
+            case_probe: HashMap::new(),
         })
     }
 
@@ -210,6 +216,7 @@ impl Engine {
             box_key: Some(box_key),
             lock: Some(lock),
             placeholders: Default::default(),
+            case_probe: HashMap::new(),
         })
     }
 
@@ -239,6 +246,7 @@ impl Engine {
             box_key,
             lock: None,
             placeholders: Default::default(),
+            case_probe: HashMap::new(),
         })
     }
 
@@ -392,8 +400,19 @@ impl Engine {
             return self.attach_mount(&space_rec, existing, &canonical, includes, excludes);
         }
 
+        // A mount a peer offered under this name keeps the peer's id, so the
+        // two attach to the same entries.
+        let offered_id = self
+            .db
+            .repo()
+            .list_offers()?
+            .into_iter()
+            .filter(|offer| offer.space_id == space_rec.id)
+            .flat_map(|offer| offer.mounts)
+            .find(|offered| offered.name == mount)
+            .map(|offered| offered.id);
         let mount_rec = Mount {
-            id: relay_core::MountId::new(),
+            id: offered_id.unwrap_or_else(relay_core::MountId::new),
             space: space_rec.id,
             name: mount.to_owned(),
         };
@@ -647,6 +666,8 @@ impl Engine {
         self.ensure_writable()?;
         let live = self.db.repo().live_objects()?;
         let sweep = self.store.sweep(&live, grace)?;
+        // Swept objects leave the index too, or `verify` reports them missing.
+        self.db.transaction(|repo| repo.prune_objects(&live))?;
         let tmp_cleaned = self.store.clean_tmp(TMP_CLEAN_AGE)?;
         Ok(GcReport {
             removed: sweep.removed,
@@ -970,6 +991,57 @@ impl Engine {
             .map_err(EngineError::from_db)
     }
 
+    /// Each mount's path and folder health: the part of [`Engine::status`]
+    /// a UI shows on every visit. It skips the entry counts and the object
+    /// store walk, which grow with the number of files synced.
+    pub fn mount_health(&self) -> Result<Vec<MountHealth>, EngineError> {
+        self.mounts(None)?
+            .into_iter()
+            .map(|(space, config)| self.health_of(space, config))
+            .collect()
+    }
+
+    /// Names of the spaces shared with each peer, by peer name.
+    pub fn peer_shares(&self) -> Result<Vec<(String, Vec<String>)>, EngineError> {
+        let mut out = Vec::new();
+        for peer in self.db.repo().list_peers()? {
+            let mut spaces = Vec::new();
+            for space_id in self.db.repo().shared_space_ids(peer.device.id)? {
+                if let Some(space) = self.db.repo().space(space_id)? {
+                    spaces.push(space.name);
+                }
+            }
+            spaces.sort();
+            out.push((peer.device.name, spaces));
+        }
+        Ok(out)
+    }
+
+    fn health_of(&self, space: Space, config: MountConfig) -> Result<MountHealth, EngineError> {
+        let (marker_ok, marker_state) = match &config.local_path {
+            None => (false, "NO_PATH".to_owned()),
+            Some(path) => match MountMarker::verify(path, config.mount.id) {
+                Ok(_) => (true, "OK".to_owned()),
+                Err(relay_fs::FsError::MarkerMissing(_)) => (false, "MISSING".to_owned()),
+                Err(relay_fs::FsError::MarkerMismatch { .. }) => (false, "MISMATCH".to_owned()),
+                Err(relay_fs::FsError::MarkerInvalid { .. }) => (false, "INVALID".to_owned()),
+                Err(relay_fs::FsError::MountRootMissing(_)) => (false, "ROOT_MISSING".to_owned()),
+                Err(relay_fs::FsError::NotADirectory(_)) => (false, "NOT_A_DIRECTORY".to_owned()),
+                Err(_) => (false, "ERROR".to_owned()),
+            },
+        };
+        let state = self.db.repo().mount_state(config.mount.id)?;
+        Ok(MountHealth {
+            space: space.name,
+            mount: config.mount.name,
+            path: config.local_path,
+            marker_ok,
+            marker_state,
+            last_scan_ms: state.as_ref().and_then(|s| s.last_scan_ms),
+            last_error: state.and_then(|s| s.last_error),
+        })
+    }
+
     pub fn status(&self) -> Result<Status, EngineError> {
         let local = self
             .db
@@ -981,39 +1053,21 @@ impl Engine {
         let listed = self.mounts(None)?;
         let mut mounts = Vec::with_capacity(listed.len());
         for (space, config) in listed {
-            let entries = self.db.repo().entries_for_mount(config.mount.id)?;
-            let live_entries = entries.iter().filter(|e| !e.is_deleted()).count();
-            let tombstones = entries.len() - live_entries;
-            let (marker_ok, marker_state) = match &config.local_path {
-                None => (false, "NO_PATH".to_owned()),
-                Some(path) => match MountMarker::verify(path, config.mount.id) {
-                    Ok(_) => (true, "OK".to_owned()),
-                    Err(relay_fs::FsError::MarkerMissing(_)) => (false, "MISSING".to_owned()),
-                    Err(relay_fs::FsError::MarkerMismatch { .. }) => (false, "MISMATCH".to_owned()),
-                    Err(relay_fs::FsError::MarkerInvalid { .. }) => (false, "INVALID".to_owned()),
-                    Err(relay_fs::FsError::MountRootMissing(_)) => {
-                        (false, "ROOT_MISSING".to_owned())
-                    }
-                    Err(relay_fs::FsError::NotADirectory(_)) => {
-                        (false, "NOT_A_DIRECTORY".to_owned())
-                    }
-                    Err(_) => (false, "ERROR".to_owned()),
-                },
-            };
-            let state = self.db.repo().mount_state(config.mount.id)?;
+            let (live_entries, tombstones) = self.db.repo().count_entries(config.mount.id)?;
+            let health = self.health_of(space, config)?;
             mounts.push(MountStatus {
-                space: space.name,
-                mount: config.mount.name,
-                path: config.local_path,
-                marker_ok,
-                marker_state,
+                space: health.space,
+                mount: health.mount,
+                path: health.path,
+                marker_ok: health.marker_ok,
+                marker_state: health.marker_state,
                 live_entries,
                 tombstones,
-                last_scan_ms: state.as_ref().and_then(|s| s.last_scan_ms),
-                last_error: state.and_then(|s| s.last_error),
+                last_scan_ms: health.last_scan_ms,
+                last_error: health.last_error,
             });
         }
-        let object_count = self.store.list()?.len() as u64;
+        let object_count = self.store.count()?;
         let mut peers = Vec::new();
         for peer in self.db.repo().list_peers()? {
             let mut spaces = Vec::new();

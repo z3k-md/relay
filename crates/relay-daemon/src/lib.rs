@@ -7,6 +7,7 @@
 mod folder_pair;
 mod host;
 mod placeholders;
+mod protected;
 mod quick_open;
 mod read_copy;
 mod remote;
@@ -33,6 +34,7 @@ const SETTLE_SLICE: Duration = Duration::from_millis(300);
 const SETTLE_CAP: Duration = Duration::from_secs(3);
 const OPEN_RETRY: Duration = Duration::from_secs(5);
 const PAUSE_POLL: Duration = Duration::from_secs(1);
+const PEERS_RETRY: Duration = Duration::from_millis(250);
 const HOST_LOCK_FILE: &str = "relay.host.lock";
 
 pub use relay_ipc::HostKind;
@@ -297,17 +299,22 @@ fn run_loop(
                         net.send(NetCommand::SetRelay(addr));
                     }
                     SyncOutput::SetPeers => {
-                        if let Ok(engine) = Engine::open_read_only(home)
-                            && let Ok(peers) = engine.peers()
-                        {
-                            let configs: Vec<PeerConfig> = peers
-                                .iter()
-                                .filter(|p| !p.revoked)
-                                .map(peer_config)
-                                .collect();
-                            host.set_known_peers(configs.clone());
-                            net.send(NetCommand::SetPeers(configs));
-                        }
+                        let configs = match refresh_peers(home) {
+                            Ok(configs) => configs,
+                            Err(err) => {
+                                // The table could not be read, so nothing
+                                // can change: log it and hand the network
+                                // the last list again, unchanged, until the
+                                // next SetPeers.
+                                tracing::error!(
+                                    error = %err,
+                                    "could not re-read peers; keeping the last known list"
+                                );
+                                host.known_peers()
+                            }
+                        };
+                        host.set_known_peers(configs.clone());
+                        net.send(NetCommand::SetPeers(configs));
                     }
                 },
                 &run_stop,
@@ -504,6 +511,24 @@ fn transport_settings(engine: &Engine) -> (Option<String>, bool) {
         }
     };
     (relay, serve)
+}
+
+/// Peers the network layer should trust now, re-read after the engine
+/// changed them. One retry covers a transient failure (a busy database).
+fn refresh_peers(home: &Path) -> Result<Vec<PeerConfig>> {
+    let read = || -> Result<Vec<PeerConfig>> {
+        let peers = Engine::open_read_only(home)?.peers()?;
+        Ok(peers
+            .iter()
+            .filter(|p| !p.revoked)
+            .map(peer_config)
+            .collect())
+    };
+    read().or_else(|err| {
+        tracing::warn!(error = %err, "re-reading peers failed; retrying once");
+        thread::sleep(PEERS_RETRY);
+        read()
+    })
 }
 
 /// The network's view of a peer: where to dial it and what it may do here.
