@@ -3,10 +3,14 @@
 //! Overlapped I/O on a dedicated thread, waiting on the completion event and a
 //! stop event, so dropping the watcher returns promptly. A zero-byte
 //! completion means the kernel buffer overflowed and the caller must rescan.
+//!
+//! The kernel only records changes once the first read is queued, so
+//! [`DirWatch::start`] returns after that read is armed: nothing that happens
+//! after `start` returns is missed.
 
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::WAIT_OBJECT_0;
@@ -51,7 +55,8 @@ const BUFFER_BYTES: usize = 64 * 1024;
 impl DirWatch {
     /// Start watching `dir`. `attributes` adds attribute changes, which is
     /// how cloud-file hydration shows up. `on_events` runs on the watcher
-    /// thread with each completed batch.
+    /// thread with each completed batch. Returns once changes are being
+    /// recorded.
     pub fn start(
         dir: &Path,
         attributes: bool,
@@ -86,9 +91,26 @@ impl DirWatch {
             filter |= FILE_NOTIFY_CHANGE_ATTRIBUTES;
         }
 
+        let (armed_tx, armed_rx) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("relay-dirwatch".into())
-            .spawn(move || run(&dir_handle, &done, &stop_for_thread, filter, &mut on_events))?;
+            .spawn(move || {
+                run(
+                    &dir_handle,
+                    &done,
+                    &stop_for_thread,
+                    filter,
+                    armed_tx,
+                    &mut on_events,
+                )
+            })?;
+        let armed = armed_rx
+            .recv()
+            .unwrap_or_else(|_| Err(io::Error::other("directory watcher thread exited")));
+        if let Err(err) = armed {
+            let _ = thread.join();
+            return Err(err);
+        }
         Ok(Self {
             stop,
             thread: Some(thread),
@@ -110,10 +132,12 @@ fn run(
     done: &OwnedHandle,
     stop: &OwnedHandle,
     filter: FILE_NOTIFY_CHANGE,
+    armed: mpsc::SyncSender<io::Result<()>>,
     on_events: &mut dyn FnMut(Vec<RawEvent>),
 ) {
     // u64 storage keeps the buffer DWORD-aligned, as the API requires.
     let mut buffer = vec![0u64; BUFFER_BYTES / 8];
+    let mut armed = Some(armed);
     loop {
         let mut overlapped = OVERLAPPED {
             hEvent: done.0,
@@ -132,7 +156,14 @@ fn run(
                 None,
             )
         };
-        if started.is_err() {
+        if let Some(armed) = armed.take() {
+            // The first read decides whether `start` succeeds.
+            let failed = started.is_err();
+            let _ = armed.send(started.clone().map_err(io::Error::from));
+            if failed {
+                return;
+            }
+        } else if started.is_err() {
             // The directory went away or the handle broke; tell the caller to
             // look again and stop.
             on_events(vec![(Action::Overflow, String::new())]);
