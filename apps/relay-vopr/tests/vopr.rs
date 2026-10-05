@@ -76,6 +76,7 @@ scenario_tests!(
     disk_errors,
     many_small_batches,
     delete_heavy,
+    home_server,
     chaos,
 );
 
@@ -93,6 +94,7 @@ fn every_scenario_has_a_test() {
         "disk_errors",
         "many_small_batches",
         "delete_heavy",
+        "home_server",
         "chaos",
     ];
     for s in Scenario::all() {

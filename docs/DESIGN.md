@@ -236,6 +236,7 @@ Where things happen:
 | QUIC sessions, object streams | `relay-net/src/session.rs`, `relay-net/src/tls.rs` |
 | Pairing, mDNS, STUN, UDP relay | `relay-net/src/{pairing,discovery,stun,relay}.rs` |
 | Remote management calls | `relay-net/src/control.rs`, `relay-daemon/src/remote.rs`, `relay-daemon/src/folder_pair.rs` |
+| Server role: join and attach shared spaces | `relay-engine/src/server.rs`, `packaging/server/` |
 | Online-only files and placeholders | `relay-engine/src/materialize.rs`, `relay-engine/src/placeholders.rs`, `relay-fs/src/cloud/` |
 | CLI commands | `relay-cli/src/main.rs` |
 

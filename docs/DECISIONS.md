@@ -56,6 +56,8 @@ Add an entry with the next free number (check open pull requests), then run
 | D41 | [Read-only copies](#d41-read-only-copies) |
 | D42 | [Sizes on disk and a faster Browse view](#d42-sizes-on-disk-and-a-faster-browse-view) |
 | D43 | [Online-only files in Explorer](#d43-online-only-files-in-explorer) |
+| D44 | [Self-hosted tiers and accounts](#d44-self-hosted-tiers-and-accounts) |
+| D45 | [Server role](#d45-server-role) |
 
 <!-- index:end -->
 
@@ -1206,3 +1208,65 @@ Plan and later stages: [`proposals/os-integration.md`](proposals/os-integration.
   4 bytes late, which `relay_fs::cloud` reads around, and its callback shims
   abort the process if reporting a failure fails, so callbacks report
   success for everything except a download that could not get its bytes.
+
+## D44. Self-hosted tiers and accounts
+
+Relay is self-hostable end to end. There is no third-party backend: this
+replaces the Supabase Postgres and Storage backend the original design
+planned for a hosted durable replica. The plan is
+[`proposals/home-server.md`](proposals/home-server.md).
+
+- **Three tiers.** (1) Sync between your own devices, with no account and no
+  server. (2) An optional home server you run, in the sync chain, holding a
+  durable copy and history. (3) Later, the same server binary hosted for
+  people without hardware. It is blind by default, so it never holds space
+  keys. Billing exists only at tier 3.
+- **The server is a peer.** It has its own identity and the same protocol,
+  and it is not the authoritative filesystem (DESIGN §5). Its extra duties
+  (durability target, history owner, preferred source, rendezvous) are
+  decided per stage of the proposal.
+- **Accounts are a directory, not a trust root.** Sign-in (OIDC, Google
+  first) finds your devices. The directory stores account email, device
+  names, public keys, and addresses, never file contents or space keys. We
+  run a default instance, and the same component runs inside a home server
+  for self-hosters. A newly signed-in device gets space keys only when an
+  existing device approves it, or from the recovery secret (D30). Approved
+  devices on one account manage each other (D37).
+- **Accountless stays.** Code pairing (D25) remains, and the sync engine
+  never depends on account authentication.
+
+## D45. Server role
+
+Home server Stage 1 ([`proposals/home-server.md`](proposals/home-server.md)).
+A device with the server role keeps a copy of every space its peers share
+with it, with no one at its keyboard.
+
+- **Setting.** `relay server enable --data DIR` stores `server_data`, the
+  canonical folder, which may not overlap the Relay home. `disable` clears
+  it; spaces, mounts, and files stay. `status` lists each kept mount.
+- **Plan.** `Engine::server_plan` returns `ConfigChange`s: a `JoinSpace` for
+  each stored offer from a peer that may manage this device (D37) and is not
+  revoked, and an `AddMount` at
+  `DIR/<space>/<mount>` for each mount of a joined or planned space with no
+  local folder. It creates those folders. A space or mount name that is not
+  one safe folder name (`.`, `..`, a `:`) is skipped, as is an offer whose
+  name another space here already has.
+- **Live.** The loop runs the plan at start and after each `SpaceOffers`
+  frame, through the same `ConfigQueue` and follow-ups as any live change
+  (D36), so sessions stay up and the new mount's index is requested at
+  once. A change that fails warns once and is not retried until the loop
+  restarts. A mount removed by hand on a server is attached again on the
+  next offer; turn the role off to manage mounts by hand.
+- **Only managers.** Auto-join needs the D37 grant, so it adds nothing a
+  manager could not already ask for remotely (D39). Members adopted from an
+  offer (D26) never hold the grant, so a device that reached the server only
+  through a shared space cannot make it join others. The server does not
+  share spaces onward by itself. Materialization is `full` until store mode
+  (Stage 2).
+- **Packaging.** `packaging/server`: a container image (Debian slim, runs as
+  a non-root user, UDP 47321, one volume), a compose file that publishes
+  host port 47322, and a systemd unit. Linux first; `relay service` stays
+  macOS and Windows.
+- **Simulator.** `relay-vopr` topology `Server` and scenario `home_server`:
+  three devices that pair only with the server, which joins and attaches
+  through `server_plan` and makes no edits of its own.

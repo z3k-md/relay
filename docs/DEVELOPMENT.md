@@ -36,6 +36,8 @@ apps/
   relay-sim      local multi-process lab
   relay-vopr     deterministic single-process sync simulator
 scripts/        install, cross-build, deploy, release, check-docs
+packaging/
+  server/       home server container image, compose file, systemd unit
 docs/
   USAGE.md       commands and safety rules
   ROADMAP.md     what is built and what is next
