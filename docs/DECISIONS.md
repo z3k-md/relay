@@ -1,12 +1,10 @@
-# Design decisions and amendments
+# Design decisions
 
-`DESIGN.md` is the original specification. This file records where the
-implementation deliberately departs from or tightens it, and why. When the two
-disagree, this file wins.
-
-What is built and what is next is [`ROADMAP.md`](ROADMAP.md). A sentence here
-that says "next phase", "not yet", or "this phase still has no …" describes
-that decision when it was written. Later decisions supersede it.
+Each entry records a choice the implementation made and why. Code comments
+cite these numbers, so a superseded entry stays as a one-line pointer to what
+replaced it. [`DESIGN.md`](DESIGN.md) summarizes the current system; when it
+and an entry disagree, the entry wins. What is built and what is next is
+[`ROADMAP.md`](ROADMAP.md).
 
 ## D1. `.git` is synchronized like any other directory
 
@@ -17,11 +15,11 @@ are generic rules that happen to matter most for Git:
 - **Transient files are excluded by default**: `**/.git/**/*.lock`,
   `.git/gc.pid`, `.git/gc.log`, and fsmonitor state. A replicated lock file
   would make Git on the other device refuse to run.
-- **Immutable before mutable (Phase 2).** Within a directory containing
+- **Immutable before mutable.** Within a directory containing
   `.git/`, content under `objects/**` is materialized before `HEAD`, `refs/**`,
   `packed-refs` and `index`, so a ref never points at an object that has not
   arrived yet.
-- **Repository-level conflict groups (Phase 3).** Concurrent versions of the
+- **Repository-level conflict groups (D21).** Concurrent versions of the
   mutable files in one `.git` directory resolve to the same device's version.
   Losing refs become conflict copies such as
   `refs/heads/main.relay-conflict-<device>-<counter>`, which Git shows as
@@ -56,14 +54,14 @@ old backup from reissuing counters it already used.
 ## D4. Per-device change sequence instead of per-entry acknowledgements
 
 Every change a device commits to its index gets the next value of a persistent,
-monotonic `Sequence`. Index exchange (Phase 2) is "changes after N", and
+monotonic `Sequence`. Index exchange (D16) is "changes after N", and
 acknowledgements are per-peer watermarks. The `replica_acks` table from the
 design is replaced by this.
 
 ## D5. Merge bases are recorded from the first release
 
 Each version stores `parent_object`, the content it was derived from, and every
-version is appended to `history`. Three-way merge (Phase 11) needs bases that
+version is appended to `history`. Three-way merge (D31) needs bases that
 cannot be reconstructed later. GC treats history as a root.
 
 ## D6. Object store GC is mark-and-sweep
@@ -85,7 +83,7 @@ database commit has not landed yet is never collected.
   or invalid names, nested mounts) are protected: they are not tombstoned by
   that scan.
 - Entries that are no longer selected because a rule or `.relayignore`
-  changed are reported as deselected and never tombstoned (design §48.6).
+  changed are reported as deselected and never tombstoned (DESIGN §9.6).
 - A file that changes while it is being hashed is reported as unstable and left
   untouched until the next scan.
 
@@ -125,17 +123,14 @@ database commit has not landed yet is never collected.
 Version vectors are stored normalized with a small integer reference per
 device instead of repeating 32-byte ids on every row.
 
-## D11. Device identity before Phase 2
+## D11. Superseded by D14
 
-Until peer authentication exists, `DeviceId` is 32 random bytes generated at
-`relay init`. Phase 2 derives it from an Ed25519 public key. No state leaves the
-machine before then, so nothing shared needs migrating. Key wrapping for Space
-keys (Phase 9) will use a separate X25519 key signed by the identity key.
+Device identity before peer authentication (random ids).
 
-## D12. Phase 0 CLI talks to the engine directly
+## D12. Superseded by D24 and D36
 
-The `relay` binary embeds `relay-engine` in Phase 0. From Phase 4 it becomes a
-thin IPC client of `relayd`, and commands keep their names.
+The CLI embeds the engine when no host runs and talks to a running host over
+local IPC. There is no separate `relayd`.
 
 ## D13. Watching
 
@@ -149,7 +144,7 @@ watcher and relies on those periodic scans. Changing the root `.relayignore`
 or the mount marker forces a full scan (rules or mount identity changed).
 Nested `.relayignore` files are not yet supported.
 
-## D14. Device identity and transport security (Phase 2)
+## D14. Device identity and transport security
 
 Supersedes D11. Each device owns an Ed25519 key at `<home>/identity/device.key`
 (PKCS#8 PEM, mode 0600 on Unix). `DeviceId` is the raw 32-byte public key.
@@ -158,9 +153,8 @@ A self-signed certificate is regenerated from the key at every start.
 Peers talk QUIC (quinn) with TLS 1.3 (rustls, `ring` provider) and ALPN
 `relay/1`. Both sides present certificates. Each side accepts a certificate
 only if its Ed25519 key equals the id of a peer the user added with
-`relay peer add`; anything else fails the handshake. There is no CA, no TOFU
-and no discovery in Phase 2. A home created before this change has a random
-id and no key; it must be re-initialized.
+`relay peer add`; anything else fails the handshake. There is no CA and no
+TOFU.
 
 ## D15. Pairing, addressing and sharing
 
@@ -260,7 +254,7 @@ engine's single input queue, which also carries watcher signals. The network
 writes fetched objects into the object store directly (verified by hash
 before rename) and serves objects from it; it never touches the database.
 
-## Phase 2 implementation notes
+## Sync implementation notes
 
 - `to_os_path` returns `Result` and rejects any logical component that is not
   exactly one `Component::Normal` on the current OS (`FsError::Unrepresentable`).
@@ -464,8 +458,7 @@ is unchanged.
 
 A running host (`relay run`, `relay service`, or the desktop app) exposes a
 blocking local-socket RPC so the CLI can inspect and steer it without
-opening the engine for write. Pairing, discovery, and extra auth tokens are
-out of scope.
+opening the engine for write. Extra auth tokens are out of scope.
 
 - **Transport.** The `interprocess` crate's local sockets, sync/blocking, one
   thread per client. Unix: a socket file `<home>/relay.sock`. If that path
@@ -520,8 +513,7 @@ out of scope.
 
 Pairing replaces copying device ids by hand. A short code plus the existing
 QUIC port is enough on the same LAN; over Tailscale the joiner also types an
-address. There is no internet rendezvous and no NAT traversal in this phase
-(D32 later hole-punches through the mailbox).
+address. There is no internet rendezvous.
 
 - **Code.** Format `NN-NNNN-NNNN` (ten decimal digits). The first two digits
   are a public *nameplate* used only to pick the right mDNS instance. The
@@ -584,15 +576,13 @@ address. There is no internet rendezvous and no NAT traversal in this phase
   `100.x.y.z:47321`).
 - **Known limits.** No internet rendezvous, no hole punching, no pairing
   through a third device. Two devices that cannot reach each other's UDP
-  port cannot pair. Peer revocation in this phase is `relay peer remove`
-  (D30 adds `relay peer revoke`).
+  port cannot pair.
 
 ## D26. Space membership
 
 A space shared with several peers is a membership set. Relaying files through
 a middle machine that has the folder attached is ordinary index exchange —
-not a separate protocol. This phase still has no NAT traversal, no encryption at
-rest, and no durable cloud replica for devices that never overlap online.
+not a separate protocol.
 
 - **Members on the offer.** `SpaceOffer` lists the other peers that space is
   also shared with (name and addresses from the local peers table). Old peers
@@ -615,9 +605,6 @@ rest, and no durable cloud replica for devices that never overlap online.
   with no local path are not stored and cannot be forwarded. Devices that are
   not directly connected still need a path through a member that has the
   folder; there is no introduction of devices for a space you have not joined.
-- **Known limits.** No NAT traversal, no encryption at rest, no durable
-  replica when devices never overlap. Nested `.relayignore` is still
-  root-only.
 
 ## D27. Replication policies
 
@@ -659,10 +646,7 @@ Share remains required — a policy never grants sync by itself.
 - **Groups.** Named sets of device ids (peers or this device). Deleting a
   group removes the group link from policies but keeps direct peer targets
   and the policy itself.
-- **Out of scope.** No durability classes, no metadata-only mode, no GUI
-  policy editor. Nested `.relayignore` is still root-only. This phase still
-  has no durable replica, encryption at rest, automatic text merge, or NAT
-  traversal (those land in D29–D32).
+- **Out of scope.** No durability classes and no policy editor in the app.
 
 ## D28. Sync progress is a snapshot
 
@@ -690,14 +674,12 @@ When two devices never overlap online, a shared directory acts as a
 non-materializing mailbox so each can catch up later. No QUIC session is
 required for that catch-up. The mailbox stores the same content-addressed
 bytes as the local object store plus length-prefixed prost entry logs; it is
-not a filesystem and does not reconstruct working trees. Encryption of
-objects at rest was the following phase (shipped in D30). This phase stores
-plaintext CAS bytes.
+not a filesystem and does not reconstruct working trees. Objects are sealed
+with the space key (D30).
 
 - **Path.** Local setting `replica_path` (string). Empty or absent means
   peer-only sync (today's behavior). `relay replica set PATH` / `clear` /
-  `status` / `gc`. One filesystem backend (`relay-replica`); no network or
-  hosted backend yet.
+  `status` / `gc`. One filesystem backend (`relay-replica`).
 - **Push.** After a scan commits or remote entries are applied, the watch
   loop pushes this device's new index entries and any referenced objects the
   mailbox does not already have. Watermark `replica_push.pushed_seq` advances
@@ -719,8 +701,6 @@ plaintext CAS bytes.
   (`--mirror`) keeps the object of the latest live entry per path even after
   ack; older versions follow the mailbox rule. A transient apply does not
   advance the received cursor.
-- **Out of scope for D29.** No hosted backend. Nested `.relayignore` is still
-  root-only. Encryption, text merge, and NAT are D30–D32.
 
 ## D30. Encryption at rest
 
@@ -738,7 +718,7 @@ mailbox objects still open.
   space, and drops it from the dial set. That is a soft revoke: data already
   decrypted on that device remains. `relay space rotate` starts a new
   generation for future objects; older generations still open.
-- **Known limits.** No hosted backend. Logs are not encrypted. A revoked
+- **Known limits.** Logs are not encrypted. A revoked
   device that already held a generation can still decrypt objects sealed
   with that generation until they age out of the mailbox.
 
@@ -773,7 +753,8 @@ close-to-tray behavior are not part of the Android build.
   not use the desktop `directories` path or a bundled `relay` binary.
 - **Sync.** The host runs while the app process is alive. Leaving the app can
   stop sync; a foreground service is later work. Connectivity is unchanged:
-  LAN, or an explicit address such as Tailscale. NAT traversal is still D32.
+  LAN, or an explicit address such as Tailscale; D32 and D34 reach other
+  networks.
 - **Mounts.** No Android-specific folder picker yet. The supported place for
   phone files is the app sandbox; pointing a mount at an arbitrary path is
   not a supported workflow.
@@ -782,8 +763,8 @@ close-to-tray behavior are not part of the Android build.
 
 ## D34. Generalized networking
 
-Phase 12 removes the requirement that every pair of devices share a LAN,
-Tailscale, or hand-written address. There is still no hosted account. Direct
+This removes the requirement that every pair of devices share a LAN,
+Tailscale, or hand-written address. Direct
 QUIC stays preferred. The relay is a dumb UDP forwarder so the QUIC handshake
 remains end to end between the two devices.
 
@@ -816,18 +797,17 @@ remains end to end between the two devices.
   mailbox object (sealed or legacy plaintext) into the local store, before
   the existing retry limit gives up.
 - **Out of scope.** No public TURN account, no global directory beyond the
-  mailbox file, no connection migration after a path is up, no Phase 13
-  materialization modes.
+  mailbox file, no connection migration after a path is up.
 
 ## D35. Selective materialization
 
-Phase 13. A device can take part in a space without storing every file's
+A device can take part in a space without storing every file's
 bytes. Replication policies (D27) still decide who is offered a path.
 Materialization is a local decision about what this device does with a path
 it wants. Rules are not synced and do not change SpaceOffer.
 
 - **Default.** With no rules, every wanted file is fully materialized, which
-  is the behavior through Phase 12.
+  as before.
 - **Rules.** Local to one device and one space. A rule has a name, one or
   more selectors, and a mode: `full`, `metadata`, `demand`, or `exclude`.
   Selectors are the same case-sensitive globs as policies, matched against
@@ -854,15 +834,14 @@ it wants. Rules are not synced and do not change SpaceOffer.
   for a metadata or unhydrated demand entry whose object is missing. Full
   copies, and demand copies that are already hydrated, still stop on a
   missing object.
-- **Out of scope.** No GUI editor. No placeholder files. No OS
-  file-on-demand. D27's "no metadata-only mode" line described that phase
-  and stays.
+- **Out of scope.** No rule editor in the app beyond folder choices (D38).
+  OS placeholders came later (D43).
 
 ## D36. Configuration changes on the running host
 
 Space, mount, share, materialization, peer, group, and policy edits, and
 held-delete decisions, are data: a `relay_core::ConfigChange`. Every caller builds one: the CLI, the desktop
-app, and later a peer that manages this device (remote explorer proposal).
+app, and a peer that manages this device (D37, D39).
 This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
 `add_mount` / `share` IPC methods.
 
@@ -890,8 +869,8 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
   loop and retried after peer frames until the offer arrives or the wait
   ends. A third device setting up a pair sends the join and the share on
   different connections. Direct writes do not wait.
-- **Remove mount.** Detach only. The folder and its files stay (§48.6). The
-  local index rows and history for that mount are dropped, because an
+- **Remove mount.** Detach only. The folder and its files stay (DESIGN
+  §9.6). The local index rows and history for that mount are dropped, because an
   unattached mount stores no entries (D16): kept rows would turn a later
   attach to another folder into "every file was deleted." The `.relay-mount`
   marker is removed. A marker this device wrote for a mount that is no
@@ -910,8 +889,9 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
 
 ## D37. Remote management
 
-A paired device can be allowed to manage another: browse its folders now,
-set up sync on it later (remote explorer proposal, Stages 2 and 3).
+A paired device can be allowed to manage another: browse its folders, set up
+sync on it (D39), and open its files (D40, D41). D46 limits what the grant
+reaches.
 
 - **A separate grant.** `peers.may_manage` on the managed device means
   "this peer may manage me." It is set only on purpose: the pairing option
@@ -950,13 +930,12 @@ set up sync on it later (remote explorer proposal, Stages 2 and 3).
   `offline`, `failed`. An unknown code from a newer peer reads as `failed`.
 - **macOS.** `Info.plist` carries folder usage strings. Settings shows
   whether Relay has Full Disk Access and opens the pane.
-- **Known limits.** Read-only so far: no remote writes (Stage 3) and no file
-  contents (Stage 5). The target must be online. Listings are not logged to
-  activity; remote writes will be.
+- **Known limits.** The target must be online. Listings are not logged to
+  activity.
 
 ## D38. Files view and folder choices
 
-Remote explorer Stage 1 puts D35 in the desktop app.
+The desktop Files view puts D35 in the app.
 
 - **Listing** is one folder at a time (`Repo::entries_in`, a ranged query
   plus a depth test), so a large mount never goes to the UI whole. Each row
@@ -982,7 +961,7 @@ Remote explorer Stage 1 puts D35 in the desktop app.
 
 ## D39. Folder pairs set up from either device
 
-Remote explorer Stage 3: one device sets up sync between a folder on itself
+One device sets up sync between a folder on itself
 or a peer and a folder on another device, with nothing done by hand on the
 others.
 
@@ -1025,7 +1004,7 @@ others.
 
 ## D40. Opening a file that is not synced here
 
-Remote explorer Stage 4. From Browse or `relay open PEER PATH`, a file on a
+From Browse or `relay open PEER PATH`, a file on a
 managed device opens here as if it had been synced all along.
 
 - **`Locate`** asks the other device for the file's folder, name, size, and
@@ -1059,7 +1038,7 @@ managed device opens here as if it had been synced all along.
 
 ## D41. Read-only copies
 
-Remote explorer Stage 5: a quick look at a file on a managed device that
+A quick look at a file on a managed device that
 sets nothing up on either device.
 
 - **Same stream as objects.** `ObjectRequest.read_file { path, max_bytes }`
@@ -1084,7 +1063,6 @@ sets nothing up on either device.
   "Read-only" next to each file and then "Sync this folder to edit".
 - **Whole file.** No hashing against an index (there is none); the size
   check and QUIC's integrity are what a quick look gets.
-
 
 ## D42. Sizes on disk and a faster Browse view
 

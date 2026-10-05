@@ -23,7 +23,7 @@ crates/
   relay-store    BLAKE3 content-addressed object store
   relay-db       SQLite schema, migrations, local index
   relay-replica  durable mailbox (a filesystem directory)
-  relay-crypto  Ed25519 device identity and certificate
+  relay-crypto   device identity, certificates, space keys, sealing
   relay-proto    peer wire protocol
   relay-net      QUIC transport, pinned mutual TLS, pairing, LAN discovery
   relay-engine   scan, watch, sync, conflicts, history
@@ -38,10 +38,10 @@ scripts/        install, cross-build, deploy, release
 docs/
   USAGE.md       commands and safety rules
   ROADMAP.md     what is built and what is next
-  DESIGN.md      original specification
-  DECISIONS.md   amendments adopted during implementation
+  DESIGN.md      how Relay works and the rules it keeps
+  DECISIONS.md   numbered decisions (cited in code as D-numbers)
   RELEASING.md   desktop release and updater signing
-  proposals/     notes that are not decisions yet
+  proposals/     plans that are not decisions yet
 ```
 
 ## Lab

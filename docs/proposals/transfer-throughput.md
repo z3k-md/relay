@@ -1,8 +1,7 @@
 # Transfer throughput
 
-Proposal for moving photos and video quickly. This does not amend
-[`DESIGN.md`](../DESIGN.md) or [`DECISIONS.md`](../DECISIONS.md). Those stay
-the source of truth until a decision adopts any of this.
+Proposal for moving photos and video quickly. Nothing here is decided until a
+decision in [`DECISIONS.md`](../DECISIONS.md) adopts it.
 
 The audience is a later performance pass. The order below is the order to
 pick the work up in. Measure first, then resume, then the packet-size cap.
@@ -70,8 +69,8 @@ parallelism. One video is a single stream.
   scope (D34). Resume covers that failure without migration.
 
 Whole-file objects are the right shape for source and documents
-([`DESIGN.md`](../DESIGN.md) §14.1). Photos at a few megabytes fit that.
-Video is the case §14.1 already deferred to chunking.
+([`DESIGN.md`](../DESIGN.md) §4). Photos at a few megabytes fit that.
+Video is the case that needs chunking (§5 below).
 
 ## 1. Ranged resume
 
@@ -185,8 +184,8 @@ sequence is just another byte source that honors an offset.
 
 ## 5. Chunks above a threshold
 
-[`DESIGN.md`](../DESIGN.md) §14.1 already names the approach: FastCDC,
-BLAKE3 chunk hashes, manifest objects, threshold somewhere in 8–32 MB.
+The approach: FastCDC, BLAKE3 chunk hashes, manifest objects, threshold
+somewhere in 8–32 MB.
 Files under the threshold stay one object so a source tree does not turn
 into a pile of chunks.
 
@@ -226,7 +225,7 @@ two peers is not worth a second writer on the same partial.
 
 ## 7. Selective copies
 
-Phase 13 ([`ROADMAP.md`](../ROADMAP.md)) is the product control for a media
+Selective materialization (D35) is the product control for a media
 library: full, metadata-only, on-demand, and excluded copies. Throughput
 work does not replace that. A fast pipe that still copies every video onto
 every device is the wrong default for a library.
