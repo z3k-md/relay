@@ -173,6 +173,14 @@ impl Host {
         }
     }
 
+    /// The peer list last handed to the network layer.
+    pub fn known_peers(&self) -> Vec<PeerConfig> {
+        self.known_peers
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     pub fn take_pair_terms(&self) -> PairTerms {
         self.pair_terms
             .lock()
@@ -212,12 +220,10 @@ impl Host {
     }
 
     pub(crate) fn peer_named(&self, name: &str) -> Result<PeerInfo, RpcErrorBody> {
-        Engine::open_read_only(&self.home)
+        let peers = Engine::open_read_only(&self.home)
             .and_then(|engine| engine.peers())
-            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
-            .into_iter()
-            .find(|p| p.name == name)
-            .ok_or_else(|| RpcErrorBody::new("not_found", format!("unknown peer {name:?}")))
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
+        peer_with_name(peers, name)
     }
 
     /// Make a remote call on a connected peer and wait for the answer.
@@ -1185,9 +1191,53 @@ fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
     })
 }
 
+/// The one peer called `name`. Names come from pairing and from the peer's
+/// own `Hello`, so two peers can share one; such a name is refused rather
+/// than resolved by row order, or a call meant for one device could reach
+/// the other.
+fn peer_with_name(peers: Vec<PeerInfo>, name: &str) -> Result<PeerInfo, RpcErrorBody> {
+    let mut matching = peers.into_iter().filter(|p| p.name == name);
+    let found = matching
+        .next()
+        .ok_or_else(|| RpcErrorBody::new("not_found", format!("unknown peer {name:?}")))?;
+    if matching.next().is_some() {
+        return Err(RpcErrorBody::new(
+            "conflict",
+            format!("ambiguous peer name {name:?}: more than one peer has it"),
+        ));
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer(name: &str) -> PeerInfo {
+        PeerInfo {
+            name: name.into(),
+            id: DeviceId::random(),
+            addresses: Vec::new(),
+            added_at_ms: 0,
+            last_seen_ms: None,
+            revoked: false,
+            may_manage: false,
+        }
+    }
+
+    #[test]
+    fn a_name_two_peers_share_is_refused() {
+        let peers = vec![peer("laptop"), peer("alice"), peer("alice")];
+        let laptop = peers[0].id;
+        assert_eq!(peer_with_name(peers.clone(), "laptop").unwrap().id, laptop);
+        let err = peer_with_name(peers.clone(), "alice").unwrap_err();
+        assert_eq!(err.code, "conflict");
+        assert!(err.message.contains("ambiguous"), "{}", err.message);
+        assert_eq!(
+            peer_with_name(peers, "nobody").unwrap_err().code,
+            "not_found"
+        );
+    }
 
     fn transfer(bytes_done: u64) -> EngineTransfer {
         EngineTransfer {
