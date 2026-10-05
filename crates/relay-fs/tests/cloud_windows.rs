@@ -55,6 +55,14 @@ fn read_elsewhere(path: &Path) -> Vec<u8> {
     out.stdout
 }
 
+/// The system may report a root's path in another form (case, prefix).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 fn placeholder_state(path: &Path) -> (Option<ObjectId>, bool, bool) {
     match cloud::probe(path).unwrap() {
         Probe::Placeholder {
@@ -87,10 +95,12 @@ fn placeholders_download_on_open_and_free_up_space() {
         display_name: "Relay test",
     })
     .unwrap();
+    let roots = cloud::registered();
     assert!(
-        cloud::registered()
+        roots
             .iter()
-            .any(|r| r.account == account && r.path == root)
+            .any(|r| r.account == account && same_dir(&r.path, &root)),
+        "{root:?} ({account}) is not among {roots:?}"
     );
 
     let content = b"hello from another device".to_vec();

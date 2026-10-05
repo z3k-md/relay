@@ -106,32 +106,35 @@ pub(super) fn unregister(account: &str) -> Result<(), FsError> {
 }
 
 pub(super) fn registered() -> Vec<RegisteredRoot> {
-    let found = catch_unwind(|| {
-        let Ok(roots) = cloud_filter::root::active_roots() else {
-            return Vec::new();
-        };
-        roots
-            .into_iter()
-            .filter_map(|info| {
-                let id = info.id();
-                let (provider, _, account) = id.to_components();
-                if provider.to_os_string() != super::PROVIDER {
-                    return None;
-                }
-                let account = account.to_string_lossy();
-                // Same provider and account under this user's SID.
-                let mine = root_id(&account).ok()?;
-                if mine.to_os_string() != id.to_os_string() {
+    // `Relay!<SID>!`: every id this user registered starts with it.
+    let Ok(prefix) = root_id("").map(|id| id.to_os_string()) else {
+        return Vec::new();
+    };
+    let prefix = prefix.to_string_lossy().into_owned();
+    let roots = catch_unwind(cloud_filter::root::active_roots)
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    // Other providers' roots can be malformed enough to panic in
+    // `cloud-filter`'s getters, so each one is read on its own.
+    roots
+        .into_iter()
+        .filter_map(|info| {
+            catch_unwind(AssertUnwindSafe(|| {
+                let id = info.id().to_os_string();
+                let account = id.to_str()?.strip_prefix(&prefix)?;
+                if account.is_empty() || account.contains('!') {
                     return None;
                 }
                 Some(RegisteredRoot {
-                    account,
+                    account: account.to_owned(),
                     path: info.path(),
                 })
-            })
-            .collect()
-    });
-    found.unwrap_or_default()
+            }))
+            .ok()
+            .flatten()
+        })
+        .collect()
 }
 
 pub(super) fn connect(path: &Path, provider: Arc<dyn Provider>) -> Result<Connection, FsError> {
