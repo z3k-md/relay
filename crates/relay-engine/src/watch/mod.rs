@@ -29,6 +29,9 @@ use scans::ScanStep;
 const STOP_POLL: Duration = Duration::from_millis(100);
 const RELOAD_POLL: Duration = Duration::from_secs(1);
 const REPLICA_PULL_INTERVAL: Duration = Duration::from_secs(5);
+/// Least time between placeholder passes while index batches stream in. A
+/// mount about to be scanned gets its pass first regardless (D43).
+const PLACEHOLDER_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchOptions {
@@ -221,6 +224,7 @@ impl Engine {
                     match input {
                         input @ (SyncInput::Config { .. }
                         | SyncInput::Fetch { .. }
+                        | SyncInput::FetchObject { .. }
                         | SyncInput::Evict { .. }
                         | SyncInput::ScanFirst { .. }) => {
                             if priority_tx.send(input).is_err() {
@@ -305,6 +309,11 @@ impl Engine {
             .map(|s| format!("{}/{}", s.space, s.mount))
             .collect();
         on_event(&WatchEvent::Started { mounts: names });
+        // Register online-only roots and fill them before the first scans,
+        // so those scans see placeholders and not missing files.
+        self.refresh_placeholder_roots();
+        self.sync_placeholders();
+        let mut last_placeholders = Instant::now();
 
         // Index inside the loop so an add-mount or share that arrives during
         // startup can be applied before a large tree finishes hashing.
@@ -341,6 +350,13 @@ impl Engine {
                 Ok(LoopMsg::Sync(input)) => match input {
                     SyncInput::Rescan { mounts } => {
                         mark_rescan(&mut states, &mounts, Instant::now());
+                    }
+                    SyncInput::Touched { root, paths } => {
+                        apply_signal(
+                            &mut states,
+                            WatchSignal::Changed { root, paths },
+                            Instant::now(),
+                        );
                     }
                     SyncInput::AddPeer(paired) => {
                         if let Err(err) = apply_add_peer(self, &syncer, &paired, &mut output) {
@@ -426,6 +442,7 @@ impl Engine {
                     } => {
                         let result = self.evict(&space, &mount, &path);
                         let _ = reply.send(result.map_err(|err| (&err).into()));
+                        self.placeholders_changed(None);
                     }
                     SyncInput::Config { change, reply } => {
                         if let Some(applied) = config.submit(self, change, reply) {
@@ -443,6 +460,16 @@ impl Engine {
                     other => {
                         // Only a peer frame can carry the offer a waiting join needs.
                         let may_bring_offer = matches!(other, SyncInput::Frame { .. });
+                        if let SyncInput::Frame {
+                            body: relay_proto::frame::Body::IndexBatch(batch),
+                            ..
+                        } = &other
+                        {
+                            let space = relay_proto::space_id_from_bytes(&batch.space_id).ok();
+                            self.placeholders_changed(space);
+                        } else if matches!(other, SyncInput::Fetch { .. }) {
+                            self.placeholders_changed(None);
+                        }
                         emit_sync(syncer.handle(self, other, &mut output), on_event);
                         if may_bring_offer && config.is_waiting() {
                             for applied in config.retry(self) {
@@ -488,6 +515,13 @@ impl Engine {
             );
 
             let jobs = flush_jobs(&mut states, now, &opts);
+            if self.placeholders_pending()
+                && (!jobs.is_empty()
+                    || now.saturating_duration_since(last_placeholders) >= PLACEHOLDER_INTERVAL)
+            {
+                self.sync_placeholders();
+                last_placeholders = now;
+            }
             let mut yielded_for_command = false;
             for job in jobs {
                 if stop.load(Ordering::Relaxed) {
@@ -510,6 +544,7 @@ impl Engine {
                     }
                     ScanStep::Finished { committed } => {
                         if committed {
+                            self.placeholders_changed(Some(state.space_id));
                             emit_sync(syncer.push_local_changes(self, &mut output), on_event);
                             emit_push(
                                 self.push_replica_watch(),

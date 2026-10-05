@@ -136,7 +136,7 @@ fn nfc_matching_entries(dir: &Path, component: &str) -> Result<Vec<PathBuf>, FsE
 
 /// Walk from `root` down to `dir`, creating missing directories one component
 /// at a time. Every *existing* ancestor must be a real directory (not a
-/// symlink, junction, or reparse point).
+/// symlink or junction).
 pub fn ensure_real_dir_chain(root: &Path, dir: &Path) -> Result<(), FsError> {
     walk_dir_chain(root, dir, true)
 }
@@ -221,21 +221,11 @@ pub(crate) fn is_real_directory(meta: &fs::Metadata) -> bool {
     meta.is_dir() && !is_symlink_like(meta)
 }
 
+/// Symlinks and junctions (name-surrogate reparse points, which std reports
+/// as symlinks). Cloud Files placeholders and other reparse points are not
+/// links: a sync root and its folders are real directories.
 pub(crate) fn is_symlink_like(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        use std::os::windows::fs::MetadataExt;
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = meta;
-        false
-    }
+    meta.file_type().is_symlink()
 }
 
 /// Strip `root` from `os_path` and rebuild a [`LogicalPath`].

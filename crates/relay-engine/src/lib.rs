@@ -9,6 +9,7 @@ mod live_config;
 mod materialize;
 mod order;
 mod peers;
+mod placeholders;
 mod policies;
 mod progress;
 mod replica;
@@ -40,6 +41,7 @@ pub use peers::{
     AdoptedMembers, ConflictClass, ConflictInfo, OfferInfo, PeerInfo, classify_conflict,
     group_git_conflicts,
 };
+pub use placeholders::{PlaceholderHost, PlaceholderReport, PlaceholderRoot};
 pub use policies::{GroupInfo, PolicyInfo};
 pub use progress::{
     Bookend, TransferDirection, TransferLive, bookends, format_bytes, format_rate, index_row,
@@ -122,6 +124,8 @@ pub struct Engine {
     box_key: Option<BoxKeyPair>,
     /// Exclusive lock on `<home>/relay.lock`. `None` for a read-only engine.
     lock: Option<File>,
+    /// Sync roots for online-only files (D43). Empty unless a host is set.
+    placeholders: placeholders::Placeholders,
 }
 
 impl Engine {
@@ -155,6 +159,7 @@ impl Engine {
             config: EngineConfig::default(),
             box_key: Some(box_key),
             lock: Some(lock),
+            placeholders: Default::default(),
         })
     }
 
@@ -204,6 +209,7 @@ impl Engine {
             config: EngineConfig::default(),
             box_key: Some(box_key),
             lock: Some(lock),
+            placeholders: Default::default(),
         })
     }
 
@@ -232,6 +238,7 @@ impl Engine {
             config: EngineConfig::default(),
             box_key,
             lock: None,
+            placeholders: Default::default(),
         })
     }
 
@@ -1253,6 +1260,13 @@ fn restore_expected_stat(
     }
     match record.stat {
         Some(stat) => Ok(Some(stat)),
+        None if let Some(stat) = crate::materialize::dehydrated_stat(dest) => {
+            if relay_fs::cloud::placeholder_object(dest) == record.content.object() {
+                Ok(Some(stat))
+            } else {
+                Err(EngineError::DestinationChanged(dest.to_path_buf()))
+            }
+        }
         None => match store.hash_file(dest, None) {
             Ok(outcome) if Some(outcome.id) == record.content.object() => Ok(Some(outcome.stat)),
             Ok(_) => Err(EngineError::DestinationChanged(dest.to_path_buf())),
@@ -1286,6 +1300,8 @@ fn live_entry_matches_disk(
                 Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(err) => Err(EngineError::Io(err)),
             },
+            // A placeholder without data: the bytes are not on disk.
+            None if crate::materialize::dehydrated_stat(&dest).is_some() => Ok(false),
             None => match store.hash_file(&dest, None) {
                 Ok(outcome) => Ok(outcome.id == *object),
                 Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {

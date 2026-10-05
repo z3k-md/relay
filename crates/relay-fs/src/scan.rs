@@ -20,6 +20,9 @@ pub struct ScannedEntry {
     pub stat: StatHint,
     pub executable: bool,
     pub symlink_target: Option<String>,
+    /// A Cloud Files placeholder whose bytes are not on disk (D43). Reading
+    /// it would download it, so the engine must not hash it.
+    pub dehydrated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,7 +206,6 @@ fn load_root_relayignore(root: &Path, warnings: &mut Vec<ScanWarning>) -> Option
 #[derive(Default)]
 struct WalkEarly {
     warnings: Vec<ScanWarning>,
-    extra_symlinks: Vec<PathBuf>,
 }
 
 fn map_policy(err: PolicyError) -> FsError {
@@ -255,19 +257,7 @@ fn walk_tree(
         }
     }
 
-    let WalkEarly {
-        warnings: mut early_warnings,
-        extra_symlinks,
-    } = early.into_inner();
-    warnings.append(&mut early_warnings);
-    for os_path in extra_symlinks {
-        if let Some(scanned) = collect_symlink_path(root, &os_path, rules, warnings) {
-            entries.push(scanned);
-            if !on_entry() {
-                return Ok(());
-            }
-        }
-    }
+    warnings.append(&mut early.into_inner().warnings);
     Ok(())
 }
 
@@ -484,6 +474,7 @@ fn maybe_emit_ancestor_dir(
             stat,
             executable: false,
             symlink_target: None,
+            dehydrated: false,
         });
     }
     scopes.push(ScanScope {
@@ -512,15 +503,11 @@ fn contains_mount_marker(dir: &Path) -> bool {
     dir.join(MOUNT_MARKER).is_file()
 }
 
+/// Symlinks and junctions are links (std reports name-surrogate reparse
+/// points as symlinks). Other reparse points, such as Cloud Files
+/// placeholders and their folders, are ordinary files and directories.
 fn is_real_directory(meta: &fs::Metadata) -> bool {
-    meta.is_dir() && !is_symlink_or_junction(meta)
-}
-
-fn is_symlink_or_junction(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    is_windows_reparse_meta(meta)
+    meta.is_dir() && !meta.file_type().is_symlink()
 }
 
 fn filter_entry(
@@ -543,14 +530,6 @@ fn filter_entry(
     };
 
     if is_bookkeeping_component(name) {
-        return false;
-    }
-
-    if is_windows_reparse_dir(entry) {
-        early
-            .borrow_mut()
-            .extra_symlinks
-            .push(entry.path().to_path_buf());
         return false;
     }
 
@@ -667,7 +646,7 @@ fn finish_entry(
     rules: &MountRules,
     warnings: &mut Vec<ScanWarning>,
 ) -> Result<Option<ScannedEntry>, FsError> {
-    let (kind, symlink_target) = if file_type.is_symlink() || is_windows_reparse_meta(meta) {
+    let (kind, symlink_target) = if file_type.is_symlink() {
         match read_symlink_target(&os_path) {
             Ok(target) => (EntryKind::Symlink, Some(target)),
             Err(warning) => {
@@ -698,6 +677,7 @@ fn finish_entry(
     }
 
     let executable = kind == EntryKind::File && is_executable(meta);
+    let dehydrated = kind == EntryKind::File && crate::cloud::is_dehydrated(meta);
 
     Ok(Some(ScannedEntry {
         path,
@@ -706,55 +686,8 @@ fn finish_entry(
         stat,
         executable,
         symlink_target,
+        dehydrated,
     }))
-}
-
-fn collect_symlink_path(
-    root: &Path,
-    os_path: &Path,
-    rules: &MountRules,
-    warnings: &mut Vec<ScanWarning>,
-) -> Option<ScannedEntry> {
-    let path = match to_logical_path(root, os_path) {
-        Ok(path) => path,
-        Err(FsError::NonUtf8(path)) => {
-            warnings.push(ScanWarning::NonUtf8Name(path));
-            return None;
-        }
-        Err(FsError::InvalidName { os_path, reason }) => {
-            warnings.push(ScanWarning::InvalidName { os_path, reason });
-            return None;
-        }
-        Err(_) => return None,
-    };
-    let target = match read_symlink_target(os_path) {
-        Ok(target) => Some(target),
-        Err(warning) => {
-            warnings.push(warning);
-            return None;
-        }
-    };
-    if !rules.is_selected(&path, EntryKind::Symlink) {
-        return None;
-    }
-    let meta = match fs::symlink_metadata(os_path) {
-        Ok(meta) => meta,
-        Err(err) => {
-            warnings.push(ScanWarning::Unreadable {
-                os_path: os_path.to_path_buf(),
-                error: err.to_string(),
-            });
-            return None;
-        }
-    };
-    Some(ScannedEntry {
-        path,
-        os_path: os_path.to_path_buf(),
-        kind: EntryKind::Symlink,
-        stat: StatHint::from_metadata(&meta),
-        executable: false,
-        symlink_target: target,
-    })
 }
 
 fn read_symlink_target(os_path: &Path) -> Result<String, ScanWarning> {
@@ -880,38 +813,6 @@ fn is_executable(meta: &fs::Metadata) -> bool {
         meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
-    {
-        let _ = meta;
-        false
-    }
-}
-
-fn is_windows_reparse_dir(entry: &DirEntry) -> bool {
-    #[cfg(windows)]
-    {
-        if !entry.file_type().is_dir() || entry.file_type().is_symlink() {
-            return false;
-        }
-        entry
-            .metadata()
-            .ok()
-            .is_some_and(|meta| is_windows_reparse_meta(&meta))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = entry;
-        false
-    }
-}
-
-fn is_windows_reparse_meta(meta: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        use std::os::windows::fs::MetadataExt;
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
     {
         let _ = meta;
         false
@@ -1072,6 +973,41 @@ mod tests {
         assert!(!effective.is_selected(
             &LogicalPath::new("node_modules/deep/secret/x").unwrap(),
             EntryKind::File
+        ));
+    }
+
+    /// Junctions stay links after D43 narrowed reparse handling to std's
+    /// symlink check: the scan records them and never walks through them.
+    #[cfg(windows)]
+    #[test]
+    fn windows_junction_is_a_link_not_a_folder() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        write_marker(&root);
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"no").unwrap();
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(root.join("jn"))
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let result = scan_mount(&root, &default_rules()).unwrap();
+        let junction = result
+            .entries
+            .iter()
+            .find(|e| e.path.as_str() == "jn")
+            .expect("junction listed");
+        assert_eq!(junction.kind, EntryKind::Symlink);
+        assert!(!paths(&result).contains(&"jn/secret.txt".to_owned()));
+        assert!(!crate::paths::is_real_directory(
+            &fs::symlink_metadata(root.join("jn")).unwrap()
         ));
     }
 

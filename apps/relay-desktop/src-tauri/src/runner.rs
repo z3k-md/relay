@@ -336,6 +336,7 @@ fn sync_loop(home: PathBuf, stop: Arc<AtomicBool>, app: AppHandle) {
             host: HostKind::Desktop,
             enable_stun: true,
             loopback_only: false,
+            placeholders: true,
         };
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {

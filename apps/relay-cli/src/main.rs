@@ -1111,6 +1111,7 @@ fn cmd_run(
             host,
             enable_stun: true,
             loopback_only: false,
+            placeholders: true,
         },
         &stop,
         &mut |event| match event {
@@ -1251,6 +1252,7 @@ fn start_pair_host(home: &Path, listen: SocketAddr) -> Result<PairHost> {
                     host: HostKind::Cli,
                     enable_stun: true,
                     loopback_only: false,
+                    placeholders: true,
                 },
                 &flag,
                 &mut |_| {},

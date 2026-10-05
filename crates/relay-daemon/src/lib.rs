@@ -6,6 +6,7 @@
 
 mod folder_pair;
 mod host;
+mod placeholders;
 mod quick_open;
 mod read_copy;
 mod remote;
@@ -47,6 +48,9 @@ pub struct DaemonOptions {
     /// Advertise only `127.0.0.1:<port>`. The sim lab sets this so peers dial
     /// loopback instead of another interface on the same machine.
     pub loopback_only: bool,
+    /// Show online-only files as native placeholders where the system
+    /// supports it (D43, Windows). `RELAY_PLACEHOLDERS=0` turns it off.
+    pub placeholders: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +77,7 @@ pub fn run(
     tracing::debug!(verbose = opts.verbose, listen = %opts.listen, host = %opts.host, "daemon starting");
     let _host_lock = acquire_host_lock(home)?;
     let host = Host::new(home, opts.host, opts.watch.use_watcher);
+    let roots = placeholders::Roots::new(&host, opts.placeholders);
     read_copy::clear(home);
     let ipc_stop = Arc::new(AtomicBool::new(false));
     let server = Server::bind(home).context("starting the local IPC server")?;
@@ -83,7 +88,7 @@ pub fn run(
         .spawn(move || server.serve(ipc_host, &ipc_stop_thread))
         .context("starting the local IPC thread")?;
 
-    let result = run_loop(home, &opts, stop, on_event, &host);
+    let result = run_loop(home, &opts, stop, on_event, &host, &roots);
     ipc_stop.store(true, Ordering::SeqCst);
     let _ = Client::connect(home);
     let _ = ipc_thread.join();
@@ -100,6 +105,7 @@ fn run_loop(
     stop: &AtomicBool,
     on_event: &mut dyn FnMut(&DaemonEvent),
     host: &Arc<Host>,
+    roots: &Arc<placeholders::Roots>,
 ) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         if is_paused(home) {
@@ -122,6 +128,8 @@ fn run_loop(
 
         host.set_state(HostState::Starting, None);
         host.seed_mounts(&engine);
+        roots.set_store_root(engine.store().root());
+        engine.set_placeholder_host(Arc::clone(roots) as Arc<dyn relay_engine::PlaceholderHost>);
         let identity = Arc::new(engine.load_identity()?);
         let peers: Vec<_> = engine.peers()?.into_iter().filter(|p| !p.revoked).collect();
 

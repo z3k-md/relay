@@ -1110,3 +1110,60 @@ device that owns it, and moves like a file manager.
   that long. Accept now blocks; a watcher wakes it with a throwaway
   connection once the server stops. A remote listing over IPC went from
   ~50 ms to ~4 ms on one machine.
+
+## D43. Online-only files in Explorer
+
+On Windows, online-only files (D35 `demand`) show in Explorer and every Open
+dialog as Cloud Files placeholders, and download when an app opens them.
+Plan and later stages: [`proposals/os-integration.md`](proposals/os-integration.md).
+
+- **Which folders.** A local mount whose space has a `demand` rule is a sync
+  root (provider `Relay`, account = mount id, population always full,
+  hydration full). The engine decides which mounts want one; the daemon
+  registers and connects them through `PlaceholderHost`. Off where the
+  system has no Cloud Files support, where registering fails (FAT, exFAT,
+  ReFS, network shares, a folder inside another provider's root), with
+  `RELAY_PLACEHOLDERS=0`, and in the sim lab and tests (`placeholders:
+  false`). Those mounts behave as before.
+- **What is on disk.** A pass from the sync loop (at start before the first
+  scans, after config changes, index batches, fetches, evictions and
+  committed scans, at most once a second otherwise) makes the disk match
+  the index: a placeholder without data for each online-only file, holding
+  `RLY1` + the object id; online-only folders as real folders; downloaded
+  plain files converted to placeholders in sync; stale placeholders pointed
+  at the current version; leftovers of deleted rows removed.
+- **A stat marks a placeholder.** An online-only row with a stat has a
+  placeholder Relay put on disk, so the scanner reads its absence as a
+  delete (the user deleted or moved it). A row without a stat is index
+  only, as before. Dropping a root clears those stats before it removes
+  the placeholders without data, so turning the feature off never deletes
+  files elsewhere.
+- **Never read a placeholder without data.** Reading one asks the daemon for
+  the bytes, which may wait on the very loop that is reading. The
+  connection refuses this process's own reads (the block-self-implicit-
+  hydration flag and a process id check), and every engine path that hashed
+  the working tree checks first: the scanner never hashes one, writes
+  replace one by stat, and evict only marks the row.
+- **Scanning a placeholder without data.** Its bytes cannot change without a
+  download, so it is never a local edit. At a path with no live row (and
+  not what a deleted row left behind) it is a file the user moved there,
+  indexed from its stored object id without reading it. On a downloaded
+  row it means "Free up space" was used: the row becomes online-only.
+- **Opening a file.** The callback asks the loop for the object
+  (`SyncInput::FetchObject`: the same peer and mailbox fetch as `Fetch`,
+  without writing the working tree), reporting progress every 10 s so the
+  system does not cancel, then streams it from the store in 1 MiB writes
+  and sends an ordinary `Fetch`, which finds the bytes in place and marks
+  the row downloaded. Explorer's dehydrate, delete, and rename are always
+  approved; the daemon then queues the paths for a scan
+  (`SyncInput::Touched`). Relay's own evict dehydrates a placeholder instead of
+  deleting it.
+- **Reparse points.** Only symlinks and junctions (name-surrogate reparse
+  points, which std reports as symlinks) are links. Other reparse points,
+  including a sync root and its placeholders, are ordinary files and
+  folders; before this every reparse point was skipped as a symlink.
+- **`cloud-filter` 0.0.6** (MIT) wraps the API, so the workspace stays
+  `unsafe_code = "forbid"`. It is pinned: its placeholder-info blob starts
+  4 bytes late, which `relay_fs::cloud` reads around, and its callback shims
+  abort the process if reporting a failure fails, so callbacks report
+  success for everything except a download that could not get its bytes.

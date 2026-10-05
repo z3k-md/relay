@@ -301,6 +301,8 @@ impl Engine {
             return Err(EngineError::NotMaterialized(label));
         }
         let dest = dest_path(&root, &key.path)?;
+        // A placeholder that stays on disk without its bytes (D43).
+        let mut placed = None;
         match &entry.content {
             EntryContent::File { object, .. } => {
                 let meta = fs::symlink_metadata(&dest).map_err(|err| {
@@ -315,11 +317,27 @@ impl Engine {
                 if meta.file_type().is_symlink() || meta.is_dir() {
                     return Err(EngineError::EvictMismatch { path: label });
                 }
-                let hashed = self.store.hash_file(&dest, None)?;
-                if hashed.id != *object {
-                    return Err(EngineError::EvictMismatch { path: label });
+                if relay_fs::cloud::is_dehydrated(&meta) {
+                    // Already freed in Explorer; only the index lagged.
+                    if relay_fs::cloud::placeholder_object(&dest) != Some(*object) {
+                        return Err(EngineError::EvictMismatch { path: label });
+                    }
+                    placed = Some(StatHint::from_metadata(&meta));
+                } else {
+                    let hashed = self.store.hash_file(&dest, None)?;
+                    if hashed.id != *object {
+                        return Err(EngineError::EvictMismatch { path: label });
+                    }
+                    let is_placeholder = matches!(
+                        relay_fs::cloud::probe(&dest),
+                        Ok(relay_fs::cloud::Probe::Placeholder { .. })
+                    );
+                    if is_placeholder && relay_fs::cloud::dehydrate(&dest).is_ok() {
+                        placed = dehydrated_stat(&dest);
+                    } else {
+                        fs::remove_file(&dest).map_err(EngineError::Io)?;
+                    }
                 }
-                fs::remove_file(&dest).map_err(EngineError::Io)?;
             }
             EntryContent::Symlink { target } => {
                 let actual = fs::read_link(&dest).map_err(|err| {
@@ -355,7 +373,7 @@ impl Engine {
             EntryContent::Deleted => return Err(EngineError::EntryDeleted(label)),
         }
         self.db
-            .transaction(|repo| repo.set_materialized(&key, false, None))
+            .transaction(|repo| repo.set_materialized(&key, false, placed))
             .map_err(EngineError::from_db)?;
         Ok(())
     }
@@ -600,6 +618,11 @@ impl Engine {
             && meta.is_file()
             && !meta.file_type().is_symlink()
         {
+            if relay_fs::cloud::is_dehydrated(&meta) {
+                // A placeholder without data: replace it, never read it.
+                let stat = StatHint::from_metadata(&meta);
+                return self.materialize_over(root, dest, object, executable, Some(stat));
+            }
             match self.store.hash_file(dest, None) {
                 Ok(outcome) if outcome.id == object => {
                     return Ok(observed_stat(dest, &self.config));
@@ -640,6 +663,15 @@ impl Engine {
             self.config.racy_window,
         ))
     }
+}
+
+/// Stat of a Cloud Files placeholder without data at `path` (D43). This
+/// process must never read such a file: the read would wait on a download
+/// this process serves.
+pub(crate) fn dehydrated_stat(path: &Path) -> Option<StatHint> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    (meta.is_file() && relay_fs::cloud::is_dehydrated(&meta))
+        .then(|| StatHint::from_metadata(&meta))
 }
 
 fn observed_stat(dest: &Path, config: &crate::EngineConfig) -> Option<StatHint> {

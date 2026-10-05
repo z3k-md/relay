@@ -28,6 +28,7 @@ pub fn run(home: std::path::PathBuf) -> anyhow::Result<()> {
             host: HostKind::Cli,
             enable_stun: false,
             loopback_only: true,
+            placeholders: false,
         },
         &stop,
         &mut |event| log_event(&home, event),

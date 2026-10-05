@@ -45,6 +45,7 @@ fn start_daemon(home: &Path) -> DaemonSession {
             host: HostKind::Cli,
             enable_stun: false,
             loopback_only: true,
+            placeholders: false,
         };
         relay_daemon::run(&home_path, opts, &stop_thread, &mut |event| {
             let _ = tx.send(event.clone());
@@ -330,6 +331,7 @@ fn ipc_hello_status_rescan_pause_and_host_lock() {
                 host: HostKind::Cli,
                 enable_stun: false,
                 loopback_only: true,
+                placeholders: false,
             },
             &stop,
             &mut |_| {},

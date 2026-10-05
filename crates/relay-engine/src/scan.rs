@@ -54,6 +54,8 @@ struct VersionWrite {
     key: EntryKey,
     content: EntryContent,
     stat: Option<relay_core::StatHint>,
+    /// False for a placeholder without data moved into place (D43).
+    materialized: bool,
 }
 
 struct StatUpdate {
@@ -62,7 +64,8 @@ struct StatUpdate {
     previous_sequence: Sequence,
 }
 
-/// Demand path whose bytes appeared on disk and already match the index.
+/// Demand path whose bytes appeared on disk and already match the index, or
+/// (in `evictions`) a placeholder whose bytes were dropped.
 struct HydrateUpdate {
     key: EntryKey,
     stat: Option<relay_core::StatHint>,
@@ -79,6 +82,7 @@ pub(crate) struct ScanPlan {
     writes: Vec<(ChangeKind, VersionWrite)>,
     stat_updates: Vec<StatUpdate>,
     hydrates: Vec<HydrateUpdate>,
+    evictions: Vec<HydrateUpdate>,
     new_objects: Vec<(relay_core::ObjectId, u64)>,
     report: ScanReport,
 }
@@ -283,6 +287,7 @@ impl Engine {
         let mut writes = Vec::new();
         let mut stat_updates = Vec::new();
         let mut hydrates = Vec::new();
+        let mut evictions = Vec::new();
         let mut new_objects = Vec::new();
         let mat_rules = self.db.repo().list_materialization_rules(space.id)?;
         let wall_now_ns = wall_clock_now_ns();
@@ -299,6 +304,42 @@ impl Engine {
             let prev = prev_by_path.get(&entry.path);
             let mode = path_mode(&mat_rules, &config.mount.name, entry.path.as_str())?;
             if scan_skip_present(mode, prev) {
+                continue;
+            }
+            if entry.dehydrated {
+                let object = relay_fs::cloud::placeholder_object(&entry.os_path);
+                match dehydrated_change(prev, object, &entry.stat) {
+                    DehydratedChange::Ignore => {}
+                    DehydratedChange::Placed(prev) => stat_updates.push(StatUpdate {
+                        key: prev.key.clone(),
+                        stat: Some(entry.stat),
+                        previous_sequence: prev.sequence,
+                    }),
+                    DehydratedChange::Evicted(prev) => evictions.push(HydrateUpdate {
+                        key: prev.key.clone(),
+                        stat: Some(entry.stat),
+                        previous_sequence: prev.sequence,
+                    }),
+                    DehydratedChange::Created(object) => writes.push((
+                        ChangeKind::Created,
+                        VersionWrite {
+                            path: entry.path.clone(),
+                            previous: prev.cloned(),
+                            key: EntryKey {
+                                space: space.id,
+                                mount: config.mount.id,
+                                path: entry.path.clone(),
+                            },
+                            content: EntryContent::File {
+                                object,
+                                size: entry.stat.size,
+                                executable: observed_executable(false, prev),
+                            },
+                            stat: Some(entry.stat),
+                            materialized: false,
+                        },
+                    )),
+                }
                 continue;
             }
             let mut observe = ObserveCtx {
@@ -422,6 +463,7 @@ impl Engine {
                     key: record.key.clone(),
                     content: EntryContent::Deleted,
                     stat: None,
+                    materialized: true,
                 },
             ));
         }
@@ -465,6 +507,7 @@ impl Engine {
             writes,
             stat_updates,
             hydrates,
+            evictions,
             new_objects,
             report,
         })
@@ -491,7 +534,7 @@ impl Engine {
                         });
                     }
                 }
-                for update in &plan.hydrates {
+                for update in plan.hydrates.iter().chain(&plan.evictions) {
                     let current = repo.entry(&update.key)?;
                     if current.as_ref().map(|c| c.sequence) != Some(update.previous_sequence) {
                         return Err(EngineError::ConcurrentModification {
@@ -504,7 +547,7 @@ impl Engine {
                 }
                 for (_, write) in &plan.writes {
                     let sequence = repo.next_sequence()?;
-                    let record = EntryRecord::local_write(
+                    let mut record = EntryRecord::local_write(
                         write.previous.as_ref(),
                         write.key.clone(),
                         write.content.clone(),
@@ -513,6 +556,7 @@ impl Engine {
                         now,
                         sequence,
                     );
+                    record.materialized = write.materialized;
                     repo.put_entry(&record)?;
                 }
                 for update in &plan.stat_updates {
@@ -520,6 +564,9 @@ impl Engine {
                 }
                 for update in &plan.hydrates {
                     repo.set_materialized(&update.key, true, update.stat)?;
+                }
+                for update in &plan.evictions {
+                    repo.set_materialized(&update.key, false, update.stat)?;
                 }
                 Ok(plan.report.clone())
             })
@@ -617,11 +664,61 @@ fn scan_skip_present(mode: MaterializationMode, prev: Option<&EntryRecord>) -> b
 }
 
 /// Absent path that must not become a tombstone.
+///
+/// An online-only row with a stat has a placeholder on disk (D43): Relay put
+/// it there, so its absence means the user deleted or moved it.
 fn scan_skip_absence(mode: MaterializationMode, record: &EntryRecord) -> bool {
     match mode {
         MaterializationMode::Exclude | MaterializationMode::Metadata => true,
-        MaterializationMode::Demand => !record.materialized,
+        MaterializationMode::Demand => !record.materialized && record.stat.is_none(),
         MaterializationMode::Full => false,
+    }
+}
+
+/// What a placeholder without data says about its path.
+#[derive(Debug, PartialEq, Eq)]
+enum DehydratedChange<'a> {
+    /// Not Relay's, or stale until the next placeholder pass replaces it.
+    Ignore,
+    /// The row's own placeholder, first seen or with a new stat.
+    Placed(&'a EntryRecord),
+    /// The row's bytes were dropped ("Free up space").
+    Evicted(&'a EntryRecord),
+    /// Moved here by the user: index it without reading it.
+    Created(relay_core::ObjectId),
+}
+
+/// A placeholder without data is never a local edit: its bytes cannot change
+/// without being downloaded first. It is a new path only where nothing live
+/// is indexed and it is not what a deleted row left behind.
+fn dehydrated_change<'a>(
+    prev: Option<&'a EntryRecord>,
+    object: Option<relay_core::ObjectId>,
+    stat: &relay_core::StatHint,
+) -> DehydratedChange<'a> {
+    let Some(object) = object else {
+        return DehydratedChange::Ignore;
+    };
+    let Some(prev) = prev else {
+        return DehydratedChange::Created(object);
+    };
+    match &prev.content {
+        EntryContent::Deleted if prev.parent_object == Some(object) => DehydratedChange::Ignore,
+        EntryContent::Deleted => DehydratedChange::Created(object),
+        EntryContent::File {
+            object: indexed, ..
+        } if *indexed == object => {
+            if prev.materialized {
+                DehydratedChange::Evicted(prev)
+            } else if prev.stat != Some(*stat) {
+                DehydratedChange::Placed(prev)
+            } else {
+                DehydratedChange::Ignore
+            }
+        }
+        EntryContent::File { .. } | EntryContent::Directory | EntryContent::Symlink { .. } => {
+            DehydratedChange::Ignore
+        }
     }
 }
 
@@ -642,6 +739,7 @@ fn version_write(
         },
         content: observation.content,
         stat: observation.stat,
+        materialized: true,
     }
 }
 
@@ -878,6 +976,122 @@ mod tests {
             .add_mount("Personal", "code", mount.path(), &[], &[])
             .unwrap();
         (home, mount, engine)
+    }
+
+    fn entry(engine: &Engine, path: &str) -> EntryRecord {
+        engine
+            .entries("Personal", "code", true)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.key.path.as_str() == path)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_missing_placeholder_is_a_delete_but_an_index_only_row_is_not() {
+        let (_home, mount, mut engine) = ready();
+        engine
+            .materialize_add("Personal", "online", "demand", &["code/**".into()])
+            .unwrap();
+        fs::write(mount.path().join("placed.txt"), b"aaa").unwrap();
+        fs::write(mount.path().join("index_only.txt"), b"bbb").unwrap();
+        engine
+            .scan("Personal", "code", ScanOptions::default())
+            .unwrap();
+        let placed = entry(&engine, "placed.txt");
+        let index_only = entry(&engine, "index_only.txt");
+        engine
+            .db
+            .transaction(|repo| {
+                repo.set_materialized(&placed.key, false, placed.stat)?;
+                repo.set_materialized(&index_only.key, false, None)
+            })
+            .unwrap();
+        fs::remove_file(mount.path().join("placed.txt")).unwrap();
+        fs::remove_file(mount.path().join("index_only.txt")).unwrap();
+
+        // Two of two files gone trips the mass-delete guard; that is not
+        // what this covers.
+        let opts = ScanOptions {
+            allow_mass_delete: true,
+            ..ScanOptions::default()
+        };
+        let report = engine.scan("Personal", "code", opts).unwrap();
+        assert_eq!(report.deleted, 1, "{report:?}");
+        assert!(entry(&engine, "placed.txt").is_deleted());
+        assert!(!entry(&engine, "index_only.txt").is_deleted());
+    }
+
+    fn record(content: EntryContent, materialized: bool) -> EntryRecord {
+        let mut out = EntryRecord::local_write(
+            None,
+            EntryKey {
+                space: relay_core::SpaceId::new(),
+                mount: MountId::new(),
+                path: LogicalPath::new("a.txt").unwrap(),
+            },
+            content,
+            None,
+            relay_core::DeviceId::random(),
+            0,
+            Sequence(1),
+        );
+        out.materialized = materialized;
+        out
+    }
+
+    #[test]
+    fn placeholders_without_data_are_never_local_edits() {
+        let a = ObjectId::of(b"a");
+        let b = ObjectId::of(b"b");
+        let stat = relay_core::StatHint {
+            size: 1,
+            mtime_ns: 5,
+            file_id: None,
+            ctime_ns: None,
+        };
+        let file = |object| EntryContent::File {
+            object,
+            size: 1,
+            executable: false,
+        };
+        // Not Relay's: ignored.
+        assert_eq!(
+            dehydrated_change(None, None, &stat),
+            DehydratedChange::Ignore
+        );
+        // Moved to a new path: indexed without reading it.
+        assert_eq!(
+            dehydrated_change(None, Some(a), &stat),
+            DehydratedChange::Created(a)
+        );
+        // Left behind by a remote delete: the placeholder pass removes it.
+        let mut deleted = record(EntryContent::Deleted, true);
+        deleted.parent_object = Some(a);
+        assert_eq!(
+            dehydrated_change(Some(&deleted), Some(a), &stat),
+            DehydratedChange::Ignore
+        );
+        assert_eq!(
+            dehydrated_change(Some(&deleted), Some(b), &stat),
+            DehydratedChange::Created(b)
+        );
+        // An older version after a remote edit: never a revert.
+        let newer = record(file(b), false);
+        assert_eq!(
+            dehydrated_change(Some(&newer), Some(a), &stat),
+            DehydratedChange::Ignore
+        );
+        let online = record(file(a), false);
+        assert_eq!(
+            dehydrated_change(Some(&online), Some(a), &stat),
+            DehydratedChange::Placed(&online)
+        );
+        let downloaded = record(file(a), true);
+        assert_eq!(
+            dehydrated_change(Some(&downloaded), Some(a), &stat),
+            DehydratedChange::Evicted(&downloaded)
+        );
     }
 
     #[test]

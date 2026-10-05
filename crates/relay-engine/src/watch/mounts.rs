@@ -27,6 +27,8 @@ pub(super) fn after_config(
         _ => {}
     }
     emit_sync(syncer.after_config(engine, applied, output), on_event);
+    // Mounts and rules decide which folders hold placeholders (D43).
+    engine.refresh_placeholder_roots();
 }
 
 /// Start watching a newly attached mount. Its first full scan is due now.
