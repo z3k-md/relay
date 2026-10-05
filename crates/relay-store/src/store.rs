@@ -164,6 +164,27 @@ impl ObjectStore {
             .map_err(|e| map_not_found(*id, path, e))
     }
 
+    /// How many objects are stored, counted without collecting their ids.
+    pub fn count(&self) -> Result<u64, StoreError> {
+        let objects = self.objects_dir();
+        if !objects.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in walkdir::WalkDir::new(&objects) {
+            let entry = entry.map_err(walkdir_err)?;
+            if entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.parse::<ObjectId>().is_ok())
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// All stored object ids. Stray non-hex names under `objects/` are ignored.
     pub fn list(&self) -> Result<Vec<ObjectId>, StoreError> {
         let objects = self.objects_dir();

@@ -29,6 +29,9 @@ use scans::ScanStep;
 const STOP_POLL: Duration = Duration::from_millis(100);
 const RELOAD_POLL: Duration = Duration::from_secs(1);
 const REPLICA_PULL_INTERVAL: Duration = Duration::from_secs(5);
+/// A mailbox push opens the replica and signs; one per input during a large
+/// transfer is thousands a minute, so pushes after sync inputs are coalesced.
+const REPLICA_PUSH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Least time between placeholder passes while index batches stream in. A
 /// mount about to be scanned gets its pass first regardless (D43).
 const PLACEHOLDER_INTERVAL: Duration = Duration::from_secs(1);
@@ -209,6 +212,8 @@ impl Engine {
         };
         let mut last_reload_check = Instant::now();
         let mut last_replica_pull: Option<Instant>;
+        let mut last_replica_push: Option<Instant> = None;
+        let mut replica_push_due = false;
         let mut replica_warned = false;
         let mut syncer = Syncer::new();
         let mut config = ConfigQueue::default();
@@ -485,16 +490,23 @@ impl Engine {
                             }
                         }
                         emit_sync(syncer.push_local_changes(self, &mut output), on_event);
-                        emit_push(
-                            self.push_replica_watch(),
-                            &mut replica_warned,
-                            on_event,
-                            &mut output,
-                        );
+                        replica_push_due = true;
                     }
                 },
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {}
+            }
+            if replica_push_due
+                && last_replica_push.is_none_or(|at| at.elapsed() >= REPLICA_PUSH_MIN_INTERVAL)
+            {
+                replica_push_due = false;
+                last_replica_push = Some(Instant::now());
+                emit_push(
+                    self.push_replica_watch(),
+                    &mut replica_warned,
+                    on_event,
+                    &mut output,
+                );
             }
             if stop.load(Ordering::Relaxed) {
                 break;
