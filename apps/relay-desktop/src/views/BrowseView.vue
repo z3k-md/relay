@@ -271,7 +271,7 @@ function formatModified(ms: number | null): string {
 function sizeTitle(entry: DirEntry): string {
   if (isFolder(entry)) {
     const size = sizes.value.get(entry.path);
-    if (!size) return sizesSupported.value ? "Counting…" : "";
+    if (!size) return sizesSupported.value ? "Counting…" : "Update Relay on that device to see folder sizes";
     const files = `${size.files.toLocaleString()} ${size.files === 1 ? "file" : "files"}`;
     return `${formatSize(size.bytes)} on disk, ${files}${size.done ? "" : " so far (counting)"}`;
   }
@@ -538,6 +538,7 @@ onUnmounted(() => {
             >
               {{ sortMark("size") }} Size
             </button>
+            <span class="w-20 shrink-0" aria-hidden="true"></span>
           </div>
           <p v-if="!entries.length && !loading" class="px-3 py-3 text-[var(--color-muted)]">
             This folder is empty.
@@ -569,16 +570,6 @@ onUnmounted(() => {
                   Opening…
                 </span>
               </button>
-              <button
-                v-if="!isFolder(entry) && (entry.size ?? 0) <= READ_COPY_MAX"
-                type="button"
-                class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
-                :disabled="!!opening"
-                title="Open a copy that sets up nothing; edits stay on this computer"
-                @click="copyFile(entry)"
-              >
-                Read-only
-              </button>
               <span
                 v-if="entry.mount"
                 class="shrink-0 rounded-full bg-emerald-100 px-2 text-[11px] text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200"
@@ -598,14 +589,6 @@ onUnmounted(() => {
               >
                 Cloud
               </span>
-              <button
-                v-if="isFolder(entry) && !syncedSomewhere(entry) && !listing.inside_mount"
-                type="button"
-                class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
-                @click="syncFolder(entry.path, entry.name)"
-              >
-                Sync…
-              </button>
               <span class="hidden w-36 shrink-0 truncate text-[12px] text-[var(--color-muted)] md:block">
                 {{ formatModified(entry.modified_ms) }}
               </span>
@@ -619,9 +602,30 @@ onUnmounted(() => {
                 :title="sizeTitle(entry)"
               >
                 <template v-if="isFolder(entry)">
-                  {{ sizes.has(entry.path) ? formatSize(sizes.get(entry.path)?.bytes) : sizesSupported ? "…" : "" }}
+                  {{ sizes.has(entry.path) ? formatSize(sizes.get(entry.path)?.bytes) : sizesSupported ? "…" : "—" }}
                 </template>
                 <template v-else>{{ formatSize(diskSize(entry)) }}</template>
+              </span>
+              <span class="flex w-20 shrink-0 justify-end">
+                <button
+                  v-if="isFolder(entry) && !syncedSomewhere(entry) && !listing.inside_mount"
+                  type="button"
+                  class="rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+                  :title="`Sync ${entry.name} to a folder on this computer`"
+                  @click="syncFolder(entry.path, entry.name)"
+                >
+                  Sync
+                </button>
+                <button
+                  v-else-if="!isFolder(entry) && (entry.size ?? 0) <= READ_COPY_MAX"
+                  type="button"
+                  class="rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
+                  :disabled="!!opening"
+                  title="Open a copy that sets up nothing; edits stay on this computer"
+                  @click="copyFile(entry)"
+                >
+                  Read-only
+                </button>
               </span>
             </li>
           </ul>
