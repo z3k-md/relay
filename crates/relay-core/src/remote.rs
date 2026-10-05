@@ -235,7 +235,7 @@ pub enum RemoteErrorCode {
     /// The operating system refused (permissions, macOS privacy prompts).
     Denied,
     /// The answering device keeps that from managing devices: a credential
-    /// store, or the contents of a file outside its synced folders (D44).
+    /// store, or the contents of a file outside its synced folders (D45).
     Protected,
     NotFound,
     Timeout,

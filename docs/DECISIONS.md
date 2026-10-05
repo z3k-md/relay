@@ -1176,7 +1176,7 @@ Plan and later stages: [`proposals/os-integration.md`](proposals/os-integration.
   abort the process if reporting a failure fails, so callbacks report
   success for everything except a download that could not get its bytes.
 
-## D44. What a manage grant reaches
+## D45. What a manage grant reaches
 
 A managing device (D37) browses and sets up sync; it does not get every byte
 on the managed device. The accounts design hands the grant to every device

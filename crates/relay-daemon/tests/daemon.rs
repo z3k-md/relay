@@ -1191,7 +1191,7 @@ fn open_remote_files_and_remove_quick_opens() {
     let space = |opened: &relay_ipc::OpenedRemote| opened.synced.clone().unwrap().space;
 
     // A read-only copy sets nothing up on either device (D41) and comes only
-    // from a folder that syncs on alice (D44).
+    // from a folder that syncs on alice (D45).
     let copy = open_as(&mut bob, &synced.path().join("plan.md"), true);
     assert_eq!(copy.synced, None);
     assert_eq!(fs::read(&copy.path).unwrap(), b"plan");
