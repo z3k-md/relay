@@ -35,6 +35,9 @@ pub(crate) struct ApplyOutcome {
     pub skipped: usize,
     pub warnings: Vec<ApplyWarning>,
     pub transient: bool,
+    /// Sender sequence of the entry a transient error stopped the batch at.
+    /// It and everything after it in the batch were not applied.
+    pub stalled_at: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,7 +50,9 @@ struct MountApply {
     config: MountConfig,
     rules: MountRules,
     case_insensitive: bool,
-    live_fold: HashMap<String, LogicalPath>,
+    /// Case-folded live paths, built on first use and only for a mount whose
+    /// filesystem folds case; the collision check is the only reader.
+    live_fold: Option<HashMap<String, LogicalPath>>,
 }
 
 impl Engine {
@@ -58,12 +63,23 @@ impl Engine {
         mut entries: Vec<RemoteEntry>,
         failed_objects: &HashSet<ObjectId>,
     ) -> Result<ApplyOutcome, EngineError> {
+        // One index read per entry, shared by the sort and the loop below.
+        let mut locals: HashMap<EntryKey, Option<EntryRecord>> =
+            HashMap::with_capacity(entries.len());
+        for entry in &entries {
+            if !locals.contains_key(&entry.key) {
+                locals.insert(entry.key.clone(), self.db.repo().entry(&entry.key)?);
+            }
+        }
+        let class_of = |entry: &RemoteEntry| {
+            let previous = locals
+                .get(&entry.key)
+                .and_then(|local| local.as_ref())
+                .and_then(|local| local.content.kind());
+            classify_apply(&entry.content, previous)
+        };
         entries.sort_by(|a, b| {
-            let local_a = self.db.repo().entry(&a.key).ok().flatten();
-            let local_b = self.db.repo().entry(&b.key).ok().flatten();
-            let ca = classify_apply(&a.content, local_a.as_ref().and_then(|l| l.content.kind()));
-            let cb = classify_apply(&b.content, local_b.as_ref().and_then(|l| l.content.kind()));
-            apply_sort_key(&a.key.path, ca).cmp(&apply_sort_key(&b.key.path, cb))
+            apply_sort_key(&a.key.path, class_of(a)).cmp(&apply_sort_key(&b.key.path, class_of(b)))
         });
 
         let mut mounts = self.load_mount_apply(space)?;
@@ -75,13 +91,13 @@ impl Engine {
             skipped: 0,
             warnings: Vec::new(),
             transient: false,
+            stalled_at: None,
         };
 
         for entry in entries {
-            let local = self.db.repo().entry(&entry.key).ok().flatten();
-            let writing = self
-                .writing_remote(&rules, &entry, local.as_ref())
-                .unwrap_or(true);
+            let sequence = entry.sequence.0;
+            let local = locals.get(&entry.key).and_then(|local| local.as_ref());
+            let writing = self.writing_remote(&rules, &entry, local).unwrap_or(true);
             if writing
                 && let Some(obj) = entry.content.object()
                 && failed_objects.contains(&obj)
@@ -95,6 +111,12 @@ impl Engine {
             }
 
             let mount_id = entry.key.mount;
+            if let Some(ctx) = mounts.get_mut(&mount_id)
+                && ctx.case_insensitive
+                && ctx.live_fold.is_none()
+            {
+                ctx.live_fold = Some(self.live_fold_for(mount_id)?);
+            }
             let Some(ctx) = mounts.get(&mount_id) else {
                 outcome.skipped += 1;
                 outcome.warnings.push(ApplyWarning {
@@ -116,6 +138,7 @@ impl Engine {
                 Ok(result) => apply_count(&mut outcome, result),
                 Err(err) if is_transient(&err) => {
                     outcome.transient = true;
+                    outcome.stalled_at = Some(sequence);
                     outcome.warnings.push(ApplyWarning {
                         path: String::new(),
                         reason: err.to_string(),
@@ -135,7 +158,7 @@ impl Engine {
     }
 
     fn load_mount_apply(
-        &self,
+        &mut self,
         space: SpaceId,
     ) -> Result<HashMap<MountId, MountApply>, EngineError> {
         let mut out = HashMap::new();
@@ -147,27 +170,43 @@ impl Engine {
             } else {
                 rules
             };
-            let case_insensitive = config
-                .local_path
-                .as_deref()
-                .is_some_and(probe_case_insensitive);
-            let mut live_fold = HashMap::new();
-            for entry in self.db.repo().entries_for_mount(config.mount.id)? {
-                if !entry.is_deleted() {
-                    live_fold.insert(entry.key.path.case_fold_key(), entry.key.path.clone());
-                }
-            }
+            let case_insensitive = match &config.local_path {
+                Some(root) => self.case_insensitive_root(config.mount.id, root),
+                None => false,
+            };
             out.insert(
                 config.mount.id,
                 MountApply {
                     config,
                     rules,
                     case_insensitive,
-                    live_fold,
+                    live_fold: None,
                 },
             );
         }
         Ok(out)
+    }
+
+    /// Whether `root` folds case. Probed once per mount path: the probe
+    /// writes and removes a file in the root, which is not a per-batch cost.
+    fn case_insensitive_root(&mut self, mount: MountId, root: &Path) -> bool {
+        match self.case_probe.get(&mount) {
+            Some((path, answer)) if path == root => *answer,
+            _ => {
+                let answer = probe_case_insensitive(root);
+                self.case_probe.insert(mount, (root.to_path_buf(), answer));
+                answer
+            }
+        }
+    }
+
+    fn live_fold_for(&self, mount: MountId) -> Result<HashMap<String, LogicalPath>, EngineError> {
+        let paths = self.db.repo().live_paths(mount)?;
+        let mut fold = HashMap::with_capacity(paths.len());
+        for path in paths {
+            fold.insert(path.case_fold_key(), path);
+        }
+        Ok(fold)
     }
 
     fn apply_entry_reeval(
@@ -199,13 +238,8 @@ impl Engine {
                         crate::ScanOptions::default(),
                     )?;
                     if let Some(ctx) = mounts.get_mut(&key.mount) {
-                        ctx.live_fold.clear();
-                        for rec in self.db.repo().entries_for_mount(key.mount)? {
-                            if !rec.is_deleted() {
-                                ctx.live_fold
-                                    .insert(rec.key.path.case_fold_key(), rec.key.path.clone());
-                            }
-                        }
+                        // Rebuilt on the next entry of this mount, if needed.
+                        ctx.live_fold = None;
                     }
                 }
             }
@@ -246,7 +280,7 @@ impl Engine {
             VersionRelation::RemoteNewer => self.apply_remote_newer(remote, local.as_ref(), mounts),
             VersionRelation::Conflict | VersionRelation::Diverged if !writing => {
                 self.commit_unmaterialized_conflict(remote, local.as_ref(), mounts)?;
-                Ok(TryApply::Done(ApplyResult::Written))
+                Ok(TryApply::Done(ApplyResult::Conflict))
             }
             VersionRelation::Conflict | VersionRelation::Diverged => {
                 self.apply_conflict(remote, local.as_ref(), mounts)
@@ -284,42 +318,79 @@ impl Engine {
         }
     }
 
-    /// Concurrent edit on a path this device is not writing. Keep the remote
-    /// content in the index and do not create a conflict file.
+    /// Concurrent edit on a path this device is not writing. Resolve it in the
+    /// index exactly as a writing device would (D18): the winner's content
+    /// under the merged vector, the loser as an index-only row at its
+    /// conflict-copy path. Nothing is written to the working tree, and every
+    /// device still reaches the same rows.
     fn commit_unmaterialized_conflict(
         &mut self,
         remote: &RemoteEntry,
         local: Option<&EntryRecord>,
         mounts: &mut HashMap<MountId, MountApply>,
     ) -> Result<(), EngineError> {
-        let vector = match local {
-            Some(local) => local.vector.merged(&remote.vector),
-            None => remote.vector.clone(),
+        let Some(local) = local else {
+            self.commit_remote(remote, None, None, false)?;
+            note_live(mounts, remote);
+            return Ok(());
         };
-        let record_object = remote
-            .content
-            .object()
-            .filter(|id| self.store.contains(id))
-            .map(|id| {
-                let size = match &remote.content {
-                    EntryContent::File { size, .. } => *size,
-                    _ => 0,
-                };
-                (id, size)
+        let remote_rec = remote.clone().into_record(local.sequence, None, false);
+        let (winner_remote, copy_loser) = conflict_outcome(local, &remote_rec);
+        let winner = if winner_remote { &remote_rec } else { local };
+        let loser = if winner_remote { local } else { &remote_rec };
+
+        let mut copy = None;
+        if copy_loser && !loser.is_deleted() {
+            let counter = loser.vector.get(&loser.modified_by);
+            let path = conflict_path(&remote.key.path, &loser.modified_by, counter)
+                .map_err(EngineError::InvalidName)?;
+            copy = Some(EntryRecord {
+                key: EntryKey {
+                    space: remote.key.space,
+                    mount: remote.key.mount,
+                    path,
+                },
+                content: loser.content.clone(),
+                vector: loser.vector.clone(),
+                parent_object: loser.parent_object,
+                sequence: relay_core::Sequence(0),
+                modified_by: loser.modified_by,
+                modified_at_unix_ms: loser.modified_at_unix_ms,
+                stat: None,
+                materialized: false,
             });
+        }
+        let mut record = winner.clone();
+        record.vector = local.vector.merged(&remote.vector);
+        record.key = remote.key.clone();
+        if winner_remote {
+            record.stat = None;
+            record.materialized = false;
+        }
+        let objects: Vec<(ObjectId, u64)> = [Some(&record), copy.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|row| match &row.content {
+                EntryContent::File { object, size, .. } if self.store.contains(object) => {
+                    Some((*object, *size))
+                }
+                _ => None,
+            })
+            .collect();
         let now = self.clock.now_ms();
-        let remote_owned = remote.clone();
         self.db.transaction(|repo| {
-            if let Some((id, size)) = record_object {
-                repo.record_object(id, size, now)?;
+            for (id, size) in &objects {
+                repo.record_object(*id, *size, now)?;
             }
-            let sequence = repo.next_sequence()?;
-            let mut record = remote_owned.into_record(sequence, None, false);
-            record.vector = vector;
+            if let Some(mut copy) = copy {
+                copy.sequence = repo.next_sequence()?;
+                repo.put_entry(&copy)?;
+            }
+            record.sequence = repo.next_sequence()?;
             repo.put_entry(&record)?;
             Ok::<(), EngineError>(())
         })?;
-        if remote.content.is_deleted() {
+        if record.content.is_deleted() {
             note_gone(mounts, remote);
         } else {
             note_live(mounts, remote);
@@ -358,6 +429,26 @@ impl Engine {
             .clone()
             .ok_or(EngineError::MountNotLocal)?;
 
+        if remote.content.is_deleted() {
+            return self.apply_deletion(remote, local, &root, mounts);
+        }
+        if cfg!(windows) && matches!(remote.content, EntryContent::Symlink { .. }) {
+            return Ok(TryApply::Done(ApplyResult::Skipped(
+                remote.key.path.to_string(),
+                "symlinks are not materialized on Windows".into(),
+            )));
+        }
+        let dest = dest_path(&root, &remote.key.path)?;
+        if let Some(step) = clear_replaced_kind(
+            local,
+            remote.content.kind(),
+            &remote.key.path,
+            &dest,
+            &self.store,
+        )? {
+            return Ok(step);
+        }
+
         match &remote.content {
             EntryContent::File {
                 object,
@@ -372,7 +463,6 @@ impl Engine {
                 MaterializeStep::Rescan => Ok(TryApply::Rescan),
             },
             EntryContent::Directory => {
-                let dest = dest_path(&root, &remote.key.path)?;
                 if let Err(err) = ensure_real_dir_chain(&root, &dest) {
                     return skip_or_err(err);
                 }
@@ -381,17 +471,13 @@ impl Engine {
                 Ok(TryApply::Done(ApplyResult::Written))
             }
             EntryContent::Symlink { target } => {
-                if cfg!(windows) {
-                    return Ok(TryApply::Done(ApplyResult::Skipped(
-                        remote.key.path.to_string(),
-                        "symlinks are not materialized on Windows".into(),
-                    )));
-                }
-                let dest = dest_path(&root, &remote.key.path)?;
                 if let Some(parent) = dest.parent()
                     && let Err(err) = ensure_real_dir_chain(&root, parent)
                 {
                     return skip_or_err(err);
+                }
+                if !symlink_still_matches(local, &dest)? {
+                    return Ok(TryApply::Rescan);
                 }
                 create_symlink(target, &dest)?;
                 let stat = fs::symlink_metadata(&dest)
@@ -434,6 +520,12 @@ impl Engine {
         };
 
         if meta.is_dir() && !meta.file_type().is_symlink() {
+            let indexed_dir = local.is_some_and(|record| {
+                !record.is_deleted() && matches!(record.content, EntryContent::Directory)
+            });
+            if !indexed_dir {
+                return Ok(TryApply::Rescan);
+            }
             match fs::remove_dir(&dest) {
                 Ok(()) => {
                     self.commit_remote(remote, None, None, true)?;
@@ -446,7 +538,12 @@ impl Engine {
                 ))),
             }
         } else {
-            if !file_still_matches(local, &dest, &self.store)? {
+            let still_matches = if meta.file_type().is_symlink() {
+                symlink_still_matches(local, &dest)?
+            } else {
+                file_still_matches(local, &dest, &self.store)?
+            };
+            if !still_matches {
                 return Ok(TryApply::Rescan);
             }
             fs::remove_file(&dest).map_err(EngineError::Io)?;
@@ -512,6 +609,16 @@ impl Engine {
 
         let mut path_stat = None;
         if winner_remote {
+            let dest = dest_path(&root, &remote.key.path)?;
+            if let Some(step) = clear_replaced_kind(
+                Some(local),
+                winner.content.kind(),
+                &remote.key.path,
+                &dest,
+                &self.store,
+            )? {
+                return Ok(step);
+            }
             match &winner.content {
                 EntryContent::File {
                     object, executable, ..
@@ -526,19 +633,14 @@ impl Engine {
                     MaterializeStep::Rescan => return Ok(TryApply::Rescan),
                 },
                 EntryContent::Directory => {
-                    let dest = dest_path(&root, &remote.key.path)?;
-                    let occupied_by_file = fs::symlink_metadata(&dest)
-                        .map(|m| !m.is_dir() || m.file_type().is_symlink())
-                        .unwrap_or(false);
-                    if occupied_by_file {
-                        if !file_still_matches(Some(local), &dest, &self.store)? {
-                            return Ok(TryApply::Rescan);
-                        }
-                        fs::remove_file(&dest).map_err(EngineError::Io)?;
-                    }
                     ensure_real_dir_chain(&root, &dest)?;
                 }
                 other => {
+                    if matches!(other, EntryContent::Symlink { .. })
+                        && !symlink_still_matches(Some(local), &dest)?
+                    {
+                        return Ok(TryApply::Rescan);
+                    }
                     if let Err(step) =
                         self.materialize_content(&root, &remote.key.path, other, None)?
                     {
@@ -916,7 +1018,10 @@ fn skip_reason(entry: &RemoteEntry, ctx: &MountApply, writing: bool) -> Option<S
         return Some("excluded by local mount rules".into());
     }
     if ctx.case_insensitive
-        && let Some(existing) = ctx.live_fold.get(&entry.key.path.case_fold_key())
+        && let Some(existing) = ctx
+            .live_fold
+            .as_ref()
+            .and_then(|fold| fold.get(&entry.key.path.case_fold_key()))
         && existing != &entry.key.path
     {
         return Some(format!(
@@ -977,21 +1082,24 @@ fn prepare_expected_existing(
             ExpectedPrep::Rescan
         });
     }
-    if let Some(record) = local {
-        if record.is_deleted() || !matches!(record.content, EntryContent::File { .. }) {
-            if dest.exists() {
-                return hash_or_rescan(store, dest, None, remote_object);
-            }
-            return Ok(ExpectedPrep::Matches(None));
-        }
-        match record.stat {
+    if let Some(record) = local
+        && !record.is_deleted()
+        && matches!(record.content, EntryContent::File { .. })
+    {
+        return match record.stat {
             Some(stat) => Ok(ExpectedPrep::Matches(Some(stat))),
             None => hash_or_rescan(store, dest, record.content.object(), remote_object),
+        };
+    }
+    // No live file record: only a file that already holds the remote bytes
+    // may be replaced. A directory or link here is an unscanned change.
+    match fs::symlink_metadata(dest) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+            hash_or_rescan(store, dest, None, remote_object)
         }
-    } else if dest.exists() {
-        hash_or_rescan(store, dest, None, remote_object)
-    } else {
-        Ok(ExpectedPrep::Matches(None))
+        Ok(_) => Ok(ExpectedPrep::Rescan),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ExpectedPrep::Matches(None)),
+        Err(err) => Err(EngineError::Io(err)),
     }
 }
 
@@ -1019,24 +1127,39 @@ fn hash_or_rescan(
     }
 }
 
+/// Whether the file at `dest` is still the one the local record describes,
+/// so it can be removed or replaced without losing anything the scanner has
+/// not indexed. Nothing on disk always matches.
+///
+/// With no live local record, any file present is unindexed and never
+/// matches, except the placeholder a deleted row left behind (D43).
 fn file_still_matches(
     local: Option<&EntryRecord>,
     dest: &Path,
     store: &relay_store::ObjectStore,
 ) -> Result<bool, EngineError> {
-    let Some(record) = local else {
-        return Ok(true);
+    let meta = match fs::symlink_metadata(dest) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(EngineError::Io(err)),
     };
-    if record.is_deleted() {
-        return Ok(true);
+    let Some(record) = local.filter(|record| !record.is_deleted()) else {
+        let leftover = local.is_some_and(|record| {
+            record.parent_object.is_some()
+                && relay_fs::cloud::is_dehydrated(&meta)
+                && relay_fs::cloud::placeholder_object(dest) == record.parent_object
+        });
+        return Ok(leftover);
+    };
+    if !matches!(record.content, EntryContent::File { .. })
+        || !meta.is_file()
+        || meta.file_type().is_symlink()
+    {
+        return Ok(false);
     }
     match record.stat {
-        Some(stat) => match fs::symlink_metadata(dest) {
-            Ok(meta) => Ok(StatHint::from_metadata(&meta) == stat),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(err) => Err(EngineError::Io(err)),
-        },
-        None if dehydrated_stat(dest).is_some() => {
+        Some(stat) => Ok(StatHint::from_metadata(&meta) == stat),
+        None if relay_fs::cloud::is_dehydrated(&meta) => {
             Ok(relay_fs::cloud::placeholder_object(dest) == record.content.object())
         }
         None => match store.hash_file(dest, None) {
@@ -1044,8 +1167,80 @@ fn file_still_matches(
             Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 Ok(true)
             }
+            Err(StoreError::SourceChanged { .. }) => Ok(false),
             Err(err) => Err(err.into()),
         },
+    }
+}
+
+/// Whether the symlink at `dest` is the one the local record describes.
+/// Nothing on disk always matches; a link with no live local record never does.
+fn symlink_still_matches(local: Option<&EntryRecord>, dest: &Path) -> Result<bool, EngineError> {
+    match fs::symlink_metadata(dest) {
+        Ok(meta) if !meta.file_type().is_symlink() => return Ok(false),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(EngineError::Io(err)),
+    }
+    let Some(EntryContent::Symlink { target }) = local
+        .filter(|record| !record.is_deleted())
+        .map(|r| &r.content)
+    else {
+        return Ok(false);
+    };
+    Ok(fs::read_link(dest).map_err(EngineError::Io)?.as_os_str() == target.as_str())
+}
+
+/// Clear the path for a remote version of another kind than the live local
+/// one: remove the file, link or empty directory the local record describes.
+/// Anything else on disk is an unscanned change and the scanner indexes it
+/// first (`Rescan`). A directory that is not empty stays, as for its tombstone.
+fn clear_replaced_kind(
+    local: Option<&EntryRecord>,
+    remote_kind: Option<EntryKind>,
+    path: &LogicalPath,
+    dest: &Path,
+    store: &relay_store::ObjectStore,
+) -> Result<Option<TryApply>, EngineError> {
+    let Some(record) = local.filter(|record| !record.is_deleted()) else {
+        return Ok(None);
+    };
+    if remote_kind.is_none() || record.content.kind() == remote_kind {
+        return Ok(None);
+    }
+    let meta = match fs::symlink_metadata(dest) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(EngineError::Io(err)),
+    };
+    match &record.content {
+        EntryContent::Directory => {
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Ok(Some(TryApply::Rescan));
+            }
+            match fs::remove_dir(dest) {
+                Ok(()) => Ok(None),
+                Err(_) => Ok(Some(TryApply::Done(ApplyResult::Skipped(
+                    path.to_string(),
+                    "directory is not empty; replacement not applied".into(),
+                )))),
+            }
+        }
+        EntryContent::File { .. } => {
+            if !file_still_matches(Some(record), dest, store)? {
+                return Ok(Some(TryApply::Rescan));
+            }
+            fs::remove_file(dest).map_err(EngineError::Io)?;
+            Ok(None)
+        }
+        EntryContent::Symlink { .. } => {
+            if !symlink_still_matches(Some(record), dest)? {
+                return Ok(Some(TryApply::Rescan));
+            }
+            fs::remove_file(dest).map_err(EngineError::Io)?;
+            Ok(None)
+        }
+        EntryContent::Deleted => Ok(None),
     }
 }
 
@@ -1072,11 +1267,24 @@ fn conflict_outcome(local: &EntryRecord, remote: &EntryRecord) -> (bool, bool) {
     }
 }
 
+/// Create (or replace) the symlink at `dest`. Only an existing symlink is
+/// replaced; callers clear a file or directory first, after checking it
+/// still matches the index.
 pub(crate) fn create_symlink(target: &str, dest: &Path) -> Result<(), EngineError> {
     #[cfg(unix)]
     {
-        if dest.exists() {
-            let _ = fs::remove_file(dest);
+        match fs::symlink_metadata(dest) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                fs::remove_file(dest).map_err(EngineError::Io)?;
+            }
+            Ok(_) => {
+                return Err(EngineError::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a symlink", dest.display()),
+                )));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(EngineError::Io(err)),
         }
         std::os::unix::fs::symlink(target, dest).map_err(EngineError::Io)
     }
@@ -1093,16 +1301,18 @@ fn racy_stat(stat: StatHint, config: &crate::EngineConfig) -> Option<StatHint> {
 
 fn note_live(mounts: &mut HashMap<MountId, MountApply>, remote: &RemoteEntry) {
     if let Some(ctx) = mounts.get_mut(&remote.key.mount)
+        && let Some(fold) = ctx.live_fold.as_mut()
         && !remote.content.is_deleted()
     {
-        ctx.live_fold
-            .insert(remote.key.path.case_fold_key(), remote.key.path.clone());
+        fold.insert(remote.key.path.case_fold_key(), remote.key.path.clone());
     }
 }
 
 fn note_gone(mounts: &mut HashMap<MountId, MountApply>, remote: &RemoteEntry) {
-    if let Some(ctx) = mounts.get_mut(&remote.key.mount) {
-        ctx.live_fold.remove(&remote.key.path.case_fold_key());
+    if let Some(ctx) = mounts.get_mut(&remote.key.mount)
+        && let Some(fold) = ctx.live_fold.as_mut()
+    {
+        fold.remove(&remote.key.path.case_fold_key());
     }
 }
 
@@ -1118,6 +1328,8 @@ fn is_transient(err: &EngineError) -> bool {
                 io::ErrorKind::PermissionDenied
                     | io::ErrorKind::TimedOut
                     | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::ResourceBusy
+                    | io::ErrorKind::Interrupted
             )
         }
         _ => false,

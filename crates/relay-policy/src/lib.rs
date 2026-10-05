@@ -4,7 +4,10 @@
 //! string (always `/`-separated). `*` does not cross `/`; `**` matches any
 //! number of components, including zero.
 
-use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use relay_core::{EntryKind, LogicalPath};
 use thiserror::Error;
 
@@ -223,9 +226,32 @@ pub fn validate_selector(pattern: &str) -> Result<(), PolicyError> {
 
 /// Whether a case-sensitive selector glob matches `path` (`/`-separated).
 pub fn selector_matches(pattern: &str, path: &str) -> Result<bool, PolicyError> {
-    Ok(compile_glob(pattern, false)?
-        .compile_matcher()
-        .is_match(path))
+    Ok(matcher_for(pattern)?.is_match(path))
+}
+
+/// Compiled single-pattern matchers. The same few selectors are tested
+/// against every entry of a batch; compiling a glob per test dominated
+/// policy and materialization checks.
+fn matcher_for(pattern: &str) -> Result<Arc<GlobMatcher>, PolicyError> {
+    const CACHE_CAP: usize = 4096;
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<GlobMatcher>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(pattern)
+    {
+        return Ok(found.clone());
+    }
+    let compiled = Arc::new(compile_glob(pattern, false)?.compile_matcher());
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(pattern.to_owned(), compiled.clone());
+    Ok(compiled)
 }
 
 fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<Glob, PolicyError> {

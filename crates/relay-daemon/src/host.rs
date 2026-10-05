@@ -71,8 +71,9 @@ struct RemoteAccess {
     manageable: bool,
 }
 
-/// How long a remote call may take end to end before IPC gives up.
-const REMOTE_CALL_WAIT: Duration = Duration::from_secs(20);
+/// What IPC allows on top of the network layer's own wait for a remote call
+/// before giving up.
+const REMOTE_CALL_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub(crate) enum PairPhase {
@@ -173,6 +174,14 @@ impl Host {
         }
     }
 
+    /// The peer list last handed to the network layer.
+    pub fn known_peers(&self) -> Vec<PeerConfig> {
+        self.known_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn take_pair_terms(&self) -> PairTerms {
         self.pair_terms
             .lock()
@@ -212,12 +221,10 @@ impl Host {
     }
 
     pub(crate) fn peer_named(&self, name: &str) -> Result<PeerInfo, RpcErrorBody> {
-        Engine::open_read_only(&self.home)
+        let peers = Engine::open_read_only(&self.home)
             .and_then(|engine| engine.peers())
-            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?
-            .into_iter()
-            .find(|p| p.name == name)
-            .ok_or_else(|| RpcErrorBody::new("not_found", format!("unknown peer {name:?}")))
+            .map_err(|err| RpcErrorBody::new("unavailable", err.to_string()))?;
+        peer_with_name(peers, name)
     }
 
     /// Make a remote call on a connected peer and wait for the answer.
@@ -225,9 +232,10 @@ impl Host {
         let net = self
             .net_sender()
             .map_err(|err| RemoteError::new(RemoteErrorCode::Offline, err.message))?;
+        let wait = relay_net::call_timeout(&call) + REMOTE_CALL_MARGIN;
         let (reply, rx) = mpsc::channel();
         net.send(NetCommand::Control { peer, call, reply });
-        rx.recv_timeout(REMOTE_CALL_WAIT)
+        rx.recv_timeout(wait)
             .map_err(|_| RemoteError::new(RemoteErrorCode::Timeout, "no answer from the network"))?
     }
 
@@ -341,12 +349,17 @@ impl Host {
 
     /// Apply a config change on the running engine loop when possible;
     /// otherwise write it directly (paused, or between reload cycles).
-    pub(crate) fn config(&self, change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
-        let wait = CONFIG_REPLY_WAIT
-            + match &change {
-                ConfigChange::JoinSpace { wait_ms, .. } => Duration::from_millis(*wait_ms),
-                _ => Duration::ZERO,
-            };
+    pub(crate) fn config(&self, mut change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
+        // A join's wait is capped here as on the network side, so a caller
+        // cannot hold the loop reply, or the engine's pending join, longer.
+        let join_wait = match &mut change {
+            ConfigChange::JoinSpace { wait_ms, .. } => {
+                *wait_ms = (*wait_ms).min(relay_net::MAX_JOIN_WAIT.as_millis() as u64);
+                Duration::from_millis(*wait_ms)
+            }
+            _ => Duration::ZERO,
+        };
+        let wait = CONFIG_REPLY_WAIT + join_wait;
         let input = |reply| SyncInput::Config {
             change: change.clone(),
             reply,
@@ -1185,9 +1198,53 @@ fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
     })
 }
 
+/// The one peer called `name`. The lookup is by the local alias, which the
+/// peers table keeps unique (a peer's own `Hello` name lands on its device
+/// row, not here), so the `conflict` branch is defensive: two matches would
+/// let a call meant for one device reach the other.
+fn peer_with_name(peers: Vec<PeerInfo>, name: &str) -> Result<PeerInfo, RpcErrorBody> {
+    let mut matching = peers.into_iter().filter(|p| p.name == name);
+    let found = matching
+        .next()
+        .ok_or_else(|| RpcErrorBody::new("not_found", format!("unknown peer {name:?}")))?;
+    if matching.next().is_some() {
+        return Err(RpcErrorBody::new(
+            "conflict",
+            format!("ambiguous peer name {name:?}: more than one peer has it"),
+        ));
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer(name: &str) -> PeerInfo {
+        PeerInfo {
+            name: name.into(),
+            id: DeviceId::random(),
+            addresses: Vec::new(),
+            added_at_ms: 0,
+            last_seen_ms: None,
+            revoked: false,
+            may_manage: false,
+        }
+    }
+
+    #[test]
+    fn a_name_two_peers_share_is_refused() {
+        let peers = vec![peer("laptop"), peer("alice"), peer("alice")];
+        let laptop = peers[0].id;
+        assert_eq!(peer_with_name(peers.clone(), "laptop").unwrap().id, laptop);
+        let err = peer_with_name(peers.clone(), "alice").unwrap_err();
+        assert_eq!(err.code, "conflict");
+        assert!(err.message.contains("ambiguous"), "{}", err.message);
+        assert_eq!(
+            peer_with_name(peers, "nobody").unwrap_err().code,
+            "not_found"
+        );
+    }
 
     fn transfer(bytes_done: u64) -> EngineTransfer {
         EngineTransfer {

@@ -179,9 +179,12 @@ impl Harness {
 
     fn tick_b(&mut self, now: std::time::Instant) {
         let mut outs = Vec::new();
-        self.sb
+        let events = self
+            .sb
             .tick(&mut self.b, now, &mut |o| outs.push(o))
             .unwrap();
+        assert_no_warnings(&events, self.strict);
+        self.events.extend(events);
         let mut q = VecDeque::new();
         for output in outs {
             match output {
@@ -1845,6 +1848,8 @@ struct Hub {
     syncers: [Syncer; 3],
     strict: bool,
     events: Vec<SyncEvent>,
+    /// Conflict resolutions each engine performed, by hub index.
+    conflicts_by_engine: [usize; 3],
 }
 
 impl Hub {
@@ -1871,7 +1876,20 @@ impl Hub {
             syncers: [Syncer::new(), Syncer::new(), Syncer::new()],
             strict: true,
             events: Vec::new(),
+            conflicts_by_engine: [0; 3],
         }
+    }
+
+    fn record(&mut self, engine: usize, events: Vec<SyncEvent>) {
+        assert_no_warnings(&events, self.strict);
+        self.conflicts_by_engine[engine] += events
+            .iter()
+            .map(|e| match e {
+                SyncEvent::RemoteApplied { conflicts, .. } => *conflicts,
+                _ => 0,
+            })
+            .sum::<usize>();
+        self.events.extend(events);
     }
 
     fn id(&self, i: usize) -> DeviceId {
@@ -1914,8 +1932,7 @@ impl Hub {
             let events = self.syncers[i]
                 .push_local_changes(&mut self.engines[i], &mut |o| outs.push(o))
                 .unwrap();
-            assert_no_warnings(&events, self.strict);
-            self.events.extend(events);
+            self.record(i, events);
             for o in outs {
                 outputs.push_back((i, o));
             }
@@ -1941,15 +1958,13 @@ impl Hub {
                 let events = self.syncers[to]
                     .handle(&mut self.engines[to], input, &mut |o| outs.push(o))
                     .unwrap();
-                assert_no_warnings(&events, self.strict);
-                self.events.extend(events);
+                self.record(to, events);
                 // Mirror the watch loop: after applying, offer local sequences onward.
                 let mut pushed = Vec::new();
                 let push_events = self.syncers[to]
                     .push_local_changes(&mut self.engines[to], &mut |o| pushed.push(o))
                     .unwrap();
-                assert_no_warnings(&push_events, self.strict);
-                self.events.extend(push_events);
+                self.record(to, push_events);
                 for o in outs.into_iter().chain(pushed) {
                     outputs.push_back((to, o));
                 }
@@ -2910,4 +2925,370 @@ fn materialization_rule_crud() {
         matches!(gone, relay_engine::EngineError::UnknownMaterialization(_)),
         "{gone}"
     );
+}
+
+// ---- Regressions from the sync review ----
+
+fn entry_any(engine: &Engine, path: &str) -> relay_engine::EntryRecord {
+    engine
+        .entries("Personal", "code", true)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.key.path.as_str() == path)
+        .unwrap_or_else(|| panic!("missing {path}"))
+}
+
+fn mount_id(engine: &Engine, name: &str) -> relay_core::MountId {
+    engine
+        .mounts(Some("Personal"))
+        .unwrap()
+        .into_iter()
+        .map(|(_, c)| c)
+        .find(|c| c.mount.name == name)
+        .unwrap_or_else(|| panic!("missing mount {name}"))
+        .mount
+        .id
+}
+
+fn assert_converged(h: &Harness) {
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+    assert_eq!(live_files(h.mount_a.path()), live_files(h.mount_b.path()));
+}
+
+#[test]
+fn remote_tombstone_does_not_delete_an_unindexed_file() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("notes.txt", b"v1")]);
+    fs::remove_file(h.mount_a.path().join("notes.txt")).unwrap();
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert!(!h.mount_b.path().join("notes.txt").exists());
+    assert!(entry_any(&h.b, "notes.txt").is_deleted());
+
+    // B's user recreates the path before any scan sees it. Meanwhile A
+    // recreates and deletes it again, so a newer tombstone arrives for a
+    // path whose only index row is a tombstone.
+    fs::write(h.mount_b.path().join("notes.txt"), b"mine").unwrap();
+    fs::write(h.mount_a.path().join("notes.txt"), b"v2").unwrap();
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    fs::remove_file(h.mount_a.path().join("notes.txt")).unwrap();
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert_eq!(
+        fs::read(h.mount_b.path().join("notes.txt")).unwrap(),
+        b"mine"
+    );
+    assert!(!entry_any(&h.b, "notes.txt").is_deleted());
+    h.push_both();
+    assert_eq!(
+        fs::read(h.mount_a.path().join("notes.txt")).unwrap(),
+        b"mine"
+    );
+    assert_converged(&h);
+}
+
+#[test]
+fn file_replaced_by_directory_on_the_receiver() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("thing", b"flat")]);
+    fs::remove_file(h.mount_a.path().join("thing")).unwrap();
+    write_tree(h.mount_a.path(), &[("thing/inner.txt", b"inner")]);
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert!(h.mount_b.path().join("thing").is_dir());
+    assert_eq!(
+        fs::read(h.mount_b.path().join("thing/inner.txt")).unwrap(),
+        b"inner"
+    );
+    assert_converged(&h);
+}
+
+#[test]
+fn directory_replaced_by_file_on_the_receiver() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("thing/inner.txt", b"inner")]);
+    fs::remove_dir_all(h.mount_a.path().join("thing")).unwrap();
+    fs::write(h.mount_a.path().join("thing"), b"flat").unwrap();
+    scan_allow_mass(&mut h.a);
+    h.push_both();
+    assert!(h.mount_b.path().join("thing").is_file());
+    assert_eq!(fs::read(h.mount_b.path().join("thing")).unwrap(), b"flat");
+    assert_converged(&h);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_replaced_by_file_and_back_on_the_receiver() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("target.txt", b"t"), ("link", b"flat")]);
+    let link_a = h.mount_a.path().join("link");
+    let link_b = h.mount_b.path().join("link");
+    fs::remove_file(&link_a).unwrap();
+    std::os::unix::fs::symlink("target.txt", &link_a).unwrap();
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    assert!(
+        fs::symlink_metadata(&link_b)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&link_b).unwrap(), Path::new("target.txt"));
+    assert_eq!(
+        index_triples(&h.a, "Personal", "code"),
+        index_triples(&h.b, "Personal", "code")
+    );
+
+    fs::remove_file(&link_a).unwrap();
+    fs::write(&link_a, b"back").unwrap();
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.push_both();
+    let meta = fs::symlink_metadata(&link_b).unwrap();
+    assert!(meta.is_file() && !meta.file_type().is_symlink());
+    assert_eq!(fs::read(&link_b).unwrap(), b"back");
+    assert_converged(&h);
+}
+
+/// A destination that cannot be written stalls its batch; after the retries
+/// the batch is given up with a hole at the stalled entry, so neither it nor
+/// the entries behind it are lost once the destination is writable again.
+#[cfg(unix)]
+#[test]
+fn locked_destination_is_re_requested_not_dropped() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("locked/existing.txt", b"e")]);
+    let locked = h.mount_b.path().join("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(locked.join(".probe"), b"").is_ok() {
+        // Directory permissions do not bind this user (root).
+        let _ = fs::remove_file(locked.join(".probe"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let before = h.received(false);
+    write_tree(
+        h.mount_a.path(),
+        &[("locked/new.txt", b"n"), ("zzz.txt", b"z")],
+    );
+    h.a.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.strict = false;
+    h.push_both();
+    // Two retries (5 s apart, on the wall clock) and the batch is given up.
+    for _ in 0..2 {
+        std::thread::sleep(std::time::Duration::from_millis(5_200));
+        h.tick_b(std::time::Instant::now());
+    }
+    assert!(!locked.join("new.txt").exists());
+    assert!(!h.mount_b.path().join("zzz.txt").exists());
+    assert_eq!(
+        h.received(false),
+        before,
+        "the watermark must not pass the stalled entry"
+    );
+    assert!(
+        h.events.iter().any(|e| matches!(
+            e,
+            SyncEvent::SyncWarning { reason, .. } if reason.contains("giving up")
+        )),
+        "{:?}",
+        h.events
+    );
+
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    h.strict = true;
+    h.events.clear();
+    h.tick_b(std::time::Instant::now() + std::time::Duration::from_secs(31));
+    assert_eq!(fs::read(locked.join("new.txt")).unwrap(), b"n");
+    assert_eq!(fs::read(h.mount_b.path().join("zzz.txt")).unwrap(), b"z");
+    assert!(h.received(false) > before);
+    assert_converged(&h);
+}
+
+/// A metadata-only device resolves concurrent versions the same way the
+/// devices holding the files do, so a hub does not keep the index churning.
+#[test]
+fn index_only_hub_resolves_concurrent_edits_without_churn() {
+    let mut h = Hub::new();
+    hub_fully_mesh(&mut h);
+    h.engines[0].create_space("Personal").unwrap();
+    h.engines[0]
+        .add_mount("Personal", "code", h.mounts[0].path(), &[], &[])
+        .unwrap();
+    write_tree(h.mounts[0].path(), &[("doc.txt", b"base")]);
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.engines[0].share("Personal", "bravo").unwrap();
+    h.engines[0].share("Personal", "charlie").unwrap();
+
+    h.connect_pair(0, 1);
+    h.engines[1].join_space("Personal", "alpha").unwrap();
+    h.engines[1]
+        .add_mount("Personal", "code", h.mounts[1].path(), &[], &[])
+        .unwrap();
+    h.engines[1]
+        .materialize_add("Personal", "hub", "metadata", &["code/**".into()])
+        .unwrap();
+    h.engines[1].share("Personal", "charlie").unwrap();
+
+    h.connect_pair(0, 2);
+    h.engines[2].join_space("Personal", "alpha").unwrap();
+    h.engines[2]
+        .add_mount("Personal", "code", h.mounts[2].path(), &[], &[])
+        .unwrap();
+    // Bravo holds no objects, so charlie meets alpha before bravo.
+    for i in 0..3 {
+        h.syncers[i] = Syncer::new();
+    }
+    h.connect_pair(0, 1);
+    h.connect_pair(0, 2);
+    h.connect_pair(1, 2);
+    h.push_all();
+    assert_eq!(
+        fs::read(h.mounts[2].path().join("doc.txt")).unwrap(),
+        b"base"
+    );
+    assert!(!h.mounts[1].path().join("doc.txt").exists());
+
+    fs::write(h.mounts[0].path().join("doc.txt"), b"alpha-edit").unwrap();
+    fs::write(h.mounts[2].path().join("doc.txt"), b"charlie-edit").unwrap();
+    h.engines[0]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.engines[2]
+        .scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    h.events.clear();
+    h.conflicts_by_engine = [0; 3];
+    h.push_all();
+
+    // At most one resolution per device: the winner carries the merged
+    // vector, so a device that sees the hub's resolution first applies it
+    // without resolving again, and the hub's rows match the writers' rows as
+    // soon as the first round goes quiet, so nothing is re-resolved later.
+    let resolved = h.conflicts_by_engine;
+    assert!(
+        resolved.iter().all(|&n| n <= 1) && resolved.iter().sum::<usize>() >= 1,
+        "{resolved:?} {:?}",
+        h.events
+    );
+    let index = index_triples(&h.engines[0], "Personal", "code");
+    assert_eq!(index, index_triples(&h.engines[1], "Personal", "code"));
+    assert_eq!(index, index_triples(&h.engines[2], "Personal", "code"));
+    h.events.clear();
+    h.conflicts_by_engine = [0; 3];
+    h.push_all();
+    assert_eq!(h.conflicts_by_engine, [0; 3], "{:?}", h.events);
+    assert_eq!(
+        live_files(h.mounts[0].path()),
+        live_files(h.mounts[2].path())
+    );
+    for i in 0..3 {
+        assert_eq!(
+            h.engines[i].conflicts(None).unwrap().len(),
+            1,
+            "{} should hold one conflict copy",
+            Hub::name(i)
+        );
+    }
+    assert!(live_files(h.mounts[1].path()).is_empty());
+    assert!(
+        h.engines[1]
+            .entries("Personal", "code", false)
+            .unwrap()
+            .iter()
+            .all(|e| !e.materialized)
+    );
+    h.push_all();
+    assert_eq!(index, index_triples(&h.engines[0], "Personal", "code"));
+    assert_eq!(index, index_triples(&h.engines[1], "Personal", "code"));
+}
+
+/// A mount a peer adds after this device joined is known under the peer's
+/// id before it is attached, and attaching it replays the entries that
+/// arrived while it was not.
+#[test]
+fn mount_offered_after_join_attaches_with_its_history() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[("a.txt", b"a")]);
+    let docs_a = TempDir::new().unwrap();
+    let docs_b = TempDir::new().unwrap();
+    h.a.add_mount("Personal", "docs", docs_a.path(), &[], &[])
+        .unwrap();
+    write_tree(docs_a.path(), &[("readme.md", b"r")]);
+    h.a.scan("Personal", "docs", ScanOptions::default())
+        .unwrap();
+    // The daemon re-offers on a mount change; a reconnect does the same here.
+    // Entries for the unattached mount are skipped, with a warning.
+    h.strict = false;
+    h.reconnect();
+    let offered =
+        h.b.mounts(Some("Personal"))
+            .unwrap()
+            .into_iter()
+            .map(|(_, c)| c)
+            .find(|c| c.mount.name == "docs")
+            .expect("an offered mount is known before it is attached");
+    assert_eq!(offered.mount.id, mount_id(&h.a, "docs"));
+    assert!(offered.local_path.is_none());
+    assert!(!docs_b.path().join("readme.md").exists());
+
+    h.strict = true;
+    h.b.add_mount("Personal", "docs", docs_b.path(), &[], &[])
+        .unwrap();
+    assert_eq!(mount_id(&h.b, "docs"), mount_id(&h.a, "docs"));
+    h.reconnect();
+    assert_eq!(fs::read(docs_b.path().join("readme.md")).unwrap(), b"r");
+    assert_eq!(
+        index_triples(&h.a, "Personal", "docs"),
+        index_triples(&h.b, "Personal", "docs")
+    );
+}
+
+#[test]
+fn hydration_does_not_overwrite_an_unscanned_file() {
+    let mut h = Harness::pair();
+    h.setup_shared_space(&[]);
+    h.b.materialize_add("Personal", "note", "demand", &["code/note.txt".into()])
+        .unwrap();
+    publish(&mut h, &[("note.txt", b"hello")]);
+    let mailbox = tempfile::tempdir().unwrap();
+    h.b.set_replica_path(mailbox.path()).unwrap();
+    let mut replica = FsReplica::open(mailbox.path()).unwrap();
+    replica
+        .put_object(ObjectId::of(b"hello"), b"hello")
+        .unwrap();
+
+    // The user wrote the path before asking for it; nothing has scanned it.
+    fs::write(h.mount_b.path().join("note.txt"), b"mine").unwrap();
+    let err = h.b.fetch_path("Personal", "code", "note.txt").unwrap_err();
+    assert!(
+        matches!(err, relay_engine::EngineError::DestinationChanged(_)),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read(h.mount_b.path().join("note.txt")).unwrap(),
+        b"mine"
+    );
+    assert!(!entry_at(&h.b, "note.txt").materialized);
+
+    // The scan records the edit as this device's version.
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    assert!(entry_at(&h.b, "note.txt").materialized);
+    h.push_both();
+    h.push_both();
+    assert_eq!(
+        fs::read(h.mount_a.path().join("note.txt")).unwrap(),
+        b"mine"
+    );
+    assert_converged(&h);
 }

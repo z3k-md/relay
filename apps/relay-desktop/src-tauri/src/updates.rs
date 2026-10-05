@@ -219,7 +219,7 @@ pub async fn check_and_maybe_install(
         if !interactive {
             emit_progress(app, &UpdateProgress::Checking { op_id: install_op });
         }
-        let info = install_downloaded(app, update, install_op, true).await?;
+        let info = install_downloaded(app, update, install_op).await?;
         if !interactive && info.error {
             publish_available(app, &version, &notes);
         }
@@ -290,7 +290,7 @@ pub async fn install(app: &AppHandle) -> Result<UpdateInfo, String> {
             ));
         }
     };
-    let info = install_downloaded(app, update, op_id, true).await?;
+    let info = install_downloaded(app, update, op_id).await?;
     if info.restart_at_ms.is_some() {
         guard.hold_until_restart();
     }
@@ -307,66 +307,46 @@ async fn install_downloaded(
     app: &AppHandle,
     update: tauri_plugin_updater::Update,
     op_id: u64,
-    prompt_restart: bool,
 ) -> Result<UpdateInfo, String> {
-    if let Some(state) = app.try_state::<AppState>() {
-        state.runner.stop_join();
-    }
     let version = update.version.clone();
     let notes = update.body.clone();
 
-    if prompt_restart {
-        emit_progress(
-            app,
-            &UpdateProgress::Downloading {
-                op_id,
-                downloaded: 0,
-                total: None,
-            },
-        );
-        if let Err(err) = download_with_progress(app, &update, op_id).await {
-            return Ok(finish_interactive(app, true, failed(op_id, err)));
-        }
-        let restart_at_ms = schedule_restart(app);
-        emit_progress(
-            app,
-            &UpdateProgress::Ready {
-                op_id,
-                version: version.clone(),
-                restart_at_ms,
-            },
-        );
-        return Ok(UpdateInfo {
+    emit_progress(
+        app,
+        &UpdateProgress::Downloading {
             op_id,
-            configured: true,
-            available: true,
-            version: Some(version.clone()),
-            notes,
-            message: format!("Relay {version} installed. Restarting shortly."),
-            installing: true,
-            restart_at_ms: Some(restart_at_ms),
-            error: false,
-        });
+            downloaded: 0,
+            total: None,
+        },
+    );
+    if let Err(err) = download_with_progress(app, &update, op_id).await {
+        return Ok(finish_interactive(app, true, failed(op_id, err)));
     }
-
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|err| anyhow_chain(err.into()))?;
-    app.request_restart();
+    let restart_at_ms = schedule_restart(app);
+    emit_progress(
+        app,
+        &UpdateProgress::Ready {
+            op_id,
+            version: version.clone(),
+            restart_at_ms,
+        },
+    );
     Ok(UpdateInfo {
         op_id,
         configured: true,
         available: true,
         version: Some(version.clone()),
         notes,
-        message: format!("Installing Relay {version}…"),
+        message: format!("Relay {version} installed. Restarting shortly."),
         installing: true,
-        restart_at_ms: None,
+        restart_at_ms: Some(restart_at_ms),
         error: false,
     })
 }
 
+/// Download and install `update`. Sync stops only once the download is
+/// complete, so a failed download leaves it running; if the install then
+/// fails, sync starts again.
 async fn download_with_progress(
     app: &AppHandle,
     update: &tauri_plugin_updater::Update,
@@ -378,8 +358,10 @@ async fn download_with_progress(
     let mut last_emit = Instant::now()
         .checked_sub(PROGRESS_EMIT_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let stopped = AtomicBool::new(false);
+    let stopped_on_finish = &stopped;
 
-    update
+    let result = update
         .download_and_install(
             move |chunk, total| {
                 downloaded = downloaded.saturating_add(chunk as u64);
@@ -398,11 +380,22 @@ async fn download_with_progress(
                 }
             },
             move || {
+                if let Some(state) = done_app.try_state::<AppState>() {
+                    state.runner.stop_join(&done_app);
+                }
+                stopped_on_finish.store(true, Ordering::SeqCst);
                 emit_progress(&done_app, &UpdateProgress::Installing { op_id });
             },
         )
         .await
-        .map_err(|err| anyhow_chain(err.into()))
+        .map_err(|err| anyhow_chain(err.into()));
+    if result.is_err()
+        && stopped.load(Ordering::SeqCst)
+        && let Some(state) = app.try_state::<AppState>()
+    {
+        state.runner.start(app);
+    }
+    result
 }
 
 fn schedule_restart(app: &AppHandle) -> u64 {

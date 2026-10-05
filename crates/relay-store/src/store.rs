@@ -164,6 +164,27 @@ impl ObjectStore {
             .map_err(|e| map_not_found(*id, path, e))
     }
 
+    /// How many objects are stored, counted without collecting their ids.
+    pub fn count(&self) -> Result<u64, StoreError> {
+        let objects = self.objects_dir();
+        if !objects.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in walkdir::WalkDir::new(&objects) {
+            let entry = entry.map_err(walkdir_err)?;
+            if entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.parse::<ObjectId>().is_ok())
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// All stored object ids. Stray non-hex names under `objects/` are ignored.
     pub fn list(&self) -> Result<Vec<ObjectId>, StoreError> {
         let objects = self.objects_dir();
@@ -271,7 +292,15 @@ impl ObjectStore {
                 actual,
             });
         }
+        self.import_prehashed(tmp, expected)
+    }
 
+    /// Fsync `tmp` and atomically publish it as `expected` without reading
+    /// it again: the caller already hashed these exact bytes (the network
+    /// layer hashes an object as it streams in). Bytes from any other source
+    /// go through [`Self::import_verified`]. `tmp` is removed on success and
+    /// when the object is already present.
+    pub fn import_prehashed(&self, tmp: &Path, expected: &ObjectId) -> Result<(), StoreError> {
         if self.contains(expected) {
             let _ = fs::remove_file(tmp);
             return Ok(());
@@ -913,6 +942,25 @@ mod tests {
         assert_corrupt(err, expected, b"other");
         assert!(!store.contains(&expected));
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn import_prehashed_publishes_and_removes_tmp() {
+        let (_dir, store) = setup();
+        let data = b"streamed-and-hashed";
+        let id = ObjectId::of(data);
+        let tmp = store.tmp_path().unwrap();
+        fs::write(&tmp, data).unwrap();
+        store.import_prehashed(&tmp, &id).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(store.read(&id).unwrap(), data);
+        store.verify(&id).unwrap();
+
+        let again = store.tmp_path().unwrap();
+        fs::write(&again, data).unwrap();
+        store.import_prehashed(&again, &id).unwrap();
+        assert!(!again.exists());
+        assert_eq!(object_file_count(&store), 1);
     }
 
     #[test]

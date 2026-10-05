@@ -5,11 +5,13 @@ use std::time::Duration;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use relay_core::DeviceId;
 
-use crate::NetEvent;
 use crate::addr::advertised_ips;
 use crate::session::Inner;
 
 pub(crate) const SERVICE_TYPE: &str = "_relay._udp.local.";
+/// Dial hints kept per trusted peer from its latest mDNS resolve. Few, so a
+/// spoofed announcement can only add a couple of failed dial attempts.
+const MAX_DISCOVERED: usize = 2;
 
 pub(crate) struct Discovery {
     mdns: ServiceDaemon,
@@ -160,7 +162,7 @@ fn handle_resolved(inner: &Inner, info: &ResolvedService) {
     } else {
         forget_ad(inner, info.get_fullname());
     }
-    maybe_merge_trusted(inner, id, addrs);
+    note_discovered(inner, id, addrs);
 }
 
 fn forget_ad(inner: &Inner, fullname: &str) {
@@ -168,33 +170,22 @@ fn forget_ad(inner: &Inner, fullname: &str) {
     ads.retain(|_, ad| ad.fullname != fullname);
 }
 
-fn maybe_merge_trusted(inner: &Inner, id: DeviceId, discovered: Vec<String>) {
-    let merged = {
-        let trusted = inner.trusted.read().unwrap_or_else(|e| e.into_inner());
-        let Some(peer) = trusted.get(&id) else {
-            return;
-        };
-        let new = discovered
-            .iter()
-            .any(|addr| !peer.addresses.iter().any(|have| have == addr));
-        if !new {
-            return;
-        }
-        relay_core::merge_peer_addresses(&peer.addresses, &discovered)
-    };
-    if merged.is_empty() {
+/// Remember where a trusted peer says it is, as a dial hint only. The
+/// announcement is unauthenticated: anyone on the LAN can claim a peer's id,
+/// so nothing here touches the stored address list. The dialer persists a
+/// hint once a dial to it completed the pinned handshake.
+fn note_discovered(inner: &Inner, id: DeviceId, discovered: Vec<String>) {
+    if !inner.is_trusted(&id) {
         return;
     }
-    {
-        let mut trusted = inner.trusted.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(peer) = trusted.get_mut(&id) {
-            peer.addresses = merged.clone();
-        }
-    }
-    inner.emit(NetEvent::PeerAddresses {
-        peer: id,
-        addresses: merged,
-    });
+    let mut discovered = discovered;
+    discovered.truncate(MAX_DISCOVERED);
+    tracing::debug!(peer = %id, addresses = ?discovered, "mDNS dial hint");
+    inner
+        .discovered
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, discovered);
 }
 
 pub(crate) fn resolved_addresses(info: &ResolvedService) -> Vec<String> {

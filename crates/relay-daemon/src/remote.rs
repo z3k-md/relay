@@ -291,32 +291,41 @@ impl Context {
     fn list(&self, path: &str, cursor: u32, limit: u32) -> Result<DirListing, RemoteError> {
         let dir = self.resolve(path)?;
         let read = fs::read_dir(&dir).map_err(|err| io_error(&err, &dir))?;
-        let mut entries: Vec<DirEntry> = read
+        // The directory read already gives names and types, which is all the
+        // order needs; only the page returned is stat'ed, so a large folder
+        // costs one stat per entry shown rather than per entry per page.
+        let mut found: Vec<Found> = read
             .flatten()
             .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
                 let path = entry.path();
-                if path == self.relay_home
-                    || relay_core::is_bookkeeping_component(entry.file_name().to_str()?)
-                {
+                if path == self.relay_home || relay_core::is_bookkeeping_component(&name) {
                     return None;
                 }
-                let meta = entry.metadata().ok()?;
-                self.describe(&path, &meta)
+                let is_dir = entry.file_type().ok()?.is_dir();
+                Some(Found { is_dir, name, path })
             })
             .collect();
-        entries.sort_by(listing_order);
-        let total = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        found.sort_by(listing_order);
+        let total = u32::try_from(found.len()).unwrap_or(u32::MAX);
         let limit = match limit {
             0 => DEFAULT_LISTING,
             n => n.min(MAX_LISTING),
         };
-        let start = (cursor as usize).min(entries.len());
-        let end = (start + limit as usize).min(entries.len());
-        let next_cursor = (end < entries.len()).then(|| u32::try_from(end).unwrap_or(u32::MAX));
+        let start = (cursor as usize).min(found.len());
+        let end = (start + limit as usize).min(found.len());
+        let next_cursor = (end < found.len()).then(|| u32::try_from(end).unwrap_or(u32::MAX));
+        let entries = found[start..end]
+            .iter()
+            .filter_map(|entry| {
+                let meta = fs::symlink_metadata(&entry.path).ok()?;
+                self.describe(&entry.path, &meta)
+            })
+            .collect();
         Ok(DirListing {
             path: utf8(&dir)?,
             parent: dir.parent().and_then(|p| p.to_str()).map(str::to_owned),
-            entries: entries.drain(start..end).collect(),
+            entries,
             next_cursor,
             total,
             inside_mount: self
@@ -641,11 +650,18 @@ fn ancestors(dir: &Path) -> Vec<RemoteRoot> {
     folders
 }
 
+/// A directory entry before it is stat'ed: what the listing order needs.
+/// A symlink to a folder is not a folder here, as in [`DirEntryKind`].
+struct Found {
+    is_dir: bool,
+    name: String,
+    path: PathBuf,
+}
+
 /// Folders first, then by name ignoring case.
-fn listing_order(a: &DirEntry, b: &DirEntry) -> Ordering {
-    let is_dir = |e: &DirEntry| e.kind == DirEntryKind::Directory;
-    is_dir(b)
-        .cmp(&is_dir(a))
+fn listing_order(a: &Found, b: &Found) -> Ordering {
+    b.is_dir
+        .cmp(&a.is_dir)
         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
 }
 

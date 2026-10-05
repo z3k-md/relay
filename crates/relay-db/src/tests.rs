@@ -1340,3 +1340,57 @@ fn peers_start_without_the_manage_grant() {
 
     assert!(!db.repo().set_peer_manage(device(8, "x").id, true).unwrap());
 }
+
+#[test]
+fn multi_row_reads_load_every_vector_across_chunks() {
+    // More rows than one vector-load chunk, each with its own vector, and
+    // one row with no versions at all: every record must come back with
+    // exactly the vector it was written with.
+    let h = Harness::new();
+    let repo = h.db.repo();
+    let total = 600u64;
+    let mut written = Vec::new();
+    for i in 1..=total {
+        let vv = if i % 7 == 0 {
+            VersionVector::new()
+        } else {
+            vector(&[(1, i), (2, i * 2), (3, i % 5)])
+        };
+        let record = h.record(
+            &format!("dir/file{i:04}.txt"),
+            file(format!("body{i}").as_bytes(), false),
+            i,
+            vv,
+            None,
+            None,
+        );
+        repo.put_entry(&record).unwrap();
+        written.push(record);
+    }
+    let read = repo.entries_for_mount(h.mount.id).unwrap();
+    assert_eq!(read.len(), written.len());
+    for (got, want) in read.iter().zip(written.iter()) {
+        assert_eq!(got.key.path, want.key.path);
+        assert_eq!(got.vector, want.vector, "vector for {}", want.key.path);
+    }
+    let since = repo
+        .changes_since_in_space(h.space.id, Sequence(300), 1000)
+        .unwrap();
+    assert_eq!(since.len(), 300);
+    assert!(since.iter().all(|e| {
+        written
+            .iter()
+            .find(|w| w.key.path == e.key.path)
+            .is_some_and(|w| w.vector == e.vector)
+    }));
+    let only: Vec<_> = repo
+        .list_index_only_by_object(ObjectId::of(b"body5"))
+        .unwrap();
+    assert!(only.is_empty(), "materialized rows are not index-only");
+    assert_eq!(repo.count_entries(h.mount.id).unwrap(), (600, 0));
+    assert_eq!(
+        repo.live_paths(h.mount.id).unwrap().len(),
+        600,
+        "live_paths lists every live row"
+    );
+}

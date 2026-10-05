@@ -12,7 +12,7 @@ use crate::commands::{apply_config, host_client, open_ro};
 use crate::error::error_chain;
 
 /// One folder of a mount. `path` `""` is the mount itself.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_folder(
     app: AppHandle,
     space: String,

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub use relay_core::DeleteHoldDecision;
@@ -624,9 +624,7 @@ impl Repo<'_> {
         ))?;
         let rows = stmt.query_map(params![mount_blob.as_slice()], Self::map_raw_entry)?;
         let raws = collect_raw_entries(rows)?;
-        raws.into_iter()
-            .map(|raw| self.assemble_record(raw))
-            .collect()
+        self.assemble_records(raws)
     }
 
     /// Live entries directly inside `folder` (the mount root when `None`):
@@ -668,9 +666,7 @@ impl Repo<'_> {
             Self::map_raw_entry,
         )?;
         let raws = collect_raw_entries(rows)?;
-        raws.into_iter()
-            .map(|raw| self.assemble_record(raw))
-            .collect()
+        self.assemble_records(raws)
     }
 
     /// Entries at `prefix` and every path under it (`prefix/...`).
@@ -700,9 +696,48 @@ impl Repo<'_> {
             Self::map_raw_entry,
         )?;
         let raws = collect_raw_entries(rows)?;
-        raws.into_iter()
-            .map(|raw| self.assemble_record(raw))
-            .collect()
+        self.assemble_records(raws)
+    }
+
+    /// Paths of every live entry in a mount, without the rest of the row.
+    pub fn live_paths(&self, mount: MountId) -> Result<Vec<relay_core::LogicalPath>, DbError> {
+        let mount_blob = mount_bytes(mount);
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT path FROM entries WHERE mount_id = ?1 AND deleted = 0")?;
+        let rows = stmt.query_map(params![mount_blob.as_slice()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let path = row?;
+            out.push(relay_core::LogicalPath::new(&path).map_err(|err| {
+                DbError::Corrupt(format!("invalid logical path {path:?}: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// `(live, tombstones)` for a mount, without reading the rows.
+    pub fn count_entries(&self, mount: MountId) -> Result<(usize, usize), DbError> {
+        let mount_blob = mount_bytes(mount);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT deleted, COUNT(*) FROM entries WHERE mount_id = ?1 GROUP BY deleted",
+        )?;
+        let rows = stmt.query_map(params![mount_blob.as_slice()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let (mut live, mut tombstones) = (0usize, 0usize);
+        for row in rows {
+            let (deleted, count) = row?;
+            let count = usize::try_from(count).map_err(|_| DbError::IntegerOverflow)?;
+            if deleted == 0 {
+                live += count;
+            } else {
+                tombstones += count;
+            }
+        }
+        Ok((live, tombstones))
     }
 
     pub fn count_live(&self, mount: MountId) -> Result<usize, DbError> {
@@ -770,15 +805,52 @@ impl Repo<'_> {
              WHERE e.materialized = 0 AND e.deleted = 0
              ORDER BY m.name, e.path",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, [u8; 16]>(0)?,
-                row.get::<_, [u8; 16]>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-            ))
-        })?;
+        let rows = stmt.query_map([], Self::map_index_only)?;
+        Self::collect_index_only(rows)
+    }
+
+    /// Index-only rows whose file is `object`: the rows a fetched object can
+    /// hydrate, without walking every index-only row.
+    pub fn list_index_only_by_object(
+        &self,
+        object: ObjectId,
+    ) -> Result<Vec<IndexOnlyEntry>, DbError> {
+        let object = *object.as_bytes();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.space_id, m.id, m.name, e.path, e.object_id
+             FROM entries e
+             JOIN mounts m ON m.id = e.mount_id
+             JOIN device_mounts dm ON dm.mount_id = m.id
+             JOIN local_device ld ON ld.device_ref = dm.device_ref
+             WHERE e.materialized = 0 AND e.deleted = 0 AND e.object_id = ?1
+             ORDER BY m.name, e.path",
+        )?;
+        let rows = stmt.query_map(params![object.as_slice()], Self::map_index_only)?;
+        Self::collect_index_only(rows)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn map_index_only(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<([u8; 16], [u8; 16], String, String, Option<Vec<u8>>)> {
+        Ok((
+            row.get::<_, [u8; 16]>(0)?,
+            row.get::<_, [u8; 16]>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+        ))
+    }
+
+    fn collect_index_only(
+        rows: rusqlite::MappedRows<
+            '_,
+            impl FnMut(
+                &rusqlite::Row<'_>,
+            )
+                -> rusqlite::Result<([u8; 16], [u8; 16], String, String, Option<Vec<u8>>)>,
+        >,
+    ) -> Result<Vec<IndexOnlyEntry>, DbError> {
         let mut out = Vec::new();
         for row in rows {
             let (space, mount, mount_name, path, object) = row?;
@@ -863,9 +935,7 @@ impl Repo<'_> {
         ))?;
         let rows = stmt.query_map(params![after, limit], Self::map_raw_entry)?;
         let raws = collect_raw_entries(rows)?;
-        raws.into_iter()
-            .map(|raw| self.assemble_record(raw))
-            .collect()
+        self.assemble_records(raws)
     }
 
     pub fn history(&self, key: &EntryKey) -> Result<Vec<HistoryRecord>, DbError> {
@@ -1143,9 +1213,7 @@ impl Repo<'_> {
         ))?;
         let rows = stmt.query_map(params![space.as_slice(), after, limit], Self::map_raw_entry)?;
         let raws = collect_raw_entries(rows)?;
-        raws.into_iter()
-            .map(|raw| self.assemble_record(raw))
-            .collect()
+        self.assemble_records(raws)
     }
 
     pub fn add_peer(
@@ -2421,32 +2489,32 @@ impl Repo<'_> {
 
         let existing = self.entry_id(record.key.mount, record.key.path.as_str())?;
         let entry_id = if let Some(entry_id) = existing {
-            match self.conn.execute(
+            let mut update = self.conn.prepare_cached(
                 "UPDATE entries SET
                     kind = ?1, deleted = ?2, object_id = ?3, size = ?4, executable = ?5,
                     symlink_target = ?6, parent_object = ?7, sequence = ?8, modified_by = ?9,
                     modified_at_ms = ?10, stat_size = ?11, stat_mtime_ns = ?12, stat_file_id = ?13,
                     stat_ctime_ns = ?14, materialized = ?15
                  WHERE id = ?16",
-                params![
-                    encoded.kind,
-                    encoded.deleted,
-                    object_id.as_ref().map(|b| b.as_slice()),
-                    size,
-                    encoded.executable,
-                    encoded.symlink_target.as_deref(),
-                    parent.as_ref().map(|b| b.as_slice()),
-                    sequence,
-                    modified_by,
-                    record.modified_at_unix_ms,
-                    stat.size,
-                    stat.mtime_ns,
-                    stat.file_id,
-                    stat.ctime_ns,
-                    i64::from(record.materialized),
-                    entry_id,
-                ],
-            ) {
+            )?;
+            match update.execute(params![
+                encoded.kind,
+                encoded.deleted,
+                object_id.as_ref().map(|b| b.as_slice()),
+                size,
+                encoded.executable,
+                encoded.symlink_target.as_deref(),
+                parent.as_ref().map(|b| b.as_slice()),
+                sequence,
+                modified_by,
+                record.modified_at_unix_ms,
+                stat.size,
+                stat.mtime_ns,
+                stat.file_id,
+                stat.ctime_ns,
+                i64::from(record.materialized),
+                entry_id,
+            ]) {
                 Ok(_) => entry_id,
                 Err(err) if is_unique_violation(&err) => {
                     return Err(DbError::DuplicateSequence(record.sequence));
@@ -2454,32 +2522,32 @@ impl Repo<'_> {
                 Err(err) => return Err(err.into()),
             }
         } else {
-            match self.conn.execute(
+            let mut insert = self.conn.prepare_cached(
                 "INSERT INTO entries (
                     mount_id, path, kind, deleted, object_id, size, executable, symlink_target,
                     parent_object, sequence, modified_by, modified_at_ms,
                     stat_size, stat_mtime_ns, stat_file_id, stat_ctime_ns, materialized
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                params![
-                    mount.as_slice(),
-                    record.key.path.as_str(),
-                    encoded.kind,
-                    encoded.deleted,
-                    object_id.as_ref().map(|b| b.as_slice()),
-                    size,
-                    encoded.executable,
-                    encoded.symlink_target.as_deref(),
-                    parent.as_ref().map(|b| b.as_slice()),
-                    sequence,
-                    modified_by,
-                    record.modified_at_unix_ms,
-                    stat.size,
-                    stat.mtime_ns,
-                    stat.file_id,
-                    stat.ctime_ns,
-                    i64::from(record.materialized),
-                ],
-            ) {
+            )?;
+            match insert.execute(params![
+                mount.as_slice(),
+                record.key.path.as_str(),
+                encoded.kind,
+                encoded.deleted,
+                object_id.as_ref().map(|b| b.as_slice()),
+                size,
+                encoded.executable,
+                encoded.symlink_target.as_deref(),
+                parent.as_ref().map(|b| b.as_slice()),
+                sequence,
+                modified_by,
+                record.modified_at_unix_ms,
+                stat.size,
+                stat.mtime_ns,
+                stat.file_id,
+                stat.ctime_ns,
+                i64::from(record.materialized),
+            ]) {
                 Ok(_) => self.conn.last_insert_rowid(),
                 Err(err) if is_unique_violation(&err) => {
                     return Err(DbError::DuplicateSequence(record.sequence));
@@ -2488,42 +2556,64 @@ impl Repo<'_> {
             }
         };
 
-        self.conn.execute(
-            "DELETE FROM entry_versions WHERE entry_id = ?1",
-            params![entry_id],
+        self.conn
+            .prepare_cached("DELETE FROM entry_versions WHERE entry_id = ?1")?
+            .execute(params![entry_id])?;
+        let mut insert_version = self.conn.prepare_cached(
+            "INSERT INTO entry_versions (entry_id, device_ref, counter) VALUES (?1, ?2, ?3)",
         )?;
         for (device_ref, counter) in version_refs {
-            self.conn.execute(
-                "INSERT INTO entry_versions (entry_id, device_ref, counter) VALUES (?1, ?2, ?3)",
-                params![entry_id, device_ref, counter],
-            )?;
+            insert_version.execute(params![entry_id, device_ref, counter])?;
         }
 
         let vector_json = serde_json::to_string(&record.vector)?;
-        self.conn.execute(
+        let mut insert_history = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO history (
                 entry_id, sequence, kind, deleted, object_id, size, executable, symlink_target,
                 parent_object, vector_json, modified_by, modified_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                entry_id,
-                sequence,
-                encoded.kind,
-                encoded.deleted,
-                object_id.as_ref().map(|b| b.as_slice()),
-                size,
-                encoded.executable,
-                encoded.symlink_target.as_deref(),
-                parent.as_ref().map(|b| b.as_slice()),
-                vector_json,
-                modified_by,
-                record.modified_at_unix_ms,
-            ],
         )?;
+        insert_history.execute(params![
+            entry_id,
+            sequence,
+            encoded.kind,
+            encoded.deleted,
+            object_id.as_ref().map(|b| b.as_slice()),
+            size,
+            encoded.executable,
+            encoded.symlink_target.as_deref(),
+            parent.as_ref().map(|b| b.as_slice()),
+            vector_json,
+            modified_by,
+            record.modified_at_unix_ms,
+        ])?;
         Ok(())
     }
 
     fn assemble_record(&self, raw: RawEntry) -> Result<EntryRecord, DbError> {
+        let vector = self.load_vector(raw.id)?;
+        Self::assemble_with_vector(raw, vector)
+    }
+
+    /// Assemble many rows with their vectors loaded in chunks rather than
+    /// one query per row.
+    fn assemble_records(&self, raws: Vec<RawEntry>) -> Result<Vec<EntryRecord>, DbError> {
+        if raws.len() <= 1 {
+            return raws
+                .into_iter()
+                .map(|raw| self.assemble_record(raw))
+                .collect();
+        }
+        let mut vectors = self.load_vectors(raws.iter().map(|raw| raw.id))?;
+        raws.into_iter()
+            .map(|raw| {
+                let vector = vectors.remove(&raw.id).unwrap_or_default();
+                Self::assemble_with_vector(raw, vector)
+            })
+            .collect()
+    }
+
+    fn assemble_with_vector(raw: RawEntry, vector: VersionVector) -> Result<EntryRecord, DbError> {
         let path = relay_core::LogicalPath::new(&raw.path).map_err(|err| {
             DbError::Corrupt(format!("invalid logical path {:?}: {err}", raw.path))
         })?;
@@ -2541,7 +2631,7 @@ impl Repo<'_> {
                 raw.executable,
                 raw.symlink_target.as_deref(),
             )?,
-            vector: self.load_vector(raw.id)?,
+            vector,
             parent_object: opt_object_id(raw.parent_object)?,
             sequence: Sequence(u64_from_i64(raw.sequence)?),
             modified_by: DeviceId::from_bytes(raw.modified_by),
@@ -2554,6 +2644,46 @@ impl Repo<'_> {
             )?,
             materialized: raw.materialized != 0,
         })
+    }
+
+    /// Vectors for many entries, `VECTOR_CHUNK` ids per statement. The
+    /// parameter list is padded with an impossible id so one cached statement
+    /// serves every chunk.
+    fn load_vectors(
+        &self,
+        ids: impl Iterator<Item = i64>,
+    ) -> Result<HashMap<i64, VersionVector>, DbError> {
+        const VECTOR_CHUNK: usize = 256;
+        let placeholders = (1..=VECTOR_CHUNK)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT ev.entry_id, d.device_id, ev.counter
+             FROM entry_versions ev
+             JOIN devices d ON d.ref = ev.device_ref
+             WHERE ev.entry_id IN ({placeholders})"
+        ))?;
+        let ids: Vec<i64> = ids.collect();
+        let mut out: HashMap<i64, VersionVector> = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(VECTOR_CHUNK) {
+            let mut bound = chunk.to_vec();
+            bound.resize(VECTOR_CHUNK, -1);
+            let rows = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, [u8; 32]>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (entry_id, device, counter) = row?;
+                out.entry(entry_id)
+                    .or_default()
+                    .set(DeviceId::from_bytes(device), u64_from_i64(counter)?);
+            }
+        }
+        Ok(out)
     }
 
     fn load_vector(&self, entry_id: i64) -> Result<VersionVector, DbError> {
@@ -2695,11 +2825,8 @@ impl Repo<'_> {
     fn entry_id(&self, mount: MountId, path: &str) -> Result<Option<i64>, DbError> {
         let mount = mount_bytes(mount);
         self.conn
-            .query_row(
-                "SELECT id FROM entries WHERE mount_id = ?1 AND path = ?2",
-                params![mount.as_slice(), path],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT id FROM entries WHERE mount_id = ?1 AND path = ?2")?
+            .query_row(params![mount.as_slice(), path], |row| row.get(0))
             .optional()
             .map_err(DbError::from)
     }
@@ -2713,11 +2840,8 @@ impl Repo<'_> {
     fn device_ref(&self, id: DeviceId) -> Result<Option<i64>, DbError> {
         let id = device_id_bytes(id);
         self.conn
-            .query_row(
-                "SELECT ref FROM devices WHERE device_id = ?1",
-                params![id.as_slice()],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT ref FROM devices WHERE device_id = ?1")?
+            .query_row(params![id.as_slice()], |row| row.get(0))
             .optional()
             .map_err(DbError::from)
     }

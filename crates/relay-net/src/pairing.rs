@@ -14,13 +14,20 @@ use tokio::time::timeout;
 use crate::NetEvent;
 use crate::addr::advertised_addresses;
 use crate::discovery::lookup_nameplate;
-use crate::io::read_message;
+use crate::io::read_message_max;
 use crate::session::{CLOSE_PROTOCOL, CLOSE_UNTRUSTED, Inner, close_code, peer_device_id};
 use crate::tls::{SERVER_NAME, make_pairing_client_config};
 
 pub(crate) const CLOSE_PAIRING: u32 = 6;
 const JOIN_RESOLVE: Duration = Duration::from_secs(15);
 const PAIR_IO: Duration = Duration::from_secs(20);
+/// Addresses a device advertises while pairing; any beyond these are dropped.
+const PAIR_ADDRESSES_MAX: usize = 16;
+/// Pairing messages stay under 2 KiB: a name of up to 64 characters, SPAKE2
+/// and MAC values of a few dozen bytes, and at most `PAIR_ADDRESSES_MAX`
+/// addresses of under 50 bytes each. Any device may open a pairing stream
+/// while a session is open, so the read buffer stays small.
+const PAIR_MESSAGE_MAX: usize = 4 * 1024;
 
 pub(crate) struct PairSession {
     pub code: PairingCode,
@@ -208,16 +215,12 @@ async fn run_initiator(inner: &Inner, conn: Connection, joiner: DeviceId) -> Res
         return Err("pairing confirmation failed".into());
     }
 
-    let our_addrs = advertised_addresses(inner.listen_port);
     let confirm_a = confirm_mac(&key, PAIR_CONFIRM_A, &transcript);
     write_pair(
         &mut send,
         Body::ConfirmA(PairConfirmA {
             mac: confirm_a.as_bytes().to_vec(),
-            info: Some(PairDeviceInfo {
-                name: inner.device_name.clone(),
-                addresses: our_addrs,
-            }),
+            info: Some(our_info(inner)),
         }),
     )
     .await?;
@@ -432,14 +435,7 @@ async fn run_joiner(inner: &Inner, conn: Connection, code: &PairingCode) -> Resu
         name: String::new(),
         addresses: Vec::new(),
     });
-    write_pair(
-        &mut send,
-        Body::JoinInfo(PairDeviceInfo {
-            name: inner.device_name.clone(),
-            addresses: advertised_addresses(inner.listen_port),
-        }),
-    )
-    .await?;
+    write_pair(&mut send, Body::JoinInfo(our_info(inner))).await?;
     let _ = send.finish();
 
     let addresses = collect_peer_addresses(&info.addresses, Some(conn.remote_address()));
@@ -452,6 +448,16 @@ async fn run_joiner(inner: &Inner, conn: Connection, code: &PairingCode) -> Resu
         initiator: false,
     });
     Ok(())
+}
+
+/// What this device tells the other about itself once the code has matched.
+fn our_info(inner: &Inner) -> PairDeviceInfo {
+    let mut addresses = advertised_addresses(inner.listen_port);
+    addresses.truncate(PAIR_ADDRESSES_MAX);
+    PairDeviceInfo {
+        name: inner.device_name.clone(),
+        addresses,
+    }
 }
 
 fn pair_transcript(
@@ -487,7 +493,9 @@ fn mac_matches(received: &[u8], expected: &blake3::Hash) -> bool {
     <[u8; 32]>::try_from(received).is_ok_and(|bytes| blake3::Hash::from_bytes(bytes) == *expected)
 }
 
-fn sanitize_name(name: &str, id: DeviceId) -> String {
+/// A peer-supplied device name, or the id's short form when it would not
+/// pass as a local name (empty, over 64 characters, control characters).
+pub(crate) fn sanitize_name(name: &str, id: DeviceId) -> String {
     if relay_core::validate_name(name).is_ok() {
         name.to_owned()
     } else {
@@ -503,7 +511,7 @@ async fn write_pair(send: &mut SendStream, body: Body) -> Result<(), String> {
 }
 
 async fn read_pair(recv: &mut RecvStream) -> Result<Body, String> {
-    let msg: PairingMessage = timeout(PAIR_IO, read_message(recv))
+    let msg: PairingMessage = timeout(PAIR_IO, read_message_max(recv, PAIR_MESSAGE_MAX))
         .await
         .map_err(|_| "timed out reading a pairing message".to_owned())?
         .map_err(|e| e.to_string())?;

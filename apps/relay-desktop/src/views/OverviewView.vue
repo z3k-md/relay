@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import Modal from "../components/Modal.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { api, copyText } from "../lib/api";
-import { formatBytes } from "../lib/updateProgress";
+import { formatBytes } from "../lib/format";
 import type { DeleteHold, Overview, RunnerState, TransferLive } from "../lib/types";
 
 const props = defineProps<{
@@ -73,7 +73,9 @@ onUnmounted(() => {
 
 const canToggle = computed(() => {
   const kind = props.overview.runner.kind;
-  return kind === "running" || kind === "starting" || kind === "paused" || kind === "error";
+  return (
+    kind === "running" || kind === "starting" || kind === "paused" || kind === "stopped" || kind === "error"
+  );
 });
 
 async function copyId() {
@@ -133,7 +135,7 @@ function runnerDetail(state: RunnerState): string | null {
       <div class="flex items-center gap-2">
         <StatusBadge :state="overview.runner" />
         <button
-          v-if="canToggle && overview.runner.kind === 'paused'"
+          v-if="canToggle && (overview.runner.kind === 'paused' || overview.runner.kind === 'stopped')"
           type="button"
           class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
           @click="emit('resume')"

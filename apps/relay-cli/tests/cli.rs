@@ -15,6 +15,53 @@ fn home_arg(home: &TempDir) -> String {
     home.path().to_str().unwrap().to_owned()
 }
 
+/// A spawned `relay` that dies with the test, so a failed assertion does not
+/// leave it holding the temp dirs open.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Start `relay run` on loopback with periodic scans only, and wait until
+/// `relay status` shows it running and its first full scan done. Callers
+/// have indexed everything already, so that scan changes nothing.
+fn start_host(home_s: &str) -> KillOnDrop {
+    const FIRST_SCAN: &str = "0 created, 0 modified, 0 deleted";
+    let bin = assert_cmd::cargo::cargo_bin("relay");
+    let host = KillOnDrop(
+        StdCommand::new(&bin)
+            .args([
+                "--home",
+                home_s,
+                "run",
+                "--listen",
+                "127.0.0.1:0",
+                "--poll",
+                "--full-scan-secs",
+                "3600",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let ready = wait_until(Duration::from_secs(15), || {
+        relay()
+            .args(["--home", home_s, "status"])
+            .ok()
+            .is_ok_and(|out| {
+                let text = String::from_utf8_lossy(&out.stdout);
+                text.contains("daemon: running") && text.contains(FIRST_SCAN)
+            })
+    });
+    assert!(ready, "host did not come up");
+    host
+}
+
 #[test]
 fn cli_end_to_end() {
     let home = TempDir::new().unwrap();
@@ -358,12 +405,14 @@ fn watch_indexes_new_file_then_stops_on_signal() {
         .success();
 
     let bin = assert_cmd::cargo::cargo_bin("relay");
-    let mut child = StdCommand::new(&bin)
-        .args(["--home", &home_s, "watch", "--debounce-ms", "50"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = KillOnDrop(
+        StdCommand::new(&bin)
+            .args(["--home", &home_s, "watch", "--debounce-ms", "50"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
 
     let started = wait_until(Duration::from_secs(10), || {
         relay()
@@ -384,25 +433,124 @@ fn watch_indexes_new_file_then_stops_on_signal() {
 
     #[cfg(unix)]
     {
-        let pid = child.id().to_string();
+        let pid = child.0.id().to_string();
         let status = StdCommand::new("kill")
             .args(["-INT", &pid])
             .status()
             .unwrap();
         assert!(status.success(), "kill -INT failed");
-        let exit = child.wait().unwrap();
+        let exit = child.0.wait().unwrap();
         assert!(exit.success(), "watch exit {exit}");
     }
     #[cfg(not(unix))]
     {
-        child.kill().unwrap();
-        let _ = child.wait();
+        child.0.kill().unwrap();
+        let _ = child.0.wait();
     }
 
     relay()
         .args(["--home", &home_s, "status"])
         .assert()
         .success();
+}
+
+#[test]
+fn rescan_exit_code_follows_the_host_scan() {
+    let home = TempDir::new().unwrap();
+    let mount = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let mount_s = mount.path().to_str().unwrap().to_owned();
+
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args([
+            "--home", &home_s, "mount", "add", "Personal", "code", &mount_s,
+        ])
+        .assert()
+        .success();
+    for i in 0..30 {
+        fs::write(mount.path().join(format!("f{i}.txt")), b"x").unwrap();
+    }
+    relay().args(["--home", &home_s, "scan"]).assert().success();
+
+    let _host = start_host(&home_s);
+
+    for i in 0..30 {
+        fs::remove_file(mount.path().join(format!("f{i}.txt"))).unwrap();
+    }
+    relay()
+        .args(["--home", &home_s, "rescan", "Personal/code"])
+        .timeout(Duration::from_secs(60))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("refusing to delete"))
+        .stderr(predicate::str::contains(
+            "stop Relay (`relay service stop`, or Ctrl-C a `relay run`) and run `relay scan --allow-mass-delete`",
+        ));
+
+    fs::remove_file(mount.path().join(".relay-mount")).unwrap();
+    relay()
+        .args(["--home", &home_s, "rescan"])
+        .timeout(Duration::from_secs(60))
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("error:"))
+        .stderr(predicate::str::contains("drive mounted"));
+}
+
+#[test]
+fn mount_add_resolves_relative_path_here_not_in_the_host() {
+    let home = TempDir::new().unwrap();
+    let first = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let first_s = first.path().to_str().unwrap().to_owned();
+    fs::create_dir(other.path().join("sub")).unwrap();
+
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args([
+            "--home", &home_s, "mount", "add", "Personal", "code", &first_s,
+        ])
+        .assert()
+        .success();
+
+    // The host runs in this test's working directory; the command below
+    // runs in another one, where `sub` exists.
+    let _host = start_host(&home_s);
+    let out = relay()
+        .current_dir(other.path())
+        .args(["--home", &home_s, "mount", "add", "Personal", "more", "sub"])
+        .timeout(Duration::from_secs(60))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added mount Personal/more at "))
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&out);
+    let shown = text.trim().split_once(" at ").unwrap().1;
+    assert_eq!(
+        fs::canonicalize(shown).unwrap(),
+        fs::canonicalize(other.path().join("sub")).unwrap(),
+        "{text}"
+    );
 }
 
 #[test]

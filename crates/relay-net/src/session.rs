@@ -7,7 +7,7 @@ use crate::discovery::{Discovery, PairingAd};
 use crate::pairing::PairSession;
 
 use quinn::{AsyncUdpSocket, Connection, RecvStream, SendStream, VarInt};
-use relay_core::{DeviceId, ObjectId, rank_addresses};
+use relay_core::{DeviceId, ObjectId, format_socket_addr, merge_peer_addresses, rank_addresses};
 use relay_crypto::{DeviceIdentity, device_id_from_certificate};
 use relay_proto::frame::Body;
 use relay_proto::{
@@ -20,8 +20,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, Semaphore};
 
-use crate::control::{self, ControlHandler};
-use crate::io::{IoErr, read_message};
+use crate::control::{self, COPY_IDLE_TIMEOUT, ControlHandler};
+use crate::io::{IoErr, read_message, read_message_max};
+use crate::pairing::sanitize_name;
 use crate::relay::{RelaySocket, resolve_relay, virtual_peer_addr};
 use crate::tls::{SERVER_NAME, TlsMaterials, make_client_config};
 use crate::{NetEvent, PeerConfig};
@@ -37,8 +38,16 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const CHUNK: usize = 64 * 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A dialed session shorter than this did not really work (the peer closed
+/// right after the handshake), so the dialer keeps backing off.
+const STABLE_SESSION: Duration = Duration::from_secs(5);
 const DIAL_ATTEMPT: Duration = Duration::from_secs(2);
 const RELAY_DIAL: Duration = Duration::from_secs(5);
+/// Bound for an `ObjectRequest`: an object id, or a remote call with paths
+/// and a config change.
+const OBJECT_REQUEST_MAX: usize = 64 * 1024;
+/// Bound for an `ObjectHeader`: a size and at most a short error.
+pub(crate) const OBJECT_HEADER_MAX: usize = 4 * 1024;
 
 pub(crate) fn close_code(code: u32) -> VarInt {
     VarInt::from_u32(code)
@@ -67,6 +76,10 @@ pub(crate) struct Inner {
     pub relay_sock: OnceLock<Arc<RelaySocket>>,
     pub pairing: Mutex<Option<PairSession>>,
     pub pairing_ads: Mutex<HashMap<String, PairingAd>>,
+    /// LAN addresses mDNS resolved for trusted peers. Dial hints only: mDNS
+    /// is unauthenticated, so one is persisted only after a dial to it
+    /// completed the pinned handshake (see `dialer`).
+    pub discovered: Mutex<HashMap<DeviceId, Vec<String>>>,
     pub discovery: Mutex<Option<Discovery>>,
     /// Answers remote calls from peers with the manage grant (D37).
     pub control: Option<Arc<dyn ControlHandler>>,
@@ -313,6 +326,34 @@ impl Inner {
             conn.close(close_code(CLOSE_UNTRUSTED), reason.as_bytes());
         }
     }
+
+    /// Dial hints for `peer`, newest resolve first.
+    fn discovered_addresses(&self, peer: DeviceId) -> Vec<String> {
+        self.discovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A discovered address just completed the pinned handshake with `peer`:
+    /// put it in front of the stored list and let the engine persist it.
+    fn learn_address(&self, peer: DeviceId, address: String) {
+        let merged = {
+            let mut trusted = self.trusted.write().unwrap_or_else(|e| e.into_inner());
+            let Some(p) = trusted.get_mut(&peer) else {
+                return;
+            };
+            p.addresses = merge_peer_addresses(&p.addresses, std::slice::from_ref(&address));
+            p.addresses.clone()
+        };
+        tracing::info!(peer = %peer, %address, "discovered address verified");
+        self.emit(NetEvent::PeerAddresses {
+            peer,
+            addresses: merged,
+        });
+    }
 }
 
 pub(crate) async fn wait_shutdown(inner: &Inner) {
@@ -381,8 +422,8 @@ pub(crate) async fn drive_connection(inner: Arc<Inner>, conn: Connection, we_dia
     // Release on every exit, including task abort (SetPeers drops the dialer).
     let mut guard = SessionGuard {
         inner: inner.clone(),
+        conn: conn.clone(),
         peer: peer_id,
-        stable_id: conn.stable_id(),
         reason: "closed".to_owned(),
     };
     if let Err(e) = run_session(inner, conn, peer_id, we_dialed).await {
@@ -392,15 +433,23 @@ pub(crate) async fn drive_connection(inner: Arc<Inner>, conn: Connection, we_dia
 
 struct SessionGuard {
     inner: Arc<Inner>,
+    conn: Connection,
     peer: DeviceId,
-    stable_id: usize,
     reason: String,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.inner
-            .release(self.peer, self.stable_id, std::mem::take(&mut self.reason));
+        // An aborted dialer never reaches `run_session`'s close: without
+        // this the peer keeps a live connection, and its detached loops keep
+        // delivering frames for a peer the engine was told is gone.
+        self.conn
+            .close(close_code(CLOSE_SHUTDOWN), b"session stopped");
+        self.inner.release(
+            self.peer,
+            self.conn.stable_id(),
+            std::mem::take(&mut self.reason),
+        );
     }
 }
 
@@ -475,7 +524,10 @@ async fn run_session(
         }
     }
 
-    let peer_name = h.device_name.clone();
+    // The daemon looks peers up by their unique local alias, but it stores
+    // and shows the name from the wire, so an unbounded or misleading one
+    // must not reach it (same rule as a pairing name).
+    let peer_name = sanitize_name(&h.device_name, peer_id);
     let remote = conn.remote_address();
     let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
     // A connection superseded during the handshake was never announced, so it
@@ -649,7 +701,7 @@ async fn serve_object(
     inner: &Inner,
     peer: DeviceId,
 ) -> Result<(), ServeErr> {
-    let req = match read_message::<ObjectRequest>(&mut recv).await {
+    let req = match read_message_max::<ObjectRequest>(&mut recv, OBJECT_REQUEST_MAX).await {
         Ok(req) => req,
         Err(e) if e.is_malformed() => {
             conn.close(close_code(CLOSE_MALFORMED), b"malformed object request");
@@ -875,9 +927,15 @@ async fn do_fetch(
     send.write_all(&req).await.map_err(FetchFail::err)?;
     send.finish().map_err(FetchFail::err)?;
 
-    let header: ObjectHeader = match read_message(&mut recv).await {
-        Ok(h) => h,
-        Err(e) => return Err(FetchFail::err(e)),
+    let header: ObjectHeader = match tokio::time::timeout(
+        COPY_IDLE_TIMEOUT,
+        read_message_max(&mut recv, OBJECT_HEADER_MAX),
+    )
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => return Err(FetchFail::err(e)),
+        Err(_) => return Err(FetchFail::err("object header stalled")),
     };
     if !header.found {
         return Err(FetchFail {
@@ -935,8 +993,10 @@ async fn write_and_import(
         let want = buf
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        match recv.read(&mut buf[..want]).await {
-            Ok(Some(n)) => {
+        // A stalled stream must not pin a fetch permit until the connection
+        // dies: QUIC keep-alive keeps it healthy while the peer's read hangs.
+        match tokio::time::timeout(COPY_IDLE_TIMEOUT, recv.read(&mut buf[..want])).await {
+            Ok(Ok(Some(n))) => {
                 tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n])
                     .await
                     .map_err(FetchFail::err)?;
@@ -944,8 +1004,9 @@ async fn write_and_import(
                 remaining -= n as u64;
                 on_progress(size - remaining);
             }
-            Ok(None) => return Err(FetchFail::err("truncated object stream")),
-            Err(e) => return Err(FetchFail::err(e)),
+            Ok(Ok(None)) => return Err(FetchFail::err("truncated object stream")),
+            Ok(Err(e)) => return Err(FetchFail::err(e)),
+            Err(_) => return Err(FetchFail::err("object stream stalled")),
         }
     }
 
@@ -965,9 +1026,11 @@ async fn write_and_import(
     let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
     drop(file);
 
+    // The bytes were hashed as they streamed in, so the store need not read
+    // them again.
     let store = store.clone();
     let tmp = tmp.to_owned();
-    tokio::task::spawn_blocking(move || store.import_verified(&tmp, &expected))
+    tokio::task::spawn_blocking(move || store.import_prehashed(&tmp, &expected))
         .await
         .map_err(FetchFail::err)?
         .map_err(FetchFail::err)?;
@@ -994,28 +1057,41 @@ pub(crate) async fn dialer(inner: Arc<Inner>, endpoint: quinn::Endpoint, peer_id
             continue;
         }
 
-        match try_dial(&inner, &endpoint, peer_id, &addresses).await {
-            Some(conn) => {
-                delay = Duration::from_secs(1);
-                drive_connection(inner.clone(), conn, true).await;
+        let hints = inner.discovered_addresses(peer_id);
+        if let Some((conn, discovered)) =
+            try_dial(&inner, &endpoint, peer_id, &addresses, &hints).await
+        {
+            if let Some(address) = discovered {
+                inner.learn_address(peer_id, address);
             }
-            None => {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = wait_shutdown(&inner) => return,
-                }
-                delay = delay.saturating_mul(2).min(MAX_BACKOFF);
+            let started = Instant::now();
+            drive_connection(inner.clone(), conn, true).await;
+            // A peer that completes the handshake and then closes (it no
+            // longer trusts us, a protocol mismatch, a duplicate) would
+            // otherwise be redialed in a hot loop: only a session that
+            // lasted resets the backoff.
+            if started.elapsed() >= STABLE_SESSION {
+                delay = Duration::from_secs(1);
+                continue;
             }
         }
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = wait_shutdown(&inner) => return,
+        }
+        delay = delay.saturating_mul(2).min(MAX_BACKOFF);
     }
 }
 
+/// Dial `hints` (fresh LAN resolves) ahead of the stored `addresses`. With
+/// the connection comes the hint that worked, if it is not stored yet.
 async fn try_dial(
     inner: &Inner,
     endpoint: &quinn::Endpoint,
     peer_id: DeviceId,
     addresses: &[String],
-) -> Option<Connection> {
+    hints: &[String],
+) -> Option<(Connection, Option<String>)> {
     let client = match make_client_config(&inner.tls, peer_id, &inner.trusted) {
         Ok(c) => c,
         Err(e) => {
@@ -1024,7 +1100,13 @@ async fn try_dial(
         }
     };
 
-    let ranked = rank_addresses(addresses);
+    let mut candidates: Vec<String> = hints.to_vec();
+    for addr in addresses {
+        if !candidates.contains(addr) {
+            candidates.push(addr.clone());
+        }
+    }
+    let ranked = rank_addresses(&candidates);
     for addr_str in &ranked {
         if inner.is_shutting_down() || inner.has_session(peer_id) {
             return None;
@@ -1043,7 +1125,12 @@ async fn try_dial(
             tracing::debug!(peer = %peer_id, %sa, "dialing");
             match endpoint.connect_with(client.clone(), sa, SERVER_NAME) {
                 Ok(connecting) => match tokio::time::timeout(DIAL_ATTEMPT, connecting).await {
-                    Ok(Ok(conn)) => return Some(conn),
+                    Ok(Ok(conn)) => {
+                        let dialed = format_socket_addr(sa);
+                        let discovered = (hints.contains(&dialed) && !addresses.contains(&dialed))
+                            .then_some(dialed);
+                        return Some((conn, discovered));
+                    }
                     Ok(Err(e)) => {
                         tracing::debug!(peer = %peer_id, %sa, error = %e, "dial failed");
                     }
@@ -1057,7 +1144,9 @@ async fn try_dial(
             }
         }
     }
-    try_relay_dial(inner, endpoint, peer_id, &client).await
+    try_relay_dial(inner, endpoint, peer_id, &client)
+        .await
+        .map(|conn| (conn, None))
 }
 
 async fn try_relay_dial(
@@ -1158,4 +1247,90 @@ pub(crate) fn apply_set_peers(inner: &Inner, peers: Vec<PeerConfig>) -> Vec<Devi
     }
     inner.send_grants();
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relay_core::MAX_PEER_ADDRESSES;
+    use std::sync::mpsc::{Receiver, channel};
+
+    /// An `Inner` with no runtime behind it: enough to drive the parts that
+    /// only touch its maps and sink.
+    fn test_inner(peers: Vec<PeerConfig>) -> (Arc<Inner>, Receiver<NetEvent>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Arc::new(DeviceIdentity::generate(dir.path()).unwrap());
+        let (tx, rx) = channel();
+        let inner = Inner {
+            our_id: identity.device_id(),
+            device_name: "me".into(),
+            store: ObjectStore::open(dir.path().join("store")).unwrap(),
+            trusted: Arc::new(RwLock::new(peers.into_iter().map(|p| (p.id, p)).collect())),
+            sessions: Mutex::new(HashMap::new()),
+            session_notify: Notify::new(),
+            sink: Arc::new(move |ev| {
+                let _ = tx.send(ev);
+            }),
+            shutdown: Notify::new(),
+            shutting_down: AtomicBool::new(false),
+            tls: TlsMaterials::from_identity(&identity).unwrap(),
+            identity,
+            listen_port: 0,
+            lan_discovery: false,
+            relay_target: Mutex::new(None),
+            relay_sock: OnceLock::new(),
+            pairing: Mutex::new(None),
+            pairing_ads: Mutex::new(HashMap::new()),
+            discovered: Mutex::new(HashMap::new()),
+            discovery: Mutex::new(None),
+            control: None,
+        };
+        (Arc::new(inner), rx, dir)
+    }
+
+    /// A discovered address is persisted only once it is verified, and then
+    /// in front of the stored ones.
+    #[test]
+    fn verified_discovered_address_goes_in_front_of_stored_ones() {
+        let peer = DeviceId::from_bytes([7; 32]);
+        let stored: Vec<String> = (1..=MAX_PEER_ADDRESSES)
+            .map(|n| format!("100.64.0.{n}:47321"))
+            .collect();
+        let (inner, events, _dir) = test_inner(vec![PeerConfig {
+            id: peer,
+            name: "peer".into(),
+            addresses: stored.clone(),
+            may_manage: false,
+        }]);
+
+        inner
+            .discovered
+            .lock()
+            .unwrap()
+            .insert(peer, vec!["192.168.1.9:47321".into()]);
+        assert_eq!(inner.discovered_addresses(peer), ["192.168.1.9:47321"]);
+        assert!(events.try_recv().is_err(), "a hint alone is not persisted");
+        let trusted = inner.trusted.read().unwrap()[&peer].addresses.clone();
+        assert_eq!(
+            trusted, stored,
+            "a hint alone does not touch the stored list"
+        );
+
+        inner.learn_address(peer, "192.168.1.9:47321".into());
+        let NetEvent::PeerAddresses { peer: p, addresses } = events.recv().unwrap() else {
+            panic!("expected PeerAddresses");
+        };
+        assert_eq!(p, peer);
+        assert_eq!(addresses[0], "192.168.1.9:47321");
+        assert_eq!(addresses.len(), MAX_PEER_ADDRESSES);
+        assert_eq!(&addresses[1..], &stored[..MAX_PEER_ADDRESSES - 1]);
+        assert_eq!(inner.trusted.read().unwrap()[&peer].addresses, addresses);
+
+        let stranger = DeviceId::from_bytes([8; 32]);
+        inner.learn_address(stranger, "192.168.1.10:47321".into());
+        assert!(
+            events.try_recv().is_err(),
+            "nothing is learned for an untrusted id"
+        );
+    }
 }

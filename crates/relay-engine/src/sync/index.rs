@@ -114,13 +114,12 @@ impl Syncer {
                 .into_iter()
                 .map(|cfg| (cfg.mount.id, cfg.mount.name))
                 .collect();
+            let wants = engine.wants_resolver(space, peer)?;
             let mut wire_entries = Vec::new();
             let mut objects = Vec::new();
             for entry in &changes {
                 let include = match mount_names.get(&entry.key.mount) {
-                    Some(mount_name) => {
-                        engine.wants(space, peer, mount_name, entry.key.path.as_str())?
-                    }
+                    Some(mount_name) => wants.wants(mount_name, entry.key.path.as_str()),
                     None => true,
                 };
                 if !include {
@@ -207,11 +206,12 @@ impl Syncer {
             .collect();
         let local = engine.device().id;
         let rules = engine.rules_for(space)?;
+        let wants = engine.wants_resolver(space, local)?;
         let mut kept = Vec::with_capacity(entries.len());
         for entry in entries {
             match mount_names.get(&entry.key.mount) {
                 Some(name) => {
-                    if !engine.wants(space, local, name, entry.key.path.as_str())? {
+                    if !wants.wants(name, entry.key.path.as_str()) {
                         continue;
                     }
                     let mode = path_mode(&rules, name, entry.key.path.as_str())?;
@@ -411,11 +411,29 @@ impl Syncer {
             {
                 head.attempts += 1;
                 if head.attempts >= MAX_ATTEMPTS {
-                    let skipped = head.entries.len();
+                    // Leave a hole at the stalled entry so `received_seq`
+                    // stays below it and the range is re-requested later
+                    // (same as objects that could not be fetched). A locked
+                    // file must not lose the entries behind it.
+                    let hole = outcome
+                        .stalled_at
+                        .map_or(batch_after, |seq| seq.saturating_sub(1));
+                    let hole = conn.holes.get(&space).map_or(hole, |h| (*h).min(hole));
+                    conn.holes.insert(space, hole);
+                    conn.resync_at
+                        .entry(space)
+                        .or_insert_with(|| Instant::now() + RESYNC_DELAY);
+                    let pending = head
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.sequence.0 > hole)
+                        .count();
                     events.push(SyncEvent::SyncWarning {
                         peer,
                         path: String::new(),
-                        reason: format!("giving up on batch after {MAX_ATTEMPTS} attempts ({skipped} entries skipped)"),
+                        reason: format!(
+                            "giving up on batch after {MAX_ATTEMPTS} attempts; {pending} entries will be re-requested"
+                        ),
                     });
                     queue.pop_front();
                     return self.process_head(engine, peer, space, out, events);

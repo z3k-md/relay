@@ -541,11 +541,42 @@ impl Engine {
     }
 
     /// Materialize full-mode index rows that were waiting on `object`.
+    ///
+    /// Reads only the index-only rows that name this object, so a fetch
+    /// does not cost a walk of every index-only row.
     pub(crate) fn materialize_full_object(&mut self, object: ObjectId) -> Result<(), EngineError> {
-        let pending = self.full_unmaterialized()?;
-        for item in pending {
-            if item.object == Some(object) && self.store.contains(&object) {
-                self.materialize_indexed(&item.key)?;
+        use std::collections::HashMap;
+
+        if !self.store.contains(&object) {
+            return Ok(());
+        }
+        let rows = self.db.repo().list_index_only_by_object(object)?;
+        let mut rules_by_space: HashMap<SpaceId, Vec<MaterializationRuleRecord>> = HashMap::new();
+        for row in rows {
+            let rules = match rules_by_space.get(&row.space) {
+                Some(rules) => rules,
+                None => {
+                    let loaded = self.db.repo().list_materialization_rules(row.space)?;
+                    rules_by_space.insert(row.space, loaded);
+                    rules_by_space.get(&row.space).expect("just inserted")
+                }
+            };
+            if path_mode(rules, &row.mount_name, row.path.as_str())? != MaterializationMode::Full {
+                continue;
+            }
+            let key = EntryKey {
+                space: row.space,
+                mount: row.mount,
+                path: row.path,
+            };
+            match self.materialize_indexed(&key) {
+                Ok(()) => {}
+                // An unscanned file at that path: the scan reconciles it;
+                // the other rows waiting on this object still write.
+                Err(EngineError::DestinationChanged(path)) => {
+                    tracing::info!(path = %path.display(), "kept an unscanned file during hydration");
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(())
@@ -627,12 +658,15 @@ impl Engine {
                 Ok(outcome) if outcome.id == object => {
                     return Ok(observed_stat(dest, &self.config));
                 }
-                Ok(_) => {
-                    let stat = StatHint::from_metadata(&meta);
-                    return self.materialize_over(root, dest, object, executable, Some(stat));
-                }
+                // Other bytes under an index-only row are an edit the scanner
+                // has not seen; overwriting them would lose it. The scan
+                // records the edit, after which no hydration is needed.
+                Ok(_) => return Err(EngineError::DestinationChanged(dest.to_path_buf())),
                 Err(err) => return Err(err.into()),
             }
+        }
+        if fs::symlink_metadata(dest).is_ok() {
+            return Err(EngineError::DestinationChanged(dest.to_path_buf()));
         }
         self.materialize_over(root, dest, object, executable, None)
     }

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import UpdateStatus from "../components/UpdateStatus.vue";
-import { api } from "../lib/api";
+import { api, errorText } from "../lib/api";
 import { checkForUpdates, updateActive } from "../lib/updateProgress";
 import type { CliShell, CliStatus, Settings } from "../lib/types";
 
@@ -27,12 +27,26 @@ async function openFullDiskAccess() {
   try {
     await api.openFullDiskAccess();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   }
 }
 
 async function recheckFullDiskAccess() {
-  fullDiskAccess.value = await api.fullDiskAccess();
+  error.value = null;
+  try {
+    fullDiskAccess.value = await api.fullDiskAccess();
+  } catch (err) {
+    error.value = errorText(err);
+  }
+}
+
+async function openLogsFolder() {
+  error.value = null;
+  try {
+    await api.openLogsFolder();
+  } catch (err) {
+    error.value = errorText(err);
+  }
 }
 
 const selectedHint = computed(() => {
@@ -75,7 +89,7 @@ async function load() {
       selectedShell.value = c.detectedShell;
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     loading.value = false;
   }
@@ -86,7 +100,7 @@ async function toggle(key: "startAtLogin" | "autoUpdate", value: boolean) {
   try {
     settings.value = await api.setSettings({ [key]: value });
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
     await load();
   }
 }
@@ -113,7 +127,7 @@ async function installCli() {
       selectedShell.value = result.detectedShell;
     }
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -267,7 +281,7 @@ defineExpose({ load });
         v-if="!mobile"
         type="button"
         class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
-        @click="api.openLogsFolder()"
+        @click="openLogsFolder"
       >
         Open logs folder
       </button>
