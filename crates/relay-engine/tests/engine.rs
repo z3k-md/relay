@@ -752,6 +752,27 @@ fn gc_and_verify() {
 }
 
 #[test]
+fn gc_after_mount_removal_leaves_nothing_for_verify_to_miss() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    fs::write(mount.path().join("doc.txt"), b"detached").unwrap();
+    scan(&mut engine);
+    let object = relay_engine::ObjectId::of(b"detached");
+    let store = ObjectStore::open(home.path().join("store")).unwrap();
+    assert!(store.contains(&object));
+
+    engine.remove_mount("Personal", "code").unwrap();
+    let report = engine.gc(Duration::ZERO).unwrap();
+    assert!(report.removed >= 1);
+    assert!(!store.contains(&object));
+
+    let verify = engine.verify_objects().unwrap();
+    assert!(verify.missing.is_empty(), "{verify:?}");
+    assert!(verify.corrupt.is_empty(), "{verify:?}");
+}
+
+#[test]
 fn sequences_increase_across_restart() {
     let home = new_home();
     let mount = new_home();

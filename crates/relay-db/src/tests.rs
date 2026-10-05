@@ -990,6 +990,57 @@ fn entries_under_is_a_range_not_like() {
 }
 
 #[test]
+fn entries_in_lists_direct_children_of_a_non_ascii_folder() {
+    let h = Harness::new();
+    let vv = vector(&[(1, 1)]);
+    let paths = ["日本/a", "日本/ab/c", "日本/b", "日本-x", "other"];
+    for (i, p) in paths.iter().enumerate() {
+        let rec = h.record(p, file(b"x", false), (i + 1) as u64, vv.clone(), None, None);
+        h.db.repo().put_entry(&rec).unwrap();
+    }
+    let dir = h.record(
+        "日本/ab",
+        EntryContent::Directory,
+        6,
+        vv.clone(),
+        None,
+        None,
+    );
+    h.db.repo().put_entry(&dir).unwrap();
+    let dir = h.record("日本", EntryContent::Directory, 7, vv, None, None);
+    h.db.repo().put_entry(&dir).unwrap();
+
+    let inside =
+        h.db.repo()
+            .entries_in(h.mount.id, Some(&path("日本")))
+            .unwrap();
+    let got: Vec<_> = inside.iter().map(|e| e.key.path.as_str()).collect();
+    assert_eq!(got, vec!["日本/a", "日本/ab", "日本/b"]);
+
+    let top = h.db.repo().entries_in(h.mount.id, None).unwrap();
+    let got: Vec<_> = top.iter().map(|e| e.key.path.as_str()).collect();
+    assert_eq!(got, vec!["other", "日本", "日本-x"]);
+}
+
+#[test]
+fn prune_objects_forgets_ids_outside_keep() {
+    let h = Harness::new();
+    let repo = h.db.repo();
+    let kept = ObjectId::of(b"kept");
+    let swept = ObjectId::of(b"swept");
+    repo.record_object(kept, 4, 1).unwrap();
+    repo.record_object(swept, 5, 2).unwrap();
+
+    let keep: std::collections::HashSet<ObjectId> = [kept].into_iter().collect();
+    assert_eq!(repo.prune_objects(&keep).unwrap(), 1);
+    assert_eq!(repo.object_count().unwrap(), 1);
+    let objects = repo.verification_objects().unwrap();
+    assert!(objects.contains(&kept));
+    assert!(!objects.contains(&swept));
+    assert_eq!(repo.prune_objects(&keep).unwrap(), 0);
+}
+
+#[test]
 fn catchup_plan_counts_entries_and_only_live_file_bytes() {
     let h = Harness::new();
     let vv = vector(&[(1, 1)]);

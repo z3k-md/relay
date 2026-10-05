@@ -50,11 +50,23 @@ pub fn materialize_file(
         .unwrap_or_else(|| Path::new("."));
     ensure_real_dir_chain(options.mount_root, parent)?;
 
+    // A replaced file keeps its read/write bits (a private `0600` file stays
+    // private); a new file gets the umask default.
+    let base_mode = expected_existing.and_then(|_| existing_rw_mode(dest));
+
     let tmp = parent.join(format!("{}{}", TEMP_PREFIX, Uuid::new_v4()));
     let mut guard = TempGuard(Some(tmp.clone()));
 
     faults::check(FaultPoint::MaterializeWrite, dest).map_err(|e| FsError::io(&tmp, e))?;
-    write_hashed(&tmp, dest, reader, expected, executable, options.mtime_ns)?;
+    write_hashed(
+        &tmp,
+        dest,
+        reader,
+        expected,
+        base_mode,
+        executable,
+        options.mtime_ns,
+    )?;
 
     if !destination_still_matches(dest, expected_existing)? {
         return Err(FsError::DestinationChanged(dest.to_path_buf()));
@@ -74,6 +86,7 @@ fn write_hashed(
     dest: &Path,
     reader: &mut dyn Read,
     expected: ObjectId,
+    base_mode: Option<u32>,
     executable: bool,
     mtime_ns: Option<i64>,
 ) -> Result<(), FsError> {
@@ -103,7 +116,7 @@ fn write_hashed(
         });
     }
 
-    set_executable(&file, tmp, executable)?;
+    set_mode(&file, tmp, base_mode, executable)?;
     if let Some(mtime_ns) = mtime_ns {
         set_mtime(&file, tmp, mtime_ns)?;
     }
@@ -174,9 +187,31 @@ fn destination_still_matches(
     }
 }
 
+/// Read/write bits of the regular file at `dest`, if there is one. Execute
+/// and special bits are left out: the record's `executable` flag decides
+/// those.
 #[cfg(unix)]
-fn set_executable(file: &File, path: &Path, executable: bool) -> Result<(), FsError> {
-    if !executable {
+fn existing_rw_mode(dest: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::symlink_metadata(dest).ok()?;
+    meta.is_file().then(|| meta.permissions().mode() & 0o666)
+}
+
+#[cfg(not(unix))]
+fn existing_rw_mode(_dest: &Path) -> Option<u32> {
+    None
+}
+
+/// Apply `base_mode` (else keep the umask default) and, for an executable,
+/// add execute where read is granted.
+#[cfg(unix)]
+fn set_mode(
+    file: &File,
+    path: &Path,
+    base_mode: Option<u32>,
+    executable: bool,
+) -> Result<(), FsError> {
+    if base_mode.is_none() && !executable {
         return Ok(());
     }
     use std::os::unix::fs::PermissionsExt;
@@ -184,14 +219,23 @@ fn set_executable(file: &File, path: &Path, executable: bool) -> Result<(), FsEr
         .metadata()
         .map_err(|e| FsError::io(path, e))?
         .permissions();
-    perms.set_mode(perms.mode() | 0o111);
+    let mut mode = base_mode.unwrap_or_else(|| perms.mode());
+    if executable {
+        mode |= (mode & 0o444) >> 2;
+    }
+    perms.set_mode(mode);
     file.set_permissions(perms)
         .map_err(|e| FsError::io(path, e))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_executable(_file: &File, _path: &Path, _executable: bool) -> Result<(), FsError> {
+fn set_mode(
+    _file: &File,
+    _path: &Path,
+    _base_mode: Option<u32>,
+    _executable: bool,
+) -> Result<(), FsError> {
     Ok(())
 }
 
@@ -326,6 +370,38 @@ mod tests {
         write_via(dir.path(), &dest, b"#!/bin/sh\n", true, None).unwrap();
         let mode = fs::metadata(&dest).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_file_keeps_its_read_write_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("secret.env");
+        fs::write(&dest, b"old").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = StatHint::from_metadata(&fs::symlink_metadata(&dest).unwrap());
+        write_via(dir.path(), &dest, b"newer", false, Some(&before)).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"newer");
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Execute follows the record, not the old file: granted only where
+        // read is, and dropped when the record says not executable.
+        let before = StatHint::from_metadata(&fs::symlink_metadata(&dest).unwrap());
+        write_via(dir.path(), &dest, b"#!/bin/sh\n", true, Some(&before)).unwrap();
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let before = StatHint::from_metadata(&fs::symlink_metadata(&dest).unwrap());
+        write_via(dir.path(), &dest, b"plain", false, Some(&before)).unwrap();
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
