@@ -7,6 +7,7 @@ cargo build --release
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+python3 scripts/check-docs.py   # doc links, D-numbers, DESIGN § references
 ```
 
 The release binary is `target/release/relay`. Plain `cargo build` skips the desktop app. See [the desktop README](../apps/relay-desktop/README.md) for the Tauri dev loop, and [RELEASING.md](RELEASING.md) for signed desktop builds.
@@ -34,7 +35,7 @@ apps/
   relay-desktop  menu bar / tray app
   relay-sim      local multi-process lab
   relay-vopr     deterministic single-process sync simulator
-scripts/        install, cross-build, deploy, release
+scripts/        install, cross-build, deploy, release, check-docs
 docs/
   USAGE.md       commands and safety rules
   ROADMAP.md     what is built and what is next

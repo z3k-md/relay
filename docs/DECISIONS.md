@@ -6,6 +6,59 @@ replaced it. [`DESIGN.md`](DESIGN.md) summarizes the current system; when it
 and an entry disagree, the entry wins. What is built and what is next is
 [`ROADMAP.md`](ROADMAP.md).
 
+Add an entry with the next free number (check open pull requests), then run
+`python3 scripts/check-docs.py --write` to refresh this index.
+
+<!-- index:start -->
+
+| | Decision |
+| --- | --- |
+| D1 | [`.git` is synchronized like any other directory](#d1-git-is-synchronized-like-any-other-directory) |
+| D2 | [Conflict resolution is deterministic and replicated](#d2-conflict-resolution-is-deterministic-and-replicated) |
+| D3 | [Version counters survive database restores](#d3-version-counters-survive-database-restores) |
+| D4 | [Per-device change sequence instead of per-entry acknowledgements](#d4-per-device-change-sequence-instead-of-per-entry-acknowledgements) |
+| D5 | [Merge bases are recorded from the first release](#d5-merge-bases-are-recorded-from-the-first-release) |
+| D6 | [Object store GC is mark-and-sweep](#d6-object-store-gc-is-mark-and-sweep) |
+| D7 | [Mount markers and mass-delete protection](#d7-mount-markers-and-mass-delete-protection) |
+| D8 | [Safe reads and writes of live files](#d8-safe-reads-and-writes-of-live-files) |
+| D9 | [Logical path rules](#d9-logical-path-rules) |
+| D10 | [Device-local integer references in the database](#d10-device-local-integer-references-in-the-database) |
+| D11 | [Superseded by D14](#d11-superseded-by-d14) |
+| D12 | [Superseded by D24 and D36](#d12-superseded-by-d24-and-d36) |
+| D13 | [Watching](#d13-watching) |
+| D14 | [Device identity and transport security](#d14-device-identity-and-transport-security) |
+| D15 | [Pairing, addressing and sharing](#d15-pairing-addressing-and-sharing) |
+| D16 | [Index exchange](#d16-index-exchange) |
+| D17 | [Applying a remote version](#d17-applying-a-remote-version) |
+| D18 | [Conflicts](#d18-conflicts) |
+| D19 | [Daemon threading](#d19-daemon-threading) |
+| D20 | [Desktop app, releases and auto-update](#d20-desktop-app-releases-and-auto-update) |
+| D21 | [Git repository conflict groups and conflict resolution](#d21-git-repository-conflict-groups-and-conflict-resolution) |
+| D22 | [Receive-side mass-delete guard](#d22-receive-side-mass-delete-guard) |
+| D23 | [Batched object durability on macOS](#d23-batched-object-durability-on-macos) |
+| D24 | [Local IPC and the host lock](#d24-local-ipc-and-the-host-lock) |
+| D25 | [Device pairing and LAN discovery](#d25-device-pairing-and-lan-discovery) |
+| D26 | [Space membership](#d26-space-membership) |
+| D27 | [Replication policies](#d27-replication-policies) |
+| D28 | [Sync progress is a snapshot](#d28-sync-progress-is-a-snapshot) |
+| D29 | [Durable mailbox](#d29-durable-mailbox) |
+| D30 | [Encryption at rest](#d30-encryption-at-rest) |
+| D31 | [Automatic text merge](#d31-automatic-text-merge) |
+| D32 | [NAT hole punching](#d32-nat-hole-punching) |
+| D33 | [Android is a foreground Tauri shell](#d33-android-is-a-foreground-tauri-shell) |
+| D34 | [Generalized networking](#d34-generalized-networking) |
+| D35 | [Selective materialization](#d35-selective-materialization) |
+| D36 | [Configuration changes on the running host](#d36-configuration-changes-on-the-running-host) |
+| D37 | [Remote management](#d37-remote-management) |
+| D38 | [Files view and folder choices](#d38-files-view-and-folder-choices) |
+| D39 | [Folder pairs set up from either device](#d39-folder-pairs-set-up-from-either-device) |
+| D40 | [Opening a file that is not synced here](#d40-opening-a-file-that-is-not-synced-here) |
+| D41 | [Read-only copies](#d41-read-only-copies) |
+| D42 | [Sizes on disk and a faster Browse view](#d42-sizes-on-disk-and-a-faster-browse-view) |
+| D43 | [Online-only files in Explorer](#d43-online-only-files-in-explorer) |
+
+<!-- index:end -->
+
 ## D1. `.git` is synchronized like any other directory
 
 The whole working tree, including `.git`, replicates. Relay never runs Git

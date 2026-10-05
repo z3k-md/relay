@@ -1,5 +1,7 @@
 # Online-only files in the OS file manager
 
+**Status:** Stage 1 shipped (D43). Stages 2–4 planned.
+
 Build plan for showing Relay's online-only files (D35 `demand` mode) inside
 Explorer, Finder, and Linux file managers, where they open like any other file
 and download on first read. Stage 1 shipped as D43; later stages become

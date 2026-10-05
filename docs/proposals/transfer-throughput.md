@@ -1,5 +1,7 @@
 # Transfer throughput
 
+**Status:** proposal, not scheduled.
+
 Proposal for moving photos and video quickly. Nothing here is decided until a
 decision in [`DECISIONS.md`](../DECISIONS.md) adopts it.
 

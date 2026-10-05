@@ -215,6 +215,30 @@ apps/
   relay-vopr     deterministic single-process simulator
 ```
 
+Where things happen:
+
+| Step | Code |
+| --- | --- |
+| Host startup, the loop that joins engine and network | `relay-daemon/src/lib.rs`; desktop: `relay-desktop/src-tauri/src/runner.rs` |
+| Local IPC server and methods | `relay-daemon/src/host.rs`, `relay-ipc/src/protocol.rs` |
+| Watcher events become partial scans | `relay-engine/src/watch/`, `relay-fs/src/watch.rs` |
+| Scan a mount into the index | `relay-engine/src/scan.rs`, `relay-fs/src/scan.rs` |
+| Index tables and queries | `relay-db/src/repo.rs`, `relay-db/src/migrate.rs` |
+| Peer frames in and out (sans-I/O `Syncer`) | `relay-engine/src/sync/mod.rs` |
+| Index exchange, watermarks, acks | `relay-engine/src/sync/index.rs` |
+| Object fetch, retry across peers and mailbox | `relay-engine/src/sync/fetch.rs` |
+| Apply a remote batch, conflicts, merge | `relay-engine/src/apply.rs`, `relay-core/src/conflict.rs`, `relay-core/src/merge.rs` |
+| Atomic writes into the working tree | `relay-fs/src/materialize.rs` |
+| Offers, membership, policy snapshots | `relay-engine/src/sync/offers.rs`, `relay-engine/src/policies.rs` |
+| Held mass deletes | `relay-engine/src/sync/deletes.rs` |
+| Live config changes | `relay-engine/src/live_config.rs`, `relay-engine/src/config.rs` |
+| Mailbox push and pull | `relay-engine/src/replica.rs`, `relay-replica/` |
+| QUIC sessions, object streams | `relay-net/src/session.rs`, `relay-net/src/tls.rs` |
+| Pairing, mDNS, STUN, UDP relay | `relay-net/src/{pairing,discovery,stun,relay}.rs` |
+| Remote management calls | `relay-net/src/control.rs`, `relay-daemon/src/remote.rs`, `relay-daemon/src/folder_pair.rs` |
+| Online-only files and placeholders | `relay-engine/src/materialize.rs`, `relay-engine/src/placeholders.rs`, `relay-fs/src/cloud/` |
+| CLI commands | `relay-cli/src/main.rs` |
+
 The workspace forbids `unsafe`. The engine does not depend on networking or
 Tokio, so it runs the same under `relay-vopr`'s virtual clock.
 
