@@ -222,8 +222,12 @@ export function createFolder(initial: string) {
       case "batch":
         if (stats.firstBatchMs === null) stats.firstBatchMs = performance.now() - started;
         stats.batches++;
-        for (const e of event.entries) all.set(e[0], e);
-        pendingBatch.push(...event.entries);
+        // No push(...entries): a batch can hold 200k entries, past the
+        // engine's argument limit.
+        for (const e of event.entries) {
+          all.set(e[0], e);
+          pendingBatch.push(e);
+        }
         stats.total = all.size;
         schedule();
         break;
@@ -241,7 +245,7 @@ export function createFolder(initial: string) {
         error.value = event.message;
         break;
       case "changes":
-        pendingChanges.push(...event.changes);
+        for (const c of event.changes) pendingChanges.push(c);
         schedule();
         break;
     }
@@ -267,7 +271,20 @@ export function createFolder(initial: string) {
     Object.assign(stats, emptyStats(target));
     started = performance.now();
     const channel = new Channel<ListEvent>();
-    channel.onmessage = (event) => onEvent(gen, event);
+    channel.onmessage = (event) => {
+      // A handler that throws stalls the channel for good (later messages
+      // wait on this one), so surface the failure instead.
+      try {
+        onEvent(gen, event);
+      } catch (err) {
+        console.error("listing event", err);
+        if (gen === generation) {
+          streaming = false;
+          loading.value = false;
+          error.value = String(err);
+        }
+      }
+    };
     try {
       await explorer.list(id, target, channel);
     } catch (err) {
