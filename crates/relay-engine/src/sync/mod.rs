@@ -1,6 +1,6 @@
 //! Engine-native peer sync I/O. The CLI/daemon maps these 1:1 onto relay-net.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -233,19 +233,19 @@ pub struct OfferedSpaceEvent {
 
 struct Connected {
     name: String,
-    send_cursor: HashMap<SpaceId, Sequence>,
-    incoming: HashMap<SpaceId, VecDeque<PendingBatch>>,
+    send_cursor: BTreeMap<SpaceId, Sequence>,
+    incoming: BTreeMap<SpaceId, VecDeque<PendingBatch>>,
     /// Highest peer sequence below which some entry could not be applied
     /// because its object never arrived. `received_seq` is not advanced past
     /// it, so a restart or re-request picks those entries up again.
-    holes: HashMap<SpaceId, u64>,
-    resync_at: HashMap<SpaceId, Instant>,
+    holes: BTreeMap<SpaceId, u64>,
+    resync_at: BTreeMap<SpaceId, Instant>,
     /// Live-local tombstones already applied for this catch-up, per mount.
-    session_deletes: HashMap<(SpaceId, MountId), usize>,
+    session_deletes: BTreeMap<(SpaceId, MountId), usize>,
     /// Paths whose local entry became a tombstone from those applies.
-    session_deleted_paths: HashMap<(SpaceId, MountId), Vec<relay_core::LogicalPath>>,
+    session_deleted_paths: BTreeMap<(SpaceId, MountId), Vec<relay_core::LogicalPath>>,
     /// `DeletesHeld` already emitted for this connection.
-    held_emitted: HashSet<(SpaceId, MountId)>,
+    held_emitted: BTreeSet<(SpaceId, MountId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -260,13 +260,13 @@ struct PendingBatch {
     after_sequence: u64,
     through_sequence: u64,
     entries: Vec<RemoteEntry>,
-    pending_objects: HashSet<ObjectId>,
+    pending_objects: BTreeSet<ObjectId>,
     /// Peers already asked for each object, including the index source.
-    asked: HashMap<ObjectId, HashSet<DeviceId>>,
+    asked: BTreeMap<ObjectId, BTreeSet<DeviceId>>,
     /// Index source reported the object missing. Alternate peers do not set this.
-    source_missing: HashSet<ObjectId>,
-    failed_objects: HashSet<ObjectId>,
-    fetch_attempts: HashMap<ObjectId, u32>,
+    source_missing: BTreeSet<ObjectId>,
+    failed_objects: BTreeSet<ObjectId>,
+    fetch_attempts: BTreeMap<ObjectId, u32>,
     attempts: u32,
     retry_at: Option<Instant>,
     caught_up: bool,
@@ -276,7 +276,7 @@ struct PendingBatch {
 struct DirectFetch {
     space: Option<SpaceId>,
     attempts: u32,
-    asked: HashSet<DeviceId>,
+    asked: BTreeSet<DeviceId>,
     waiting: bool,
     gave_up: bool,
     warned: bool,
@@ -297,33 +297,37 @@ enum Fetch {
 }
 
 pub struct Syncer {
-    connected: HashMap<DeviceId, Connected>,
+    connected: BTreeMap<DeviceId, Connected>,
     /// Last time this process wrote `last_seen_ms` for a live peer.
-    seen_at: HashMap<DeviceId, Instant>,
+    seen_at: BTreeMap<DeviceId, Instant>,
     index_batch_entries: usize,
     progress: ProgressBook,
     next_batch_id: u64,
     /// Objects requested for full-mode hydration or an explicit fetch.
-    direct: HashMap<ObjectId, DirectFetch>,
-    fetch_waiters: HashMap<ObjectId, Vec<FetchWaiter>>,
+    direct: BTreeMap<ObjectId, DirectFetch>,
+    fetch_waiters: BTreeMap<ObjectId, Vec<FetchWaiter>>,
     /// Non-file hydration failures already reported.
-    hydrate_warned: HashSet<EntryKey>,
+    hydrate_warned: BTreeSet<EntryKey>,
     /// Last time index-only rows were considered for hydration.
     hydrated_at: Option<Instant>,
+    /// Monotonic time to use instead of [`Instant::now`]. Set by a
+    /// simulator that drives the state machine on a virtual clock.
+    frozen_now: Option<Instant>,
 }
 
 impl Default for Syncer {
     fn default() -> Self {
         Self {
-            connected: HashMap::new(),
-            seen_at: HashMap::new(),
+            connected: BTreeMap::new(),
+            seen_at: BTreeMap::new(),
             index_batch_entries: INDEX_BATCH_ENTRIES,
             progress: ProgressBook::default(),
             next_batch_id: 0,
-            direct: HashMap::new(),
-            fetch_waiters: HashMap::new(),
-            hydrate_warned: HashSet::new(),
+            direct: BTreeMap::new(),
+            fetch_waiters: BTreeMap::new(),
+            hydrate_warned: BTreeSet::new(),
             hydrated_at: None,
+            frozen_now: None,
         }
     }
 }
@@ -342,6 +346,18 @@ impl Syncer {
             index_batch_entries: n,
             ..Self::default()
         }
+    }
+
+    /// Pin every retry, resync and presence timer read to `now` instead of
+    /// [`Instant::now`]. A deterministic simulator calls this before each
+    /// [`Syncer::handle`] or [`Syncer::tick`], so a delay elapses only when
+    /// the simulated clock says so.
+    pub fn set_now(&mut self, now: Instant) {
+        self.frozen_now = Some(now);
+    }
+
+    pub(super) fn now(&self) -> Instant {
+        self.frozen_now.unwrap_or_else(Instant::now)
     }
 
     pub fn handle(
@@ -394,12 +410,11 @@ impl Syncer {
                 incoming,
                 bytes,
             } => {
+                let now = self.now();
                 if incoming {
-                    self.progress
-                        .note_download(peer, object, bytes, Instant::now());
+                    self.progress.note_download(peer, object, bytes, now);
                 } else {
-                    self.progress
-                        .note_upload(peer, object, bytes, Instant::now());
+                    self.progress.note_upload(peer, object, bytes, now);
                 }
             }
             SyncInput::Fetch {
@@ -432,7 +447,8 @@ impl Syncer {
     }
 
     pub(super) fn flush_progress(&mut self, events: &mut Vec<SyncEvent>, force: bool) {
-        if let Some(rows) = self.progress.emit_if_changed(Instant::now(), force) {
+        let now = self.now();
+        if let Some(rows) = self.progress.emit_if_changed(now, force) {
             events.push(SyncEvent::Transfers(rows));
         }
     }
@@ -575,20 +591,21 @@ impl Syncer {
             peer,
             Connected {
                 name: name.clone(),
-                send_cursor: HashMap::new(),
-                incoming: HashMap::new(),
-                holes: HashMap::new(),
-                resync_at: HashMap::new(),
-                session_deletes: HashMap::new(),
-                session_deleted_paths: HashMap::new(),
-                held_emitted: HashSet::new(),
+                send_cursor: BTreeMap::new(),
+                incoming: BTreeMap::new(),
+                holes: BTreeMap::new(),
+                resync_at: BTreeMap::new(),
+                session_deletes: BTreeMap::new(),
+                session_deleted_paths: BTreeMap::new(),
+                held_emitted: BTreeSet::new(),
             },
         );
         events.push(SyncEvent::PeerConnected {
             peer,
             name: name.clone(),
         });
-        self.seen_at.insert(peer, Instant::now());
+        let now = self.now();
+        self.seen_at.insert(peer, now);
 
         let offers = engine.space_offers_for_peer(peer)?;
         out(SyncOutput::Send {

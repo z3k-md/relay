@@ -1320,18 +1320,19 @@ fn skip_or_err<T>(err: relay_fs::FsError) -> Result<T, EngineError> {
     Err(EngineError::Fs(err))
 }
 
+/// An I/O failure while writing the working tree or the store is retried
+/// (the batch stays queued) rather than skipped: a full disk, a locked file
+/// or a flaky volume must not drop an update for good, which would leave
+/// this replica silently diverged until the path changes again. Only errors
+/// that describe the request itself, not the device, are final.
 fn is_transient(err: &EngineError) -> bool {
     match err {
-        EngineError::Io(source) | EngineError::Fs(relay_fs::FsError::Io { source, .. }) => {
-            matches!(
-                source.kind(),
-                io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::TimedOut
-                    | io::ErrorKind::WouldBlock
-                    | io::ErrorKind::ResourceBusy
-                    | io::ErrorKind::Interrupted
-            )
-        }
+        EngineError::Io(source)
+        | EngineError::Fs(relay_fs::FsError::Io { source, .. })
+        | EngineError::Store(StoreError::Io { source, .. }) => !matches!(
+            source.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData | io::ErrorKind::Unsupported
+        ),
         _ => false,
     }
 }

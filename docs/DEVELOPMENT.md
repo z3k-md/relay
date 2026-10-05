@@ -33,6 +33,7 @@ apps/
   relay-cli      the relay binary
   relay-desktop  menu bar / tray app
   relay-sim      local multi-process lab
+  relay-vopr     deterministic single-process sync simulator
 scripts/        install, cross-build, deploy, release
 docs/
   USAGE.md       commands and safety rules
@@ -56,6 +57,17 @@ cargo run -p relay-sim -- down
 ```
 
 `sim/scripts/pair-and-sync.sh` and `sim/scripts/kill-during-mailbox-push.sh` are the same flow as scripts. The lab defaults to `./.relay-sim`, or `RELAY_SIM_LAB` / `--lab`.
+
+## Simulator
+
+`relay-vopr` runs many engines in one process on one thread, on a virtual clock, over a virtual network, in the style of TigerBeetle's VOPR. It is the fast way to test sync scenarios: a seed fixes the workload, the message schedule and every injected fault, and a failing seed replays exactly. See [`apps/relay-vopr/README.md`](../apps/relay-vopr/README.md).
+
+```bash
+cargo run -p relay-vopr -- list
+cargo run -p relay-vopr -- run --scenario chaos --seed 7 --trace
+cargo run -p relay-vopr -- sweep --seeds 100            # every scenario, all cores
+RELAY_VOPR_SEEDS=20 cargo nextest run -p relay-vopr      # the CI test, wider
+```
 
 ## Install from source
 

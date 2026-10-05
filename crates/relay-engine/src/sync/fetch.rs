@@ -39,8 +39,8 @@ impl Syncer {
             if !self.clear_pending_object(batch_peer, space, object) {
                 continue;
             }
-            self.progress
-                .note_fetched(batch_peer, object, Instant::now());
+            let now = self.now();
+            self.progress.note_fetched(batch_peer, object, now);
             self.flush_progress(events, true);
             self.process_head(engine, batch_peer, space, out, events)?;
         }
@@ -362,7 +362,7 @@ impl Syncer {
         &self,
         engine: &Engine,
         space: SpaceId,
-        asked: &HashSet<DeviceId>,
+        asked: &BTreeSet<DeviceId>,
     ) -> Result<Option<DeviceId>, EngineError> {
         let mut peers: Vec<DeviceId> = self
             .connected
@@ -390,7 +390,7 @@ impl Syncer {
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
         let targets = self.failure_targets(object, peer);
-        let mut emitted = HashSet::new();
+        let mut emitted = BTreeSet::new();
         for (batch_peer, space, batch_id) in targets {
             if peer == batch_peer && not_found {
                 self.mark_source_missing(batch_peer, space, batch_id, object);
@@ -577,7 +577,7 @@ impl Syncer {
         space: SpaceId,
         batch_id: u64,
         object: ObjectId,
-    ) -> HashSet<DeviceId> {
+    ) -> BTreeSet<DeviceId> {
         self.connected
             .get(&peer)
             .and_then(|conn| conn.incoming.get(&space))
@@ -593,7 +593,7 @@ impl Syncer {
         engine: &Engine,
         space: SpaceId,
         batch_peer: DeviceId,
-        asked: &HashSet<DeviceId>,
+        asked: &BTreeSet<DeviceId>,
     ) -> Result<Option<DeviceId>, EngineError> {
         let mut candidates: Vec<DeviceId> = self
             .connected

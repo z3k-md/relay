@@ -83,6 +83,33 @@ impl DeviceIdentity {
         Self::from_key(key, &path)
     }
 
+    /// Like [`DeviceIdentity::generate`], but the Ed25519 key is derived
+    /// from `seed` instead of the OS random source. Only the deterministic
+    /// simulator uses this: the same seed yields the same device id.
+    pub fn generate_from_seed(dir: &Path, seed: &[u8; 32]) -> Result<DeviceIdentity, CryptoError> {
+        use base64ct::{Base64, Encoding};
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+
+        let path = dir.join(KEY_FILE);
+        if path.exists() {
+            return Err(CryptoError::KeyExists(path));
+        }
+        let der = ed25519_dalek::SigningKey::from_bytes(seed)
+            .to_pkcs8_der()
+            .map_err(|e| CryptoError::Certificate(e.to_string()))?;
+        let body = Base64::encode_string(der.as_bytes());
+        let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+        for line in body.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(line).expect("base64 is ascii"));
+            pem.push('\n');
+        }
+        pem.push_str("-----END PRIVATE KEY-----\n");
+        let key = KeyPair::from_pem(&pem).map_err(|e| CryptoError::Certificate(e.to_string()))?;
+        fs::create_dir_all(dir).map_err(io_err(dir))?;
+        write_private(&path, key.serialize_pem().as_bytes())?;
+        Self::from_key(key, &path)
+    }
+
     pub fn load(dir: &Path) -> Result<DeviceIdentity, CryptoError> {
         let path = dir.join(KEY_FILE);
         let pem = fs::read_to_string(&path).map_err(io_err(&path))?;
@@ -228,5 +255,28 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::DeviceIdentity;
+
+    #[test]
+    fn seeded_identity_is_stable_and_reloadable() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let seed = [7u8; 32];
+        let ia = DeviceIdentity::generate_from_seed(a.path(), &seed).unwrap();
+        let ib = DeviceIdentity::generate_from_seed(b.path(), &seed).unwrap();
+        assert_eq!(ia.device_id(), ib.device_id());
+        let reloaded = DeviceIdentity::load(a.path()).unwrap();
+        assert_eq!(reloaded.device_id(), ia.device_id());
+        let other =
+            DeviceIdentity::generate_from_seed(tempfile::tempdir().unwrap().path(), &[8u8; 32])
+                .unwrap();
+        assert_ne!(other.device_id(), ia.device_id());
+        // The certificate must still be usable with the derived key.
+        ia.certificate_der().unwrap();
     }
 }

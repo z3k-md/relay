@@ -110,7 +110,7 @@ impl Syncer {
             let caught_up = through.0 >= latest.0;
 
             let mounts = engine.db.repo().list_mounts(Some(space))?;
-            let mount_names: HashMap<MountId, String> = mounts
+            let mount_names: BTreeMap<MountId, String> = mounts
                 .into_iter()
                 .map(|cfg| (cfg.mount.id, cfg.mount.name))
                 .collect();
@@ -200,7 +200,7 @@ impl Syncer {
         }
 
         let mounts = engine.db.repo().list_mounts(Some(space))?;
-        let mount_names: HashMap<MountId, String> = mounts
+        let mount_names: BTreeMap<MountId, String> = mounts
             .into_iter()
             .map(|cfg| (cfg.mount.id, cfg.mount.name))
             .collect();
@@ -225,7 +225,7 @@ impl Syncer {
         }
         let entries = kept;
 
-        let mut pending = HashSet::new();
+        let mut pending = BTreeSet::new();
         for entry in &entries {
             let Some(obj) = entry.content.object() else {
                 continue;
@@ -241,9 +241,9 @@ impl Syncer {
                 pending.insert(obj);
             }
         }
-        let mut asked = HashMap::new();
+        let mut asked = BTreeMap::new();
         for obj in &pending {
-            asked.insert(*obj, HashSet::from([peer]));
+            asked.insert(*obj, BTreeSet::from([peer]));
             out(SyncOutput::FetchObject { peer, object: *obj });
         }
 
@@ -307,9 +307,9 @@ impl Syncer {
             entries,
             pending_objects: pending,
             asked,
-            source_missing: HashSet::new(),
-            failed_objects: HashSet::new(),
-            fetch_attempts: HashMap::new(),
+            source_missing: BTreeSet::new(),
+            failed_objects: BTreeSet::new(),
+            fetch_attempts: BTreeMap::new(),
             attempts: 0,
             retry_at: None,
             caught_up: batch.caught_up,
@@ -352,6 +352,7 @@ impl Syncer {
         out: &mut dyn FnMut(SyncOutput),
         events: &mut Vec<SyncEvent>,
     ) -> Result<(), EngineError> {
+        let now = self.now();
         let Some(conn) = self.connected.get_mut(&peer) else {
             return Ok(());
         };
@@ -364,7 +365,7 @@ impl Syncer {
         if !head.pending_objects.is_empty() {
             return Ok(());
         }
-        if head.retry_at.is_some() && head.retry_at.is_some_and(|t| Instant::now() < t) {
+        if head.retry_at.is_some_and(|t| now < t) {
             return Ok(());
         }
 
@@ -395,7 +396,8 @@ impl Syncer {
             MassDeleteAction::Proceed => {}
         }
 
-        let outcome = engine.apply_remote_batch(peer, space, entries.clone(), &failed)?;
+        let failed_set: std::collections::HashSet<ObjectId> = failed.iter().copied().collect();
+        let outcome = engine.apply_remote_batch(peer, space, entries.clone(), &failed_set)?;
         for w in &outcome.warnings {
             events.push(SyncEvent::SyncWarning {
                 peer,
@@ -422,7 +424,7 @@ impl Syncer {
                     conn.holes.insert(space, hole);
                     conn.resync_at
                         .entry(space)
-                        .or_insert_with(|| Instant::now() + RESYNC_DELAY);
+                        .or_insert_with(|| now + RESYNC_DELAY);
                     let pending = head
                         .entries
                         .iter()
@@ -438,7 +440,7 @@ impl Syncer {
                     queue.pop_front();
                     return self.process_head(engine, peer, space, out, events);
                 }
-                head.retry_at = Some(Instant::now() + RETRY_DELAY);
+                head.retry_at = Some(now + RETRY_DELAY);
             }
             return Ok(());
         }
@@ -468,9 +470,7 @@ impl Syncer {
                     let hole = min.saturating_sub(1);
                     let hole = conn.holes.get(&space).map_or(hole, |h| (*h).min(hole));
                     conn.holes.insert(space, hole);
-                    conn.resync_at
-                        .entry(space)
-                        .or_insert_with(|| Instant::now() + RESYNC_DELAY);
+                    conn.resync_at.entry(space).or_insert(now + RESYNC_DELAY);
                     events.push(SyncEvent::SyncWarning {
                         peer,
                         path: String::new(),

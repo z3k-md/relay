@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use relay_core::faults::{self, FaultPoint};
 use relay_core::{ObjectId, StatHint, TEMP_PREFIX};
 use uuid::Uuid;
 
@@ -56,6 +57,7 @@ pub fn materialize_file(
     let tmp = parent.join(format!("{}{}", TEMP_PREFIX, Uuid::new_v4()));
     let mut guard = TempGuard(Some(tmp.clone()));
 
+    faults::check(FaultPoint::MaterializeWrite, dest).map_err(|e| FsError::io(&tmp, e))?;
     write_hashed(
         &tmp,
         dest,
@@ -70,6 +72,7 @@ pub fn materialize_file(
         return Err(FsError::DestinationChanged(dest.to_path_buf()));
     }
 
+    faults::check(FaultPoint::MaterializeRename, dest).map_err(|e| FsError::io(dest, e))?;
     rename_with_retry(&tmp, dest)?;
     guard.defuse();
     crate::sync_parent_dir(parent)?;

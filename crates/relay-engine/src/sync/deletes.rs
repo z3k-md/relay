@@ -4,8 +4,10 @@ use super::*;
 
 impl Syncer {
     /// Re-run batches held for a mass delete in `space` after a decision
-    /// (D22). Without this the held head waits for a reconnect.
-    pub(crate) fn resume_held(
+    /// ([`Engine::decide_delete_hold`], D22). Without this the held head
+    /// waits for a reconnect. The watch loop calls it through a config
+    /// change; the simulator drives it directly.
+    pub fn resume_held(
         &mut self,
         engine: &mut Engine,
         space: SpaceId,
@@ -24,7 +26,7 @@ impl Syncer {
         engine: &mut Engine,
         peer: DeviceId,
         space: SpaceId,
-        batch_deletes: &HashMap<MountId, Vec<relay_core::LogicalPath>>,
+        batch_deletes: &BTreeMap<MountId, Vec<relay_core::LogicalPath>>,
         events: &mut Vec<SyncEvent>,
     ) -> Result<MassDeleteAction, EngineError> {
         let holds: Vec<_> = engine
@@ -35,7 +37,7 @@ impl Syncer {
             .filter(|h| h.peer.id == peer && h.space.id == space)
             .collect();
 
-        let mut mounts: HashSet<MountId> = batch_deletes.keys().copied().collect();
+        let mut mounts: BTreeSet<MountId> = batch_deletes.keys().copied().collect();
         for hold in &holds {
             mounts.insert(hold.mount.id);
         }
@@ -78,7 +80,7 @@ impl Syncer {
                 .and_then(|c| c.incoming.get(&space))
             {
                 Some(queue) => {
-                    let mut out: HashMap<MountId, Vec<relay_core::LogicalPath>> = HashMap::new();
+                    let mut out: BTreeMap<MountId, Vec<relay_core::LogicalPath>> = BTreeMap::new();
                     for batch in queue {
                         for (mount, paths) in live_tombstones(engine, &batch.entries)? {
                             out.entry(mount).or_default().extend(paths);
@@ -86,7 +88,7 @@ impl Syncer {
                     }
                     out
                 }
-                None => HashMap::new(),
+                None => BTreeMap::new(),
             };
             for (mount, deletions, live) in new_holds {
                 let mut paths = queued_deletes.get(&mount).cloned().unwrap_or_default();
@@ -174,8 +176,8 @@ pub(super) enum MassDeleteAction {
 pub(super) fn live_tombstones(
     engine: &Engine,
     entries: &[relay_proto::RemoteEntry],
-) -> Result<HashMap<MountId, Vec<relay_core::LogicalPath>>, EngineError> {
-    let mut out: HashMap<MountId, Vec<relay_core::LogicalPath>> = HashMap::new();
+) -> Result<BTreeMap<MountId, Vec<relay_core::LogicalPath>>, EngineError> {
+    let mut out: BTreeMap<MountId, Vec<relay_core::LogicalPath>> = BTreeMap::new();
     for entry in entries {
         if !matches!(entry.content, EntryContent::Deleted) {
             continue;
@@ -198,9 +200,9 @@ pub(super) fn live_tombstones(
 pub(super) fn applied_tombstone_paths(
     engine: &Engine,
     space: SpaceId,
-    batch_deletes: &HashMap<MountId, Vec<relay_core::LogicalPath>>,
-) -> Result<HashMap<MountId, Vec<relay_core::LogicalPath>>, EngineError> {
-    let mut out: HashMap<MountId, Vec<relay_core::LogicalPath>> = HashMap::new();
+    batch_deletes: &BTreeMap<MountId, Vec<relay_core::LogicalPath>>,
+) -> Result<BTreeMap<MountId, Vec<relay_core::LogicalPath>>, EngineError> {
+    let mut out: BTreeMap<MountId, Vec<relay_core::LogicalPath>> = BTreeMap::new();
     for (mount, paths) in batch_deletes {
         for path in paths {
             let key = EntryKey {
