@@ -62,6 +62,12 @@ pub enum RemoteCall {
         /// Inside the mount, `/`-separated.
         path: String,
     },
+    /// Space on disk taken by each folder directly inside `path`, counted
+    /// in the background on the answering device (D42). Ask again for
+    /// progress until [`FolderSizes::done`].
+    FolderSizes {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +82,28 @@ pub enum RemoteReply {
     Applied { applied: ConfigApplied },
     Located { located: Located },
     Done,
+    FolderSizes { sizes: FolderSizes },
+}
+
+/// Progress on the sizes of the folders inside one folder (D42).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSizes {
+    /// Canonical path of the folder asked about.
+    pub path: String,
+    pub folders: Vec<FolderSize>,
+    /// Every folder is counted.
+    pub done: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSize {
+    /// Same as the folder's [`DirEntry::path`] in a listing.
+    pub path: String,
+    /// Space allocated on disk, so far if not `done`.
+    pub bytes: u64,
+    /// Files counted, so far if not `done`.
+    pub files: u64,
+    pub done: bool,
 }
 
 /// A read-only copy that arrived (D41).
@@ -141,6 +169,10 @@ pub struct DirListing {
     pub total: u32,
     /// The mount this folder is inside of (or is), if any.
     pub inside_mount: Option<MountRef>,
+    /// This folder and every folder above it, outermost first, for a path
+    /// bar: the caller never splits paths itself. Empty from older devices.
+    #[serde(default)]
+    pub ancestors: Vec<RemoteRoot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,7 +189,13 @@ pub struct DirEntry {
     pub name: String,
     pub path: String,
     pub kind: DirEntryKind,
+    /// A file's length in bytes.
     pub size: Option<u64>,
+    /// Space a file takes on disk: allocated blocks, so less than `size`
+    /// for compressed, sparse, or cloud-only files (D42). `None` from
+    /// devices that predate it.
+    #[serde(default)]
+    pub disk_size: Option<u64>,
     pub modified_ms: Option<i64>,
     /// Dot-file, or the hidden attribute on Windows.
     pub hidden: bool,

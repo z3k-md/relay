@@ -14,8 +14,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use relay_core::DeviceId;
 use relay_core::remote::{
-    DEFAULT_LISTING, DirEntry, DirEntryKind, DirListing, MAX_LISTING, MountRef, RemoteCall,
-    RemoteError, RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult, RemoteRoot, RemoteSpace,
+    DEFAULT_LISTING, DirEntry, DirEntryKind, DirListing, FolderSize, FolderSizes, MAX_LISTING,
+    MountRef, RemoteCall, RemoteError, RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult,
+    RemoteRoot, RemoteSpace,
 };
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ use relay_ipc::ActivityItem;
 use relay_net::ControlHandler;
 
 use crate::host::{Host, now_ms};
+use crate::sizes::{self, Sizer};
 
 pub(crate) struct Browser {
     home: PathBuf,
@@ -112,6 +114,9 @@ pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, by: &str) -> Re
         }
         RemoteCall::Locate { path } => Ok(RemoteReply::Located {
             located: Context::load(&engine()?, home)?.locate(&path)?,
+        }),
+        RemoteCall::FolderSizes { path } => Ok(RemoteReply::FolderSizes {
+            sizes: Context::load(&engine()?, home)?.folder_sizes(&host.sizer, &path)?,
         }),
         RemoteCall::ScanFirst { space, mount, path } => {
             host.scan_first(&space, &mount, &path)
@@ -319,6 +324,37 @@ impl Context {
                 .iter()
                 .find(|(root, _)| dir.starts_with(root))
                 .map(|(_, mount)| mount.clone()),
+            ancestors: ancestors(&dir),
+        })
+    }
+
+    /// Sizes of the folders directly inside `path`, as far as counted.
+    fn folder_sizes(&self, sizer: &Sizer, path: &str) -> Result<FolderSizes, RemoteError> {
+        let dir = self.resolve(path)?;
+        let read = fs::read_dir(&dir).map_err(|err| io_error(&err, &dir))?;
+        let folders: Vec<PathBuf> = read
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|entry| entry.path())
+            .filter(|path| *path != self.relay_home && path.to_str().is_some())
+            .collect();
+        let folders: Vec<FolderSize> = sizer
+            .sizes(&folders)
+            .into_iter()
+            .zip(&folders)
+            .filter_map(|(progress, path)| {
+                Some(FolderSize {
+                    path: path.to_str()?.to_owned(),
+                    bytes: progress.bytes,
+                    files: progress.files,
+                    done: progress.done,
+                })
+            })
+            .collect();
+        Ok(FolderSizes {
+            path: utf8(&dir)?,
+            done: folders.iter().all(|f| f.done),
+            folders,
         })
     }
 
@@ -521,6 +557,7 @@ impl Context {
                 .iter()
                 .any(|(root, _)| root != path && root.starts_with(path)),
             size: (kind == DirEntryKind::File).then_some(meta.len()),
+            disk_size: (kind == DirEntryKind::File).then(|| sizes::allocated(path, meta)),
             modified_ms: meta
                 .modified()
                 .ok()
@@ -581,6 +618,27 @@ fn writable(dir: &Path) -> bool {
         Ok(_) => fs::remove_file(&probe).is_ok(),
         Err(_) => false,
     }
+}
+
+/// `dir` and the folders above it, outermost first. Empty if any of them has
+/// no UTF-8 name, since the caller could not open it anyway.
+fn ancestors(dir: &Path) -> Vec<RemoteRoot> {
+    let mut folders: Vec<RemoteRoot> = dir
+        .ancestors()
+        .map(|path| {
+            let path_str = path.to_str()?;
+            let name = path
+                .file_name()
+                .map_or(Some(path_str), |name| name.to_str())?;
+            Some(RemoteRoot {
+                name: name.to_owned(),
+                path: path_str.to_owned(),
+            })
+        })
+        .collect::<Option<_>>()
+        .unwrap_or_default();
+    folders.reverse();
+    folders
 }
 
 /// Folders first, then by name ignoring case.
@@ -708,6 +766,58 @@ mod tests {
 
         let inside = ctx.list(synced.to_str().unwrap(), 0, 0).unwrap();
         assert_eq!(inside.inside_mount.unwrap().space, "S");
+        let crumbs: Vec<_> = inside.ancestors.iter().map(|a| a.name.as_str()).collect();
+        assert!(crumbs.ends_with(&["zdir", "synced"]), "{crumbs:?}");
+        assert_eq!(inside.ancestors.last().unwrap().path, inside.path);
+        assert_eq!(
+            inside.ancestors[inside.ancestors.len() - 2].path,
+            inside.parent.unwrap()
+        );
+        assert_eq!(page.ancestors.len() + 2, inside.ancestors.len());
+    }
+
+    /// Folder sizes come back keyed by the same paths a listing shows, and
+    /// files list their space on disk next to their length.
+    #[test]
+    fn folder_sizes_match_listing_paths() {
+        let root = tempfile::TempDir::new().unwrap();
+        let root_path = dunce::canonicalize(root.path()).unwrap();
+        fs::create_dir_all(root_path.join("Projects/app")).unwrap();
+        fs::write(root_path.join("Projects/app/main.rs"), vec![b'x'; 10_000]).unwrap();
+        fs::write(root_path.join("notes.txt"), b"hi").unwrap();
+        fs::create_dir(root_path.join("relay-home")).unwrap();
+        let ctx = context(&root_path.join("relay-home"), Vec::new());
+        let dir = root_path.to_str().unwrap();
+
+        let listing = ctx.list(dir, 0, 0).unwrap();
+        let notes = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "notes.txt")
+            .unwrap();
+        assert_eq!(notes.size, Some(2));
+        assert!(notes.disk_size.is_some());
+        let projects = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "Projects")
+            .unwrap();
+        assert_eq!(projects.disk_size, None);
+
+        let sizer = Sizer::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let sizes = loop {
+            let sizes = ctx.folder_sizes(&sizer, dir).unwrap();
+            if sizes.done {
+                break sizes;
+            }
+            assert!(Instant::now() < deadline, "sizes never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(sizes.path, listing.path);
+        assert_eq!(sizes.folders.len(), 1, "relay home and files are left out");
+        assert_eq!(sizes.folders[0].path, projects.path);
+        assert_eq!(sizes.folders[0].files, 1);
     }
 
     #[test]

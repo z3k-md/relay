@@ -293,7 +293,7 @@ fn connect_timeout(endpoint: &Endpoint, timeout: Duration) -> std::io::Result<St
 }
 
 #[cfg(unix)]
-fn connect_now(endpoint: &Endpoint) -> std::io::Result<Stream> {
+pub(crate) fn connect_now(endpoint: &Endpoint) -> std::io::Result<Stream> {
     match endpoint {
         Endpoint::SocketFile(path) => {
             use interprocess::local_socket::{GenericFilePath, ToFsName};
@@ -307,7 +307,7 @@ fn connect_now(endpoint: &Endpoint) -> std::io::Result<Stream> {
 }
 
 #[cfg(windows)]
-fn connect_now(endpoint: &Endpoint) -> std::io::Result<Stream> {
+pub(crate) fn connect_now(endpoint: &Endpoint) -> std::io::Result<Stream> {
     match endpoint {
         Endpoint::NamedPipe(name) => {
             use interprocess::local_socket::{GenericNamespaced, ToNsName};

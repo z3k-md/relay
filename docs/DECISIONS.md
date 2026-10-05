@@ -1077,3 +1077,36 @@ sets nothing up on either device.
 - **Whole file.** No hashing against an index (there is none); the size
   check and QUIC's integrity are what a quick look gets.
 
+
+## D42. Sizes on disk and a faster Browse view
+
+The Browse view shows how much space every file and folder takes on the
+device that owns it, and moves like a file manager.
+
+- **Space on disk, not length.** `DirEntry.disk_size` (wire tag 10) is a
+  file's allocated size: `st_blocks × 512` on Unix; on Windows 0 for cloud
+  placeholders, `GetCompressedFileSizeW` for compressed or sparse files, and
+  otherwise the length rounded up to a 4 KiB cluster. `size` stays the
+  length and still drives the large-file and read-only-copy limits.
+- **Folder sizes are polled, never awaited.** `RemoteCall::FolderSizes
+  { path }` (call and reply tag 10) returns what is counted so far for each
+  folder directly inside `path`; the app asks again every 700 ms until
+  `done`. Two background threads on the owning device count, newest request
+  first. A walk does not follow symlinks or junctions, stays on one
+  filesystem, and counts a hard-linked file once. Finished counts are
+  cached for ten minutes (4,096 at most); a stale one is reported, not
+  done, while it is redone. A count nobody asked about for 15 s is dropped.
+  An older device answers `invalid`, and the app stops asking it.
+- **Path bar without parsing.** `DirListing.ancestors` (tag 7) lists the
+  folder and those above it, outermost first, so the caller still never
+  splits a path (D37). The app shows anything above a root (Home, a drive)
+  as that root's name, and a typed path goes to the device as is.
+- **History.** Back, forward, and up, with mouse buttons 4 and 5, Alt+←/→
+  (⌘[ and ⌘] on macOS), Alt+↑, F5 or Ctrl+R to refresh, Ctrl+L to type a
+  path. Folders seen before show at once from a cache and refresh behind
+  it; a late answer for a folder already left is dropped.
+- **IPC accepts block.** The local IPC server polled `accept` every 50 ms,
+  and the app connects once per command, so every command waited up to
+  that long. Accept now blocks; a watcher wakes it with a throwaway
+  connection once the server stops. A remote listing over IPC went from
+  ~50 ms to ~4 ms on one machine.

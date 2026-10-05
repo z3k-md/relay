@@ -9,6 +9,7 @@ mod host;
 mod quick_open;
 mod read_copy;
 mod remote;
+mod sizes;
 
 use std::fs::File;
 use std::net::SocketAddr;
