@@ -74,7 +74,8 @@ export type RemoteCall =
   | { call: "roots" }
   | { call: "list_dir"; path: string; cursor?: number; limit?: number }
   | { call: "stat"; path: string }
-  | { call: "spaces" };
+  | { call: "spaces" }
+  | { call: "folder_sizes"; path: string };
 
 export interface RemoteRoot {
   name: string;
@@ -91,6 +92,8 @@ export interface DirEntry {
   path: string;
   kind: "file" | "directory" | "symlink" | "other";
   size: number | null;
+  /** Space the file takes on disk (D42). Absent from older devices. */
+  disk_size?: number | null;
   modified_ms: number | null;
   hidden: boolean;
   /** A cloud placeholder: syncing it would download it. */
@@ -106,6 +109,22 @@ export interface DirListing {
   next_cursor: number | null;
   total: number;
   inside_mount: MountRef | null;
+  /** This folder and those above it, outermost first. Empty from older devices. */
+  ancestors?: RemoteRoot[];
+}
+
+export interface FolderSize {
+  path: string;
+  /** Space on disk, so far if not done. */
+  bytes: number;
+  files: number;
+  done: boolean;
+}
+
+export interface FolderSizes {
+  path: string;
+  folders: FolderSize[];
+  done: boolean;
 }
 
 export interface RemoteSpace {
@@ -117,7 +136,8 @@ export type RemoteReply =
   | { reply: "roots"; roots: RemoteRoot[] }
   | { reply: "listing"; listing: DirListing }
   | { reply: "stat"; entry: DirEntry }
-  | { reply: "spaces"; spaces: RemoteSpace[] };
+  | { reply: "spaces"; spaces: RemoteSpace[] }
+  | { reply: "folder_sizes"; sizes: FolderSizes };
 
 export interface PathPreview {
   path: string | null;

@@ -11,8 +11,9 @@
 //! of a second one in protobuf. A change a peer cannot decode is `invalid`.
 
 use relay_core::remote::{
-    DirEntry, DirEntryKind, DirListing, Located, MountRef, MountedPath, PathPreview, RemoteCall,
-    RemoteError, RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult, RemoteRoot, RemoteSpace,
+    DirEntry, DirEntryKind, DirListing, FolderSize, FolderSizes, Located, MountRef, MountedPath,
+    PathPreview, RemoteCall, RemoteError, RemoteErrorCode, RemoteMount, RemoteReply, RemoteResult,
+    RemoteRoot, RemoteSpace,
 };
 
 use crate::{Empty, ProtoError, invalid};
@@ -31,7 +32,10 @@ pub struct PeerGrants {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ControlRequest {
-    #[prost(oneof = "control_request::Call", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(
+        oneof = "control_request::Call",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
+    )]
     pub call: Option<control_request::Call>,
 }
 
@@ -57,6 +61,9 @@ pub mod control_request {
         Locate(String),
         #[prost(message, tag = "9")]
         ScanFirst(super::WireMountedPath),
+        /// An older peer decodes this as no call and answers `invalid`.
+        #[prost(string, tag = "10")]
+        FolderSizes(String),
     }
 }
 
@@ -82,7 +89,7 @@ pub struct WireCreateDir {
 pub struct ControlResponse {
     #[prost(
         oneof = "control_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15"
     )]
     pub reply: Option<control_response::Reply>,
 }
@@ -109,6 +116,8 @@ pub mod control_response {
         Located(super::WireLocated),
         #[prost(message, tag = "9")]
         Done(super::Empty),
+        #[prost(message, tag = "10")]
+        FolderSizes(super::WireFolderSizes),
         #[prost(message, tag = "15")]
         Error(super::WireRemoteError),
     }
@@ -142,6 +151,8 @@ pub struct WireListing {
     pub total: u32,
     #[prost(message, optional, tag = "6")]
     pub inside_mount: Option<WireMountRef>,
+    #[prost(message, repeated, tag = "7")]
+    pub ancestors: Vec<WireRoot>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -165,6 +176,30 @@ pub struct WireDirEntry {
     pub mount: Option<WireMountRef>,
     #[prost(bool, tag = "9")]
     pub contains_mount: bool,
+    #[prost(uint64, optional, tag = "10")]
+    pub disk_size: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WireFolderSizes {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(message, repeated, tag = "2")]
+    pub folders: Vec<WireFolderSize>,
+    #[prost(bool, tag = "3")]
+    pub done: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WireFolderSize {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(uint64, tag = "2")]
+    pub bytes: u64,
+    #[prost(uint64, tag = "3")]
+    pub files: u64,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -278,6 +313,7 @@ pub fn call_to_wire(call: &RemoteCall) -> ControlRequest {
             mount: mount.clone(),
             path: path.clone(),
         }),
+        RemoteCall::FolderSizes { path } => Call::FolderSizes(path.clone()),
     };
     ControlRequest { call: Some(call) }
 }
@@ -309,6 +345,7 @@ pub fn call_from_wire(request: ControlRequest) -> Result<RemoteCall, ProtoError>
                 mount: at.mount,
                 path: at.path,
             },
+            Call::FolderSizes(path) => RemoteCall::FolderSizes { path },
         },
     )
 }
@@ -332,6 +369,14 @@ pub fn result_to_wire(result: &RemoteResult) -> ControlResponse {
             next_cursor: listing.next_cursor,
             total: listing.total,
             inside_mount: listing.inside_mount.as_ref().map(mount_ref_to_wire),
+            ancestors: listing
+                .ancestors
+                .iter()
+                .map(|folder| WireRoot {
+                    name: folder.name.clone(),
+                    path: folder.path.clone(),
+                })
+                .collect(),
         }),
         Ok(RemoteReply::Stat { entry }) => Reply::Stat(entry_to_wire(entry)),
         Ok(RemoteReply::Spaces { spaces }) => Reply::Spaces(WireSpaces {
@@ -376,6 +421,20 @@ pub fn result_to_wire(result: &RemoteResult) -> ControlResponse {
             }),
         }),
         Ok(RemoteReply::Done) => Reply::Done(Empty {}),
+        Ok(RemoteReply::FolderSizes { sizes }) => Reply::FolderSizes(WireFolderSizes {
+            path: sizes.path.clone(),
+            folders: sizes
+                .folders
+                .iter()
+                .map(|folder| WireFolderSize {
+                    path: folder.path.clone(),
+                    bytes: folder.bytes,
+                    files: folder.files,
+                    done: folder.done,
+                })
+                .collect(),
+            done: sizes.done,
+        }),
         Err(err) => Reply::Error(error_to_wire(err)),
     };
     ControlResponse { reply: Some(reply) }
@@ -403,6 +462,14 @@ pub fn result_from_wire(response: ControlResponse) -> Result<RemoteResult, Proto
                     next_cursor: listing.next_cursor,
                     total: listing.total,
                     inside_mount: listing.inside_mount.map(mount_ref_from_wire),
+                    ancestors: listing
+                        .ancestors
+                        .into_iter()
+                        .map(|folder| RemoteRoot {
+                            name: folder.name,
+                            path: folder.path,
+                        })
+                        .collect(),
                 },
             }),
             Reply::Stat(entry) => Ok(RemoteReply::Stat {
@@ -458,6 +525,22 @@ pub fn result_from_wire(response: ControlResponse) -> Result<RemoteResult, Proto
                 },
             }),
             Reply::Done(_) => Ok(RemoteReply::Done),
+            Reply::FolderSizes(sizes) => Ok(RemoteReply::FolderSizes {
+                sizes: FolderSizes {
+                    path: sizes.path,
+                    folders: sizes
+                        .folders
+                        .into_iter()
+                        .map(|folder| FolderSize {
+                            path: folder.path,
+                            bytes: folder.bytes,
+                            files: folder.files,
+                            done: folder.done,
+                        })
+                        .collect(),
+                    done: sizes.done,
+                },
+            }),
             Reply::Error(err) => Err(error_from_wire(err)),
         },
     )
@@ -491,6 +574,7 @@ fn entry_to_wire(entry: &DirEntry) -> WireDirEntry {
         cloud_only: entry.cloud_only,
         mount: entry.mount.as_ref().map(mount_ref_to_wire),
         contains_mount: entry.contains_mount,
+        disk_size: entry.disk_size,
     }
 }
 
@@ -505,6 +589,7 @@ fn entry_from_wire(entry: WireDirEntry) -> DirEntry {
             _ => DirEntryKind::Other,
         },
         size: entry.size,
+        disk_size: entry.disk_size,
         modified_ms: entry.modified_ms,
         hidden: entry.hidden,
         cloud_only: entry.cloud_only,
@@ -558,6 +643,9 @@ mod tests {
                 parent: "/Users/zach".into(),
                 name: "xyz-foo".into(),
             },
+            RemoteCall::FolderSizes {
+                path: "/Users/zach".into(),
+            },
             RemoteCall::Apply {
                 change: relay_core::ConfigChange::Share {
                     space: "S".into(),
@@ -576,6 +664,7 @@ mod tests {
                     path: "/Users/zach/Code".into(),
                     kind: DirEntryKind::Directory,
                     size: None,
+                    disk_size: None,
                     modified_ms: Some(1_700_000_000_000),
                     hidden: false,
                     cloud_only: false,
@@ -588,6 +677,16 @@ mod tests {
                 next_cursor: None,
                 total: 1,
                 inside_mount: None,
+                ancestors: vec![
+                    RemoteRoot {
+                        name: "/".into(),
+                        path: "/".into(),
+                    },
+                    RemoteRoot {
+                        name: "Users".into(),
+                        path: "/Users".into(),
+                    },
+                ],
             },
         }));
         round_trip(Ok(RemoteReply::Located {
@@ -603,6 +702,26 @@ mod tests {
             },
         }));
         round_trip(Ok(RemoteReply::Done));
+        round_trip(Ok(RemoteReply::FolderSizes {
+            sizes: FolderSizes {
+                path: "/Users/zach".into(),
+                folders: vec![
+                    FolderSize {
+                        path: "/Users/zach/Code".into(),
+                        bytes: 3 << 30,
+                        files: 120_000,
+                        done: true,
+                    },
+                    FolderSize {
+                        path: "/Users/zach/Library".into(),
+                        bytes: 4096,
+                        files: 1,
+                        done: false,
+                    },
+                ],
+                done: false,
+            },
+        }));
         round_trip(Ok(RemoteReply::Applied {
             applied: relay_core::ConfigApplied::Done,
         }));

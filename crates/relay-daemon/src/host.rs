@@ -18,6 +18,8 @@ use relay_ipc::{
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
+use crate::sizes::Sizer;
+
 const ACTIVITY_CAP: usize = 500;
 const PAIR_TTL: Duration = Duration::from_secs(10 * 60);
 const PAIR_JOIN_WAIT: Duration = Duration::from_secs(60);
@@ -50,6 +52,8 @@ pub(crate) struct Host {
     /// Kept apart from `peers`: grants can arrive before the engine reports
     /// the peer as connected.
     remote_access: Mutex<HashMap<DeviceId, RemoteAccess>>,
+    /// Folder sizes counted for peers browsing this device (D42).
+    pub sizer: Sizer,
     pub wake: Wake,
 }
 
@@ -152,6 +156,7 @@ impl Host {
             pair_cv: Condvar::new(),
             pair_terms: Mutex::new(PairTerms::default()),
             remote_access: Mutex::new(HashMap::new()),
+            sizer: Sizer::default(),
             wake: Wake::new(),
         })
     }

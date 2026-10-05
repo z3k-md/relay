@@ -41,34 +41,50 @@ impl Server {
     }
 
     /// Accept clients until `stop` is set. One thread per connection.
+    ///
+    /// Accept blocks, so a client is served the moment it connects (the
+    /// desktop app connects once per command and used to wait out a 50 ms
+    /// poll each time). Once `stop` is set, a watcher wakes the accept with
+    /// throwaway connections until the loop has ended.
     pub fn serve<H: Handler>(self, handler: Arc<H>, stop: &AtomicBool) {
-        self.listener
-            .set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
-            .ok();
-        while !stop.load(Ordering::Relaxed) {
-            match self.listener.accept() {
-                Ok(stream) => {
-                    // Unix accept() inherits O_NONBLOCK from the listener.
-                    let _ = stream.set_nonblocking(false);
-                    let handler = Arc::clone(&handler);
-                    thread::spawn(move || {
-                        let _ = handle_client(stream, handler.as_ref());
-                    });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => {
+        let Self { listener, endpoint } = self;
+        let ended = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while !ended.load(Ordering::Relaxed) {
                     if stop.load(Ordering::Relaxed) {
-                        break;
+                        let _ = crate::client::connect_now(&endpoint);
                     }
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(STOP_POLL);
+                }
+            });
+            loop {
+                match listener.accept() {
+                    Ok(stream) => {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let handler = Arc::clone(&handler);
+                        thread::spawn(move || {
+                            let _ = handle_client(stream, handler.as_ref());
+                        });
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(STOP_POLL);
+                    }
                 }
             }
-        }
+            ended.store(true, Ordering::Relaxed);
+        });
     }
 }
+
+/// How often the watcher checks `stop`, and the pause after a failed accept.
+const STOP_POLL: Duration = Duration::from_millis(50);
 
 fn handle_client<H: Handler + ?Sized>(stream: Stream, handler: &H) -> Result<(), IpcError> {
     let mut stream = BufReader::new(stream);

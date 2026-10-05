@@ -841,6 +841,31 @@ fn granted_peer_browses_folders_over_ipc() {
     let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["Projects", "notes.txt"]);
 
+    // Folder sizes are counted on alice in the background and polled.
+    let projects = listing.entries[0].path.clone();
+    let mut done = false;
+    for _ in 0..200 {
+        let reply = wait_ipc(home_b.path())
+            .remote(
+                "alice",
+                &RemoteCall::FolderSizes {
+                    path: listing.path.clone(),
+                },
+            )
+            .expect("folder sizes on alice");
+        let RemoteReply::FolderSizes { sizes } = reply else {
+            panic!("unexpected reply {reply:?}");
+        };
+        assert_eq!(sizes.folders.len(), 1);
+        assert_eq!(sizes.folders[0].path, projects);
+        if sizes.done {
+            done = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(done, "folder sizes never finished");
+
     let refused = wait_ipc(home_a.path())
         .remote("bob", &RemoteCall::Roots)
         .unwrap_err();
