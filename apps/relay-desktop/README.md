@@ -47,4 +47,6 @@ bun run tauri android init
 bun run tauri android build -- --apk --target aarch64
 ```
 
-`android init` writes `src-tauri/gen/android`. The debug APK is under `src-tauri/gen/android/app/build/outputs/apk/`.
+`android init` writes `src-tauri/gen/android`. The debug APK is under `src-tauri/gen/android/app/build/outputs/apk/`. CI builds the same debug APK on every pull request and uploads it as the `relay-android-debug-aarch64` artifact.
+
+The background-sync and storage plan is [`docs/proposals/android.md`](../../docs/proposals/android.md).

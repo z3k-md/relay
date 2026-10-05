@@ -219,6 +219,57 @@ jobs:
       - name: Full simulator suite
         run: cargo nextest run -p relay-vopr --locked --no-fail-fast
 
+  # Debug APK for arm64 phones (D33 shell). Catches Android-only breakage in
+  # the engine crates, the cfg(target_os = "android") paths, and the Gradle
+  # project. Not a required check; it runs beside `rust`, so it adds no
+  # wall-clock to the required path. The APK is uploaded for sideloading.
+  android:
+    name: android (apk, aarch64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup target add aarch64-linux-android
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: apps/relay-desktop/package.json
+
+      - name: Build debug APK
+        working-directory: apps/relay-desktop
+        run: |
+          set -euo pipefail
+          # The runner image ships the SDK (ANDROID_HOME) and a current NDK.
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          bun install --frozen-lockfile
+          bun run tauri android build --debug --apk --target aarch64 --ci
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-android-debug-aarch64
+          path: apps/relay-desktop/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
   # rust-cache keys each entry by the Cargo.lock hash, so every lockfile
   # change on main leaves the previous entry behind until GitHub evicts it.
   # Keep the newest entry per key prefix (one per OS, one per release
@@ -226,7 +277,7 @@ jobs:
   prune-caches:
     name: prune caches
     runs-on: ubuntu-latest
-    needs: rust
+    needs: [rust, android]
     if: always() && github.event_name == 'push'
     timeout-minutes: 5
     permissions:
