@@ -377,3 +377,28 @@ export type Page =
   | "conflicts"
   | "activity"
   | "settings";
+
+/** How a connection reaches the other device (D48). */
+export type PathKind = "loopback" | "lan" | "tailscale" | "internet" | "relayed";
+
+/** One direction of a connection test. */
+export interface SpeedLeg {
+  bytes: number;
+  elapsed_ms: number;
+  bits_per_sec: number;
+  /** Bytes per `sample_ms` window, in order. */
+  samples: number[];
+}
+
+/** Result of a connection test (relay_core::speed::SpeedReport). */
+export interface SpeedReport {
+  path: PathKind;
+  address: string;
+  rtt_us: number;
+  mtu: number;
+  sent_packets: number;
+  lost_packets: number;
+  sample_ms: number;
+  download: SpeedLeg;
+  upload: SpeedLeg;
+}

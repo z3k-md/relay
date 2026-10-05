@@ -60,6 +60,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D45 | [Server role](#d45-server-role) |
 | D46 | [What a manage grant reaches](#d46-what-a-manage-grant-reaches) |
 | D47 | [Store mode](#d47-store-mode) |
+| D48 | [Connection test](#d48-connection-test) |
 | D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
 
 <!-- index:end -->
@@ -1362,6 +1363,43 @@ A device can keep every file's bytes without a working-tree copy.
 - **Simulator.** In `home_server`, the server's folder must stay empty after
   quiesce, and its tree is read from its index and store, so a file the
   server indexed without its bytes fails the run.
+
+## D48. Connection test
+
+A user can measure the link to a connected peer from the Peers view or
+`relay peer test`. It is stage 1 of
+[`proposals/performance-insights.md`](proposals/performance-insights.md).
+
+- **Shape.** Five seconds of download, then five of upload, over the
+  session's existing QUIC connection, so the test takes the same path,
+  congestion controller, and packet size as sync. Each direction is one
+  bidirectional stream: an `ObjectRequest` with `speed_test` set
+  (`upload`, `duration_ms`), an accepting `ObjectHeader`, then raw bytes
+  until the sender's clock runs out. After an upload the answering device
+  writes one `SpeedTestDone` with the bytes it counted and the time from the
+  first byte to the end. Rates are always the receiver's count. Each side
+  clamps a direction to 10 s.
+- **No disk.** The sender writes zeros; QUIC encrypts every byte and
+  nothing compresses. The result is the link, not either store.
+- **What it reports.** `SpeedReport` (`relay_core::speed`): bytes, elapsed,
+  and rate per direction; bytes per 250 ms window for the graph; the
+  smoothed RTT, the packet size, and packets sent and lost during the
+  test from Quinn's path stats; and the path kind from the remote address
+  (loopback, LAN, Tailscale, internet, or relayed when it is the D34
+  virtual address).
+- **Who may ask.** Any connected trusted peer; no manage grant (D37). It
+  reads nothing and changes nothing, and a trusted peer can already pull
+  every shared object. Each device answers one test at a time and runs one
+  at a time; a second answers `busy`.
+- **Compatibility.** `Hello.features` bit `FEATURE_SPEED_TEST` (2). An
+  older peer would read the request as an object request with an empty id
+  and close the connection as malformed, so the request goes only to peers
+  that set the bit; others answer `unsupported` locally. `PROTOCOL_VERSION`
+  stays 1.
+- **Known limits.** Sync keeps running during a test, so a busy link reads
+  low. The upload graph counts what this side handed to QUIC, which runs
+  ahead of the receiver by up to the flow-control window; the upload rate
+  itself is the receiver's.
 
 ## D49. Automatic releases after main CI
 

@@ -163,6 +163,7 @@ relay service logs -f
 | `relay pair [--share SPACE]... [--allow-manage]` / `relay pair CODE [--addr HOST:PORT] [--allow-manage]` | Pair with another device. `--allow-manage` lets it manage this one |
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
 | `relay peer allow-manage NAME` / `peer deny-manage NAME` | Let a peer browse this device and set up sync on it, or stop |
+| `relay peer test NAME [--seconds N]` | Measure the connection to a connected peer: download, then upload (default 10 s total, max 20) |
 | `relay browse PEER [PATH] [--all]` | List a managed device's roots, or one of its folders |
 | `relay open PEER PATH [--into DIR \| --read-only]` | Get a file from a managed device: its folder syncs here online-only and the file downloads, or with `--read-only` a one-off copy. Prints the local path |
 | `relay opened` / `opened remove SPACE` | List folders set up by `relay open`, or remove one |

@@ -4,6 +4,7 @@ import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } fro
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
+import SpeedTestDialog from "../components/SpeedTestDialog.vue";
 import { api, errorText } from "../lib/api";
 import type { ActivityItem, PeerView, SpaceView } from "../lib/types";
 
@@ -18,6 +19,8 @@ const name = ref("");
 const deviceId = ref("");
 const address = ref("");
 const confirmName = ref<string | null>(null);
+/** Peer whose connection test is open. */
+const testing = ref<string | null>(null);
 const busy = ref(false);
 const share = ref<string[]>([]);
 const pairCode = ref("");
@@ -394,13 +397,24 @@ defineExpose({ load });
             You can browse {{ peer.name }} from Browse.
           </p>
         </div>
-        <button
-          type="button"
-          class="mt-0.5 shrink-0 text-[var(--color-danger)]"
-          @click="confirmName = peer.name"
-        >
-          Remove
-        </button>
+        <div class="mt-0.5 flex shrink-0 flex-col items-end gap-1">
+          <button
+            v-if="peer.connected"
+            type="button"
+            class="text-[var(--color-accent)]"
+            title="Measure download and upload speed to this device"
+            @click="testing = peer.name"
+          >
+            Test connection
+          </button>
+          <button
+            type="button"
+            class="text-[var(--color-danger)]"
+            @click="confirmName = peer.name"
+          >
+            Remove
+          </button>
+        </div>
       </li>
     </ul>
     <p class="mt-3 text-[12px] text-[var(--color-muted)]">
@@ -552,6 +566,8 @@ defineExpose({ load });
         </button>
       </div>
     </Modal>
+
+    <SpeedTestDialog :peer="testing" @close="testing = null" />
 
     <Modal :open="!!confirmName" title="Remove peer?" @close="confirmName = null">
       <p>

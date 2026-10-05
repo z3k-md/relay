@@ -373,6 +373,16 @@ pub struct RemoteParams {
     pub call: relay_core::remote::RemoteCall,
 }
 
+/// Run a connection test against a connected peer (D48).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedTestParams {
+    /// The peer's local name.
+    pub peer: String,
+    /// Milliseconds each way; `SPEED_TEST_DEFAULT_MS` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairJoinResult {
     pub peer_name: String,

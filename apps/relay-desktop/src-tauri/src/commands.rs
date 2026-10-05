@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use relay_core::remote::{RemoteCall, RemoteError, RemoteErrorCode, RemoteReply};
+use relay_core::speed::SpeedReport;
 use relay_core::{ConfigApplied, ConfigChange, DeviceId};
 use relay_engine::{
     ConflictClass, DeleteHoldDecision, Engine, EngineError, Resolution,
@@ -20,7 +21,7 @@ use crate::sidecar::{self, CliInstallResult, CliStatus, ShellKind};
 #[cfg(not(target_os = "android"))]
 use crate::updates::{self, UpdateInfo};
 use crate::{AppState, settings};
-use relay_ipc::{Client, PairJoinParams, PairStartParams, PeerLive};
+use relay_ipc::{Client, PairJoinParams, PairStartParams, PeerLive, SpeedTestParams};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -321,6 +322,28 @@ pub fn remote_call(
         )
     })?;
     client.remote(&peer, &call).map_err(|err| match err {
+        relay_ipc::IpcError::Remote { code, message } => {
+            RemoteError::new(RemoteErrorCode::parse(&code), message)
+        }
+        other => RemoteError::new(RemoteErrorCode::Failed, error_chain(&other)),
+    })
+}
+
+/// Measure the connection to a connected peer (D48). Blocks for the test,
+/// about ten seconds.
+#[tauri::command(async)]
+pub fn speed_test(app: AppHandle, peer: String) -> Result<SpeedReport, RemoteError> {
+    let mut client = host_client(&app).ok().flatten().ok_or_else(|| {
+        RemoteError::new(
+            RemoteErrorCode::Failed,
+            "Relay is not running on this computer. Resume sync and try again.",
+        )
+    })?;
+    let params = SpeedTestParams {
+        peer,
+        duration_ms: None,
+    };
+    client.speed_test(&params).map_err(|err| match err {
         relay_ipc::IpcError::Remote { code, message } => {
             RemoteError::new(RemoteErrorCode::parse(&code), message)
         }

@@ -25,6 +25,7 @@ import type {
   ResolveReport,
   RunnerState,
   Settings,
+  SpeedReport,
   SpaceView,
   UpdateAvailable,
   UpdateInfo,
@@ -56,8 +57,13 @@ export class RemoteCallError extends Error {
 }
 
 async function remoteCall(peer: string, request: RemoteCall): Promise<RemoteReply> {
+  return remoteInvoke<RemoteReply>("remote_call", { peer, call: request });
+}
+
+/** A Tauri command whose errors are `RemoteError`s. */
+async function remoteInvoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
   try {
-    return await invoke<RemoteReply>("remote_call", { peer, call: request });
+    return await invoke<T>(cmd, args);
   } catch (err) {
     if (err && typeof err === "object" && "code" in err && "message" in err) {
       const { code, message } = err as { code: RemoteErrorCode; message: string };
@@ -85,6 +91,8 @@ export const api = {
   setPeerManage: (name: string, allowed: boolean) =>
     call<void>("set_peer_manage", { name, allowed }),
   remoteCall,
+  /** About ten seconds: download, then upload (D48). */
+  speedTest: (peer: string) => remoteInvoke<SpeedReport>("speed_test", { peer }),
   pairStart: (share: string[], allowManage: boolean) =>
     call<PairStartResult>("pair_start", { share, allowManage }),
   pairStatus: () => call<PairStatus>("pair_status"),

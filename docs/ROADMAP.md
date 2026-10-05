@@ -34,6 +34,9 @@ Not in a fixed order.
   self-hosters run it inside their home server.
 - **Relay Explorer.** A Files-class file manager in the desktop app, Windows
   first. The WebView2 performance spike is draft PR #5.
+- **Performance insights** ([proposal](proposals/performance-insights.md)).
+  A connection test between two devices (D48) is in review; live per-peer
+  graphs, `relay bench`, and history follow.
 - **Integrations.** Editor sync status, conflict notifications, restore from
   the app, and post-sync automation. These stay above the engine.
 

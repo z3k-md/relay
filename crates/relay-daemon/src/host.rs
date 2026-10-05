@@ -5,6 +5,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use relay_core::remote::{RemoteCall, RemoteError, RemoteErrorCode, RemoteReply, RemoteResult};
+use relay_core::speed::{SPEED_TEST_DEFAULT_MS, SPEED_TEST_MAX_MS, SpeedReport};
 use relay_core::{ConfigApplied, ConfigChange, DeviceId, PairingCode, SpaceId};
 use relay_engine::{
     Engine, EngineError, PeerInfo, Rejected, ScanReport, SyncInput, TransferDirection,
@@ -14,7 +15,8 @@ use relay_ipc::{
     ActivityItem, EvictResult, FetchParams, FolderPairParams, Handler, Hello, HostKind, HostState,
     Idle, MountLive, OpenRemoteParams, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
     PairStartParams, PairStartResult, PairStatus, PeerLive, RemoteParams, RescanParams,
-    RpcErrorBody, Status, TransferDirection as IpcDirection, TransferLive, Watching,
+    RpcErrorBody, SpeedTestParams, Status, TransferDirection as IpcDirection, TransferLive,
+    Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -237,6 +239,27 @@ impl Host {
         net.send(NetCommand::Control { peer, call, reply });
         rx.recv_timeout(wait)
             .map_err(|_| RemoteError::new(RemoteErrorCode::Timeout, "no answer from the network"))?
+    }
+
+    /// Measure the link to a connected peer by its local name (D48).
+    fn speed_test(&self, params: SpeedTestParams) -> Result<SpeedReport, RpcErrorBody> {
+        let peer = self.peer_named(&params.peer)?;
+        let net = self.net_sender()?;
+        let duration_ms = params
+            .duration_ms
+            .unwrap_or(SPEED_TEST_DEFAULT_MS)
+            .clamp(1, SPEED_TEST_MAX_MS);
+        let (reply, rx) = mpsc::channel();
+        net.send(NetCommand::SpeedTest {
+            peer: peer.id,
+            duration_ms,
+            reply,
+        });
+        // The network bounds the test itself; this only covers a lost reply.
+        let wait = Duration::from_millis(u64::from(duration_ms) * 2) + Duration::from_secs(60);
+        rx.recv_timeout(wait)
+            .map_err(|_| RpcErrorBody::new("timeout", "no answer from the network"))?
+            .map_err(|err| RpcErrorBody::new(err.code.as_str(), err.message))
     }
 
     pub fn finish_pair(&self, result: Result<(String, String), String>) {
@@ -977,6 +1000,11 @@ impl Handler for Host {
                 let params: RemoteParams = serde_json::from_value(params)
                     .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
                 serde_json::to_value(self.remote(params)?).map_err(internal)
+            }
+            "speed_test" => {
+                let params: SpeedTestParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(self.speed_test(params)?).map_err(internal)
             }
             "pair_join" => {
                 let params: PairJoinParams = serde_json::from_value(params)
