@@ -1,5 +1,4 @@
-//! Set up a folder pair across devices from this one (remote explorer
-//! Stage 3).
+//! Set up a folder pair across devices from this one (D39).
 //!
 //! Each step is a remote call on the device it touches: this device answers
 //! its own steps through [`remote::answer`], a peer answers through the

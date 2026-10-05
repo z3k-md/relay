@@ -1,5 +1,7 @@
 # Home server
 
+**Status:** Stage 1 (server role, D45) and Stage 2 (store mode, D47) shipped. Stage 3 is next.
+
 Build plan for an always-on Relay server: a NAS, mini PC, or VPS that joins
 the sync chain, holds a durable copy of every space, keeps history the other
 devices cannot erase, and gives roaming devices one place to meet. This does
@@ -17,8 +19,7 @@ D47. The rest becomes decisions as each stage lands.
    not want their own hardware. Blind by default (below): it never holds
    space keys. Billing exists only at this tier.
 
-Everything is self-hostable. There is no third-party backend (D44 replaces
-the Supabase backend in `DESIGN.md` §38 and Phase 8).
+Everything is self-hostable. There is no third-party backend (D44 replaced the Supabase backend of the original design).
 
 ## What exists today
 
@@ -39,12 +40,11 @@ the Supabase backend in `DESIGN.md` §38 and Phase 8).
 The server is an ordinary device: its own Ed25519 identity, paired like any
 other, version vectors, the same QUIC protocol. It does not order writes, take
 locks, or resolve conflicts differently (D18, D31). Devices on the same LAN
-keep syncing directly when it is down. §38 stands: the persistent service is
-not the authoritative filesystem.
+keep syncing directly when it is down. It is not the authoritative filesystem (DESIGN §5).
 
 It differs in four narrow ways:
 
-1. **Durability target.** It counts toward `minimum_durable_replicas` (§19).
+1. **Durability target.** It counts toward `minimum_durable_replicas` (DESIGN §5).
    Clients show "backed up" from its acks, never from its presence.
 2. **History owner.** Its retention policy decides what it deletes. Clients
    cannot shorten it.
@@ -87,7 +87,7 @@ mirrors is not a backup.
   policy, or a command run on the server, deletes.
 - **Retention per space**, applied on the server and independent of client
   tombstones: for example every version for 30 days, daily for a year, the
-  latest forever. Generalizes the D29 mirror and §20.4.
+  latest forever. Generalizes the D29 mirror.
 - **Snapshots.** A snapshot is an index manifest over the object store.
   `relay restore SPACE --at TIME` restores a whole tree.
 - **Mass-change hold.** The D22 receive-side hold, extended to many files
@@ -101,15 +101,14 @@ mirrors is not a backup.
   at rest (D30), can serve file contents, and later thumbnails, search, or a
   web view. Disk encryption is the OS's job.
 - **Blind** (VPS, a friend's house, tier 3): no space keys. Stores sealed
-  objects and logs, relays, acks. Needs encrypted entry logs and keyed object
-  ids (§37) first, or it learns paths, sizes, and content hashes.
+  objects and logs, relays, acks. Needs encrypted entry logs and keyed object ids first, or it learns paths, sizes, and content hashes.
 
 `peer revoke` must take effect on the server at once. `space rotate` does not
 re-encrypt history; say so.
 
 ### Accounts (D44)
 
-The account is a directory and sign-in layer, never the trust root (§21).
+The account is a directory and sign-in layer, never the trust root (DESIGN §6).
 OIDC sign-in, Google first. The directory stores account email, device
 names, device public keys, and addresses. It never stores file contents or
 space keys. We run a free default; the same component ships inside the
@@ -119,7 +118,7 @@ A new device that signs in is pending until an existing device approves it
 and wraps the space keys for it. With no device online, the recovery secret
 (D30) works instead. A stolen Google login gets device names, not data.
 Approved devices on one account hold the D37 manage grant on each other.
-Code pairing stays, and the sync engine never depends on accounts (§23.2).
+Code pairing stays, and the sync engine never depends on accounts (DESIGN §6).
 
 The account-wide grant waits on manage-grant scoping (N-H4), so that a
 signed-in device cannot read outside the folders the grant should cover.

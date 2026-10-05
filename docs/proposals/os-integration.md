@@ -1,9 +1,11 @@
 # Online-only files in the OS file manager
 
+**Status:** Stage 1 shipped (D43). Stages 2–4 planned.
+
 Build plan for showing Relay's online-only files (D35 `demand` mode) inside
 Explorer, Finder, and Linux file managers, where they open like any other file
-and download on first read. This does not amend [`DESIGN.md`](../DESIGN.md) or
-[`DECISIONS.md`](../DECISIONS.md). Stage 1 is recorded as D43.
+and download on first read. Stage 1 shipped as D43; later stages become
+decisions as they land.
 
 ## Goal
 
@@ -13,8 +15,8 @@ cloud badge. Opening one downloads it from whichever device has it, then
 opens it. "Free up space" and "Always keep on this device" work from the
 context menu. Nothing else about syncing changes.
 
-Today an online-only file has an index row and no file on disk: it can be
-opened only from Relay's own Files and Browse views.
+On macOS and Linux an online-only file still has an index row and no file on
+disk: it can be opened only from Relay's own Files and Browse views.
 
 ## Platform APIs
 
@@ -29,60 +31,12 @@ opened only from Relay's own Files and Browse views.
 
 ## Stages
 
-### Stage 1: Windows placeholders (this change)
+### Stage 1: Windows placeholders (shipped, D43)
 
-- **Which folders.** On Windows, every attached mount whose space has a
-  `demand` rule becomes a Cloud Files sync root, if the volume is NTFS and the
-  platform supports it. `RELAY_PLACEHOLDERS=0` turns it off for the host.
-  Registration is per user: provider `Relay`, account `<mount id>`, display
-  name `Relay · <space>`.
-- **Full population.** Directories are real folders and every file exists on
-  disk (`PopulationType::AlwaysFull`), so Explorer never asks us to list a
-  folder. A reconcile pass makes the disk match the index for the mount:
-  - online-only row, nothing on disk: create a placeholder with the row's
-    size and modified time. The placeholder's blob is the object id.
-  - online-only row, stale placeholder (size changed remotely): replace it.
-  - downloaded row, regular file whose stat matches the index: convert it to
-    a placeholder marked in sync.
-  - deleted row, placeholder on disk with no data: remove it.
-  The pass runs when the host starts, after each received batch for the
-  space, and after rule changes.
-- **Opening a file.** The driver calls `fetch_data` on a callback thread. The
-  daemon asks the sync loop to get the object into the local store
-  (`SyncInput::FetchObject`: the same peer and mailbox fetch as `Fetch`, but
-  without writing the working tree, because the file being opened is the
-  destination). It then streams the stored object into the placeholder in
-  4 KiB-aligned chunks with progress, and afterwards sends an ordinary
-  `Fetch`, which finds the file already matching and marks the row
-  downloaded. Open fails with "network unavailable" if no connected device or
-  mailbox has the bytes within the fetch timeout.
-- **Free up space.** Explorer's dehydrate is approved, and the row goes back to
-  online-only through `Evict`. Relay's own evict dehydrates the placeholder
-  instead of deleting the file, so the file stays visible.
-- **Always keep on this device.** Pinning hydrates through `fetch_data`. Phase
-  2 maps a pin to a `full` folder choice so it survives index rewrites.
-- **Deletes and renames** in Explorer are approved immediately. The watcher
-  (and the daemon, from the callbacks) queues the paths for a scan, and they
-  sync like any other change. An online-only row whose placeholder Relay
-  put on disk carries that placeholder's stat, so its absence is a delete;
-  a placeholder without data at a new path is indexed from the object id
-  it holds, without reading it.
-- **The engine never reads a placeholder that holds no data.** Reading one
-  would call back into the daemon and wait on the loop that is reading, a
-  deadlock. The connection refuses this process's own reads, and the
-  scanner never hashes such a file: it is never a local edit. Writing over
-  one renames a temp file onto it by stat. `ScannedEntry.dehydrated` and
-  `relay_fs::cloud::is_dehydrated` carry the check: Windows recall and
-  offline attributes, false elsewhere.
-- **Stopping.** Removing the mount or its last demand rule unregisters the
-  sync root. The rows stop counting a missing placeholder as a delete, then
-  placeholders that hold no data are deleted, because nothing can open them
-  afterwards; downloaded files stay.
-- **Crate.** `cloud-filter` (MIT, a maintained fork of `wincs`) wraps the API.
-  It is a Windows-only dependency of `relay-fs`, so the workspace stays
-  `unsafe_code = "forbid"`. If it stops being maintained, the module behind
-  `relay_fs::cloud` is about 300 lines to replace with direct `windows`
-  calls in a crate that allows `unsafe`.
+Mounts whose space has a `demand` rule become Cloud Files sync roots with full
+population: real folders, a placeholder per online-only file, hydrated through
+`SyncInput::FetchObject` when an app opens one. The engine never reads a
+placeholder that holds no data. Details and limits are in D43.
 
 ### Stage 2: Pins, status, and partial reads
 
@@ -126,11 +80,12 @@ opened only from Relay's own Files and Browse views.
 
 ### Later: Relay as the file manager
 
-Once online-only files are native everywhere, the Browse view can grow into a
-cross-device explorer (tabs, search across devices, moves between devices,
-versions) without needing to replace Explorer or Finder. Becoming the default
-folder handler stays an option for Windows (`Folder\shell` override) and Linux
-(`xdg-mime default … inode/directory`); macOS has no supported way.
+Native placeholders come first because they reach every app's Open dialog,
+which a separate file manager never can. A Files-class Relay Explorer, Windows
+first, is planned on top of them; its WebView2 performance spike is draft PR
+#5. Becoming the default folder handler stays an option on Windows
+(`Folder\shell` override) and Linux (`xdg-mime default … inode/directory`);
+macOS has no supported way.
 
 ## Risks
 

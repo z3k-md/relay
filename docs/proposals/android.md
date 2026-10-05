@@ -1,7 +1,8 @@
 # Android app
 
-**Status:** Proposal. Stage 1 (CI APK build) in progress. App stack pending
-Zach's call; recommended: keep the Tauri UI, add a Kotlin service.
+**Status:** Stage 1 (CI APK build) shipped. Stage 2 (service-hosted engine)
+in progress, PR #19. App stack pending Zach's call; recommended: keep the
+Tauri UI, add a Kotlin service.
 
 Turn the D33 foreground shell into a phone that is a full Relay device: it
 syncs in the background, backs up the camera folder, and shows its files in

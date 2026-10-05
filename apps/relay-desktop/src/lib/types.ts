@@ -39,7 +39,7 @@ export interface PeerView {
   supportsRemote: boolean;
 }
 
-// Files view (remote explorer Stage 1). Engine shapes as-is, so snake_case.
+// Files view (D38). Engine shapes as-is, so snake_case.
 
 export type MaterializationMode = "full" | "metadata" | "demand" | "exclude" | "store";
 
