@@ -206,6 +206,9 @@ pub struct Simulator<'a> {
     name_counter: u64,
     step: u32,
     verbose: bool,
+    /// The run's temp dir as given and as the OS resolves it (macOS puts
+    /// `/private` in front of `/var`), stripped from traced engine messages.
+    root_names: Vec<String>,
     // Dropped last: engines hold files under it.
     _root: TempDir,
 }
@@ -318,6 +321,19 @@ impl<'a> Simulator<'a> {
             name_counter: 0,
             step: 0,
             verbose,
+            root_names: {
+                let given = root.path().to_string_lossy().into_owned();
+                let mut names = vec![given.clone()];
+                if let Ok(real) = fs::canonicalize(root.path()) {
+                    let real = real.to_string_lossy().into_owned();
+                    if real != given {
+                        // Longest first, so the resolved form never leaves a
+                        // prefix behind.
+                        names.insert(0, real);
+                    }
+                }
+                names
+            },
             _root: root,
         };
         sim.setup()?;
@@ -330,9 +346,10 @@ impl<'a> Simulator<'a> {
         let mut line = line.into();
         // Engine messages can name files under the run's temp dir; keep the
         // trace, and so its digest, free of that per-run path.
-        let root = self._root.path().to_string_lossy().into_owned();
-        if line.contains(&root) {
-            line = line.replace(&root, "<root>");
+        for root in &self.root_names {
+            if line.contains(root.as_str()) {
+                line = line.replace(root.as_str(), "<root>");
+            }
         }
         self.digest.update(line.as_bytes());
         self.digest.update(b"\n");

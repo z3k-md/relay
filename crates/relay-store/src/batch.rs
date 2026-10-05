@@ -152,6 +152,12 @@ mod apple {
             });
         }
 
+        // Same fault point as `durable_install`, so an injected store
+        // failure surfaces at the same put on every platform.
+        let dest = batch.store.path_for(&id);
+        relay_core::faults::check(relay_core::faults::FaultPoint::StorePut, &dest)
+            .map_err(|e| io_err(&dest, e))?;
+
         rustix::fs::fsync(tmp.as_file()).map_err(|e| io_err(tmp.path(), e.into()))?;
         let tmp = tmp.into_temp_path();
 

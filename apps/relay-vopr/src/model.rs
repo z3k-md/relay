@@ -25,9 +25,13 @@ pub enum Last {
         parent: Option<Vec<u8>>,
     },
     Deleted {
-        /// Another node wrote the path without having seen this delete. The
-        /// engine keeps the live side of such a race, so the path may stay.
+        /// Another node wrote the path without having seen this delete, or
+        /// deleted a different version of it (so one of the two deletes
+        /// raced the edit that produced the other's). The engine keeps the
+        /// live side of such a race, so the path may stay.
         contested: bool,
+        /// What was deleted, if the deleter saw a file there.
+        deleted: Option<Vec<u8>>,
     },
 }
 
@@ -142,12 +146,18 @@ impl Model {
             .iter()
             .enumerate()
             .any(|(k, l)| k != node && matches!(l, Some(Last::Content { .. })));
-        if new.is_some() && cur.is_some() {
+        let mut other_deletes_differ = false;
+        if cur.is_some() {
             for (k, slot) in entry.last.iter_mut().enumerate() {
                 if k != node
-                    && let Some(Last::Deleted { contested }) = slot
+                    && let Some(Last::Deleted { contested, deleted }) = slot
                 {
-                    *contested = true;
+                    if new.is_some() {
+                        *contested = true;
+                    } else if deleted.is_some() && deleted.as_deref() != cur {
+                        *contested = true;
+                        other_deletes_differ = true;
+                    }
                 }
             }
         }
@@ -165,7 +175,8 @@ impl Model {
             }
             (None, slot) => {
                 *slot = Some(Last::Deleted {
-                    contested: others_live,
+                    contested: others_live || other_deletes_differ,
+                    deleted: cur.map(<[u8]>::to_vec),
                 })
             }
         }
@@ -193,7 +204,7 @@ impl Model {
             for (node, last) in model.last.iter().enumerate() {
                 match last {
                     None => {}
-                    Some(Last::Deleted { contested: c }) => {
+                    Some(Last::Deleted { contested: c, .. }) => {
                         any_deleted = true;
                         contested |= c;
                     }
