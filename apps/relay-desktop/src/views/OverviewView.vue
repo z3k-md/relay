@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onActivated, onMounted, onUnmounted, ref } from "vue";
 import Modal from "../components/Modal.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { api, copyText } from "../lib/api";
@@ -53,8 +53,9 @@ async function decide() {
   }
 }
 
+// Kept alive across tab switches: every visit, the first included, reloads.
+onActivated(loadHolds);
 onMounted(async () => {
-  await loadHolds();
   unlistens.push(
     await listen("relay://activity", (event) => {
       const kind = (event.payload as { kind?: string }).kind;

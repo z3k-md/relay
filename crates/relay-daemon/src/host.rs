@@ -613,11 +613,10 @@ impl Host {
         } else {
             Watching::Poll
         };
-        let Ok(status) = engine.status() else {
+        let Ok(health) = engine.mount_health() else {
             return;
         };
-        let mounts = status
-            .mounts
+        let mounts = health
             .into_iter()
             .map(|m| MountLive {
                 watching: if m.path.is_none() {

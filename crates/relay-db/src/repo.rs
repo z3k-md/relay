@@ -627,6 +627,28 @@ impl Repo<'_> {
         self.assemble_records(raws)
     }
 
+    /// Live entries whose path contains `needle`, in path order. The text
+    /// test runs in SQLite, so a large mount is scanned without building a
+    /// record for every entry.
+    pub fn live_entries_containing(
+        &self,
+        mount: MountId,
+        needle: &str,
+    ) -> Result<Vec<EntryRecord>, DbError> {
+        let mount_blob = mount_bytes(mount);
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {ENTRY_SELECT}
+             FROM entries e
+             JOIN devices d ON d.ref = e.modified_by
+             JOIN mounts m ON m.id = e.mount_id
+             WHERE e.mount_id = ?1 AND e.deleted = 0 AND instr(e.path, ?2) > 0
+             ORDER BY e.path"
+        ))?;
+        let rows = stmt.query_map(params![mount_blob.as_slice(), needle], Self::map_raw_entry)?;
+        let raws = collect_raw_entries(rows)?;
+        self.assemble_records(raws)
+    }
+
     /// Live entries directly inside `folder` (the mount root when `None`):
     /// one level, no tombstones.
     ///

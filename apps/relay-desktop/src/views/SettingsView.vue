@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onActivated, ref, watch } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import UpdateStatus from "../components/UpdateStatus.vue";
 import { api, errorText } from "../lib/api";
@@ -69,8 +69,11 @@ const showShellPicker = computed(
   () => !!cli.value && !cli.value.onPath && (cli.value.shellHints?.length ?? 0) > 0,
 );
 
+let loaded = false;
+
+/** The placeholder shows only until the first load; later loads refresh in place. */
 async function load() {
-  loading.value = true;
+  if (!loaded) loading.value = true;
   error.value = null;
   try {
     if (props.mobile) {
@@ -92,6 +95,7 @@ async function load() {
     error.value = errorText(err);
   } finally {
     loading.value = false;
+    loaded = true;
   }
 }
 
@@ -137,7 +141,7 @@ watch(selectedShell, () => {
   cliMessage.value = null;
 });
 
-onMounted(load);
+onActivated(load);
 defineExpose({ load });
 </script>
 

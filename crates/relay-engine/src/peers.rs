@@ -483,8 +483,13 @@ impl Engine {
         let listed = self.mounts(space)?;
         let mut out = Vec::new();
         for (space_rec, config) in listed {
-            for entry in self.db.repo().entries_for_mount(config.mount.id)? {
-                if !entry.is_deleted() && relay_core::conflict::is_conflict_copy(&entry.key.path) {
+            let candidates = self
+                .db
+                .repo()
+                .live_entries_containing(config.mount.id, relay_core::conflict::CONFLICT_MARKER)?;
+            for entry in candidates {
+                // The marker may sit in a folder name; only the file name counts.
+                if relay_core::conflict::is_conflict_copy(&entry.key.path) {
                     let class = classify_conflict(&entry.key.path);
                     out.push(ConflictInfo {
                         space: space_rec.name.clone(),

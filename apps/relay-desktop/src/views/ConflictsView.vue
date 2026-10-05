@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onActivated, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
@@ -57,8 +57,11 @@ const gitGroups = computed(() => {
   return [...map.values()];
 });
 
+let loaded = false;
+
+/** The placeholder shows only until the first load; later loads refresh in place. */
 async function load() {
-  loading.value = true;
+  if (!loaded) loading.value = true;
   error.value = null;
   try {
     items.value = await api.listConflicts();
@@ -66,6 +69,7 @@ async function load() {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
     loading.value = false;
+    loaded = true;
   }
 }
 
@@ -97,7 +101,7 @@ async function runConfirmed() {
   }
 }
 
-onMounted(load);
+onActivated(load);
 defineExpose({ load });
 </script>
 

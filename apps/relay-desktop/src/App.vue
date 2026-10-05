@@ -239,24 +239,28 @@ onUnmounted(() => {
             </div>
           </div>
           <UpdateStatus v-if="page !== 'settings'" class="mb-4" />
-          <OverviewView
-            v-if="page === 'overview'"
-            :overview="overview"
-            :transfers="transfers"
-            @pause="pause"
-            @resume="resume"
-          />
-          <PeersView v-else-if="page === 'peers'" />
-          <SpacesView v-else-if="page === 'spaces'" :transfers="transfers" />
-          <FilesView v-else-if="page === 'files'" :transfers="transfers" />
-          <BrowseView v-else-if="page === 'browse'" />
-          <ConflictsView v-else-if="page === 'conflicts'" />
-          <ActivityView v-else-if="page === 'activity'" ref="activityRef" />
-          <SettingsView
-            v-else-if="page === 'settings'"
-            :version="overview.version"
-            :mobile="overview.mobile"
-          />
+          <!-- Pages stay mounted once visited: switching back shows them at once
+               and each refreshes in place (onActivated) instead of reloading. -->
+          <KeepAlive>
+            <OverviewView
+              v-if="page === 'overview'"
+              :overview="overview"
+              :transfers="transfers"
+              @pause="pause"
+              @resume="resume"
+            />
+            <PeersView v-else-if="page === 'peers'" />
+            <SpacesView v-else-if="page === 'spaces'" :transfers="transfers" />
+            <FilesView v-else-if="page === 'files'" :transfers="transfers" />
+            <BrowseView v-else-if="page === 'browse'" />
+            <ConflictsView v-else-if="page === 'conflicts'" />
+            <ActivityView v-else-if="page === 'activity'" ref="activityRef" />
+            <SettingsView
+              v-else-if="page === 'settings'"
+              :version="overview.version"
+              :mobile="overview.mobile"
+            />
+          </KeepAlive>
         </main>
       </div>
     </template>
