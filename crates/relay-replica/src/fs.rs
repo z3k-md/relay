@@ -23,6 +23,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
@@ -58,6 +59,8 @@ pub struct FsReplica {
     root: PathBuf,
     /// Cheap unchanged-log probe for [`DurableReplica::entries_after`].
     log_sig: Mutex<HashMap<(DeviceId, SpaceId), LogSig>>,
+    /// Set once [`Self::lock`] has warned that this directory cannot lock.
+    lock_warned: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +98,7 @@ impl FsReplica {
         let replica = Self {
             root,
             log_sig: Mutex::new(HashMap::new()),
+            lock_warned: AtomicBool::new(false),
         };
         create_dir(&replica.objects_dir())?;
         create_dir(&replica.objects_dir().join(SEALED_DIR))?;
@@ -130,7 +134,10 @@ impl FsReplica {
     /// file is read, changed and rewritten, and for the whole of `gc`, so
     /// two devices sharing the directory never interleave those rewrites.
     /// Dropping the file releases it. A filesystem that cannot lock
-    /// (`Unsupported`) proceeds unlocked.
+    /// proceeds unlocked, as every release before the lock did: silently
+    /// when locking is `Unsupported`, otherwise with one warning per
+    /// replica (a network share without a lock manager fails `flock` with
+    /// `ENOLCK`, which std leaves uncategorized).
     fn lock(&self) -> Result<Option<File>, ReplicaError> {
         let path = self.root.join(LOCK_FILE);
         let file = File::options()
@@ -143,7 +150,16 @@ impl FsReplica {
         match file.lock() {
             Ok(()) => Ok(Some(file)),
             Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(None),
-            Err(err) => Err(ReplicaError::io(&path, err)),
+            Err(err) => {
+                if !self.lock_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "replica lock failed; proceeding unlocked"
+                    );
+                }
+                Ok(None)
+            }
         }
     }
 

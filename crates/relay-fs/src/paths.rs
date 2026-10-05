@@ -72,6 +72,11 @@ fn inspect_normal_component(component: &str) -> Result<(), String> {
 /// On macOS and Windows a direct join also succeeds for a name that differs
 /// only in case, so the on-disk spelling is confirmed; a path that exists
 /// only as `Foo` when `foo` was asked for is `Ok(None)` (see [`Resolved`]).
+/// The spelling is confirmed once for the whole path from its canonical
+/// form, not per component: the engine's apply path resolves every entry
+/// here and the scanner resolves every ancestor of every requested path, so
+/// a call costs at most one `canonicalize` of the path (plus one of the
+/// root).
 ///
 /// Intermediate components that are not real directories (including
 /// symlinks) yield `Ok(None)`. Permission and other IO errors are
@@ -102,13 +107,40 @@ pub(crate) fn resolve_os_path_detailed(
     root: &Path,
     path: &LogicalPath,
 ) -> Result<Resolved, FsError> {
+    if !CASE_INSENSITIVE_PLATFORM {
+        return walk_components(root, path, false);
+    }
+    // Accept every direct join as it comes, then confirm the spelling of
+    // the whole path with one `canonicalize`. When that cannot decide (a
+    // link as the last component, a root that does not canonicalize) each
+    // component is confirmed on its own.
+    match walk_components(root, path, false)? {
+        Resolved::Missing => Ok(Resolved::Missing),
+        Resolved::Found(current) | Resolved::CaseMismatch(current) => {
+            match confirm_whole_path(root, &current, path) {
+                Some(resolved) => Ok(resolved),
+                None => walk_components(root, path, true),
+            }
+        }
+    }
+}
+
+/// One component at a time from `root`. With `confirm_each`, a direct join
+/// is only accepted once [`spelling_confirmed`] or the directory listing
+/// proves the on-disk spelling; without it the caller confirms the whole
+/// path afterwards (or, on a case-sensitive platform, needs no confirmation).
+fn walk_components(
+    root: &Path,
+    path: &LogicalPath,
+    confirm_each: bool,
+) -> Result<Resolved, FsError> {
     let mut current = root.to_path_buf();
     let mut case_mismatch = false;
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
         require_normal_component(path, component)?;
         let is_last = components.peek().is_none();
-        let next = match resolve_component(&current, component)? {
+        let next = match resolve_component(&current, component, confirm_each)? {
             ComponentMatch::Found(next) => next,
             ComponentMatch::Missing => return Ok(Resolved::Missing),
             ComponentMatch::CaseVariant(next) => {
@@ -142,11 +174,15 @@ enum ComponentMatch {
     CaseVariant(PathBuf),
 }
 
-fn resolve_component(dir: &Path, component: &str) -> Result<ComponentMatch, FsError> {
+fn resolve_component(
+    dir: &Path,
+    component: &str,
+    confirm: bool,
+) -> Result<ComponentMatch, FsError> {
     let direct = dir.join(component);
     match fs::symlink_metadata(&direct) {
         Ok(meta) => {
-            if !CASE_INSENSITIVE_PLATFORM || spelling_confirmed(&direct, &meta, component) {
+            if !confirm || spelling_confirmed(&direct, &meta, component) {
                 return Ok(ComponentMatch::Found(direct));
             }
         }
@@ -161,6 +197,59 @@ fn resolve_component(dir: &Path, component: &str) -> Result<ComponentMatch, FsEr
     Ok(match first_in_byte_order(case_variants) {
         Some(variant) => ComponentMatch::CaseVariant(variant),
         None => ComponentMatch::Missing,
+    })
+}
+
+/// Confirm the spelling of the whole resolved path at once: its canonical
+/// form carries every on-disk name. `None` when that form cannot be trusted
+/// (a link as the last component canonicalizes to its target; canonicalizing
+/// or the root prefix strip failed), so the caller confirms per component.
+fn confirm_whole_path(root: &Path, current: &Path, path: &LogicalPath) -> Option<Resolved> {
+    let meta = fs::symlink_metadata(current).ok()?;
+    if is_symlink_like(&meta) {
+        return None;
+    }
+    let canonical = fs::canonicalize(current).ok()?;
+    let canonical_root = fs::canonicalize(root).ok()?;
+    let on_disk = canonical.strip_prefix(&canonical_root).ok()?;
+    Some(match compare_spelling(on_disk, path)? {
+        Spelling::Same => Resolved::Found(current.to_path_buf()),
+        Spelling::Differs(on_disk) => Resolved::CaseMismatch(root.join(on_disk)),
+    })
+}
+
+/// How the on-disk components of a canonical path (relative to the canonical
+/// root) compare with the logical ones.
+#[derive(Debug, PartialEq, Eq)]
+enum Spelling {
+    /// Every on-disk name equals its logical component after NFC.
+    Same,
+    /// At least one differs (in case, on a case-insensitive filesystem); the
+    /// payload is the relative path as spelled on disk.
+    Differs(PathBuf),
+}
+
+/// `None` when `on_disk` is not one ordinary UTF-8 name per logical
+/// component, which the per-component walk sorts out.
+fn compare_spelling(on_disk: &Path, path: &LogicalPath) -> Option<Spelling> {
+    let mut names = on_disk.components();
+    let mut spelled = PathBuf::new();
+    let mut same = true;
+    for component in path.components() {
+        let Component::Normal(name) = names.next()? else {
+            return None;
+        };
+        let name = name.to_str()?;
+        same &= name.nfc().eq(component.chars());
+        spelled.push(name);
+    }
+    if names.next().is_some() {
+        return None;
+    }
+    Some(if same {
+        Spelling::Same
+    } else {
+        Spelling::Differs(spelled)
     })
 }
 
@@ -499,6 +588,32 @@ mod tests {
         assert_eq!(
             resolve_os_path_detailed(root, &gone).unwrap(),
             Resolved::Missing
+        );
+    }
+
+    /// The canonical path confirms the whole spelling at once on macOS and
+    /// Windows; the comparison itself runs anywhere.
+    #[test]
+    fn compare_spelling_reports_the_component_that_differs() {
+        let logical = LogicalPath::new("caf\u{e9}/Dir/File.txt").unwrap();
+        // NFD on disk is the same name.
+        assert_eq!(
+            compare_spelling(Path::new("cafe\u{301}/Dir/File.txt"), &logical),
+            Some(Spelling::Same)
+        );
+        assert_eq!(
+            compare_spelling(Path::new("cafe\u{301}/dir/File.txt"), &logical),
+            Some(Spelling::Differs(PathBuf::from("cafe\u{301}/dir/File.txt")))
+        );
+        assert_eq!(
+            compare_spelling(Path::new("caf\u{e9}/Dir/FILE.TXT"), &logical),
+            Some(Spelling::Differs(PathBuf::from("caf\u{e9}/Dir/FILE.TXT")))
+        );
+        // A different depth is left to the per-component walk.
+        assert_eq!(compare_spelling(Path::new("caf\u{e9}/Dir"), &logical), None);
+        assert_eq!(
+            compare_spelling(Path::new("caf\u{e9}/Dir/File.txt/more"), &logical),
+            None
         );
     }
 
