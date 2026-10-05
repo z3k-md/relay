@@ -138,6 +138,10 @@ pub fn open_window(app: &AppHandle) -> tauri::Result<()> {
                 .join("relay-explorer-bench")
                 .join("webview"),
         );
+        #[cfg(windows)]
+        if let Some(args) = bench_browser_args() {
+            builder = builder.additional_browser_args(&args);
+        }
     }
     let window = builder.build()?;
     let app = app.clone();
@@ -359,6 +363,17 @@ pub struct MemoryInfo {
     processes: u32,
     private_bytes: u64,
     working_set_bytes: u64,
+    private_working_set_bytes: u64,
+    each: Vec<ProcessMemoryInfo>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessMemoryInfo {
+    kind: String,
+    private_bytes: u64,
+    working_set_bytes: u64,
+    private_working_set_bytes: u64,
 }
 
 /// Memory of the app and its WebView2 processes (Windows only).
@@ -372,6 +387,17 @@ pub async fn explorer_memory() -> Option<MemoryInfo> {
                 processes: m.processes,
                 private_bytes: m.private_bytes,
                 working_set_bytes: m.working_set_bytes,
+                private_working_set_bytes: m.private_working_set_bytes,
+                each: m
+                    .each
+                    .into_iter()
+                    .map(|p| ProcessMemoryInfo {
+                        kind: p.kind,
+                        private_bytes: p.private_bytes,
+                        working_set_bytes: p.working_set_bytes,
+                        private_working_set_bytes: p.private_working_set_bytes,
+                    })
+                    .collect(),
             })
     }
     #[cfg(not(windows))]
@@ -402,7 +428,91 @@ pub async fn explorer_autobench() -> Option<String> {
     autobench_output().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Wry's own WebView2 arguments, which ours must keep.
+#[cfg(windows)]
+const WRY_DISABLED_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+
+/// Extra Chromium switches for the benchmark window, from
+/// `RELAY_EXPLORER_WEBVIEW_ARGS`, merged into wry's defaults. Chromium keeps
+/// only the last `--disable-features` and `--enable-features`, so each kind's
+/// lists are joined. For trying memory settings; the window has its own
+/// profile, so they cannot clash with another Relay's WebView2.
+pub fn bench_browser_args() -> Option<String> {
+    let extra = std::env::var("RELAY_EXPLORER_WEBVIEW_ARGS").ok()?;
+    let extra = extra.trim();
+    if extra.is_empty() {
+        return None;
+    }
+    let mut disabled: Vec<&str> = Vec::new();
+    #[cfg(windows)]
+    disabled.push(WRY_DISABLED_FEATURES);
+    let mut enabled = Vec::new();
+    let mut rest = Vec::new();
+    for arg in extra.split_whitespace() {
+        if let Some(list) = arg.strip_prefix("--disable-features=") {
+            disabled.push(list);
+        } else if let Some(list) = arg.strip_prefix("--enable-features=") {
+            enabled.push(list);
+        } else {
+            rest.push(arg);
+        }
+    }
+    let mut args = Vec::new();
+    if !disabled.is_empty() {
+        args.push(format!("--disable-features={}", disabled.join(",")));
+    }
+    if !enabled.is_empty() {
+        args.push(format!("--enable-features={}", enabled.join(",")));
+    }
+    args.extend(rest.into_iter().map(String::from));
+    Some(args.join(" "))
+}
+
+/// The extra WebView2 switches the benchmark runs with, for its report.
+#[tauri::command]
+pub async fn explorer_bench_args() -> Option<String> {
+    autobench_output().and(bench_browser_args())
+}
+
+/// Ask WebView2 to hold as little memory as it can (`low`), as Relay would
+/// when its window goes to the tray, or go back to normal.
+#[tauri::command]
+pub async fn explorer_memory_target(window: WebviewWindow, low: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        window
+            .with_webview(move |webview| {
+                let result =
+                    relay_shell_win::webview::set_memory_target(&webview.controller(), low)
+                        .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            })
+            .map_err(|e| e.to_string())?;
+        rx.await.map_err(|e| e.to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, low);
+        Err("not supported on this platform".into())
+    }
+}
+
+/// Set while the benchmark takes its last reading with no window open, so
+/// closing the window doesn't end the app first.
+static READING_WITHOUT_WINDOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the app should stay up although its last window closed.
+pub fn reading_without_window() -> bool {
+    READING_WITHOUT_WINDOW.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Write the benchmark results and quit. Only in benchmark mode.
+///
+/// On Windows it first closes the window and appends one more reading: the
+/// app with no UI, which is what Relay costs sitting in the tray if it
+/// closes its window instead of hiding it.
 #[tauri::command]
 pub async fn explorer_save_results(app: AppHandle, text: String) -> Result<(), String> {
     let path = autobench_output().ok_or("not in benchmark mode")?;
@@ -414,6 +524,29 @@ pub async fn explorer_save_results(app: AppHandle, text: String) -> Result<(), S
         "{text}\n\nRelay Explorer benchmark results written to {}",
         path.display()
     );
+    #[cfg(windows)]
+    std::thread::spawn(move || {
+        READING_WITHOUT_WINDOW.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(window) = app.get_webview_window(LABEL) {
+            let _ = window.destroy();
+        }
+        // Long enough for the WebView2 processes to shut down.
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let line = match relay_shell_win::memory::process_tree() {
+            Ok(m) => format!(
+                "Memory with the window closed, after 10 s (no sync engine in bench mode): working set {} MB, private working set {} MB, private {} MB, {} processes",
+                m.working_set_bytes / (1024 * 1024),
+                m.private_working_set_bytes / (1024 * 1024),
+                m.private_bytes / (1024 * 1024),
+                m.processes
+            ),
+            Err(err) => format!("Memory with the window closed: {err}"),
+        };
+        println!("{line}");
+        let _ = std::fs::write(&path, format!("{text}\n{line}\n"));
+        app.exit(0);
+    });
+    #[cfg(not(windows))]
     app.exit(0);
     Ok(())
 }

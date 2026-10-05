@@ -50,8 +50,14 @@ export interface Places {
 
 export interface MemoryInfo {
   processes: number;
+  /** Private commit. */
   privateBytes: number;
+  /** Counts pages shared between the processes once per process. */
   workingSetBytes: number;
+  /** Resident pages no other process shares: Task Manager's Memory column. */
+  privateWorkingSetBytes: number;
+  /** Each process: its executable, plus Chromium's process type for WebView2's. */
+  each: { kind: string; privateBytes: number; workingSetBytes: number; privateWorkingSetBytes: number }[];
 }
 
 export const explorer = {
@@ -73,6 +79,10 @@ export const explorer = {
   autobench: () => invoke<string | null>("explorer_autobench"),
   /** Write the benchmark results and quit the app. */
   saveResults: (text: string) => invoke<void>("explorer_save_results", { text }),
+  /** Extra WebView2 switches the benchmark window runs with, if any. */
+  benchArgs: () => invoke<string | null>("explorer_bench_args"),
+  /** WebView2's memory target: low trims caches, as when the window goes to the tray. */
+  memoryTarget: (low: boolean) => invoke<void>("explorer_memory_target", { low }),
 };
 
 export function separator(path: string): string {

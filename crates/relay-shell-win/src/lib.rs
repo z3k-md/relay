@@ -13,4 +13,4 @@
 mod win;
 
 #[cfg(windows)]
-pub use win::{Error, dnd, enumerate, fileop, image, memory, menu, sta, watch};
+pub use win::{Error, dnd, enumerate, fileop, image, memory, menu, sta, watch, webview};

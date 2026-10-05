@@ -9,8 +9,11 @@ publish.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 png = "0.18"
+# Same version wry uses, so Tauri's controller handle is this crate's type.
+webview2-com = "0.39"
 windows-core = "0.62"
 windows = { version = "0.62", features = [
+    "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",

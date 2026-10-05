@@ -9,5 +9,6 @@ pub mod memory;
 pub mod menu;
 pub mod sta;
 pub mod watch;
+pub mod webview;
 
 pub use com::Error;

@@ -143,6 +143,10 @@ pub fn run() {
             explorer::explorer_autobench,
             #[cfg(not(target_os = "android"))]
             explorer::explorer_save_results,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_bench_args,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_memory_target,
         ])
         .setup(move |app| {
             let home = app_home(app)?;
@@ -208,7 +212,16 @@ pub fn run() {
         }
     };
     app.run(|app, event| match event {
-        tauri::RunEvent::ExitRequested { .. } => {
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
+            // The benchmark closes its window before its last memory reading,
+            // then exits with a code.
+            #[cfg(not(target_os = "android"))]
+            if code.is_none() && explorer::reading_without_window() {
+                api.prevent_exit();
+                return;
+            }
+            #[cfg(target_os = "android")]
+            let _ = (code, api);
             // Cmd-Q / dock Quit / app.exit all land here. Tray Quit also calls
             // stop_join first; a second call is a no-op once the thread is gone.
             if let Some(state) = app.try_state::<AppState>() {

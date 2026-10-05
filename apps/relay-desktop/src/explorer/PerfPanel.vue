@@ -116,9 +116,9 @@ const bars = computed(() => [
         : null,
   },
   {
-    label: "RSS ≤ 250 MB with 3 tabs",
-    value: memory.value ? `${(memory.value.workingSetBytes / MB).toFixed(0)} MB, ${props.tabs} tabs` : "—",
-    pass: memory.value && props.tabs >= 3 ? memory.value.workingSetBytes <= 250 * MB : null,
+    label: "Private working set ≤ 250 MB with 3 tabs",
+    value: memory.value ? `${(memory.value.privateWorkingSetBytes / MB).toFixed(0)} MB, ${props.tabs} tabs` : "—",
+    pass: memory.value && props.tabs >= 3 ? memory.value.privateWorkingSetBytes <= 250 * MB : null,
   },
 ]);
 
@@ -142,7 +142,7 @@ async function copyResults() {
     "",
     ...scrollResults.value.map((r) => `Scroll ${describeScroll(r)}`),
     memory.value
-      ? `Memory: working set ${(memory.value.workingSetBytes / MB).toFixed(0)} MB (peak ${(peak.value / MB).toFixed(0)} MB), private ${(memory.value.privateBytes / MB).toFixed(0)} MB, ${memory.value.processes} processes, ${props.tabs} tabs`
+      ? `Memory: working set ${(memory.value.workingSetBytes / MB).toFixed(0)} MB (peak ${(peak.value / MB).toFixed(0)} MB), private working set ${(memory.value.privateWorkingSetBytes / MB).toFixed(0)} MB, private ${(memory.value.privateBytes / MB).toFixed(0)} MB, ${memory.value.processes} processes, ${props.tabs} tabs`
       : "Memory: n/a",
     `Last drag: ${props.lastDrag || "none"}`,
     `Last drop: ${props.lastDrop || "none"}`,
@@ -233,6 +233,7 @@ onBeforeUnmount(() => {
       <h2 class="mb-1 font-semibold">Memory (app + WebView2)</h2>
       <p v-if="memory" class="tabular-nums">
         Working set {{ (memory.workingSetBytes / MB).toFixed(0) }} MB (peak {{ (peak / MB).toFixed(0) }} MB)<br />
+        Private working set {{ (memory.privateWorkingSetBytes / MB).toFixed(0) }} MB (Task Manager)<br />
         Private {{ (memory.privateBytes / MB).toFixed(0) }} MB · {{ memory.processes }} processes ·
         {{ tabs }} tabs
       </p>

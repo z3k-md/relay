@@ -1,5 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
-import { explorer } from "./api";
+import { type MemoryInfo, explorer } from "./api";
 import { type ScrollResult, describeScroll, machineLines, runScroll } from "./bench";
 import type { Folder } from "./folder";
 
@@ -37,13 +37,42 @@ function listingLine(label: string, f: Folder): string {
 }
 
 /**
+ * Settled readings side by side, one row per process: working set, private
+ * working set and private commit, in MB. Processes of the same kind are
+ * numbered in order.
+ */
+function perProcess(readings: Record<string, MemoryInfo | null>): string[] {
+  const names = Object.keys(readings);
+  const rows = new Map<string, string[]>();
+  names.forEach((name, col) => {
+    const seen = new Map<string, number>();
+    for (const p of readings[name]?.each ?? []) {
+      const n = (seen.get(p.kind) ?? 0) + 1;
+      seen.set(p.kind, n);
+      const key = n > 1 ? `${p.kind} #${n}` : p.kind;
+      const row = rows.get(key) ?? names.map(() => "—");
+      row[col] = [p.workingSetBytes, p.privateWorkingSetBytes, p.privateBytes].map((b) => (b / MB).toFixed(0)).join(" / ");
+      rows.set(key, row);
+    }
+  });
+  if (rows.size === 0) return [];
+  return [
+    "",
+    `Per process, working set / private working set / private commit, MB (${names.join(" | ")}):`,
+    ...[...rows].map(([kind, cells]) => `  ${kind}: ${cells.join(" | ")}`),
+  ];
+}
+
+/**
  * The P0 pass bars, end to end, with no clicking: first paint of a 10k
  * folder (5 runs), sweep and smooth scroll of 200k items, a thumbnail grid
  * sweep, then memory with three tabs open (and at the start, for the
  * WebView2 runtime's fixed cost). Returns the report.
  */
 export async function autobench(host: BenchHost): Promise<string> {
-  const lines = [`Relay Explorer P0 benchmark (${new Date().toISOString()})`, ...machineLines(), ""];
+  const lines = [`Relay Explorer P0 benchmark (${new Date().toISOString()})`, ...machineLines()];
+  const args = await explorer.benchArgs().catch(() => null);
+  lines.push(`WebView2 switches: ${args ?? "default"}`, "");
 
   // WebView2 stops animation frames while the window is minimized or fully
   // covered. Lists apply batches on a frame and every timing here is
@@ -154,23 +183,39 @@ export async function autobench(host: BenchHost): Promise<string> {
     await waitDone(home);
     const memoryNow = await explorer.memory();
     const memory = await settled(`${host.tabs()} tabs`);
+    // What WebView2 gives back when asked to (Relay would ask when its
+    // window goes to the tray), and whether it keeps it after going back.
+    let low: typeof memory = null;
+    let lowError = "";
+    try {
+      await explorer.memoryTarget(true);
+      low = await settled("memory target low");
+      await explorer.memoryTarget(false);
+    } catch (err) {
+      lowError = String(err);
+    }
     const mem = (m: typeof memory) =>
       m
-        ? `working set ${(m.workingSetBytes / MB).toFixed(0)} MB, private ${(m.privateBytes / MB).toFixed(0)} MB, ${m.processes} processes`
+        ? `working set ${(m.workingSetBytes / MB).toFixed(0)} MB, private working set ${(m.privateWorkingSetBytes / MB).toFixed(0)} MB, private ${(m.privateBytes / MB).toFixed(0)} MB, ${m.processes} processes`
         : "n/a";
     const settle = `${SETTLE_MS / 1000} s idle`;
     lines.push(`Memory at start (1 tab, home), after ${settle}: ${mem(atStart)}`);
     lines.push(`Memory after 200k scroll (1 tab): ${mem(afterBigNow)}; after ${settle}: ${mem(afterBig)}`);
     lines.push(`Memory with ${host.tabs()} tabs: ${mem(memoryNow)}; after ${settle}: ${mem(memory)}`);
+    lines.push(`Memory with ${host.tabs()} tabs, WebView2 target Low, after ${settle}: ${lowError || mem(low)}`);
+    lines.push(...perProcess({ start: atStart, [`${host.tabs()} tabs`]: memory, "3 tabs, Low": low }));
 
     const mark = (ok: boolean) => (ok ? "PASS" : "FAIL");
     lines.push(
       "",
       `${mark(medianPaint <= 150)} first paint ≤ 150 ms for 10k items: median ${medianPaint.toFixed(0)} ms (runs ${paints.map((p) => p.toFixed(0)).join(", ")})`,
       `${mark(sweep.avgFps >= 57 && sweep.p95 <= 20 && sweep.blank <= sweep.frames / 100)} 60 fps sweeping 200k items: ${sweep.avgFps.toFixed(1)} fps, p95 ${sweep.p95.toFixed(1)} ms, ${sweep.blank} blank frames`,
-      memory
-        ? `${mark(memory.workingSetBytes <= 250 * MB)} ≤ 250 MB with ${host.tabs()} tabs: ${(memory.workingSetBytes / MB).toFixed(0)} MB`
-        : "n/a memory (Windows only)",
+      ...(memory
+        ? [
+            `${mark(memory.workingSetBytes <= 250 * MB)} ≤ 250 MB working set with ${host.tabs()} tabs: ${(memory.workingSetBytes / MB).toFixed(0)} MB (counts shared pages once per process)`,
+            `${mark(memory.privateWorkingSetBytes <= 250 * MB)} ≤ 250 MB private working set with ${host.tabs()} tabs (Task Manager's Memory column): ${(memory.privateWorkingSetBytes / MB).toFixed(0)} MB`,
+          ]
+        : ["n/a memory (Windows only)"]),
     );
   } catch (err) {
     lines.push("", `Benchmark stopped: ${err}`);

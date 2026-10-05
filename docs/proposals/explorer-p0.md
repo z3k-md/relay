@@ -13,7 +13,7 @@ files); this page covers only what the spike contains and how to judge it.
 | --- | --- | --- |
 | First paint | ≤ 150 ms for a 10k-item folder | `invoke` to the first painted frame that shows rows |
 | Scrolling | 60 fps with 200k items | "Sweep": top to bottom in 5 s, so every frame shows new rows and icons; average fps and p95 frame time |
-| Memory | Working set ≤ 250 MB with 3 tabs | App process plus every WebView2 child process |
+| Memory | ≤ 250 MB with 3 tabs | App process plus every WebView2 child process; working set and private working set are both reported |
 | External drop | 1,000 files from Explorer, and an Outlook attachment | Lands in the folder under the pointer, through the shell's own copy engine |
 
 If any bar fails by a wide margin on a mid-range Windows PC, we stop and
@@ -48,6 +48,16 @@ drawing a minimized or fully covered window, so the run pauses until the
 window is visible again, and redoes any timing that overlapped the pause.
 The first run creates the benchmark folders, which takes a while for 200k
 files.
+
+Memory is reported three ways, total and per process: working set (counts
+DLL pages the WebView2 processes share once per process, so it overstates),
+private working set (what Task Manager's Memory column shows) and private
+commit. After the three-tab reading, the run asks WebView2 for its Low
+memory target and reads again. After saving, it closes the window and
+reads the app alone. To try Chromium switches on the benchmark window
+only, set `RELAY_EXPLORER_WEBVIEW_ARGS`, for example
+`--in-process-gpu --enable-features=NetworkServiceInProcess2`; the report
+names the switches it ran with.
 
 An installed Relay can stay running. In benchmark mode the app opens only
 the explorer window and leaves everything else alone: it doesn't hand off
