@@ -170,6 +170,8 @@ export function runnerLabel(state: RunnerState): string {
       return "Running";
     case "paused":
       return "Paused";
+    case "stopped":
+      return "Stopped";
     case "error":
       return "Error";
     case "externalService":

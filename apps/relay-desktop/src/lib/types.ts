@@ -3,6 +3,7 @@ export type RunnerState =
   | { kind: "starting" }
   | { kind: "running" }
   | { kind: "paused" }
+  | { kind: "stopped" }
   | { kind: "error"; message: string }
   | { kind: "externalService"; message: string };
 

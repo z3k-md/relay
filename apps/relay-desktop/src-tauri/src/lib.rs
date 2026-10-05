@@ -167,7 +167,7 @@ pub fn run() {
             // Cmd-Q / dock Quit / app.exit all land here. Tray Quit also calls
             // stop_join first; a second call is a no-op once the thread is gone.
             if let Some(state) = app.try_state::<AppState>() {
-                state.runner.stop_join();
+                state.runner.stop_join(app);
             }
         }
         // Dock click and a notification click both ask the app to reopen.

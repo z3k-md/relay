@@ -140,7 +140,10 @@ pub fn cli_status() -> CliStatus {
     #[cfg(not(windows))]
     {
         let install = unix_install_link();
-        let install_exists = install.is_file() || install.is_symlink();
+        let present = install.is_file() || install.is_symlink();
+        // Something else at the link path is not an install of ours.
+        let foreign = present && !is_relay_link(&install, &sidecar);
+        let install_exists = present && !foreign;
         let bin_dir = install.parent().map(|p| p.to_path_buf());
         let on_path = bin_dir
             .as_ref()
@@ -149,7 +152,12 @@ pub fn cli_status() -> CliStatus {
         let detected_shell = detect_login_shell();
         let shell_hints = all_shell_hints();
         let path_configured = shell_config_has_path(detected_shell);
-        let hint = if on_path && install_exists {
+        let hint = if foreign {
+            Some(format!(
+                "{} is not Relay's. Click Install to replace it with the Relay command.",
+                install.display()
+            ))
+        } else if on_path && install_exists {
             None
         } else if !on_path && path_configured {
             Some(
@@ -174,7 +182,8 @@ pub fn cli_status() -> CliStatus {
 }
 
 /// Install the CLI symlink/binary. When `configure_path` is true (user-initiated),
-/// also append a PATH line to the chosen shell's config if needed.
+/// also append a PATH line to the chosen shell's config if needed, and replace
+/// whatever else is at the link path.
 pub fn install_cli(
     shell: Option<ShellKind>,
     configure_path: bool,
@@ -430,6 +439,32 @@ pub(crate) fn ensure_shell_path_config(shell: ShellKind, home: &Path) -> anyhow:
     Ok(path)
 }
 
+/// Whether `link` is a symlink Relay made: to this app's CLI, to the CLI of
+/// another Relay install, or to one that is gone (an app since removed).
+#[cfg(not(windows))]
+fn is_relay_link(link: &Path, sidecar: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    if target == sidecar || !link.exists() {
+        return true;
+    }
+    if target.file_name() != sidecar.file_name() {
+        return false;
+    }
+    let Some(dir) = target.parent() else {
+        return false;
+    };
+    // The same install folder, or inside any Relay app bundle.
+    let in_bundle = dir.ends_with("Contents/MacOS")
+        && dir.components().any(|part| {
+            part.as_os_str().to_str().is_some_and(|name| {
+                name.ends_with(".app") && name.to_ascii_lowercase().starts_with("relay")
+            })
+        });
+    Some(dir) == sidecar.parent() || in_bundle
+}
+
 #[cfg(not(windows))]
 fn unix_install(
     sidecar: &Path,
@@ -439,6 +474,13 @@ fn unix_install(
     let link = unix_install_link();
     let dir = link.parent().expect("link has a parent");
     let already_installed = link.exists() || link.is_symlink();
+    // Only the Install button replaces a file that is not Relay's.
+    if already_installed && !configure_path && !is_relay_link(&link, sidecar) {
+        anyhow::bail!(
+            "{} is not Relay's; click Install in Settings to replace it",
+            link.display()
+        );
+    }
     std::fs::create_dir_all(dir)?;
     if already_installed {
         std::fs::remove_file(&link)?;
@@ -634,6 +676,44 @@ mod tests {
         assert_eq!(bash, dir.join(".bashrc"));
         let bash_content = fs::read_to_string(&bash).unwrap();
         assert!(bash_content.contains(r#"export PATH="$HOME/.local/bin:$PATH""#));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relay_links_are_recognised() {
+        let dir = std::env::temp_dir().join(format!("cli-link-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("app").join("relay");
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(&sidecar, b"").unwrap();
+        let link = dir.join("link");
+        let relink = |to: &Path| {
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(to, &link).unwrap();
+        };
+
+        // Ours: to this app's CLI, to another Relay bundle, or to one since removed.
+        relink(&sidecar);
+        assert!(is_relay_link(&link, &sidecar));
+        let bundle = dir.join("Relay.app").join("Contents").join("MacOS");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("relay"), b"").unwrap();
+        relink(&bundle.join("relay"));
+        assert!(is_relay_link(&link, &sidecar));
+        relink(&dir.join("gone").join("relay"));
+        assert!(is_relay_link(&link, &sidecar));
+
+        // Someone else's: a plain file, or a link to a `relay` elsewhere.
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, b"").unwrap();
+        assert!(!is_relay_link(&link, &sidecar));
+        let other = dir.join("tools").join("relay");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, b"").unwrap();
+        relink(&other);
+        assert!(!is_relay_link(&link, &sidecar));
 
         let _ = fs::remove_dir_all(&dir);
     }

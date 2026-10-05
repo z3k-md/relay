@@ -109,7 +109,7 @@ fn toggle_pause(app: &AppHandle) {
 
 pub fn quit_app(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        state.runner.stop_join();
+        state.runner.stop_join(app);
     }
     app.exit(0);
 }
