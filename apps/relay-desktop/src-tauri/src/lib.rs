@@ -1,5 +1,7 @@
 mod commands;
 mod error;
+#[cfg(not(target_os = "android"))]
+mod explorer;
 mod files;
 mod pairs;
 mod privacy;
@@ -28,9 +30,15 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The explorer benchmark runs beside an installed Relay without touching
+    // it: no single-instance hand-off, settings, sync engine, tray, autostart,
+    // CLI install or update checks.
+    #[cfg(not(target_os = "android"))]
+    let bench = explorer::autobench_output().is_some();
+
     let mut builder = tauri::Builder::default();
     #[cfg(not(target_os = "android"))]
-    {
+    if !bench {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tray::show_main_window(app);
         }));
@@ -53,7 +61,10 @@ pub fn run() {
             .plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
                 Some(vec!["--hidden"]),
-            ));
+            ))
+            .manage(explorer::ExplorerState::default())
+            .register_asynchronous_uri_scheme_protocol("relay-icon", explorer::handle_icon)
+            .register_asynchronous_uri_scheme_protocol("relay-thumb", explorer::handle_thumb);
     }
     builder = builder
         .invoke_handler(tauri::generate_handler![
@@ -108,23 +119,61 @@ pub fn run() {
             commands::open_full_disk_access,
             commands::cli_status,
             commands::install_cli,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_open,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_places,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_list,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_close_tab,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_open_item,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_context_menu,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_ready,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_drop_target,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_start_drag,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_memory,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_make_bench,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_autobench,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_save_results,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_bench_args,
+            #[cfg(not(target_os = "android"))]
+            explorer::explorer_memory_target,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let home = app_home(app)?;
-            let _ = std::fs::create_dir_all(home.join("logs"));
+            let runner = Arc::new(Runner::new(home.clone()));
+            app.manage(AppState {
+                home: home.clone(),
+                runner: Arc::clone(&runner),
+            });
 
+            #[cfg(not(target_os = "android"))]
+            if bench {
+                explorer::open_window(app.handle())?;
+                if let Some(main) = app.get_webview_window("main") {
+                    main.destroy()?;
+                }
+                return Ok(());
+            }
+
+            let _ = std::fs::create_dir_all(home.join("logs"));
             if let Err(err) = settings::apply_first_run_defaults(app.handle()) {
                 log::warn!("settings defaults: {err:#}");
             }
             if let Err(err) = settings::migrate_paused_to_db(app.handle(), &home) {
                 log::warn!("paused-flag migration: {err:#}");
             }
-
-            let runner = Arc::new(Runner::new(home.clone()));
-            app.manage(AppState {
-                home,
-                runner: Arc::clone(&runner),
-            });
 
             #[cfg(not(target_os = "android"))]
             {
@@ -165,7 +214,16 @@ pub fn run() {
         }
     };
     app.run(|app, event| match event {
-        tauri::RunEvent::ExitRequested { .. } => {
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
+            // The benchmark closes its window before its last memory reading,
+            // then exits with a code.
+            #[cfg(not(target_os = "android"))]
+            if code.is_none() && explorer::reading_without_window() {
+                api.prevent_exit();
+                return;
+            }
+            #[cfg(target_os = "android")]
+            let _ = (code, api);
             // Cmd-Q / dock Quit / app.exit all land here. Tray Quit also calls
             // stop_join first; a second call is a no-op once the thread is gone.
             if let Some(state) = app.try_state::<AppState>() {

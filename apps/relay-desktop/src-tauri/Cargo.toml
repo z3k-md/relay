@@ -26,6 +26,7 @@ log = "0.4"
 relay-core.workspace = true
 relay-daemon.workspace = true
 relay-engine.workspace = true
+relay-explorer.workspace = true
 relay-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -41,6 +42,8 @@ tauri-plugin-store = "2"
 tauri-plugin-updater = "2"
 
 [target.'cfg(windows)'.dependencies]
+relay-shell-win.workspace = true
+tokio = { workspace = true }
 winreg = "0.55"
 
 # This crate does not inherit workspace lints: Tauri 2 macros expand to

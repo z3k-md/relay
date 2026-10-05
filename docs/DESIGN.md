@@ -212,6 +212,8 @@ crates/
   relay-engine   scan, sync, apply, policies, materialization, placeholders
   relay-daemon   the host loop: network + engine, remote management
   relay-ipc      local RPC between a host and its clients
+  relay-explorer explorer model: listing batches, watcher coalescing, drop rules (D50)
+  relay-shell-win  Windows shell FFI for the explorer: listing, icons, menus, drag and drop
 apps/
   relay-cli      the relay binary
   relay-desktop  Tauri app (macOS, Windows, Android)
@@ -243,8 +245,10 @@ Where things happen:
 | Server role: join and attach shared spaces | `relay-engine/src/server.rs`, `packaging/server/` |
 | Online-only files and placeholders | `relay-engine/src/materialize.rs`, `relay-engine/src/placeholders.rs`, `relay-fs/src/cloud/` |
 | CLI commands | `relay-cli/src/main.rs` |
+| Explorer window, listing channel, icon and thumbnail schemes | `relay-desktop/src-tauri/src/explorer/`, `relay-desktop/src/explorer/` |
 
-The workspace forbids `unsafe`. The engine does not depend on networking or
+The workspace forbids `unsafe`, except in `relay-shell-win`'s `win` module,
+which wraps the Windows shell behind a safe API. The engine does not depend on networking or
 Tokio, so it runs the same under `relay-vopr`'s virtual clock.
 
 # 11. Testing

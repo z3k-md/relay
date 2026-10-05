@@ -4212,7 +4212,9 @@ dependencies = [
  "relay-core",
  "relay-daemon",
  "relay-engine",
+ "relay-explorer",
  "relay-ipc",
+ "relay-shell-win",
  "serde",
  "serde_json",
  "tauri",
@@ -4226,6 +4228,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-store",
  "tauri-plugin-updater",
+ "tokio",
  "winreg 0.55.0",
 ]
 
@@ -4250,6 +4253,19 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "relay-explorer"
+version = "0.1.10"
+dependencies = [
+ "notify",
+ "percent-encoding",
+ "png 0.18.1",
+ "relay-shell-win",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -4342,6 +4358,17 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "relay-shell-win"
+version = "0.1.10"
+dependencies = [
+ "png 0.18.1",
+ "tempfile",
+ "webview2-com",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

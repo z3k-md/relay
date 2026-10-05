@@ -19,6 +19,13 @@ Backup semantics (append-only, retention, snapshots) are next.
 shipped (D43). Next: pins and sync status in Explorer, then the macOS File
 Provider extension, then a Linux FUSE view.
 
+**Relay Explorer** (D50; [P0 spike](proposals/explorer-p0.md)). A
+Files-class file manager in the desktop app, Windows first, built on
+WebView2 over a Rust shell layer. The P0 spike passed its speed and memory
+bars. P1 is a browsing MVP: tabs, layouts, sidebar with Relay devices and
+spaces, and per-folder settings. It replaces the Browse and Files views and
+becomes the main window.
+
 **Android background sync** ([proposal](proposals/android.md)). Stage 1, a
 CI debug APK build, shipped. Stage 2 runs the engine in a foreground sync
 service (PR #19); then background catch-up, a DocumentsProvider, and shared
@@ -32,8 +39,6 @@ Not in a fixed order.
 - **Accounts** (D44). A sign-in directory, Google first, that finds your
   devices; an existing device approves a new one. We run a default instance;
   self-hosters run it inside their home server.
-- **Relay Explorer.** A Files-class file manager in the desktop app, Windows
-  first. The WebView2 performance spike is draft PR #5.
 - **Performance insights** ([proposal](proposals/performance-insights.md)).
   A connection test between two devices (D48) is in review; live per-peer
   graphs, `relay bench`, and history follow.

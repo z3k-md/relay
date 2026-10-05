@@ -62,6 +62,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D47 | [Store mode](#d47-store-mode) |
 | D48 | [Connection test](#d48-connection-test) |
 | D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
+| D50 | [Relay Explorer on WebView2](#d50-relay-explorer-on-webview2) |
 
 <!-- index:end -->
 
@@ -1423,3 +1424,42 @@ shares the `release-main` concurrency group, so two releases never run at
 once. The `Release v` commit is pushed with `GITHUB_TOKEN`, which starts
 no workflows, so a release cannot trigger another. Release commits still
 skip CI.
+
+## D50. Relay Explorer on WebView2
+
+The explorer is built on the existing Tauri/WebView2 front end over a Rust
+shell layer (`relay-shell-win`, the only crate allowed `unsafe`), not on a
+native WinUI front end. The P0 spike
+([proposal](proposals/explorer-p0.md)) decided it. Release build on a
+143 Hz Windows desktop:
+
+- **First paint:** 23 ms for a 10k-item folder (bar: 150 ms).
+- **Scrolling:** 131 fps through 200k items, with no blank frames (bar: 60 fps).
+- **Memory, three heavy tabs:** 192 MB of private working set after 60 s idle (bar: 250 MB).
+
+Memory is judged on private working set, which is what Task Manager's Memory
+column shows. The summed working set counts the DLL pages the seven
+WebView2 processes share once per process; it read 555 MB for the same
+moment.
+
+Every Relay window will run WebView2 with `--in-process-gpu
+--enable-features=NetworkServiceInProcess2`. In the spike this cut the
+three-tab reading from 192 to 154 MB and lifted the sweep from 131 to
+144 fps, the display's full rate. The separate GPU process was dropping
+about 1 frame in 10. The costs:
+
+- a GPU or driver crash takes down the WebView2 browser process and every
+  Relay window, where a separate GPU process would restart on its own;
+- GPU code loses its own sandbox. That is acceptable because Relay shows
+  only its own pages.
+
+These are Chromium switches, not WebView2 options, and WebView2 fixes
+switches per profile, so they apply to every window. They ship on by
+default with a setting to turn them off, and only after a clean soak on
+AMD and Intel integrated GPUs.
+
+A hidden window asks WebView2 for its Low memory target, which halves
+private working set. A closed explorer window is destroyed, not hidden,
+which leaves the app at about 8 MB. The benchmark window
+(`RELAY_EXPLORER_BENCH`) uses its own WebView2 profile, so it can run with
+other switches beside an installed Relay.
