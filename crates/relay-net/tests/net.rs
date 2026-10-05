@@ -372,9 +372,10 @@ fn rejections() -> Arc<Rejections> {
         .get_or_init(|| {
             use tracing_subscriber::layer::SubscriberExt;
             let counter = Arc::new(Rejections::default());
-            let _ = tracing::subscriber::set_global_default(
+            tracing::subscriber::set_global_default(
                 tracing_subscriber::registry().with(RejectionLayer(counter.clone())),
-            );
+            )
+            .expect("no other global tracing subscriber in this test binary");
             counter
         })
         .clone()
@@ -388,24 +389,33 @@ fn rejected_dialer_backs_off() {
     let alice = spawn("alice", vec![]);
     let alice_addr = alice.handle.local_addr();
     let eve = spawn("eve", vec![trust(alice.id, "alice", Some(alice_addr))]);
+    let attempts = || {
+        counter
+            .by_peer
+            .lock()
+            .unwrap()
+            .get(&eve.id.to_string())
+            .copied()
+            .unwrap_or(0)
+    };
 
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while attempts() == 0 {
+        assert!(Instant::now() < deadline, "eve never reached alice");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let first = attempts();
     std::thread::sleep(Duration::from_secs(3));
-    let attempts = counter
-        .by_peer
-        .lock()
-        .unwrap()
-        .get(&eve.id.to_string())
-        .copied()
-        .unwrap_or(0);
-    // Delays of 1 s and 2 s allow three attempts in 3 s; the unfixed loop
-    // made about a hundred per second.
+    let redials = attempts() - first;
+    // Delays of 1 s and 2 s allow at most three redials in the 3 s after the
+    // first rejection; the unfixed loop made about a hundred per second.
     assert!(
-        (1..=5).contains(&attempts),
-        "eve made {attempts} attempts in 3 s"
+        (1..=3).contains(&redials),
+        "eve redialed {redials} times in the 3 s after her first rejection"
     );
 }
 
-/// The daemon resolves peers by name, so a name from the wire is held to
+/// The daemon stores and shows a name from the wire, so it is held to
 /// the same rule as a pairing name: one that would not pass locally
 /// becomes the id's short form.
 #[test]

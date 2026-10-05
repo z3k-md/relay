@@ -32,8 +32,11 @@ const BIND_LEN: usize = RELAY_HEADER_LEN + ID_LEN + ID_LEN + SIG_LEN;
 pub(crate) const MAX_RELAY_PAYLOAD: usize = 1400;
 
 /// A session that carried nothing for this long is forgotten; a device
-/// binds again on its next dial.
-const SESSION_IDLE: Duration = Duration::from_secs(60);
+/// binds again on its next dial. A slot is refreshed only by that bind or
+/// by forwarded data, and a dial cycle for an unreachable peer runs about a
+/// minute (the candidates, the relay dial, then the 30 s backoff), so the
+/// margin covers a slow lookup or a lost bind; `MAX_SESSIONS` bounds memory.
+const SESSION_IDLE: Duration = Duration::from_secs(5 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 /// Sessions a forwarder keeps at once. Any keypair can bind, so without a
 /// cap the table is a memory sink for a public relay.

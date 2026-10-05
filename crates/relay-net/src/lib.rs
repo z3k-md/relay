@@ -37,7 +37,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 pub use addr::advertised_addresses;
-pub use control::{ControlHandler, call_timeout};
+pub use control::{ControlHandler, MAX_JOIN_WAIT, call_timeout};
 pub use error::NetError;
 pub use relay::{RelayServer, serve_relay};
 use session::{

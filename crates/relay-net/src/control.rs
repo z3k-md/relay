@@ -30,11 +30,13 @@ use crate::session::{Inner, OBJECT_HEADER_MAX};
 /// How long one call may run on the answering device.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a call that runs on the engine loop (`Apply`, `ScanFirst`) may
-/// take there: its daemon waits this long for the loop (`CONFIG_REPLY_WAIT`),
-/// plus the join wait a change itself carries.
-const LOOP_CALL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longest join wait a caller may ask for.
-const MAX_JOIN_WAIT: Duration = Duration::from_secs(60);
+/// take there: a little longer than its daemon waits for the loop
+/// (`CONFIG_REPLY_WAIT`, 30 s), so the daemon's own timeout answers rather
+/// than racing this one, plus the join wait a change itself carries.
+const LOOP_CALL_TIMEOUT: Duration = Duration::from_secs(35);
+/// Longest join wait a caller may ask for. The daemon clamps a join's
+/// `wait_ms` to this as well, so neither side waits longer than the other.
+pub const MAX_JOIN_WAIT: Duration = Duration::from_secs(60);
 /// What a caller adds for the network on top of the answering device's bound.
 const CALL_MARGIN: Duration = Duration::from_secs(5);
 /// How long a caller waits for a copy to start, including the network.
@@ -354,13 +356,13 @@ mod tests {
                 space: "Photos".into(),
             },
         };
-        assert_eq!(call_timeout(&add), Duration::from_secs(35));
+        assert_eq!(call_timeout(&add), Duration::from_secs(40));
         let scan = RemoteCall::ScanFirst {
             space: "Photos".into(),
             mount: "m".into(),
             path: "a/b".into(),
         };
-        assert_eq!(call_timeout(&scan), Duration::from_secs(35));
+        assert_eq!(call_timeout(&scan), Duration::from_secs(40));
         let join = |wait_ms| RemoteCall::Apply {
             change: ConfigChange::JoinSpace {
                 space: "Photos".into(),
@@ -368,8 +370,8 @@ mod tests {
                 wait_ms,
             },
         };
-        assert_eq!(handler_timeout(&join(8_000)), Duration::from_secs(38));
-        assert_eq!(call_timeout(&join(8_000)), Duration::from_secs(43));
+        assert_eq!(handler_timeout(&join(8_000)), Duration::from_secs(43));
+        assert_eq!(call_timeout(&join(8_000)), Duration::from_secs(48));
         assert_eq!(
             handler_timeout(&join(u64::MAX)),
             LOOP_CALL_TIMEOUT + MAX_JOIN_WAIT,

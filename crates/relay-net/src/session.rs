@@ -524,8 +524,9 @@ async fn run_session(
         }
     }
 
-    // The daemon resolves peers by name; an unbounded or misleading name must
-    // not reach it (same rule as a pairing name).
+    // The daemon looks peers up by their unique local alias, but it stores
+    // and shows the name from the wire, so an unbounded or misleading one
+    // must not reach it (same rule as a pairing name).
     let peer_name = sanitize_name(&h.device_name, peer_id);
     let remote = conn.remote_address();
     let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();

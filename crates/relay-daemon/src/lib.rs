@@ -301,9 +301,10 @@ fn run_loop(
                         let configs = match refresh_peers(home) {
                             Ok(configs) => configs,
                             Err(err) => {
-                                // The network layer must not keep a peer the
-                                // engine just revoked. Hand it the last list
-                                // again until the next change can be read.
+                                // The table could not be read, so nothing
+                                // can change: log it and hand the network
+                                // the last list again, unchanged, until the
+                                // next SetPeers.
                                 tracing::error!(
                                     error = %err,
                                     "could not re-read peers; keeping the last known list"

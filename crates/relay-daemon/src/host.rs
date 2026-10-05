@@ -178,8 +178,8 @@ impl Host {
     pub fn known_peers(&self) -> Vec<PeerConfig> {
         self.known_peers
             .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn take_pair_terms(&self) -> PairTerms {
@@ -349,12 +349,17 @@ impl Host {
 
     /// Apply a config change on the running engine loop when possible;
     /// otherwise write it directly (paused, or between reload cycles).
-    pub(crate) fn config(&self, change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
-        let wait = CONFIG_REPLY_WAIT
-            + match &change {
-                ConfigChange::JoinSpace { wait_ms, .. } => Duration::from_millis(*wait_ms),
-                _ => Duration::ZERO,
-            };
+    pub(crate) fn config(&self, mut change: ConfigChange) -> Result<ConfigApplied, RpcErrorBody> {
+        // A join's wait is capped here as on the network side, so a caller
+        // cannot hold the loop reply, or the engine's pending join, longer.
+        let join_wait = match &mut change {
+            ConfigChange::JoinSpace { wait_ms, .. } => {
+                *wait_ms = (*wait_ms).min(relay_net::MAX_JOIN_WAIT.as_millis() as u64);
+                Duration::from_millis(*wait_ms)
+            }
+            _ => Duration::ZERO,
+        };
+        let wait = CONFIG_REPLY_WAIT + join_wait;
         let input = |reply| SyncInput::Config {
             change: change.clone(),
             reply,
@@ -1193,10 +1198,10 @@ fn activity_from_watch(event: &WatchEvent) -> Option<ActivityItem> {
     })
 }
 
-/// The one peer called `name`. Names come from pairing and from the peer's
-/// own `Hello`, so two peers can share one; such a name is refused rather
-/// than resolved by row order, or a call meant for one device could reach
-/// the other.
+/// The one peer called `name`. The lookup is by the local alias, which the
+/// peers table keeps unique (a peer's own `Hello` name lands on its device
+/// row, not here), so the `conflict` branch is defensive: two matches would
+/// let a call meant for one device reach the other.
 fn peer_with_name(peers: Vec<PeerInfo>, name: &str) -> Result<PeerInfo, RpcErrorBody> {
     let mut matching = peers.into_iter().filter(|p| p.name == name);
     let found = matching
