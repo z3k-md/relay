@@ -58,6 +58,10 @@ pub(crate) struct Inner {
     /// Signs relay BIND frames. Also keeps the key alive for the runtime thread.
     pub identity: Arc<DeviceIdentity>,
     pub listen_port: u16,
+    /// mDNS binds UDP 5353 on every interface, so a loopback-only node
+    /// (tests, the simulator) skips it: nothing on the LAN could reach it,
+    /// and the wildcard bind trips the Windows Firewall prompt per binary.
+    pub lan_discovery: bool,
     /// `host:port` to dial after every direct address fails. `None` disables it.
     pub relay_target: Mutex<Option<String>>,
     pub relay_sock: OnceLock<Arc<RelaySocket>>,

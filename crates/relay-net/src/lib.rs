@@ -307,6 +307,7 @@ pub fn start(
         tls,
         identity: config.identity,
         listen_port: local_addr.port(),
+        lan_discovery: !local_addr.ip().is_loopback(),
         relay_target: Mutex::new(config.relay),
         relay_sock: OnceLock::new(),
         pairing: Mutex::new(None),
@@ -438,7 +439,9 @@ async fn run(
     prime_relay(&inner).await;
     let mut dialers = HashMap::new();
     spawn_dialers(&inner, &endpoint, &mut dialers);
-    if let Some(discovery) = discovery::start(&inner, inner.listen_port) {
+    if inner.lan_discovery
+        && let Some(discovery) = discovery::start(&inner, inner.listen_port)
+    {
         *inner.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(discovery);
     }
 
