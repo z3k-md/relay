@@ -18,7 +18,14 @@ const PLACEHOLDER_ENDPOINT: &str = "OWNER/REPO";
 const RESTART_DELAY: Duration = Duration::from_secs(5);
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 const STARTUP_DELAY: Duration = Duration::from_secs(3);
-const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// latest.json is about 1 KB, so checking often costs nothing and a new
+/// release reaches running apps within minutes.
+const CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The loop wakes this often and checks once CHECK_INTERVAL of wall-clock
+/// time has passed. A monotonic sleep pauses while the machine sleeps, so a
+/// laptop opened after a night away checks within a tick instead of a full
+/// interval later.
+const CHECK_TICK: Duration = Duration::from_secs(30);
 
 struct UpdateWatch {
     pending: Option<UpdateAvailable>,
@@ -527,12 +534,39 @@ pub fn spawn_periodic_checks(app: &AppHandle) {
                     Ok(Err(err)) => log::warn!("update check failed: {err}"),
                     Err(_) => log::warn!("update check task ended before it finished"),
                 }
-                std::thread::sleep(CHECK_INTERVAL);
+                let last_check = SystemTime::now();
+                while !check_due(last_check, SystemTime::now()) {
+                    std::thread::sleep(CHECK_TICK);
+                }
             }
         });
     if spawned.is_err() {
         log::warn!("could not start update checks");
     }
+}
+
+/// Whether CHECK_INTERVAL of wall-clock time has passed since `last`. A clock
+/// set backwards also counts as due, so a bad clock cannot stop checks.
+fn check_due(last: SystemTime, now: SystemTime) -> bool {
+    !matches!(now.duration_since(last), Ok(elapsed) if elapsed < CHECK_INTERVAL)
+}
+
+/// The GitHub Releases page for the repository the updater downloads from,
+/// derived from the updater endpoint in tauri.conf.json.
+pub fn releases_page() -> Option<String> {
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).ok()?;
+    let endpoints = config.pointer("/plugins/updater/endpoints")?.as_array()?;
+    endpoints
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find_map(releases_page_from_endpoint)
+}
+
+fn releases_page_from_endpoint(endpoint: &str) -> Option<String> {
+    let page = endpoint.strip_suffix("/latest/download/latest.json")?;
+    (page.starts_with("https://github.com/") && !page.contains(PLACEHOLDER_ENDPOINT))
+        .then(|| page.to_owned())
 }
 
 fn watch() -> std::sync::MutexGuard<'static, UpdateWatch> {
@@ -579,4 +613,45 @@ fn notify_available(app: &AppHandle, version: &str, installing: bool) {
         return;
     }
     watch().notified_version = Some(version.to_owned());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_after_interval_or_backwards_clock() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(!check_due(t0, t0));
+        assert!(!check_due(t0, t0 + CHECK_INTERVAL - CHECK_TICK));
+        assert!(check_due(t0, t0 + CHECK_INTERVAL));
+        // A machine that slept for hours checks on its first tick awake.
+        assert!(check_due(t0, t0 + Duration::from_secs(8 * 3600)));
+        assert!(check_due(t0, t0 - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn releases_page_comes_from_updater_endpoint() {
+        assert_eq!(
+            releases_page_from_endpoint(
+                "https://github.com/z3k-md/relay/releases/latest/download/latest.json"
+            )
+            .as_deref(),
+            Some("https://github.com/z3k-md/relay/releases"),
+        );
+        assert_eq!(
+            releases_page_from_endpoint(
+                "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+            ),
+            None,
+        );
+        assert_eq!(
+            releases_page_from_endpoint("https://example.com/latest.json"),
+            None
+        );
+        assert_eq!(
+            releases_page().as_deref(),
+            Some("https://github.com/z3k-md/relay/releases"),
+        );
+    }
 }

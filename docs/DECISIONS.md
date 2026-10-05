@@ -367,6 +367,11 @@ set the `RELEASE_REPO` variable and `RELEASE_TOKEN` secret so artifacts
 go to a public repo and point the endpoint there. Losing the private key
 means existing installs can never auto-update again.
 
+Running apps fetch `latest.json` at startup and every 5 minutes of
+wall-clock time. The file is about 1 KB, so a short interval costs nothing,
+and measuring wall-clock time rather than sleeping a fixed interval means a
+machine that wakes from sleep checks within one 30-second tick.
+
 ## D21. Git repository conflict groups and conflict resolution
 
 Concurrent versions of mutable files inside one `.git` directory (anything

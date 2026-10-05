@@ -125,9 +125,11 @@ and publishes it only after checking that `latest.json` lists
 `darwin-aarch64`, `darwin-x86_64` and `windows-x86_64`. Installed apps never
 see a half-built release.
 
-Watch `https://github.com/OWNER/REPO/actions`. Running desktop apps pick
-the new version up within about 30 minutes, or immediately from the tray
-**Check for updates**. Headless installs can download `relay-macos-universal`
+Watch `https://github.com/OWNER/REPO/actions`. Running desktop apps check
+at startup and every 5 minutes of wall-clock time (a machine waking from
+sleep checks within 30 seconds), or immediately from the tray **Check for
+updates**. Settings → Updates links to the Releases page, derived from the
+updater endpoint. Headless installs can download `relay-macos-universal`
 or `relay-windows-x86_64.exe` from the same Release.
 
 `bump=none`, or a re-run of the failed build jobs, rebuilds the current
