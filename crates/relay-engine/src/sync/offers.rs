@@ -110,6 +110,7 @@ impl Syncer {
                 if !known.contains(&space_id) && engine.db.repo().is_shared(space_id, peer)? {
                     newly_joined.push(space_id);
                 }
+                engine.adopt_offered_mounts(space_id, &mounts)?;
                 let adopted = engine.adopt_offered_members(space_id, &members)?;
                 if adopted.peers_changed {
                     set_peers = true;

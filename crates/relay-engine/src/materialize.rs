@@ -545,7 +545,15 @@ impl Engine {
         let pending = self.full_unmaterialized()?;
         for item in pending {
             if item.object == Some(object) && self.store.contains(&object) {
-                self.materialize_indexed(&item.key)?;
+                match self.materialize_indexed(&item.key) {
+                    Ok(()) => {}
+                    // An unscanned file at that path: the scan reconciles
+                    // it; the other rows waiting on this object still write.
+                    Err(EngineError::DestinationChanged(path)) => {
+                        tracing::info!(path = %path.display(), "kept an unscanned file during hydration");
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
         Ok(())
@@ -627,12 +635,15 @@ impl Engine {
                 Ok(outcome) if outcome.id == object => {
                     return Ok(observed_stat(dest, &self.config));
                 }
-                Ok(_) => {
-                    let stat = StatHint::from_metadata(&meta);
-                    return self.materialize_over(root, dest, object, executable, Some(stat));
-                }
+                // Other bytes under an index-only row are an edit the scanner
+                // has not seen; overwriting them would lose it. The scan
+                // records the edit, after which no hydration is needed.
+                Ok(_) => return Err(EngineError::DestinationChanged(dest.to_path_buf())),
                 Err(err) => return Err(err.into()),
             }
+        }
+        if fs::symlink_metadata(dest).is_ok() {
+            return Err(EngineError::DestinationChanged(dest.to_path_buf()));
         }
         self.materialize_over(root, dest, object, executable, None)
     }

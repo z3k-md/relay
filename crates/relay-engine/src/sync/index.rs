@@ -413,23 +413,31 @@ impl Syncer {
             {
                 head.attempts += 1;
                 if head.attempts >= MAX_ATTEMPTS {
-                    // Set the batch aside, but keep a hole at its start so
-                    // `received_seq` never moves past it and a later
-                    // re-request brings it back; otherwise the entries
-                    // would be lost until the peer changes them again.
-                    let skipped = head.entries.len();
-                    let hole = head.after_sequence;
+                    // Leave a hole at the stalled entry so `received_seq`
+                    // stays below it and the range is re-requested later
+                    // (same as objects that could not be fetched). A locked
+                    // file must not lose the entries behind it.
+                    let hole = outcome
+                        .stalled_at
+                        .map_or(batch_after, |seq| seq.saturating_sub(1));
+                    let hole = conn.holes.get(&space).map_or(hole, |h| (*h).min(hole));
+                    conn.holes.insert(space, hole);
+                    conn.resync_at
+                        .entry(space)
+                        .or_insert_with(|| now + RESYNC_DELAY);
+                    let pending = head
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.sequence.0 > hole)
+                        .count();
                     events.push(SyncEvent::SyncWarning {
                         peer,
                         path: String::new(),
                         reason: format!(
-                            "giving up on batch after {MAX_ATTEMPTS} attempts ({skipped} entries deferred; will re-request them)"
+                            "giving up on batch after {MAX_ATTEMPTS} attempts; {pending} entries will be re-requested"
                         ),
                     });
                     queue.pop_front();
-                    let hole = conn.holes.get(&space).map_or(hole, |h| (*h).min(hole));
-                    conn.holes.insert(space, hole);
-                    conn.resync_at.entry(space).or_insert(now + RESYNC_DELAY);
                     return self.process_head(engine, peer, space, out, events);
                 }
                 head.retry_at = Some(now + RETRY_DELAY);
