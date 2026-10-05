@@ -1,6 +1,11 @@
-# Build and publish Relay desktop + CLI. Ordinary pushes do not run this.
-# scripts/release.sh (or the workflow_dispatch API) starts it on main.
+# Build and publish Relay desktop + CLI (D49). Two ways in:
+#   - automatic: CI passing on a push to main starts a patch release when the
+#     push changed shipped code (crates/, the desktop app or CLI, Cargo files)
+#     since the last `Release v` commit;
+#   - manual: scripts/release.sh (or the workflow_dispatch API) on main, for
+#     minor/major/exact versions or a rebuild.
 #
+# 0. gate:     decide whether a CI completion should ship
 # 1. create:   bump the patch version unless this version is still unpublished,
 #              commit it, then open a draft release (drafts are invisible to
 #              the updater)
@@ -39,6 +44,10 @@ on:
         required: false
         type: string
         default: ""
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: write
@@ -56,8 +65,68 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  gate:
+    name: should this ship
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ship: ${{ steps.decide.outputs.ship }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ship() { echo "ship=$1" >> "$GITHUB_OUTPUT"; echo "ship=$1: $2"; }
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            ship true "started by hand"
+            exit 0
+          fi
+          if [ "$CONCLUSION" != "success" ] || [ "$RUN_EVENT" != "push" ]; then
+            ship false "CI ${CONCLUSION} on a ${RUN_EVENT}"
+            exit 0
+          fi
+          # A newer push has its own CI run, which releases it once green.
+          head=$(git rev-parse "origin/${REF_NAME}")
+          if [ "$head" != "$RUN_SHA" ]; then
+            ship false "${REF_NAME} moved past ${RUN_SHA::7} to ${head::7}"
+            exit 0
+          fi
+          if git log -1 --format=%s "$RUN_SHA" | grep -q '^Release v'; then
+            ship false "${RUN_SHA::7} is a release commit"
+            exit 0
+          fi
+          last=$(git log -1 --format=%H --grep='^Release v' "$RUN_SHA")
+          if [ -z "$last" ]; then
+            ship true "no earlier release commit"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$last" "$RUN_SHA" \
+            | grep -E '^(crates/|apps/relay-(cli|desktop)/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)' \
+            | grep -Ev '\.md$' || true)
+          if [ -z "$changed" ]; then
+            ship false "nothing shipped changed since ${last::7}"
+            exit 0
+          fi
+          printf '%s\n' "$changed" | head -n 20
+          ship true "shipped code changed since ${last::7}"
+
   create:
     name: create draft release
+    needs: gate
+    if: needs.gate.outputs.ship == 'true'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.bump.outputs.tag }}
@@ -114,7 +183,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           DEST: ${{ steps.meta.outputs.full }}
-          BUMP: ${{ inputs.bump }}
+          # Automatic runs have no inputs: a patch release.
+          BUMP: ${{ inputs.bump || 'patch' }}
           EXACT: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |

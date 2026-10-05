@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { computed, onActivated, ref, watch } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import UpdateStatus from "../components/UpdateStatus.vue";
@@ -19,6 +20,8 @@ const cliMessage = ref<string | null>(null);
 const busy = ref(false);
 const checking = computed(() => updateActive.value);
 const selectedShell = ref<CliShell>("zsh");
+/** GitHub Releases page the updater downloads from; null when not configured. */
+const releasesUrl = ref<string | null>(null);
 /** macOS only: whether devices allowed to manage this Mac can read every folder. */
 const fullDiskAccess = ref<boolean | null>(null);
 
@@ -35,6 +38,16 @@ async function recheckFullDiskAccess() {
   error.value = null;
   try {
     fullDiskAccess.value = await api.fullDiskAccess();
+  } catch (err) {
+    error.value = errorText(err);
+  }
+}
+
+async function openReleases() {
+  if (!releasesUrl.value) return;
+  error.value = null;
+  try {
+    await openUrl(releasesUrl.value);
   } catch (err) {
     error.value = errorText(err);
   }
@@ -80,14 +93,16 @@ async function load() {
       settings.value = await api.getSettings();
       return;
     }
-    const [s, c, fda] = await Promise.all([
+    const [s, c, fda, releases] = await Promise.all([
       api.getSettings(),
       api.cliStatus(),
       api.fullDiskAccess(),
+      api.releasesUrl(),
     ]);
     settings.value = s;
     cli.value = c;
     fullDiskAccess.value = fda;
+    releasesUrl.value = releases;
     if (c.detectedShell) {
       selectedShell.value = c.detectedShell;
     }
@@ -221,7 +236,14 @@ defineExpose({ load });
           <div>
             <p class="font-medium">Updates</p>
             <p class="text-[12px] text-[var(--color-muted)]">
-              Version {{ props.version }}. Checked at startup and every 15 minutes.
+              Version {{ props.version }}. Checked at startup and every 5 minutes.
+              <a
+                v-if="releasesUrl"
+                :href="releasesUrl"
+                class="text-[var(--color-accent)] underline"
+                @click.prevent="openReleases"
+                >All releases</a
+              >
             </p>
           </div>
           <button

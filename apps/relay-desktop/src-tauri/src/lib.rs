@@ -98,6 +98,7 @@ pub fn run() {
             commands::check_for_updates,
             commands::pending_update,
             commands::install_update,
+            commands::releases_url,
             commands::restart_app,
             commands::get_settings,
             commands::set_settings,
