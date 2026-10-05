@@ -69,6 +69,10 @@ cargo run -p relay-vopr -- sweep --seeds 100            # every scenario, all co
 RELAY_VOPR_SEEDS=20 cargo nextest run -p relay-vopr      # the CI test, wider
 ```
 
+CI runs a one-seed smoke on every pull request, the full suite on Linux when
+the engine changes (or on the `ci:full-sim` label) and on pushes to `main`,
+and every OS plus a wide seed sweep nightly.
+
 ## Install from source
 
 ### macOS

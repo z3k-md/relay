@@ -1,0 +1,141 @@
+# Nightly deterministic-simulation sweep (apps/relay-vopr).
+#
+# The per-push CI runs the simulator at one seed on Linux (see ci.yml). This
+# workflow runs the full suite on every platform and a wide seed sweep on
+# Linux in release mode, and opens an issue with the reproduction commands
+# when a seed fails. Run it by hand from the Actions tab for a one-off sweep.
+name: Sim nightly
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Seeds per scenario for the Linux sweep
+        default: "50"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  suite:
+    name: sim suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@v4
+        with:
+          drive-size: 12GB
+          workspace-copy: true
+          env-mapping: |
+            TMP,{{ DEV_DRIVE }}/tmp
+            TEMP,{{ DEV_DRIVE }}/tmp
+
+      - name: Create temp dir on Dev Drive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+
+      - name: Install pinned Rust toolchain
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
+        run: rustup show
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.DEV_DRIVE_WORKSPACE || '.' }} -> target
+          save-if: false
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Full simulator suite (3 seeds per scenario)
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
+        env:
+          RELAY_VOPR_SEEDS: "3"
+        run: cargo nextest run -p relay-vopr --locked --no-fail-fast
+
+  sweep:
+    name: sim sweep (linux, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-sweep
+          save-if: ${{ github.event_name == 'schedule' }}
+
+      - name: Build simulator (release)
+        run: cargo build --release --locked -p relay-vopr
+
+      - name: Sweep every scenario
+        id: sweep
+        run: |
+          seeds="${{ github.event.inputs.seeds || '50' }}"
+          set +e
+          ./target/release/relay-vopr sweep --seeds "$seeds" --jobs "$(nproc)" 2>&1 | tee sweep.log
+          status=${PIPESTATUS[0]}
+          set -e
+          grep -E '^(FAIL|reproduce:)' sweep.log > failures.txt || true
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Upload sweep log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-sweep-log
+          path: |
+            sweep.log
+            failures.txt
+          retention-days: 14
+
+      - name: Open an issue for failing seeds
+        if: failure() && steps.sweep.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Sim sweep failed on $(date -u +%Y-%m-%d) (${GITHUB_SHA::7})"
+          {
+            echo "The nightly simulator sweep found failing seeds on \`${GITHUB_SHA}\`."
+            echo
+            echo "Each line below replays on a dev box; add \`--trace\` for the full event log."
+            echo
+            echo '```'
+            cat failures.txt
+            echo '```'
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > body.md
+          gh issue create --title "$title" --body-file body.md --label "sim-failure" \
+            || gh issue create --title "$title" --body-file body.md

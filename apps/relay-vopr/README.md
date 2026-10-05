@@ -94,6 +94,15 @@ events, and the command that replays it.
 checks that one seed replays to one trace. `RELAY_VOPR_SEEDS` and
 `RELAY_VOPR_STEPS` widen and lengthen it.
 
+In CI the suite is tiered (see `.github/workflows/ci.yml`): every pull
+request runs a one-seed, 200-step smoke on Linux; pull requests that touch
+the engine crates, or carry the `ci:full-sim` label, and pushes to `main`
+run the full three-seed suite on Linux; `sim-nightly.yml` runs it on every
+OS and sweeps 50 seeds per scenario in release mode, opening an issue with
+the replay commands when a seed fails. A seed that fails on one platform
+only prints its whole trace in the CI log, since it cannot be replayed
+elsewhere.
+
 Homes and mounts live under `/dev/shm` when it exists (every engine write is
 fsynced, which otherwise dominates the run time), else the OS temp dir;
 `RELAY_VOPR_TMP` overrides.
