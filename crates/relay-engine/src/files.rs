@@ -1,6 +1,5 @@
 //! What a Files view shows for one folder of a mount, and the per-folder
-//! "keep on this device" / "online only" choice (D35, remote explorer
-//! Stage 1).
+//! "keep on this device" / "online only" choice (D35, D38).
 //!
 //! A folder choice is a materialization rule named `folder-…` whose
 //! selectors are `mount/path/**` and the folder itself, `mount/path` (so an

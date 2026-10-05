@@ -7,6 +7,7 @@ cargo build --release
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+python3 scripts/check-docs.py   # doc links, D-numbers, DESIGN § references
 ```
 
 The release binary is `target/release/relay`. Plain `cargo build` skips the desktop app. See [the desktop README](../apps/relay-desktop/README.md) for the Tauri dev loop, and [RELEASING.md](RELEASING.md) for signed desktop builds.
@@ -23,7 +24,7 @@ crates/
   relay-store    BLAKE3 content-addressed object store
   relay-db       SQLite schema, migrations, local index
   relay-replica  durable mailbox (a filesystem directory)
-  relay-crypto  Ed25519 device identity and certificate
+  relay-crypto   device identity, certificates, space keys, sealing
   relay-proto    peer wire protocol
   relay-net      QUIC transport, pinned mutual TLS, pairing, LAN discovery
   relay-engine   scan, watch, sync, conflicts, history
@@ -34,14 +35,16 @@ apps/
   relay-desktop  menu bar / tray app
   relay-sim      local multi-process lab
   relay-vopr     deterministic single-process sync simulator
-scripts/        install, cross-build, deploy, release
+scripts/        install, cross-build, deploy, release, check-docs
+packaging/
+  server/       home server container image, compose file, systemd unit
 docs/
   USAGE.md       commands and safety rules
   ROADMAP.md     what is built and what is next
-  DESIGN.md      original specification
-  DECISIONS.md   amendments adopted during implementation
+  DESIGN.md      how Relay works and the rules it keeps
+  DECISIONS.md   numbered decisions (cited in code as D-numbers)
   RELEASING.md   desktop release and updater signing
-  proposals/     notes that are not decisions yet
+  proposals/     plans that are not decisions yet
 ```
 
 ## Lab
