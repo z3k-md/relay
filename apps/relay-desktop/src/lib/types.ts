@@ -195,6 +195,7 @@ export interface QuickOpen {
 export type RemoteErrorCode =
   | "forbidden"
   | "denied"
+  | "protected"
   | "not_found"
   | "timeout"
   | "unsupported"

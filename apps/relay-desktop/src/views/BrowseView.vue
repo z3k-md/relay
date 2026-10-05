@@ -642,7 +642,7 @@ onUnmounted(() => {
                   Sync
                 </button>
                 <button
-                  v-else-if="!isFolder(entry) && (entry.size ?? 0) <= READ_COPY_MAX"
+                  v-else-if="!isFolder(entry) && listing.inside_mount && (entry.size ?? 0) <= READ_COPY_MAX"
                   type="button"
                   class="rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
                   :disabled="!!opening"

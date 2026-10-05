@@ -8,6 +8,8 @@ export function describeRemoteError(err: unknown, device: string): string {
   switch (err.code) {
     case "denied":
       return `${device} needs to allow this. ${err.message}`;
+    case "protected":
+      return `${device} keeps that private. ${err.message}`;
     case "forbidden":
       return `${device} has not allowed this computer to manage it. Turn it on in Peers on ${device}.`;
     case "offline":

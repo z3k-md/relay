@@ -726,6 +726,7 @@ mod tests {
             applied: relay_core::ConfigApplied::Done,
         }));
         round_trip(Err(RemoteError::new(RemoteErrorCode::Forbidden, "no")));
+        round_trip(Err(RemoteError::new(RemoteErrorCode::Protected, "no")));
     }
 
     /// An old object request decodes with no control call, and a control
