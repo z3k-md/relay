@@ -2864,6 +2864,7 @@ impl RescanWait {
 
 fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
     let deadline = Instant::now() + Duration::from_secs(600);
+    let mut failed: Vec<ActivityItem> = Vec::new();
     while !wait.pending.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2882,12 +2883,19 @@ fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
                 let Some(key) = key else {
                     continue;
                 };
-                if wait.pending.remove(&key) {
-                    if json {
-                        println!("{}", serde_json::to_string(&item)?);
-                    } else {
-                        println!("{}", item.summary);
-                    }
+                if !wait.pending.remove(&key) {
+                    continue;
+                }
+                if json {
+                    println!("{}", serde_json::to_string(&item)?);
+                } else if item.kind == "scan_failed" {
+                    eprintln!("error: {}", item.summary);
+                    print_watch_error_hints(&item.summary);
+                } else {
+                    println!("{}", item.summary);
+                }
+                if item.kind == "scan_failed" {
+                    failed.push(item);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -2896,7 +2904,22 @@ fn wait_rescan_finish(mut wait: RescanWait, json: bool) -> Result<ExitCode> {
             }
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(rescan_exit_code(&failed))
+}
+
+/// The host ran the scans; exit as `relay scan` would have: 2 for a refused
+/// mass delete, 1 for any other failure.
+fn rescan_exit_code(failed: &[ActivityItem]) -> ExitCode {
+    if failed.is_empty() {
+        ExitCode::SUCCESS
+    } else if failed
+        .iter()
+        .any(|item| item.summary.contains("refusing to delete"))
+    {
+        ExitCode::from(2)
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 fn cmd_activity(home: &Path, n: usize, follow: bool, json: bool) -> Result<ExitCode> {
@@ -3527,6 +3550,28 @@ mod tests {
         assert_eq!(
             file.path.as_ref().map(LogicalPath::as_str),
             Some("foo/bar.txt")
+        );
+    }
+
+    #[test]
+    fn rescan_exit_code_distinguishes_mass_delete() {
+        let item = |summary: &str| ActivityItem {
+            at_ms: 0,
+            kind: "scan_failed".to_owned(),
+            summary: summary.to_owned(),
+            detail: Some("S/m".to_owned()),
+        };
+        assert_eq!(rescan_exit_code(&[]), ExitCode::SUCCESS);
+        assert_eq!(
+            rescan_exit_code(&[item("S/m: mount marker missing at /x")]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            rescan_exit_code(&[
+                item("S/m: mount marker missing at /x"),
+                item("S/n: refusing to delete 30 of 30 live entries"),
+            ]),
+            ExitCode::from(2)
         );
     }
 }
