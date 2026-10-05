@@ -37,7 +37,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 pub use addr::advertised_addresses;
-pub use control::ControlHandler;
+pub use control::{ControlHandler, call_timeout};
 pub use error::NetError;
 pub use relay::{RelayServer, serve_relay};
 use session::{
@@ -131,7 +131,8 @@ pub enum NetEvent {
     PairFailed {
         reason: String,
     },
-    /// Merged address list for an already-trusted peer (LAN discovery).
+    /// Merged address list for a trusted peer: a LAN address mDNS resolved
+    /// for it just completed the pinned handshake.
     PeerAddresses {
         peer: DeviceId,
         addresses: Vec<String>,
@@ -312,6 +313,7 @@ pub fn start(
         relay_sock: OnceLock::new(),
         pairing: Mutex::new(None),
         pairing_ads: Mutex::new(HashMap::new()),
+        discovered: Mutex::new(HashMap::new()),
         discovery: Mutex::new(None),
         control: config.control,
     });

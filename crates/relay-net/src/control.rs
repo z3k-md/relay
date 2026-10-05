@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use quinn::{Connection, RecvStream, SendStream};
-use relay_core::DeviceId;
 use relay_core::remote::{CopiedFile, RemoteCall, RemoteError, RemoteErrorCode, RemoteResult};
+use relay_core::{ConfigChange, DeviceId};
 use relay_proto::{
     ControlRequest, ControlResponse, FEATURE_CONTROL, Frame, ObjectHeader, ObjectRequest,
     PeerGrants, ReadFileRequest, call_from_wire, call_to_wire, encode_frame, error_from_wire,
@@ -24,18 +24,49 @@ use relay_proto::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::io::read_message;
-use crate::session::Inner;
+use crate::io::read_message_max;
+use crate::session::{Inner, OBJECT_HEADER_MAX};
 
 /// How long one call may run on the answering device.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a caller waits for an answer, including the network.
+/// How long a call that runs on the engine loop (`Apply`, `ScanFirst`) may
+/// take there: its daemon waits this long for the loop (`CONFIG_REPLY_WAIT`),
+/// plus the join wait a change itself carries.
+const LOOP_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest join wait a caller may ask for.
+const MAX_JOIN_WAIT: Duration = Duration::from_secs(60);
+/// What a caller adds for the network on top of the answering device's bound.
+const CALL_MARGIN: Duration = Duration::from_secs(5);
+/// How long a caller waits for a copy to start, including the network.
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Calls one peer may have running here at once.
 pub(crate) const MAX_CONCURRENT_CALLS: usize = 4;
 /// A copy whose bytes stop arriving for this long has failed.
-const COPY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const COPY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const COPY_CHUNK: usize = 64 * 1024;
+/// Bound for a `ControlResponse`: a listing page can hold 5,000 entries
+/// with full paths.
+const CONTROL_RESPONSE_MAX: usize = 4 * 1024 * 1024;
+
+/// How long `call` may run on the answering device. A config change or a
+/// scan waits on the engine loop and, for a join, on the offer; the handler
+/// must outlast that, or work it abandons still lands after the caller gave
+/// up and undid its own side.
+fn handler_timeout(call: &RemoteCall) -> Duration {
+    match call {
+        RemoteCall::Apply {
+            change: ConfigChange::JoinSpace { wait_ms, .. },
+        } => LOOP_CALL_TIMEOUT + Duration::from_millis(*wait_ms).min(MAX_JOIN_WAIT),
+        RemoteCall::Apply { .. } | RemoteCall::ScanFirst { .. } => LOOP_CALL_TIMEOUT,
+        _ => HANDLER_TIMEOUT,
+    }
+}
+
+/// How long a caller waits for the answer to `call`, including the network.
+/// Anything waiting on that caller should allow at least this long.
+pub fn call_timeout(call: &RemoteCall) -> Duration {
+    handler_timeout(call) + CALL_MARGIN
+}
 
 /// Answers remote calls from peers that hold the manage grant. The daemon
 /// implements this; the network layer only checks the grant and transports.
@@ -89,10 +120,12 @@ pub(crate) async fn call(inner: Arc<Inner>, peer: DeviceId, call: RemoteCall) ->
         .map_err(failed)?;
         send.write_all(&request).await.map_err(failed)?;
         send.finish().map_err(failed)?;
-        let response: ControlResponse = read_message(&mut recv).await.map_err(failed)?;
+        let response: ControlResponse = read_message_max(&mut recv, CONTROL_RESPONSE_MAX)
+            .await
+            .map_err(failed)?;
         result_from_wire(response).map_err(failed)?
     };
-    match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
+    match tokio::time::timeout(call_timeout(&call), exchange).await {
         Ok(result) => result,
         Err(_) => Err(RemoteError::new(
             RemoteErrorCode::Timeout,
@@ -146,11 +179,12 @@ fn admit(
     Ok((handler, permit))
 }
 
-/// Run handler work on a blocking thread, bounded by [`HANDLER_TIMEOUT`].
+/// Run handler work on a blocking thread, bounded by `limit`.
 async fn on_handler<T: Send + 'static>(
+    limit: Duration,
     work: impl FnOnce() -> Result<T, RemoteError> + Send + 'static,
 ) -> Result<T, RemoteError> {
-    match tokio::time::timeout(HANDLER_TIMEOUT, tokio::task::spawn_blocking(work)).await {
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(work)).await {
         Ok(Ok(result)) => result,
         Ok(Err(join)) => Err(failed(join)),
         Err(_) => Err(RemoteError::new(
@@ -164,7 +198,8 @@ async fn answer(inner: &Inner, peer: DeviceId, request: ControlRequest) -> Remot
     let (handler, _permit) = admit(inner, peer)?;
     let call = call_from_wire(request)
         .map_err(|err| RemoteError::new(RemoteErrorCode::Invalid, err.to_string()))?;
-    on_handler(move || handler.handle(peer, call)).await
+    let limit = handler_timeout(&call);
+    on_handler(limit, move || handler.handle(peer, call)).await
 }
 
 /// Answer one read-file request: a header, then exactly `size` bytes.
@@ -177,7 +212,10 @@ pub(crate) async fn serve_read(
     let opened = async {
         let (handler, permit) = admit(inner, peer)?;
         let ReadFileRequest { path, max_bytes } = request;
-        let file = on_handler(move || handler.open_file(peer, &path, max_bytes)).await?;
+        let file = on_handler(HANDLER_TIMEOUT, move || {
+            handler.open_file(peer, &path, max_bytes)
+        })
+        .await?;
         let meta = file.metadata().map_err(failed)?;
         Ok::<_, RemoteError>((file, meta, permit))
     }
@@ -232,15 +270,16 @@ pub(crate) async fn read_file(
     .map_err(failed)?;
     send.write_all(&request).await.map_err(failed)?;
     send.finish().map_err(failed)?;
-    let header: ObjectHeader = tokio::time::timeout(CALL_TIMEOUT, read_message(&mut recv))
-        .await
-        .map_err(|_| {
-            RemoteError::new(
-                RemoteErrorCode::Timeout,
-                "that device did not answer in time",
-            )
-        })?
-        .map_err(failed)?;
+    let header: ObjectHeader =
+        tokio::time::timeout(CALL_TIMEOUT, read_message_max(&mut recv, OBJECT_HEADER_MAX))
+            .await
+            .map_err(|_| {
+                RemoteError::new(
+                    RemoteErrorCode::Timeout,
+                    "that device did not answer in time",
+                )
+            })?
+            .map_err(failed)?;
     if let Some(err) = header.error {
         return Err(error_from_wire(err));
     }
@@ -301,4 +340,40 @@ pub(crate) fn grants_frame(may_manage_you: bool) -> Option<Vec<u8>> {
 
 fn failed(err: impl ToString) -> RemoteError {
     RemoteError::new(RemoteErrorCode::Failed, err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_changes_get_the_loop_wait_and_joins_their_own_on_top() {
+        assert_eq!(call_timeout(&RemoteCall::Roots), Duration::from_secs(15));
+        let add = RemoteCall::Apply {
+            change: ConfigChange::DeleteSpace {
+                space: "Photos".into(),
+            },
+        };
+        assert_eq!(call_timeout(&add), Duration::from_secs(35));
+        let scan = RemoteCall::ScanFirst {
+            space: "Photos".into(),
+            mount: "m".into(),
+            path: "a/b".into(),
+        };
+        assert_eq!(call_timeout(&scan), Duration::from_secs(35));
+        let join = |wait_ms| RemoteCall::Apply {
+            change: ConfigChange::JoinSpace {
+                space: "Photos".into(),
+                from_peer: "mac".into(),
+                wait_ms,
+            },
+        };
+        assert_eq!(handler_timeout(&join(8_000)), Duration::from_secs(38));
+        assert_eq!(call_timeout(&join(8_000)), Duration::from_secs(43));
+        assert_eq!(
+            handler_timeout(&join(u64::MAX)),
+            LOOP_CALL_TIMEOUT + MAX_JOIN_WAIT,
+            "a peer cannot pin a call slot for longer than the cap"
+        );
+    }
 }

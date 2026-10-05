@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use rand::RngCore;
@@ -318,6 +319,121 @@ fn untrusted_node_cannot_connect() {
         "alice should not connect: {:#?}",
         alice.events.got
     );
+}
+
+/// Counts, per peer id, how often this process refused a peer after the
+/// handshake. Neither side emits an event for that, so the test reads the
+/// warning the accepting side logs.
+#[derive(Default)]
+struct Rejections {
+    by_peer: Mutex<HashMap<String, usize>>,
+}
+
+static REJECTIONS: OnceLock<Arc<Rejections>> = OnceLock::new();
+
+struct RejectionLayer(Arc<Rejections>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RejectionLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        #[derive(Default)]
+        struct Fields {
+            message: String,
+            peer: String,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "message" => self.message = format!("{value:?}"),
+                    "peer" => self.peer = format!("{value:?}"),
+                    _ => {}
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields.message == "peer is not in the trusted set after handshake" {
+            *self
+                .0
+                .by_peer
+                .lock()
+                .unwrap()
+                .entry(fields.peer)
+                .or_default() += 1;
+        }
+    }
+}
+
+fn rejections() -> Arc<Rejections> {
+    REJECTIONS
+        .get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let counter = Arc::new(Rejections::default());
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(RejectionLayer(counter.clone())),
+            );
+            counter
+        })
+        .clone()
+}
+
+/// A peer that completes the handshake and then closes (here: it does not
+/// trust the dialer) is redialed with backoff, not in a hot loop.
+#[test]
+fn rejected_dialer_backs_off() {
+    let counter = rejections();
+    let alice = spawn("alice", vec![]);
+    let alice_addr = alice.handle.local_addr();
+    let eve = spawn("eve", vec![trust(alice.id, "alice", Some(alice_addr))]);
+
+    std::thread::sleep(Duration::from_secs(3));
+    let attempts = counter
+        .by_peer
+        .lock()
+        .unwrap()
+        .get(&eve.id.to_string())
+        .copied()
+        .unwrap_or(0);
+    // Delays of 1 s and 2 s allow three attempts in 3 s; the unfixed loop
+    // made about a hundred per second.
+    assert!(
+        (1..=5).contains(&attempts),
+        "eve made {attempts} attempts in 3 s"
+    );
+}
+
+/// The daemon resolves peers by name, so a name from the wire is held to
+/// the same rule as a pairing name: one that would not pass locally
+/// becomes the id's short form.
+#[test]
+fn hello_name_that_fails_validation_becomes_the_short_id() {
+    let mut bob = spawn("bob\u{7}", vec![]);
+    let bob_id = bob.id;
+    let bob_addr = bob.handle.local_addr();
+    let mut alice = spawn(&"a".repeat(65), vec![trust(bob_id, "bob", Some(bob_addr))]);
+    bob.handle
+        .send(NetCommand::SetPeers(vec![trust(alice.id, "alice", None)]));
+    wait_connected(&mut alice.events, bob_id, &bob_id.short());
+    wait_connected(&mut bob.events, alice.id, &alice.id.short());
+}
+
+/// Emptying a trusted peer's addresses stops its dialer. The connection it
+/// drove must close for real, or the peer keeps a session the dialing
+/// engine was told is gone.
+#[test]
+fn stopping_a_dialer_closes_its_connection() {
+    let (mut alice, mut bob) = pair_alice_dials_bob();
+    let alice_id = alice.id;
+    let bob_id = bob.id;
+
+    alice
+        .handle
+        .send(NetCommand::SetPeers(vec![trust(bob_id, "bob", None)]));
+    wait_disconnected(&mut alice.events, bob_id);
+    wait_disconnected(&mut bob.events, alice_id);
 }
 
 #[test]

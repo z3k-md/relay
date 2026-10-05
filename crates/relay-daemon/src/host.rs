@@ -71,8 +71,9 @@ struct RemoteAccess {
     manageable: bool,
 }
 
-/// How long a remote call may take end to end before IPC gives up.
-const REMOTE_CALL_WAIT: Duration = Duration::from_secs(20);
+/// What IPC allows on top of the network layer's own wait for a remote call
+/// before giving up.
+const REMOTE_CALL_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub(crate) enum PairPhase {
@@ -231,9 +232,10 @@ impl Host {
         let net = self
             .net_sender()
             .map_err(|err| RemoteError::new(RemoteErrorCode::Offline, err.message))?;
+        let wait = relay_net::call_timeout(&call) + REMOTE_CALL_MARGIN;
         let (reply, rx) = mpsc::channel();
         net.send(NetCommand::Control { peer, call, reply });
-        rx.recv_timeout(REMOTE_CALL_WAIT)
+        rx.recv_timeout(wait)
             .map_err(|_| RemoteError::new(RemoteErrorCode::Timeout, "no answer from the network"))?
     }
 
