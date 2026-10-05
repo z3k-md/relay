@@ -1121,7 +1121,9 @@ fn cmd_run(
             watch: opts,
             verbose,
             host,
-            enable_stun: true,
+            // A loopback host (tests, local experiments) is unreachable from
+            // outside, so asking STUN for its public address is noise.
+            enable_stun: !listen.ip().is_loopback(),
             loopback_only: false,
             placeholders: true,
         },
@@ -1262,7 +1264,7 @@ fn start_pair_host(home: &Path, listen: SocketAddr) -> Result<PairHost> {
                     watch: WatchOptions::default(),
                     verbose: false,
                     host: HostKind::Cli,
-                    enable_stun: true,
+                    enable_stun: !listen.ip().is_loopback(),
                     loopback_only: false,
                     placeholders: true,
                 },
@@ -1474,10 +1476,7 @@ fn print_watch_event(
             paths,
             report,
         } => {
-            if !*full && !report.has_changes() && !verbose {
-                return;
-            }
-            if *full && !report.has_changes() && !verbose {
+            if !report.has_changes() && !verbose {
                 return;
             }
             if *full && !report.has_changes() {
@@ -3414,6 +3413,10 @@ struct Target {
 }
 
 fn parse_target(raw: &str) -> Result<Target> {
+    // Windows shells complete paths with backslashes, and no file there can
+    // have one in its name, so they are separators too.
+    #[cfg(windows)]
+    let raw: &str = &raw.replace('\\', "/");
     let raw = raw.strip_suffix('/').unwrap_or(raw);
     let mut parts = raw.split('/');
     let space = parts
@@ -3606,6 +3609,18 @@ mod tests {
         assert_eq!(dir.path.as_ref().map(LogicalPath::as_str), Some("foo"));
 
         let file = parse_target("Personal/code/foo/bar.txt/").unwrap();
+        assert_eq!(
+            file.path.as_ref().map(LogicalPath::as_str),
+            Some("foo/bar.txt")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_target_accepts_backslashes() {
+        let file = parse_target(r"Personal\code\foo\bar.txt").unwrap();
+        assert_eq!(file.space, "Personal");
+        assert_eq!(file.mount.as_deref(), Some("code"));
         assert_eq!(
             file.path.as_ref().map(LogicalPath::as_str),
             Some("foo/bar.txt")
