@@ -668,10 +668,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
             into,
             read_only,
         } => {
+            // The host joins the folder onto this root in its own working
+            // directory, so make it absolute here.
+            let root = into
+                .map(|dir| {
+                    std::path::absolute(&dir)
+                        .with_context(|| format!("resolving {}", dir.display()))
+                })
+                .transpose()?;
             let opened = running_host(&home)?.open_remote(&OpenRemoteParams {
                 peer,
                 path,
-                root: into,
+                root,
                 read_only,
             })?;
             if json {
@@ -873,6 +881,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 if dev_excludes {
                     excludes.extend(DEV_EXCLUDES.iter().map(|s| (*s).to_owned()));
                 }
+                // A running host would resolve a relative path against its
+                // own working directory, not this one.
+                let path = std::path::absolute(&path)
+                    .with_context(|| format!("resolving {}", path.display()))?;
                 apply_config(
                     &home,
                     ConfigChange::AddMount {

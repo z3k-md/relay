@@ -504,6 +504,51 @@ fn rescan_exit_code_follows_the_host_scan() {
 }
 
 #[test]
+fn mount_add_resolves_relative_path_here_not_in_the_host() {
+    let home = TempDir::new().unwrap();
+    let first = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let first_s = first.path().to_str().unwrap().to_owned();
+    fs::create_dir(other.path().join("sub")).unwrap();
+
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    relay()
+        .args(["--home", &home_s, "space", "create", "Personal"])
+        .assert()
+        .success();
+    relay()
+        .args([
+            "--home", &home_s, "mount", "add", "Personal", "code", &first_s,
+        ])
+        .assert()
+        .success();
+
+    // The host runs in this test's working directory; the command below
+    // runs in another one, where `sub` exists.
+    let _host = start_host(&home_s);
+    let out = relay()
+        .current_dir(other.path())
+        .args(["--home", &home_s, "mount", "add", "Personal", "more", "sub"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added mount Personal/more at "))
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&out);
+    let shown = text.trim().split_once(" at ").unwrap().1;
+    assert_eq!(
+        fs::canonicalize(shown).unwrap(),
+        fs::canonicalize(other.path().join("sub")).unwrap(),
+        "{text}"
+    );
+}
+
+#[test]
 fn cli_identity_peers_share_and_conflicts() {
     let home_a = TempDir::new().unwrap();
     let home_b = TempDir::new().unwrap();
