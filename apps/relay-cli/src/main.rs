@@ -2983,11 +2983,25 @@ fn cmd_activity(home: &Path, n: usize, follow: bool, json: bool) -> Result<ExitC
     let _ = ctrlc::set_handler(move || {
         flag.store(true, Ordering::SeqCst);
     });
+    // The read blocks through Ctrl-C, so a worker reads and this thread
+    // polls the flag between items.
     let mut sub = client.subscribe()?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let next = sub.next_item();
+            let more = matches!(next, Ok(Some(_)));
+            if tx.send(next).is_err() || !more {
+                break;
+            }
+        }
+    });
     while !stop.load(Ordering::Relaxed) {
-        match sub.next_item()? {
-            Some(item) => print_activity_item(&item, json),
-            None => break,
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(Some(item))) => print_activity_item(&item, json),
+            Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
     Ok(ExitCode::SUCCESS)
