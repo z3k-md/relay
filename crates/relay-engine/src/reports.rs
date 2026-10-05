@@ -148,6 +148,18 @@ pub struct MountStatus {
     pub last_error: Option<String>,
 }
 
+/// A mount's path and folder health, without the counts in [`MountStatus`].
+#[derive(Clone, Debug, Serialize)]
+pub struct MountHealth {
+    pub space: String,
+    pub mount: String,
+    pub path: Option<PathBuf>,
+    pub marker_ok: bool,
+    pub marker_state: String,
+    pub last_scan_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DeleteHold {
     pub peer: DeviceId,

@@ -491,20 +491,20 @@ pub fn list_spaces(app: AppHandle) -> Result<Vec<SpaceView>, String> {
     let engine = open_ro(&state.home)?;
     let spaces = engine.spaces().map_err(|err| error_chain(&err))?;
     let mounts = engine.mounts(None).map_err(|err| error_chain(&err))?;
-    let status = engine.status().map_err(|err| error_chain(&err))?;
+    // Not `engine.status()`: its entry counts and object store walk grow
+    // with the files synced, and this runs on every visit to Spaces/Peers.
+    let health = engine.mount_health().map_err(|err| error_chain(&err))?;
+    let peer_shares = engine.peer_shares().map_err(|err| error_chain(&err))?;
 
     let mut shared: HashMap<String, Vec<String>> = HashMap::new();
-    for peer in status.peers {
-        for space in peer.spaces {
-            shared
-                .entry(space.space)
-                .or_default()
-                .push(peer.name.clone());
+    for (peer, spaces) in peer_shares {
+        for space in spaces {
+            shared.entry(space).or_default().push(peer.clone());
         }
     }
 
     let mut mount_state: HashMap<(String, String), (Option<String>, String, bool)> = HashMap::new();
-    for m in status.mounts {
+    for m in health {
         mount_state.insert(
             (m.space, m.mount),
             (

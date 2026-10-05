@@ -10,7 +10,16 @@ const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: tr
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onActivated,
+  onDeactivated,
+  onMounted,
+  onUnmounted,
+  ref,
+  watch,
+} from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import PairFolderDialog from "../components/PairFolderDialog.vue";
@@ -356,10 +365,6 @@ async function loadPeers() {
 }
 
 onMounted(async () => {
-  window.addEventListener("mousedown", onMouse);
-  window.addEventListener("mouseup", onMouse);
-  window.addEventListener("keydown", onKey);
-  const loads = Promise.all([loadPeers(), loadQuickOpens()]);
   const off = await listen<ActivityItem>("relay://activity", (event) => {
     if (event.payload.kind === "peerConnected" || event.payload.kind === "peerDisconnected") {
       void loadPeers();
@@ -367,14 +372,25 @@ onMounted(async () => {
   });
   if (gone) off();
   else stopActivity = off;
-  await loads;
+});
+
+// Kept alive across tab switches: keys and mouse buttons only act while the
+// page shows, and a revisit refreshes in place, keeping the open folder.
+onActivated(async () => {
+  window.addEventListener("mousedown", onMouse);
+  window.addEventListener("mouseup", onMouse);
+  window.addEventListener("keydown", onKey);
+  await Promise.all([loadPeers(), loadQuickOpens()]);
+});
+
+onDeactivated(() => {
+  window.removeEventListener("mousedown", onMouse);
+  window.removeEventListener("mouseup", onMouse);
+  window.removeEventListener("keydown", onKey);
 });
 
 onUnmounted(() => {
   gone = true;
-  window.removeEventListener("mousedown", onMouse);
-  window.removeEventListener("mouseup", onMouse);
-  window.removeEventListener("keydown", onKey);
   stopActivity?.();
   stopSizes();
 });

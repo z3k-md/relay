@@ -287,6 +287,59 @@ fn missing_marker_refuses_scan() {
 }
 
 #[test]
+fn mount_health_and_peer_shares_match_status() {
+    let home = new_home();
+    let mount = new_home();
+    let mut engine = ready(home.path(), mount.path());
+    fs::write(mount.path().join("a.txt"), b"x").unwrap();
+    scan(&mut engine);
+    let peer = relay_engine::DeviceIdentity::generate(new_home().path())
+        .unwrap()
+        .device_id();
+    engine
+        .add_peer("bravo", peer, &["127.0.0.1:47321".into()])
+        .unwrap();
+    engine.share("Personal", "bravo").unwrap();
+
+    let check = |engine: &Engine| {
+        let status = engine.status().unwrap();
+        let health = engine.mount_health().unwrap();
+        assert_eq!(health.len(), status.mounts.len());
+        for (h, s) in health.iter().zip(&status.mounts) {
+            assert_eq!(
+                (&h.space, &h.mount, &h.path, h.marker_ok, &h.marker_state),
+                (&s.space, &s.mount, &s.path, s.marker_ok, &s.marker_state),
+            );
+            assert_eq!(
+                (h.last_scan_ms, &h.last_error),
+                (s.last_scan_ms, &s.last_error)
+            );
+        }
+        let shares: Vec<_> = status
+            .peers
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.spaces.iter().map(|s| s.space.clone()).collect(),
+                )
+            })
+            .collect::<Vec<(String, Vec<String>)>>();
+        assert_eq!(engine.peer_shares().unwrap(), shares);
+    };
+    check(&engine);
+    assert!(engine.mount_health().unwrap()[0].marker_ok);
+    assert_eq!(
+        engine.peer_shares().unwrap(),
+        vec![("bravo".to_owned(), vec!["Personal".to_owned()])]
+    );
+
+    fs::remove_file(mount.path().join(".relay-mount")).unwrap();
+    check(&engine);
+    assert_eq!(engine.mount_health().unwrap()[0].marker_state, "MISSING");
+}
+
+#[test]
 fn missing_mount_root_refuses_scan() {
     let home = new_home();
     let mount = new_home();

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
@@ -271,21 +271,32 @@ async function removePeer() {
   }
 }
 
+let loaded = false;
+
 onMounted(async () => {
-  nowMs.value = Date.now();
-  clockTimer = window.setInterval(() => {
-    nowMs.value = Date.now();
-  }, 1000);
   stopActivity = await listen<ActivityItem>("relay://activity", (event) => {
     if (event.payload.kind === "peerConnected" || event.payload.kind === "peerDisconnected") {
       void load(true);
     }
   });
-  await load();
+});
+// Kept alive across tab switches: a revisit refreshes in place, and the
+// "online for" clock only ticks while the page shows.
+onActivated(async () => {
+  nowMs.value = Date.now();
+  clockTimer = window.setInterval(() => {
+    nowMs.value = Date.now();
+  }, 1000);
+  const silent = loaded;
+  loaded = true;
+  await load(silent);
+});
+onDeactivated(() => {
+  if (clockTimer !== undefined) window.clearInterval(clockTimer);
+  clockTimer = undefined;
 });
 onUnmounted(() => {
   stopPairWatch();
-  if (clockTimer !== undefined) window.clearInterval(clockTimer);
   stopActivity?.();
   if (pairCode.value && !pairDone.value) {
     api.pairCancel().catch(() => {});
