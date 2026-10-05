@@ -829,6 +829,20 @@ impl Repo<'_> {
         Ok(())
     }
 
+    /// Forget the stat of every index-only row in `mount`. Such a stat marks
+    /// a Cloud Files placeholder Relay put on disk (D43); without one, a
+    /// missing file is not read as a delete. Returns how many rows changed.
+    pub fn clear_unmaterialized_stats(&self, mount: MountId) -> Result<usize, DbError> {
+        let mount = mount_bytes(mount);
+        let changed = self.conn.execute(
+            "UPDATE entries SET stat_size = NULL, stat_mtime_ns = NULL, stat_file_id = NULL,
+                 stat_ctime_ns = NULL
+             WHERE mount_id = ?1 AND materialized = 0 AND stat_size IS NOT NULL",
+            params![mount.as_slice()],
+        )?;
+        Ok(changed)
+    }
+
     pub fn changes_since(
         &self,
         after: Sequence,

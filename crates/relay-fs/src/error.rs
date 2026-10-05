@@ -50,6 +50,12 @@ pub enum FsError {
     #[error("invalid ignore pattern {pattern:?}: {message}")]
     InvalidPattern { pattern: String, message: String },
 
+    #[error("Cloud Files error at {path}: {message}")]
+    Cloud { path: PathBuf, message: String },
+
+    #[error("online-only placeholders are not supported on this system")]
+    CloudUnsupported,
+
     #[error("filesystem error at {path}: {source}")]
     Io {
         path: PathBuf,

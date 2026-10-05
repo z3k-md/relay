@@ -1,6 +1,7 @@
 //! Engine-native peer sync I/O. The CLI/daemon maps these 1:1 onto relay-net.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -120,6 +121,20 @@ pub enum SyncInput {
         mount: String,
         path: String,
         reply: mpsc::Sender<Result<(), Rejected>>,
+    },
+    /// Get one object into the local store, asking a connected peer or the
+    /// mailbox, without writing the working tree: a placeholder being opened
+    /// is the destination (D43).
+    FetchObject {
+        space: SpaceId,
+        object: ObjectId,
+        reply: mpsc::Sender<Result<(), Rejected>>,
+    },
+    /// Paths under a mount root changed in ways the watcher may not report,
+    /// such as a placeholder freed or moved in Explorer (D43).
+    Touched {
+        root: PathBuf,
+        paths: Vec<PathBuf>,
     },
     /// Index these paths of one mount now, ahead of any scan in progress.
     /// Replies with whether anything changed.
@@ -268,7 +283,10 @@ struct DirectFetch {
 }
 
 struct FetchWaiter {
-    key: EntryKey,
+    space: SpaceId,
+    /// The demand row to write once the object lands. `None` only fills the
+    /// store ([`SyncInput::FetchObject`]).
+    key: Option<EntryKey>,
     reply: mpsc::Sender<Result<(), Rejected>>,
 }
 
@@ -392,8 +410,16 @@ impl Syncer {
             } => {
                 self.on_fetch_request(engine, &space, &mount, &path, reply, out, &mut events)?;
             }
+            SyncInput::FetchObject {
+                space,
+                object,
+                reply,
+            } => {
+                self.on_fetch_object(engine, space, object, reply, out)?;
+            }
             // Applied by the watch loop, which owns the working tree.
             SyncInput::Evict { .. }
+            | SyncInput::Touched { .. }
             | SyncInput::ScanFirst { .. }
             | SyncInput::Rescan { .. }
             | SyncInput::AddPeer(_)

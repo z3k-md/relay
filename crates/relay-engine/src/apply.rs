@@ -22,7 +22,7 @@ use relay_store::StoreError;
 
 use crate::Engine;
 use crate::error::EngineError;
-use crate::materialize::path_mode;
+use crate::materialize::{dehydrated_stat, path_mode};
 use crate::order::{apply_sort_key, classify_apply};
 use crate::scan::{recorded_stat, wall_clock_now_ns};
 
@@ -752,6 +752,18 @@ impl Engine {
     ) -> Result<Result<(), TryApply>, EngineError> {
         if let EntryContent::File { object, .. } = content {
             let dest = dest_path(root, path)?;
+            if dehydrated_stat(&dest).is_some() {
+                return Ok(
+                    if relay_fs::cloud::placeholder_object(&dest) == Some(*object) {
+                        Ok(())
+                    } else {
+                        Err(TryApply::Done(ApplyResult::Skipped(
+                            path.to_string(),
+                            "conflict copy path is already taken".into(),
+                        )))
+                    },
+                );
+            }
             if fs::symlink_metadata(&dest).is_ok() {
                 return match self.store.hash_file(&dest, None) {
                     Ok(outcome) if outcome.id == *object => Ok(Ok(())),
@@ -948,6 +960,23 @@ fn prepare_expected_existing(
     local: Option<&EntryRecord>,
     remote_object: ObjectId,
 ) -> Result<ExpectedPrep, EngineError> {
+    if let Some(stat) = dehydrated_stat(dest) {
+        // Never read a placeholder without data. Replace it when it holds
+        // this version, the local one, or what a deleted row left behind;
+        // otherwise the scanner indexes it first.
+        let object = relay_fs::cloud::placeholder_object(dest);
+        let known = object.is_some()
+            && (object == Some(remote_object)
+                || local.is_some_and(|record| {
+                    record.content.object() == object
+                        || (record.is_deleted() && record.parent_object == object)
+                }));
+        return Ok(if known {
+            ExpectedPrep::Matches(Some(stat))
+        } else {
+            ExpectedPrep::Rescan
+        });
+    }
     if let Some(record) = local {
         if record.is_deleted() || !matches!(record.content, EntryContent::File { .. }) {
             if dest.exists() {
@@ -1007,6 +1036,9 @@ fn file_still_matches(
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
             Err(err) => Err(EngineError::Io(err)),
         },
+        None if dehydrated_stat(dest).is_some() => {
+            Ok(relay_fs::cloud::placeholder_object(dest) == record.content.object())
+        }
         None => match store.hash_file(dest, None) {
             Ok(outcome) => Ok(Some(outcome.id) == record.content.object()),
             Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {

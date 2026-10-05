@@ -128,26 +128,59 @@ impl Syncer {
                     let _ = reply.send(Err((&EngineError::ObjectUnavailable).into()));
                     return Ok(());
                 };
-                self.fetch_waiters
-                    .entry(object)
-                    .or_default()
-                    .push(FetchWaiter { key, reply });
-                if let Some(state) = self.direct.get_mut(&object) {
-                    state.gave_up = false;
-                    state.warned = false;
-                    state.space = Some(space);
-                }
-                let waiting = self.direct.get(&object).is_some_and(|state| state.waiting)
-                    || self.batch_pending(object);
-                if !waiting {
-                    self.request_direct(peer, object, space, out);
-                }
+                self.wait_for_object(peer, space, object, Some(key), reply, out);
             }
             Err(err) => {
                 let _ = reply.send(Err((&err).into()));
             }
         }
         Ok(())
+    }
+
+    /// Fill the store with `object` for a placeholder being opened (D43).
+    pub(super) fn on_fetch_object(
+        &mut self,
+        engine: &mut Engine,
+        space: SpaceId,
+        object: ObjectId,
+        reply: mpsc::Sender<Result<(), Rejected>>,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<(), EngineError> {
+        if engine.store.contains(&object) || engine.ingest_mailbox_object(space, object)? {
+            let _ = reply.send(Ok(()));
+            return Ok(());
+        }
+        let Some(peer) = self.peer_for_space(engine, space)? else {
+            let _ = reply.send(Err((&EngineError::ObjectUnavailable).into()));
+            return Ok(());
+        };
+        self.wait_for_object(peer, space, object, None, reply, out);
+        Ok(())
+    }
+
+    fn wait_for_object(
+        &mut self,
+        peer: DeviceId,
+        space: SpaceId,
+        object: ObjectId,
+        key: Option<EntryKey>,
+        reply: mpsc::Sender<Result<(), Rejected>>,
+        out: &mut dyn FnMut(SyncOutput),
+    ) {
+        self.fetch_waiters
+            .entry(object)
+            .or_default()
+            .push(FetchWaiter { space, key, reply });
+        if let Some(state) = self.direct.get_mut(&object) {
+            state.gave_up = false;
+            state.warned = false;
+            state.space = Some(space);
+        }
+        let waiting = self.direct.get(&object).is_some_and(|state| state.waiting)
+            || self.batch_pending(object);
+        if !waiting {
+            self.request_direct(peer, object, space, out);
+        }
     }
 
     fn settle_direct(
@@ -160,7 +193,11 @@ impl Syncer {
         self.materialize_full_ready(engine, object, events)?;
         if let Some(waiters) = self.fetch_waiters.remove(&object) {
             for waiter in waiters {
-                match engine.materialize_indexed(&waiter.key) {
+                let written = match &waiter.key {
+                    Some(key) => engine.materialize_indexed(key),
+                    None => Ok(()),
+                };
+                match written {
                     Ok(()) => {
                         let _ = waiter.reply.send(Ok(()));
                     }
@@ -191,7 +228,7 @@ impl Syncer {
         let space = self
             .fetch_waiters
             .get(&object)
-            .and_then(|waiters| waiters.first().map(|waiter| waiter.key.space))
+            .and_then(|waiters| waiters.first().map(|waiter| waiter.space))
             .or_else(|| self.direct.get(&object).and_then(|state| state.space));
         let attempts = {
             let state = self.direct.entry(object).or_default();
@@ -227,7 +264,9 @@ impl Syncer {
         let path = self
             .fetch_waiters
             .get(&object)
-            .and_then(|waiters| waiters.first().map(|waiter| waiter.key.path.to_string()))
+            .and_then(|waiters| waiters.first())
+            .and_then(|waiter| waiter.key.as_ref())
+            .map(|key| key.path.to_string())
             .unwrap_or_default();
         self.give_up_direct(engine, object, &path, events);
         Ok(())

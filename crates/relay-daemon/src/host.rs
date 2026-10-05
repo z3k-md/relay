@@ -293,6 +293,12 @@ impl Host {
         self.sync_tx.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Queue an input for the running loop without waiting. False when no
+    /// loop runs.
+    pub(crate) fn send_to_loop(&self, input: SyncInput) -> bool {
+        self.sync_tx().is_some_and(|tx| tx.send(input).is_ok())
+    }
+
     /// Send an input to the running loop and wait for its reply. `None` when
     /// no loop runs, so the caller writes directly. `wait` `None` waits as
     /// long as the loop is alive: the loop always replies, or drops the

@@ -45,6 +45,7 @@ fn start_daemon(home: &Path) -> DaemonSession {
             host: HostKind::Cli,
             enable_stun: false,
             loopback_only: true,
+            placeholders: false,
         };
         relay_daemon::run(&home_path, opts, &stop_thread, &mut |event| {
             let _ = tx.send(event.clone());
@@ -330,6 +331,7 @@ fn ipc_hello_status_rescan_pause_and_host_lock() {
                 host: HostKind::Cli,
                 enable_stun: false,
                 loopback_only: true,
+                placeholders: false,
             },
             &stop,
             &mut |_| {},
@@ -812,11 +814,15 @@ fn granted_peer_browses_folders_over_ipc() {
     assert!(wait_started(&session_b).is_some(), "bob started");
     pair_granting(home_a.path(), addr_a, home_b.path(), true);
 
-    let alice_peers = Engine::open_read_only(home_a.path())
-        .unwrap()
-        .peers()
-        .unwrap();
-    assert!(alice_peers.iter().any(|p| p.name == "bob" && p.may_manage));
+    // The peer row and its grant are separate writes.
+    assert!(
+        wait_until(CONVERGE, || Engine::open_read_only(home_a.path())
+            .and_then(|engine| engine.peers())
+            .is_ok_and(|peers| peers
+                .iter()
+                .any(|p| p.name == "bob" && p.may_manage))),
+        "alice never recorded bob's grant"
+    );
     assert!(
         wait_until(CONVERGE, || wait_ipc(home_b.path()).status().is_ok_and(
             |s| s.peers.iter().any(|p| p.name == "alice" && p.manageable)

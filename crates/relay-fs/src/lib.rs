@@ -1,5 +1,6 @@
 //! Filesystem scanning, mount markers, path mapping, and atomic writes.
 
+pub mod cloud;
 mod error;
 mod marker;
 mod materialize;
