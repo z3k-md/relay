@@ -426,6 +426,50 @@ impl Engine {
         })
     }
 
+    /// Record mounts listed on an offer for a space this device has already
+    /// joined, with the offered ids, as `join_space` does at join time. A
+    /// mount the peer added later must keep its id here, or attaching it by
+    /// name would mint a second id and the two would never sync.
+    pub(crate) fn adopt_offered_mounts(
+        &mut self,
+        space: SpaceId,
+        mounts: &[OfferedMount],
+    ) -> Result<(), EngineError> {
+        let missing: Vec<&OfferedMount> = mounts
+            .iter()
+            .filter(|offered| {
+                self.db
+                    .repo()
+                    .mount_by_name(space, &offered.name)
+                    .is_ok_and(|found| found.is_none())
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let now = self.clock.now_ms();
+        self.db
+            .transaction(|repo| {
+                for offered in &missing {
+                    if repo.mount_by_name(space, &offered.name)?.is_none() {
+                        repo.create_mount(
+                            &Mount {
+                                id: offered.id,
+                                space,
+                                name: offered.name.clone(),
+                            },
+                            now,
+                        )?;
+                    }
+                }
+                Ok::<(), EngineError>(())
+            })
+            .map_err(|err| match err {
+                EngineError::Db(inner) => EngineError::from_db(inner),
+                other => other,
+            })
+    }
+
     pub fn conflicts(&self, space: Option<&str>) -> Result<Vec<EntryRecord>, EngineError> {
         Ok(self
             .conflict_infos(space)?
