@@ -3,6 +3,8 @@ import { useRemoteFolders } from "../lib/remoteFolders";
 
 /** Kept across visits to the page, so coming back resumes where you were. */
 const browser = useRemoteFolders({ sizes: true });
+/** Name order: case does not matter, and 2 comes before 10. */
+const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 </script>
 
 <script setup lang="ts">
@@ -67,6 +69,8 @@ const typedPath = ref("");
 const pathInput = ref<HTMLInputElement | null>(null);
 const crumbBar = ref<HTMLElement | null>(null);
 let stopActivity: UnlistenFn | undefined;
+/** Set on unmount, so a listener that resolves after it is dropped at once. */
+let gone = false;
 
 const browsable = computed(() => peers.value.filter((p) => p.connected && p.canManage));
 const unavailable = computed(() => peers.value.filter((p) => !(p.connected && p.canManage)));
@@ -88,8 +92,7 @@ const entries = computed(() => {
   const shown = (listing.value?.entries ?? []).filter((entry) => showHidden.value || !entry.hidden);
   const dir = sortDesc.value ? -1 : 1;
   const foldersFirst = (a: DirEntry, b: DirEntry) => Number(isFolder(b)) - Number(isFolder(a));
-  const byName = (a: DirEntry, b: DirEntry) =>
-    a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true });
+  const byName = (a: DirEntry, b: DirEntry) => collator.compare(a.name, b.name);
   return [...shown].sort((a, b) => {
     switch (sortKey.value) {
       case "name":
@@ -336,10 +339,13 @@ function onKey(event: KeyboardEvent) {
 
 async function loadPeers() {
   try {
+    const before = browsable.value;
     peers.value = await api.listPeers();
     const current = device.value;
     if (current && browsable.value.some((p) => p.name === current)) {
-      await resume();
+      // Only a device that just became browsable is listed again: resuming
+      // on every peer blip would drop a navigation in flight.
+      if (!before.some((p) => p.name === current)) await resume();
     } else {
       const first = browsable.value[0];
       if (first) await choose(first.name);
@@ -354,15 +360,18 @@ onMounted(async () => {
   window.addEventListener("mouseup", onMouse);
   window.addEventListener("keydown", onKey);
   const loads = Promise.all([loadPeers(), loadQuickOpens()]);
-  stopActivity = await listen<ActivityItem>("relay://activity", (event) => {
+  const off = await listen<ActivityItem>("relay://activity", (event) => {
     if (event.payload.kind === "peerConnected" || event.payload.kind === "peerDisconnected") {
       void loadPeers();
     }
   });
+  if (gone) off();
+  else stopActivity = off;
   await loads;
 });
 
 onUnmounted(() => {
+  gone = true;
   window.removeEventListener("mousedown", onMouse);
   window.removeEventListener("mouseup", onMouse);
   window.removeEventListener("keydown", onKey);

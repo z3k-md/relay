@@ -67,6 +67,9 @@ struct Inner {
 pub struct Runner {
     home: PathBuf,
     inner: Mutex<Inner>,
+    /// Held for a whole start or stop. Commands run on worker threads, so
+    /// without it two starts could both find no thread and spawn two loops.
+    lifecycle: Mutex<()>,
 }
 
 impl Runner {
@@ -83,6 +86,7 @@ impl Runner {
                 scans: Vec::new(),
                 published: Vec::new(),
             }),
+            lifecycle: Mutex::new(()),
         }
     }
 
@@ -125,6 +129,11 @@ impl Runner {
     }
 
     pub fn start(&self, app: &AppHandle) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.start_locked(app);
+    }
+
+    fn start_locked(&self, app: &AppHandle) {
         if external_service_running(&self.home) {
             self.set_state(
                 app,
@@ -138,7 +147,7 @@ impl Runner {
             self.set_state(app, RunnerState::NotInitialized);
             return;
         }
-        self.stop_join(app);
+        self.stop_join_locked(app);
         self.set_state(app, RunnerState::Starting);
 
         let home = self.home.clone();
@@ -161,6 +170,11 @@ impl Runner {
     /// no peers or transfers until the next start, so the UI never says
     /// Running while nothing syncs.
     pub fn stop_join(&self, app: &AppHandle) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_join_locked(app);
+    }
+
+    fn stop_join_locked(&self, app: &AppHandle) {
         let handle = self.inner.lock().ok().and_then(|mut g| {
             g.stop.store(true, Ordering::SeqCst);
             g.thread.take()
@@ -180,8 +194,9 @@ impl Runner {
     }
 
     pub fn restart(&self, app: &AppHandle) {
-        self.stop_join(app);
-        self.start(app);
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_join_locked(app);
+        self.start_locked(app);
     }
 
     pub fn pause(&self, _app: &AppHandle) -> anyhow::Result<()> {
@@ -199,11 +214,12 @@ impl Runner {
         }
         let mut engine = relay_engine::Engine::open_for_config(&self.home)?;
         engine.set_paused(false)?;
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         if !matches!(
             self.state(),
             RunnerState::Starting | RunnerState::Running | RunnerState::Paused
         ) {
-            self.start(app);
+            self.start_locked(app);
         }
         Ok(())
     }

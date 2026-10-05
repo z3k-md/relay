@@ -446,11 +446,11 @@ fn is_relay_link(link: &Path, sidecar: &Path) -> bool {
     let Ok(target) = std::fs::read_link(link) else {
         return false;
     };
-    if target == sidecar || !link.exists() {
-        return true;
-    }
     if target.file_name() != sidecar.file_name() {
         return false;
+    }
+    if target == sidecar || !link.exists() {
+        return true;
     }
     let Some(dir) = target.parent() else {
         return false;
@@ -705,7 +705,8 @@ mod tests {
         relink(&dir.join("gone").join("relay"));
         assert!(is_relay_link(&link, &sidecar));
 
-        // Someone else's: a plain file, or a link to a `relay` elsewhere.
+        // Someone else's: a plain file, a link to a `relay` elsewhere, or a
+        // dangling link to something not called `relay`.
         fs::remove_file(&link).unwrap();
         fs::write(&link, b"").unwrap();
         assert!(!is_relay_link(&link, &sidecar));
@@ -713,6 +714,8 @@ mod tests {
         fs::create_dir_all(other.parent().unwrap()).unwrap();
         fs::write(&other, b"").unwrap();
         relink(&other);
+        assert!(!is_relay_link(&link, &sidecar));
+        relink(&dir.join("gone").join("other"));
         assert!(!is_relay_link(&link, &sidecar));
 
         let _ = fs::remove_dir_all(&dir);

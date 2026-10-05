@@ -79,7 +79,7 @@ pub fn refresh(app: &AppHandle) {
         .status
         .set_text(runner::status_line(&state, connected, summary.as_deref()));
     let pause_label = match &state {
-        RunnerState::Paused => "Resume sync",
+        RunnerState::Paused | RunnerState::Stopped => "Resume sync",
         _ => "Pause sync",
     };
     let _ = tray.pause.set_text(pause_label);
@@ -97,7 +97,10 @@ fn toggle_pause(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
-    let result = if matches!(state.runner.state(), RunnerState::Paused) {
+    let result = if matches!(
+        state.runner.state(),
+        RunnerState::Paused | RunnerState::Stopped
+    ) {
         state.runner.resume(app)
     } else {
         state.runner.pause(app)
