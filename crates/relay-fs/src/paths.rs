@@ -69,57 +69,134 @@ fn inspect_normal_component(component: &str) -> Result<(), String> {
 /// first in byte order of the on-disk name (the same survivor the scanner
 /// keeps after a normalization collision).
 ///
+/// On macOS and Windows a direct join also succeeds for a name that differs
+/// only in case, so the on-disk spelling is confirmed; a path that exists
+/// only as `Foo` when `foo` was asked for is `Ok(None)` (see [`Resolved`]).
+///
 /// Intermediate components that are not real directories (including
 /// symlinks) yield `Ok(None)`. Permission and other IO errors are
 /// [`FsError::Io`].
 pub fn resolve_os_path(root: &Path, path: &LogicalPath) -> Result<Option<PathBuf>, FsError> {
+    Ok(match resolve_os_path_detailed(root, path)? {
+        Resolved::Found(os_path) => Some(os_path),
+        Resolved::Missing | Resolved::CaseMismatch(_) => None,
+    })
+}
+
+/// Outcome of [`resolve_os_path_detailed`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// The path exists under this on-disk spelling.
+    Found(PathBuf),
+    /// Nothing on disk matches.
+    Missing,
+    /// On a case-insensitive filesystem the path exists only under a spelling
+    /// that differs from the logical one in case (`Foo` on disk, `foo`
+    /// asked). The logical path itself counts as missing; the payload is the
+    /// on-disk path so the caller can index the real name.
+    CaseMismatch(PathBuf),
+}
+
+/// [`resolve_os_path`] that also reports a case-only spelling difference.
+pub(crate) fn resolve_os_path_detailed(
+    root: &Path,
+    path: &LogicalPath,
+) -> Result<Resolved, FsError> {
     let mut current = root.to_path_buf();
+    let mut case_mismatch = false;
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
         require_normal_component(path, component)?;
         let is_last = components.peek().is_none();
-        let Some(next) = resolve_component(&current, component)? else {
-            return Ok(None);
+        let next = match resolve_component(&current, component)? {
+            ComponentMatch::Found(next) => next,
+            ComponentMatch::Missing => return Ok(Resolved::Missing),
+            ComponentMatch::CaseVariant(next) => {
+                case_mismatch = true;
+                next
+            }
         };
         if !is_last {
             let meta = match fs::symlink_metadata(&next) {
                 Ok(meta) => meta,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Resolved::Missing),
                 Err(err) => return Err(FsError::io(&next, err)),
             };
             if !is_real_directory(&meta) {
-                return Ok(None);
+                return Ok(Resolved::Missing);
             }
         }
         current = next;
     }
-    Ok(Some(current))
+    Ok(if case_mismatch {
+        Resolved::CaseMismatch(current)
+    } else {
+        Resolved::Found(current)
+    })
 }
 
-fn resolve_component(dir: &Path, component: &str) -> Result<Option<PathBuf>, FsError> {
+enum ComponentMatch {
+    Found(PathBuf),
+    Missing,
+    /// Exists only under a spelling that differs in case.
+    CaseVariant(PathBuf),
+}
+
+fn resolve_component(dir: &Path, component: &str) -> Result<ComponentMatch, FsError> {
     let direct = dir.join(component);
     match fs::symlink_metadata(&direct) {
-        Ok(_) => return Ok(Some(direct)),
+        Ok(meta) => {
+            if !CASE_INSENSITIVE_PLATFORM || spelling_confirmed(&direct, &meta, component) {
+                return Ok(ComponentMatch::Found(direct));
+            }
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(FsError::io(&direct, err)),
     }
 
-    let mut matches = nfc_matching_entries(dir, component)?;
-    if matches.is_empty() {
-        return Ok(None);
+    let (matches, case_variants) = matching_entries(dir, component)?;
+    if let Some(first) = first_in_byte_order(matches) {
+        return Ok(ComponentMatch::Found(first));
     }
-    matches.sort_by(|a, b| name_bytes(a).cmp(name_bytes(b)));
-    Ok(matches.into_iter().next())
+    Ok(match first_in_byte_order(case_variants) {
+        Some(variant) => ComponentMatch::CaseVariant(variant),
+        None => ComponentMatch::Missing,
+    })
 }
 
-fn nfc_matching_entries(dir: &Path, component: &str) -> Result<Vec<PathBuf>, FsError> {
+/// macOS and Windows default filesystems match names case-insensitively, so
+/// a direct join there does not prove the spelling.
+const CASE_INSENSITIVE_PLATFORM: bool = cfg!(any(windows, target_os = "macos"));
+
+/// True when the entry `direct` hit is spelled `component` on disk. The
+/// canonical path carries the on-disk name without listing the directory;
+/// links cannot be canonicalized (that names their target), so they are
+/// confirmed by the directory listing instead.
+fn spelling_confirmed(direct: &Path, meta: &fs::Metadata, component: &str) -> bool {
+    if is_symlink_like(meta) {
+        return false;
+    }
+    let Ok(canonical) = fs::canonicalize(direct) else {
+        return false;
+    };
+    canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.nfc().eq(component.chars()))
+}
+
+/// Entries of `dir` whose NFC form equals `component`, and (on
+/// case-insensitive platforms) those that equal it only after case folding.
+fn matching_entries(dir: &Path, component: &str) -> Result<(Vec<PathBuf>, Vec<PathBuf>), FsError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(err) => return Err(FsError::io(dir, err)),
     };
 
+    let folded = CASE_INSENSITIVE_PLATFORM.then(|| component.to_lowercase());
     let mut matches = Vec::new();
+    let mut case_variants = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| FsError::io(dir, err))?;
         let name = entry.file_name();
@@ -129,9 +206,18 @@ fn nfc_matching_entries(dir: &Path, component: &str) -> Result<Vec<PathBuf>, FsE
         let nfc: String = name.nfc().collect();
         if nfc == component {
             matches.push(entry.path());
+        } else if let Some(folded) = &folded
+            && nfc.to_lowercase() == *folded
+        {
+            case_variants.push(entry.path());
         }
     }
-    Ok(matches)
+    Ok((matches, case_variants))
+}
+
+fn first_in_byte_order(mut paths: Vec<PathBuf>) -> Option<PathBuf> {
+    paths.sort_by(|a, b| name_bytes(a).cmp(name_bytes(b)));
+    paths.into_iter().next()
 }
 
 /// Walk from `root` down to `dir`, creating missing directories one component
@@ -350,6 +436,69 @@ mod tests {
         assert_eq!(
             resolve_os_path(root, &logical).unwrap().as_deref(),
             Some(nfc_file.as_path())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_os_path_is_case_sensitive_on_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("Dir")).unwrap();
+        std::fs::write(root.join("Dir/File.txt"), b"x").unwrap();
+        let exact = LogicalPath::new("Dir/File.txt").unwrap();
+        assert_eq!(
+            resolve_os_path_detailed(root, &exact).unwrap(),
+            Resolved::Found(root.join("Dir/File.txt"))
+        );
+        for other in ["dir/File.txt", "Dir/file.txt", "DIR"] {
+            let logical = LogicalPath::new(other).unwrap();
+            assert_eq!(
+                resolve_os_path_detailed(root, &logical).unwrap(),
+                Resolved::Missing,
+                "{other}"
+            );
+            assert_eq!(resolve_os_path(root, &logical).unwrap(), None, "{other}");
+        }
+    }
+
+    /// The direct join finds `Foo` when `foo` is asked for; the on-disk
+    /// spelling is reported and the logical path counts as missing.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn resolve_os_path_reports_case_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("case-probe"), b"").unwrap();
+        if !root.join("CASE-PROBE").exists() {
+            eprintln!("skipping: the temp volume is case-sensitive");
+            return;
+        }
+        std::fs::create_dir(root.join("Dir")).unwrap();
+        std::fs::write(root.join("Dir/File.txt"), b"x").unwrap();
+
+        let exact = LogicalPath::new("Dir/File.txt").unwrap();
+        assert_eq!(
+            resolve_os_path_detailed(root, &exact).unwrap(),
+            Resolved::Found(root.join("Dir/File.txt"))
+        );
+        for (other, on_disk) in [
+            ("dir/File.txt", "Dir/File.txt"),
+            ("Dir/file.txt", "Dir/File.txt"),
+            ("DIR", "Dir"),
+        ] {
+            let logical = LogicalPath::new(other).unwrap();
+            assert_eq!(
+                resolve_os_path_detailed(root, &logical).unwrap(),
+                Resolved::CaseMismatch(root.join(on_disk)),
+                "{other}"
+            );
+            assert_eq!(resolve_os_path(root, &logical).unwrap(), None, "{other}");
+        }
+        let gone = LogicalPath::new("dir/gone.txt").unwrap();
+        assert_eq!(
+            resolve_os_path_detailed(root, &gone).unwrap(),
+            Resolved::Missing
         );
     }
 
