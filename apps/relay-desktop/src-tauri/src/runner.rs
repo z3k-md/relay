@@ -36,6 +36,8 @@ pub enum RunnerState {
     Starting,
     Running,
     Paused,
+    // Stopped on purpose: an update is installing, or the app is quitting.
+    Stopped,
     Error { message: String },
     ExternalService { message: String },
 }
@@ -53,6 +55,9 @@ struct Inner {
     events: VecDeque<ActivityItem>,
     /// Peer id → unix ms when the current session started.
     connected: HashMap<String, i64>,
+    /// Tells the current sync thread to stop. Fresh for every start, so a
+    /// slow old loop never sees its own flag lowered again.
+    stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     transfers: Vec<TransferLive>,
     scans: Vec<TransferLive>,
@@ -61,24 +66,27 @@ struct Inner {
 
 pub struct Runner {
     home: PathBuf,
-    stop: Arc<AtomicBool>,
     inner: Mutex<Inner>,
+    /// Held for a whole start or stop. Commands run on worker threads, so
+    /// without it two starts could both find no thread and spawn two loops.
+    lifecycle: Mutex<()>,
 }
 
 impl Runner {
     pub fn new(home: PathBuf) -> Self {
         Self {
             home,
-            stop: Arc::new(AtomicBool::new(false)),
             inner: Mutex::new(Inner {
                 state: RunnerState::NotInitialized,
                 events: VecDeque::new(),
                 connected: HashMap::new(),
+                stop: Arc::new(AtomicBool::new(false)),
                 thread: None,
                 transfers: Vec::new(),
                 scans: Vec::new(),
                 published: Vec::new(),
             }),
+            lifecycle: Mutex::new(()),
         }
     }
 
@@ -121,6 +129,11 @@ impl Runner {
     }
 
     pub fn start(&self, app: &AppHandle) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.start_locked(app);
+    }
+
+    fn start_locked(&self, app: &AppHandle) {
         if external_service_running(&self.home) {
             self.set_state(
                 app,
@@ -134,12 +147,14 @@ impl Runner {
             self.set_state(app, RunnerState::NotInitialized);
             return;
         }
-        self.stop_join();
-        self.stop.store(false, Ordering::SeqCst);
+        self.stop_join_locked(app);
         self.set_state(app, RunnerState::Starting);
 
         let home = self.home.clone();
-        let stop = Arc::clone(&self.stop);
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.stop = Arc::clone(&stop);
+        }
         let app = app.clone();
         let handle = thread::Builder::new()
             .name("relay-sync".to_owned())
@@ -151,17 +166,37 @@ impl Runner {
         }
     }
 
-    pub fn stop_join(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let handle = self.inner.lock().ok().and_then(|mut g| g.thread.take());
-        if let Some(handle) = handle {
-            join_with_timeout(handle, JOIN_TIMEOUT);
+    /// Stop the sync thread and wait (briefly) for it. Shows as Stopped with
+    /// no peers or transfers until the next start, so the UI never says
+    /// Running while nothing syncs.
+    pub fn stop_join(&self, app: &AppHandle) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_join_locked(app);
+    }
+
+    fn stop_join_locked(&self, app: &AppHandle) {
+        let handle = self.inner.lock().ok().and_then(|mut g| {
+            g.stop.store(true, Ordering::SeqCst);
+            g.thread.take()
+        });
+        let Some(handle) = handle else {
+            return;
+        };
+        join_with_timeout(handle, JOIN_TIMEOUT);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.connected.clear();
+            inner.transfers.clear();
+            inner.scans.clear();
+            inner.published.clear();
         }
+        self.set_state(app, RunnerState::Stopped);
+        let _ = app.emit("relay://transfers", &Vec::<UiTransfer>::new());
     }
 
     pub fn restart(&self, app: &AppHandle) {
-        self.stop_join();
-        self.start(app);
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_join_locked(app);
+        self.start_locked(app);
     }
 
     pub fn pause(&self, _app: &AppHandle) -> anyhow::Result<()> {
@@ -179,11 +214,12 @@ impl Runner {
         }
         let mut engine = relay_engine::Engine::open_for_config(&self.home)?;
         engine.set_paused(false)?;
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         if !matches!(
             self.state(),
             RunnerState::Starting | RunnerState::Running | RunnerState::Paused
         ) {
-            self.start(app);
+            self.start_locked(app);
         }
         Ok(())
     }
@@ -683,6 +719,7 @@ pub fn status_line(state: &RunnerState, connected: usize, summary: Option<&str>)
             }
         }
         RunnerState::Paused => "Relay — Paused".to_owned(),
+        RunnerState::Stopped => "Relay — Stopped".to_owned(),
         RunnerState::Error { .. } => "Relay — Error".to_owned(),
         RunnerState::ExternalService { .. } => "Relay — Syncing via background service".to_owned(),
     }

@@ -4,7 +4,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
-import { api } from "../lib/api";
+import { api, errorText } from "../lib/api";
 import type { ActivityItem, PeerView, SpaceView } from "../lib/types";
 
 const peers = ref<PeerView[]>([]);
@@ -30,7 +30,11 @@ const joinAddr = ref("");
 /** Pairing lets the other device manage this one unless unchecked (D37). */
 const allowManage = ref(true);
 const nowMs = ref(Date.now());
+/** How often the pairing status is asked for while a code is shown. */
+const PAIR_STATUS_MS = 750;
 let statusTimer: number | undefined;
+/** A status check in flight does not ask again once the watch stopped. */
+let watchingPair = false;
 let tickTimer: number | undefined;
 let clockTimer: number | undefined;
 let stopActivity: UnlistenFn | undefined;
@@ -59,7 +63,7 @@ async function load(silent = false) {
     error.value = null;
   } catch (err) {
     if (gen !== loadGen) return;
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     if (gen === loadGen) loading.value = false;
   }
@@ -129,14 +133,38 @@ function sharedLabel(peer: PeerView): string {
 }
 
 function stopPairWatch() {
+  watchingPair = false;
   if (statusTimer !== undefined) {
-    window.clearInterval(statusTimer);
+    window.clearTimeout(statusTimer);
     statusTimer = undefined;
   }
   if (tickTimer !== undefined) {
     window.clearInterval(tickTimer);
     tickTimer = undefined;
   }
+}
+
+/** Ask once, and again after a pause: calls never pile up on a slow host. */
+async function watchPairStatus() {
+  statusTimer = undefined;
+  try {
+    const status = await api.pairStatus();
+    if (status.state === "paired") {
+      pairDone.value = status.peerName;
+      stopPairWatch();
+      await load();
+    } else if (status.state === "failed") {
+      pairFailed.value = status.reason;
+      stopPairWatch();
+    } else if (status.state === "expired") {
+      pairFailed.value = "This code expired. Start a new pairing.";
+      stopPairWatch();
+    }
+  } catch (err) {
+    pairFailed.value = errorText(err);
+    stopPairWatch();
+  }
+  if (watchingPair) statusTimer = window.setTimeout(watchPairStatus, PAIR_STATUS_MS);
 }
 
 async function startPair() {
@@ -153,27 +181,10 @@ async function startPair() {
     tickTimer = window.setInterval(() => {
       pairNow.value = Date.now();
     }, 1000);
-    statusTimer = window.setInterval(async () => {
-      try {
-        const status = await api.pairStatus();
-        if (status.state === "paired") {
-          pairDone.value = status.peerName;
-          stopPairWatch();
-          await load();
-        } else if (status.state === "failed") {
-          pairFailed.value = status.reason;
-          stopPairWatch();
-        } else if (status.state === "expired") {
-          pairFailed.value = "This code expired. Start a new pairing.";
-          stopPairWatch();
-        }
-      } catch (err) {
-        pairFailed.value = err instanceof Error ? err.message : String(err);
-        stopPairWatch();
-      }
-    }, 750);
+    watchingPair = true;
+    statusTimer = window.setTimeout(watchPairStatus, PAIR_STATUS_MS);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
     pairing.value = false;
   } finally {
     busy.value = false;
@@ -209,7 +220,7 @@ async function joinPair() {
     joinAddr.value = "";
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -226,7 +237,7 @@ async function addPeer() {
     address.value = "";
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -239,7 +250,7 @@ async function toggleManage(peer: PeerView) {
     await api.setPeerManage(peer.name, !peer.allowedToManage);
     await load(true);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
@@ -254,7 +265,7 @@ async function removePeer() {
     confirmName.value = null;
     await load();
   } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
+    error.value = errorText(err);
   } finally {
     busy.value = false;
   }
