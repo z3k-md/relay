@@ -43,6 +43,14 @@ somewhere else. Leave the window alone while it runs, because the scroll
 timings need it on screen. The first run creates the benchmark folders,
 which takes a while for 200k files.
 
+An installed Relay can stay running. In benchmark mode the app opens only
+the explorer window and leaves everything else alone: it doesn't hand off
+to the running copy, and it starts no sync engine or tray icon. It also
+writes no settings and doesn't touch autostart, the CLI or updates.
+
+`bun run dev` runs a bash script first. If `bash` on your PATH is the WSL
+stub with no distro installed, put Git Bash first on PATH for that shell.
+
 ### By hand, and the checks that need a person
 
 Run `bun run dev`, open the tray menu and pick **Explorer (preview)**. The

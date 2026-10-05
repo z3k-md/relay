@@ -30,9 +30,15 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The explorer benchmark runs beside an installed Relay without touching
+    // it: no single-instance hand-off, settings, sync engine, tray, autostart,
+    // CLI install or update checks.
+    #[cfg(not(target_os = "android"))]
+    let bench = explorer::autobench_output().is_some();
+
     let mut builder = tauri::Builder::default();
     #[cfg(not(target_os = "android"))]
-    {
+    if !bench {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tray::show_main_window(app);
         }));
@@ -138,22 +144,30 @@ pub fn run() {
             #[cfg(not(target_os = "android"))]
             explorer::explorer_save_results,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let home = app_home(app)?;
-            let _ = std::fs::create_dir_all(home.join("logs"));
+            let runner = Arc::new(Runner::new(home.clone()));
+            app.manage(AppState {
+                home: home.clone(),
+                runner: Arc::clone(&runner),
+            });
 
+            #[cfg(not(target_os = "android"))]
+            if bench {
+                explorer::open_window(app.handle())?;
+                if let Some(main) = app.get_webview_window("main") {
+                    main.destroy()?;
+                }
+                return Ok(());
+            }
+
+            let _ = std::fs::create_dir_all(home.join("logs"));
             if let Err(err) = settings::apply_first_run_defaults(app.handle()) {
                 log::warn!("settings defaults: {err:#}");
             }
             if let Err(err) = settings::migrate_paused_to_db(app.handle(), &home) {
                 log::warn!("paused-flag migration: {err:#}");
             }
-
-            let runner = Arc::new(Runner::new(home.clone()));
-            app.manage(AppState {
-                home,
-                runner: Arc::clone(&runner),
-            });
 
             #[cfg(not(target_os = "android"))]
             {
@@ -165,11 +179,6 @@ pub fn run() {
                     settings::load(app.handle()).start_at_login,
                 );
                 commands::maybe_install_cli(app.handle());
-                if explorer::autobench_output().is_some()
-                    && let Err(err) = explorer::open_window(app.handle())
-                {
-                    log::warn!("explorer window: {err}");
-                }
 
                 if let Some(window) = app.get_webview_window("main") {
                     let window_hide = window.clone();
