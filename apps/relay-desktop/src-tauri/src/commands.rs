@@ -163,7 +163,16 @@ pub fn suggested_device_name() -> String {
             }
         }
     }
-    if let Ok(output) = std::process::Command::new("hostname").output()
+    #[allow(unused_mut)]
+    let mut hostname = std::process::Command::new("hostname");
+    // A console program; hidden so it doesn't flash a terminal on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        hostname.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = hostname.output()
         && output.status.success()
     {
         let value = String::from_utf8_lossy(&output.stdout);

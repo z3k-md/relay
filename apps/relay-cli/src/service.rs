@@ -707,7 +707,16 @@ pub fn status_info(home: &Path) -> Result<ServiceStatus> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn run_os_command(program: &str, args: &[&str]) -> Result<std::process::Output> {
-    std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    // Output is captured, so PowerShell never needs a window of its own; without this
+    // it can show one when the CLI itself was started without a console.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
         .args(args)
         .output()
         .with_context(|| format!("running {program} {}", args.join(" ")))
