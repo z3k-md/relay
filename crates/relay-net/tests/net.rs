@@ -976,3 +976,148 @@ fn connection_test_to_a_device_that_is_not_connected_is_offline() {
     let err = speed_test(&bob, DeviceId::random(), 100).unwrap_err();
     assert_eq!(err.code, RemoteErrorCode::Offline);
 }
+
+/// Takes drops into `inbox`, or refuses them when it is `None`.
+struct Inbox {
+    dir: Option<std::path::PathBuf>,
+    saved: Mutex<Vec<(DeviceId, std::path::PathBuf, u64)>>,
+}
+
+impl ControlHandler for Inbox {
+    fn handle(&self, _peer: DeviceId, _call: RemoteCall) -> RemoteResult {
+        Err(RemoteError::new(RemoteErrorCode::Unsupported, "inbox only"))
+    }
+
+    fn drop_inbox(&self, _peer: DeviceId, _size: u64) -> Result<std::path::PathBuf, RemoteError> {
+        self.dir
+            .clone()
+            .ok_or_else(|| RemoteError::new(RemoteErrorCode::Forbidden, "drops are off"))
+    }
+
+    fn dropped(&self, peer: DeviceId, path: &std::path::Path, size: u64) {
+        self.saved
+            .lock()
+            .unwrap()
+            .push((peer, path.to_path_buf(), size));
+    }
+}
+
+/// Alice takes drops through `inbox`; Bob sends them. No manage grant.
+fn drop_pair(inbox: Option<std::path::PathBuf>) -> (Node, Node, Arc<Inbox>) {
+    let handler = Arc::new(Inbox {
+        dir: inbox,
+        saved: Mutex::new(Vec::new()),
+    });
+    let mut bob = spawn("bob", vec![]);
+    let alice_dir = TempDir::new().unwrap();
+    let alice_identity = Arc::new(DeviceIdentity::generate(alice_dir.path()).unwrap());
+    let mut alice = start_node(
+        "alice",
+        alice_identity,
+        alice_dir,
+        vec![trust(bob.id, "bob", Some(bob.handle.local_addr()))],
+        listen(),
+        None,
+        Some(handler.clone() as Arc<dyn ControlHandler>),
+    );
+    bob.handle
+        .send(NetCommand::SetPeers(vec![trust(alice.id, "alice", None)]));
+    wait_connected(&mut alice.events, bob.id, "bob");
+    wait_connected(&mut bob.events, alice.id, "alice");
+    (alice, bob, handler)
+}
+
+fn send_drop(
+    sender: &Node,
+    peer: DeviceId,
+    path: &std::path::Path,
+    name: Option<&str>,
+) -> Result<relay_core::drops::DropSent, RemoteError> {
+    let (reply, rx) = std::sync::mpsc::channel();
+    sender.handle.send(NetCommand::SendDrop {
+        peer,
+        path: path.to_path_buf(),
+        name: name.map(str::to_owned),
+        reply,
+    });
+    rx.recv_timeout(TIMEOUT).expect("drop reply")
+}
+
+#[test]
+fn a_drop_arrives_verified_under_a_free_name() {
+    let inbox = TempDir::new().unwrap();
+    let (alice, bob, handler) = drop_pair(Some(inbox.path().to_path_buf()));
+    let source = TempDir::new().unwrap();
+    let photo = source.path().join("PXL_1.jpg");
+    let mut bytes = vec![0u8; 300 * 1024];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    std::fs::write(&photo, &bytes).unwrap();
+    let taken = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&photo)
+        .unwrap()
+        .set_modified(taken)
+        .unwrap();
+
+    let first = send_drop(&bob, alice.id, &photo, None).expect("first drop");
+    assert_eq!(first.saved_name, "PXL_1.jpg");
+    assert_eq!(first.size, bytes.len() as u64);
+    let second = send_drop(&bob, alice.id, &photo, None).expect("second drop");
+    assert_eq!(second.saved_name, "PXL_1 (2).jpg");
+    let renamed = send_drop(&bob, alice.id, &photo, Some("../escape.jpg")).expect("renamed");
+    assert_eq!(renamed.saved_name, "escape.jpg");
+
+    for name in ["PXL_1.jpg", "PXL_1 (2).jpg", "escape.jpg"] {
+        let saved = inbox.path().join(name);
+        assert_eq!(std::fs::read(&saved).unwrap(), bytes, "{name}");
+        let modified = std::fs::metadata(&saved).unwrap().modified().unwrap();
+        assert_eq!(modified, taken, "{name} keeps the photo's time");
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(inbox.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().starts_with('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "no partial files: {leftovers:?}");
+    let saved = handler.saved.lock().unwrap();
+    assert_eq!(saved.len(), 3);
+    assert!(
+        saved
+            .iter()
+            .all(|(peer, _, size)| *peer == bob.id && *size == bytes.len() as u64)
+    );
+}
+
+#[test]
+fn a_device_with_drops_off_refuses_them() {
+    let (alice, bob, handler) = drop_pair(None);
+    let source = TempDir::new().unwrap();
+    let file = source.path().join("a.png");
+    std::fs::write(&file, b"png").unwrap();
+    let err = send_drop(&bob, alice.id, &file, None).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Forbidden, "{err}");
+    assert!(handler.saved.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_device_without_a_handler_does_not_take_drops() {
+    // Bob runs with no handler at all; Alice sends to him.
+    let (alice, bob, _handler) = drop_pair(None);
+    let source = TempDir::new().unwrap();
+    let file = source.path().join("a.png");
+    std::fs::write(&file, b"png").unwrap();
+    let err = send_drop(&alice, bob.id, &file, None).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Unsupported, "{err}");
+}
+
+#[test]
+fn dropping_a_folder_or_to_an_offline_device_fails_cleanly() {
+    let bob = spawn("bob", vec![]);
+    let source = TempDir::new().unwrap();
+    let err = send_drop(&bob, DeviceId::random(), source.path(), Some("x")).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Offline, "{err}");
+    let (alice, bob, _handler) = drop_pair(None);
+    let err = send_drop(&bob, alice.id, source.path(), Some("x")).unwrap_err();
+    assert_eq!(err.code, RemoteErrorCode::Invalid, "{err}");
+}

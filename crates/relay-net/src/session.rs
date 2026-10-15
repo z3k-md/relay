@@ -11,8 +11,9 @@ use relay_core::{DeviceId, ObjectId, format_socket_addr, merge_peer_addresses, r
 use relay_crypto::{DeviceIdentity, device_id_from_certificate};
 use relay_proto::frame::Body;
 use relay_proto::{
-    ErrorFrame, FEATURE_CONTROL, FEATURE_SPEED_TEST, Frame, Hello, ObjectHeader, ObjectRequest,
-    PROTOCOL_VERSION, Ping, device_id_from_bytes, encode_frame, object_id_from_bytes,
+    ErrorFrame, FEATURE_CONTROL, FEATURE_DROP, FEATURE_SPEED_TEST, Frame, Hello, ObjectHeader,
+    ObjectRequest, PROTOCOL_VERSION, Ping, device_id_from_bytes, encode_frame,
+    object_id_from_bytes,
 };
 use relay_store::ObjectStore;
 use rustls::pki_types::CertificateDer;
@@ -87,6 +88,8 @@ pub(crate) struct Inner {
     pub speed_tests_in: Arc<Semaphore>,
     /// One connection test run from here at a time.
     pub speed_tests_out: Arc<Semaphore>,
+    /// Drops taken at once (D50).
+    pub drops_in: Arc<Semaphore>,
 }
 
 type EstablishedSession = (
@@ -474,7 +477,7 @@ async fn run_session(
         device_id: inner.our_id.as_bytes().to_vec(),
         device_name: inner.device_name.clone(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
-        features: FEATURE_CONTROL | FEATURE_SPEED_TEST,
+        features: FEATURE_CONTROL | FEATURE_SPEED_TEST | FEATURE_DROP,
     }));
     let hello_bytes = encode_frame(&hello).map_err(|e| e.to_string())?;
 
@@ -732,6 +735,11 @@ async fn serve_object(
     }
     if let Some(test) = req.speed_test {
         return crate::speed::serve(inner, peer, send, recv, test)
+            .await
+            .map_err(|message| ServeErr { message });
+    }
+    if let Some(offer) = req.drop_offer {
+        return crate::drops::serve(inner, peer, send, recv, offer)
             .await
             .map_err(|message| ServeErr { message });
     }
@@ -1295,6 +1303,7 @@ mod tests {
             control: None,
             speed_tests_in: Arc::new(Semaphore::new(1)),
             speed_tests_out: Arc::new(Semaphore::new(1)),
+            drops_in: Arc::new(Semaphore::new(crate::drops::MAX_DROPS_IN)),
         };
         (Arc::new(inner), rx, dir)
     }

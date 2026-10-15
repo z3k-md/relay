@@ -22,8 +22,8 @@ use relay_engine::{
     resolve_conflict, resolve_git_conflicts,
 };
 use relay_ipc::{
-    ActivityItem, Client, FolderEnd, FolderPairParams, IpcError, OpenRemoteParams, PairJoinParams,
-    PairStartParams, PairStatus, SpeedTestParams, Status as DaemonStatus,
+    ActivityItem, Client, DropSendParams, FolderEnd, FolderPairParams, IpcError, OpenRemoteParams,
+    PairJoinParams, PairStartParams, PairStatus, SpeedTestParams, Status as DaemonStatus,
 };
 
 mod output;
@@ -104,6 +104,11 @@ enum Command {
     Server {
         #[command(subcommand)]
         cmd: ServerCmd,
+    },
+    /// Send a file to a connected device, and choose where files sent here go
+    Drop {
+        #[command(subcommand)]
+        cmd: DropCmd,
     },
     /// Durable mailbox for offline catch-up
     Replica {
@@ -342,6 +347,32 @@ enum ReplicaCmd {
         mirror: bool,
         #[arg(long, default_value_t = 3600)]
         grace_secs: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DropCmd {
+    /// Send files to a connected peer. Each lands in its drop folder
+    Send {
+        peer: String,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Name to offer instead of the file name (one file only)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show whether this device takes files and where they go
+    Status,
+    /// Take files that trusted peers send
+    On,
+    /// Refuse files that peers send
+    Off,
+    /// Put received files in DIR, or back in the default folder with --default
+    Inbox {
+        #[arg(required_unless_present = "default", conflicts_with = "default")]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        default: bool,
     },
 }
 
@@ -684,6 +715,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Recovery { cmd } => cmd_recovery(&home, cmd, json),
         Command::Server { cmd } => cmd_server(&home, cmd, json),
+        Command::Drop { cmd } => cmd_drop(&home, cmd, json),
         Command::Replica { cmd } => cmd_replica(&home, cmd, json),
         Command::Transport { cmd } => cmd_transport(&home, cmd, json),
         Command::Group { cmd } => cmd_group(&home, cmd, json),
@@ -1905,6 +1937,80 @@ fn print_transport(status: &TransportStatus, json: bool) -> Result<()> {
         None => println!("mailbox not set"),
     }
     Ok(())
+}
+
+fn cmd_drop(home: &Path, cmd: DropCmd, json: bool) -> Result<ExitCode> {
+    let settings = match cmd {
+        DropCmd::Send { peer, files, name } => return drop_send(home, &peer, files, name, json),
+        DropCmd::Status => Engine::open_read_only(home)?.drop_settings()?,
+        DropCmd::On => Engine::open_for_config(home)?.set_drops_receive(true)?,
+        DropCmd::Off => Engine::open_for_config(home)?.set_drops_receive(false)?,
+        DropCmd::Inbox { dir, default } => {
+            let dir = if default { None } else { dir };
+            Engine::open_for_config(home)?.set_drop_inbox(dir.as_deref())?
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&settings)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("receive {}", if settings.receive { "on" } else { "off" });
+    match &settings.inbox {
+        Some(inbox) if settings.inbox_set => println!("inbox {}", inbox.display()),
+        Some(inbox) => println!("inbox {} (default)", inbox.display()),
+        None => println!("inbox not set"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn drop_send(
+    home: &Path,
+    peer: &str,
+    files: Vec<PathBuf>,
+    name: Option<String>,
+    json: bool,
+) -> Result<ExitCode> {
+    if name.is_some() && files.len() > 1 {
+        bail!("--name works with a single file");
+    }
+    let mut client = running_host(home)?;
+    let mut sent = Vec::new();
+    let mut failed = false;
+    for file in files {
+        // The host may run in another folder, so it gets an absolute path.
+        let path = std::path::absolute(&file)?;
+        let params = DropSendParams {
+            peer: peer.to_owned(),
+            path,
+            name: name.clone(),
+        };
+        match client.drop_send(&params) {
+            Ok(done) => {
+                if !json {
+                    println!(
+                        "{} -> {peer} {} ({}, {:.1} s)",
+                        file.display(),
+                        done.saved_name,
+                        human_bytes(done.size),
+                        done.elapsed_ms as f64 / 1000.0,
+                    );
+                }
+                sent.push(serde_json::json!({ "file": file, "sent": done }));
+            }
+            Err(err) => {
+                failed = true;
+                eprintln!("{}: {err}", file.display());
+            }
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sent)?);
+    }
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn cmd_server(home: &Path, cmd: ServerCmd, json: bool) -> Result<ExitCode> {

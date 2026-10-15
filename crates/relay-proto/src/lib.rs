@@ -389,6 +389,43 @@ pub struct ObjectRequest {
     /// [`ObjectHeader`] first. Sent only to peers with [`FEATURE_SPEED_TEST`].
     #[prost(message, optional, tag = "4")]
     pub speed_test: Option<SpeedTestRequest>,
+    /// Set to push one file to the answering device (D50). Answered with an
+    /// [`ObjectHeader`]; after acceptance the requester writes the bytes and
+    /// the answering device ends with a [`DropDone`]. Sent only to peers
+    /// with [`FEATURE_DROP`].
+    #[prost(message, optional, tag = "5")]
+    pub drop_offer: Option<DropOffer>,
+}
+
+/// `Hello.features` bit: this device takes [`DropOffer`]s (D50).
+pub const FEATURE_DROP: u64 = 4;
+
+/// One file the requester wants to push (D50).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DropOffer {
+    /// A suggestion; the answering device cleans it and may number it.
+    #[prost(string, tag = "1")]
+    pub name: String,
+    /// Exactly this many bytes follow acceptance.
+    #[prost(uint64, tag = "2")]
+    pub size: u64,
+    /// BLAKE3 of the bytes. The answering device keeps nothing that differs.
+    #[prost(bytes = "vec", tag = "3")]
+    pub blake3: Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub mime: String,
+    /// When the file was made, for the saved copy's modified time.
+    #[prost(int64, optional, tag = "5")]
+    pub taken_ms: Option<i64>,
+}
+
+/// The answering device's last word on a drop: saved, or why not.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DropDone {
+    #[prost(string, tag = "1")]
+    pub saved_name: String,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<control::WireRemoteError>,
 }
 
 /// `Hello.features` bit: this device answers [`SpeedTestRequest`]s (D48).

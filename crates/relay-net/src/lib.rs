@@ -11,6 +11,7 @@
 mod addr;
 mod control;
 mod discovery;
+mod drops;
 mod error;
 mod io;
 mod pairing;
@@ -29,6 +30,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use quinn::AsyncUdpSocket;
+use relay_core::drops::DropSent;
 use relay_core::remote::{CopiedFile, RemoteCall, RemoteError, RemoteResult};
 use relay_core::speed::SpeedReport;
 use relay_core::{DeviceId, ObjectId};
@@ -197,6 +199,14 @@ pub enum NetCommand {
         duration_ms: u32,
         reply: std::sync::mpsc::Sender<Result<SpeedReport, RemoteError>>,
     },
+    /// Push the file at `path` to a connected peer's inbox (D50), offered
+    /// as `name`, or its own file name when `None`.
+    SendDrop {
+        peer: DeviceId,
+        path: PathBuf,
+        name: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<DropSent, RemoteError>>,
+    },
     Shutdown,
 }
 
@@ -327,6 +337,7 @@ pub fn start(
         control: config.control,
         speed_tests_in: Arc::new(tokio::sync::Semaphore::new(1)),
         speed_tests_out: Arc::new(tokio::sync::Semaphore::new(1)),
+        drops_in: Arc::new(tokio::sync::Semaphore::new(drops::MAX_DROPS_IN)),
     });
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -502,6 +513,12 @@ async fn run(
                         let inner = inner.clone();
                         tokio::spawn(async move {
                             let _ = reply.send(speed::run(inner, peer, duration_ms).await);
+                        });
+                    }
+                    Some(NetCommand::SendDrop { peer, path, name, reply }) => {
+                        let inner = inner.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(drops::send(inner, peer, path, name).await);
                         });
                     }
                     Some(NetCommand::Control { peer, call, reply }) => {

@@ -3,6 +3,7 @@
 mod apply;
 mod clock;
 mod config;
+mod drops;
 mod error;
 mod files;
 mod live_config;
@@ -36,6 +37,7 @@ use relay_policy::MountRules;
 use relay_store::StoreError;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use drops::{DropSettings, default_drop_inbox};
 pub use error::EngineError;
 pub use files::{CopyState, FileRow, FolderView};
 pub use materialize::{MaterializationInfo, MaterializationMode};

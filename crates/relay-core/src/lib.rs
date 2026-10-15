@@ -6,6 +6,7 @@
 pub mod addr;
 pub mod config;
 pub mod conflict;
+pub mod drops;
 pub mod entry;
 pub mod error;
 pub mod faults;
