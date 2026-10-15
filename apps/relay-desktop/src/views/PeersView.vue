@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
@@ -21,6 +22,29 @@ const address = ref("");
 const confirmName = ref<string | null>(null);
 /** Peer whose connection test is open. */
 const testing = ref<string | null>(null);
+/** Peer a file is being sent to (D50). */
+const sending = ref<string | null>(null);
+const sent = ref<string | null>(null);
+
+async function sendFile(peer: string) {
+  const selected = await openDialog({ multiple: true, title: `Send to ${peer}` });
+  const paths = typeof selected === "string" ? [selected] : (selected ?? []);
+  if (paths.length === 0) return;
+  sending.value = peer;
+  error.value = null;
+  sent.value = null;
+  try {
+    const names: string[] = [];
+    for (const path of paths) {
+      names.push((await api.dropSend(peer, path)).saved_name);
+    }
+    sent.value = `Sent ${names.join(", ")} to ${peer}.`;
+  } catch (err) {
+    error.value = errorText(err);
+  } finally {
+    sending.value = null;
+  }
+}
 const busy = ref(false);
 const share = ref<string[]>([]);
 const pairCode = ref("");
@@ -330,6 +354,7 @@ defineExpose({ load });
       </div>
     </div>
     <ErrorBanner :message="error" />
+    <p v-if="sent" class="mb-2 text-[13px] text-[var(--color-ok)]">{{ sent }}</p>
     <p v-if="loading" class="text-[var(--color-muted)]">Loading peers…</p>
     <EmptyState
       v-else-if="peers.length === 0"
@@ -406,6 +431,16 @@ defineExpose({ load });
             @click="testing = peer.name"
           >
             Test connection
+          </button>
+          <button
+            v-if="peer.connected"
+            type="button"
+            class="text-[var(--color-accent)] disabled:opacity-50"
+            title="Send a file to this device's drop folder"
+            :disabled="sending === peer.name"
+            @click="sendFile(peer.name)"
+          >
+            {{ sending === peer.name ? "Sending…" : "Send file…" }}
           </button>
           <button
             type="button"

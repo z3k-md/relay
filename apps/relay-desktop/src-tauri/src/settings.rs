@@ -7,6 +7,7 @@ const KEY_START_AT_LOGIN: &str = "start_at_login";
 const KEY_AUTO_UPDATE: &str = "auto_update";
 const KEY_PAUSED: &str = "paused";
 const KEY_DEFAULTS_APPLIED: &str = "defaults_applied";
+const KEY_DROP_AUTO_COPY: &str = "drop_auto_copy";
 #[cfg(not(target_os = "android"))]
 const KEY_CLI_INSTALL_ATTEMPTED: &str = "cli_install_attempted";
 
@@ -106,4 +107,14 @@ pub fn set_start_at_login(app: &AppHandle, value: bool) -> anyhow::Result<()> {
 
 pub fn set_auto_update(app: &AppHandle, value: bool) -> anyhow::Result<()> {
     set_bool(app, KEY_AUTO_UPDATE, value)
+}
+
+/// Copy every file another device drops here to the clipboard as it
+/// arrives (D50). Off by default.
+pub fn drop_auto_copy(app: &AppHandle) -> bool {
+    get_bool(app, KEY_DROP_AUTO_COPY, false)
+}
+
+pub fn set_drop_auto_copy(app: &AppHandle, value: bool) -> anyhow::Result<()> {
+    set_bool(app, KEY_DROP_AUTO_COPY, value)
 }

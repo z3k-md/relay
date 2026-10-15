@@ -1,7 +1,7 @@
 # Send a photo to a computer
 
-**Status:** Stage 1 (drops, D50) in review. Stage 2 next. The phone stages
-need Android stage 2 (PR #19).
+**Status:** Stages 1 (drops, D50) and 2 (desktop popup) in review. The phone
+stages need Android stage 2 (PR #19).
 
 Take a photo on the phone, tap **Send to Desk** in the notification that
 appears, and a few seconds later the photo pops up on the computer, ready
@@ -83,9 +83,6 @@ The wire, who may drop, the inbox, and the activity item are D50.
   and the file itself (`CF_HDROP`, a file URL) on the clipboard, so it pastes
   into chat apps and file managers alike. This goes through a maintained
   safe wrapper (D43).
-- The system notification (`tauri-plugin-notification`) has no drag-out
-  and no buttons on Windows. It is only the fallback when the popup cannot
-  show.
 - A setting copies every arriving drop to the clipboard automatically.
 
 ## Stages

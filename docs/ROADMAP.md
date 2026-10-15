@@ -39,9 +39,9 @@ Not in a fixed order.
   graphs, `relay bench`, and history follow.
 - **Send a photo to a computer** ([proposal](proposals/photo-drop.md)).
   Tap Send to Desk in the notification after taking a photo, and it pops
-  up on the computer ready to copy or drag. Stage 1, drops (D50), is in
-  review: `relay drop send` and an inbox folder. Next the desktop popup,
-  then the phone side on top of Android stage 2.
+  up on the computer ready to copy or drag. Drops (D50) and the
+  desktop popup are in review. Next the phone side, on top of Android
+  stage 2.
 - **Integrations.** Editor sync status, conflict notifications, restore from
   the app, and post-sync automation. These stay above the engine.
 

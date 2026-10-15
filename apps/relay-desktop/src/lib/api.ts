@@ -10,6 +10,9 @@ import type {
   PairStatus,
   GitResolveReport,
   DeleteHold,
+  DropArrival,
+  DropSent,
+  DropSettings,
   FolderPairParams,
   FolderPairPlan,
   FolderPairResult,
@@ -93,6 +96,16 @@ export const api = {
   remoteCall,
   /** About ten seconds: download, then upload (D48). */
   speedTest: (peer: string) => remoteInvoke<SpeedReport>("speed_test", { peer }),
+  /** Send one file to a connected peer; resolves once it is saved there (D50). */
+  dropSend: (peer: string, path: string) => remoteInvoke<DropSent>("drop_send", { peer, path }),
+  dropTake: () => call<DropArrival[]>("drop_take"),
+  dropCopy: (path: string) => call<void>("drop_copy", { path }),
+  dropOpen: (path: string) => call<void>("drop_open", { path }),
+  dropReveal: (path: string) => call<void>("drop_reveal", { path }),
+  dropDrag: (path: string) => call<void>("drop_drag", { path }),
+  getDropSettings: () => call<DropSettings>("get_drop_settings"),
+  setDropSettings: (patch: { receive?: boolean; inbox?: string; autoCopy?: boolean }) =>
+    call<DropSettings>("set_drop_settings", { patch }),
   pairStart: (share: string[], allowManage: boolean) =>
     call<PairStartResult>("pair_start", { share, allowManage }),
   pairStatus: () => call<PairStatus>("pair_status"),

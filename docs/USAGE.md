@@ -168,6 +168,8 @@ relay drop off
 
 A home server takes no files until `relay drop on`.
 
+The desktop app shows each arriving file in a small popup in the corner: drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. Settings has the same switch and folder, plus an option to copy every arrival automatically. Peers has **Send file…** for each connected device.
+
 ## Commands
 
 | Command | What it does |

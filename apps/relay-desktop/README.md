@@ -28,7 +28,7 @@ macOS produces an ad-hoc signed `.app` and `.dmg`. Windows produces a per-user N
 | What | Where |
 | --- | --- |
 | Device database, object store, logs | `RELAY_HOME` if set, otherwise the platform data directory. Same as the CLI. See [Using Relay](../../docs/USAGE.md). |
-| App settings (start at login, auto-update, pause) | Tauri store `settings.json` in the app config directory |
+| App settings (start at login, auto-update, pause, copy drops on arrival) | Tauri store `settings.json` in the app config directory |
 | Logs | `<home>/logs`. Settings has **Open logs folder**. |
 
 If `relay service` is already running, the app does not start a second sync loop. `relay service uninstall` switches the machine to in-app sync.
