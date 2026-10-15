@@ -70,3 +70,62 @@ pub extern "system" fn Java_dev_relay_desktop_RelayNative_status<'local>(
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
+
+/// How long a send from the phone waits for sync to start and the computer
+/// to connect.
+const DROP_CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(25);
+
+fn java_string(env: &mut JNIEnv, value: &JString) -> Option<String> {
+    env.get_string(value).ok().map(String::from)
+}
+
+/// `RelayNative.dropSend(home, peer, path)`: start sync if needed and send
+/// one file to `peer` (D50). Blocks; call it off the main thread. Returns
+/// null once the computer saved the file, otherwise why it failed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_relay_desktop_RelayNative_dropSend<'local>(
+    mut env: JNIEnv<'local>,
+    _this: JObject<'local>,
+    home: JString<'local>,
+    peer: JString<'local>,
+    path: JString<'local>,
+) -> jstring {
+    let (Some(home), Some(peer), Some(path)) = (
+        java_string(&mut env, &home),
+        java_string(&mut env, &peer),
+        java_string(&mut env, &path),
+    ) else {
+        return env
+            .new_string("bad arguments")
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    };
+    let home = PathBuf::from(home);
+    runner(home.clone()).ensure_running();
+    match crate::drops::send_when_connected(&home, &peer, PathBuf::from(path), DROP_CONNECT_WAIT) {
+        Ok(sent) => {
+            log::info!("dropped {} on {peer}", sent.saved_name);
+            std::ptr::null_mut()
+        }
+        Err(err) => env
+            .new_string(err)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+/// `RelayNative.peers(home)`: paired devices a photo can go to, one name
+/// per line.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_relay_desktop_RelayNative_peers<'local>(
+    mut env: JNIEnv<'local>,
+    _this: JObject<'local>,
+    home: JString<'local>,
+) -> jstring {
+    let names = java_string(&mut env, &home)
+        .and_then(|home| crate::drops::peer_names(std::path::Path::new(&home)).ok())
+        .unwrap_or_default();
+    env.new_string(names.join("\n"))
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
