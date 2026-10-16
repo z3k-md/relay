@@ -1029,7 +1029,7 @@ fn dunce_like(path: &Path) -> String {
     canonical(path).to_str().unwrap().to_owned()
 }
 
-/// Remote explorer Stage 3: bob, allowed to manage alice, pairs folders in
+/// D39: bob, allowed to manage alice, pairs folders in
 /// both directions from bob alone, and a failed setup leaves nothing behind.
 #[test]
 fn manager_sets_up_folder_pairs_both_ways() {
@@ -1143,7 +1143,7 @@ fn manager_sets_up_folder_pairs_both_ways() {
     stop_daemon(session_b);
 }
 
-/// Remote explorer Stage 4: bob opens alice's files whether or not they sync
+/// D40: bob opens alice's files whether or not they sync
 /// anywhere, and removing a quick-open undoes only what it set up.
 #[test]
 fn open_remote_files_and_remove_quick_opens() {

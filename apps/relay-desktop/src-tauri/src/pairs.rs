@@ -1,5 +1,5 @@
-//! Folder pairs set up from this device (remote explorer Stage 3), and files
-//! opened from other devices (Stage 4). The host does the work; these pass
+//! Folder pairs set up from this device (D39), and files
+//! opened from other devices (D40). The host does the work; these pass
 //! the request through.
 
 use relay_ipc::{FolderPairParams, FolderPairPlan, FolderPairResult, OpenRemoteParams, QuickOpen};

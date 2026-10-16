@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use interprocess::local_socket::{Stream, prelude::*};
 use relay_core::remote::{RemoteCall, RemoteReply};
+use relay_core::speed::SpeedReport;
 use relay_core::{ConfigApplied, ConfigChange};
 
 use crate::IpcError;
@@ -14,7 +15,7 @@ use crate::protocol::{
     ActivityItem, EvictResult, FetchParams, FolderPairParams, FolderPairPlan, FolderPairResult,
     Hello, OpenRemoteParams, OpenedRemote, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
     PairStartParams, PairStartResult, PairStatus, QuickOpen, RemoteParams, Request, RescanParams,
-    RescanResult, Response, Status, decode_line, encode_line,
+    RescanResult, Response, SpeedTestParams, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -185,6 +186,14 @@ impl Client {
         };
         self.call(
             "remote",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    /// Measure the link to a connected peer (D48). Blocks for the test.
+    pub fn speed_test(&mut self, params: &SpeedTestParams) -> Result<SpeedReport, IpcError> {
+        self.call(
+            "speed_test",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
     }

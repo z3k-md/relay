@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onActivated, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import { api, formatTime } from "../lib/api";
@@ -9,8 +9,11 @@ const items = ref<ActivityItem[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
 
+let loaded = false;
+
+/** The placeholder shows only until the first load; later loads refresh in place. */
 async function load() {
-  loading.value = true;
+  if (!loaded) loading.value = true;
   error.value = null;
   try {
     items.value = await api.getActivity();
@@ -18,6 +21,7 @@ async function load() {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
     loading.value = false;
+    loaded = true;
   }
 }
 
@@ -25,7 +29,7 @@ function prepend(item: ActivityItem) {
   items.value = [item, ...items.value.filter((x) => x.tsMs !== item.tsMs || x.message !== item.message)].slice(0, 300);
 }
 
-onMounted(load);
+onActivated(load);
 defineExpose({ load, prepend });
 </script>
 

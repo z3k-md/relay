@@ -16,6 +16,7 @@ mod io;
 mod pairing;
 mod relay;
 mod session;
+mod speed;
 mod stun;
 mod tls;
 
@@ -29,6 +30,7 @@ use std::time::{Duration, SystemTime};
 
 use quinn::AsyncUdpSocket;
 use relay_core::remote::{CopiedFile, RemoteCall, RemoteError, RemoteResult};
+use relay_core::speed::SpeedReport;
 use relay_core::{DeviceId, ObjectId};
 use relay_crypto::DeviceIdentity;
 use relay_proto::encode_frame;
@@ -188,6 +190,13 @@ pub enum NetCommand {
         dest: PathBuf,
         reply: std::sync::mpsc::Sender<Result<CopiedFile, RemoteError>>,
     },
+    /// Measure the link to a connected peer: `duration_ms` receiving, then
+    /// the same sending (D48). Clamped to `SPEED_TEST_MAX_MS` each way.
+    SpeedTest {
+        peer: DeviceId,
+        duration_ms: u32,
+        reply: std::sync::mpsc::Sender<Result<SpeedReport, RemoteError>>,
+    },
     Shutdown,
 }
 
@@ -316,6 +325,8 @@ pub fn start(
         discovered: Mutex::new(HashMap::new()),
         discovery: Mutex::new(None),
         control: config.control,
+        speed_tests_in: Arc::new(tokio::sync::Semaphore::new(1)),
+        speed_tests_out: Arc::new(tokio::sync::Semaphore::new(1)),
     });
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -485,6 +496,12 @@ async fn run(
                         tokio::spawn(async move {
                             let copied = control::read_file(inner, peer, path, max_bytes, dest).await;
                             let _ = reply.send(copied);
+                        });
+                    }
+                    Some(NetCommand::SpeedTest { peer, duration_ms, reply }) => {
+                        let inner = inner.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(speed::run(inner, peer, duration_ms).await);
                         });
                     }
                     Some(NetCommand::Control { peer, call, reply }) => {

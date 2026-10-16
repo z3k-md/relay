@@ -17,9 +17,7 @@ fn parse_hex32(value: &str) -> Result<[u8; 32], CoreError> {
 
 /// Long-lived device identity.
 ///
-/// Phase 2 derives this from the device's Ed25519 public key. Until then it is
-/// 32 random bytes generated on first launch; nothing leaves the machine, so
-/// the switch does not need a migration of shared state.
+/// The raw 32-byte Ed25519 public key of the device (D14).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DeviceId(#[serde(with = "hex_32")] [u8; 32]);
 

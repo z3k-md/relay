@@ -1,5 +1,4 @@
-//! Open a file on a paired device that this one does not sync (remote
-//! explorer Stage 4).
+//! Open a file on a paired device that this one does not sync (D40).
 //!
 //! The file's folder becomes an online-only folder here, so the file opens
 //! like any synced file and edits flow back. Three cases, by where the file

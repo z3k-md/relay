@@ -1763,17 +1763,38 @@ impl<'a> Simulator<'a> {
     }
 
     fn check_converged(&mut self) -> Result<(), Failure> {
-        let trees: Vec<Tree> = self
-            .nodes
-            .iter()
-            .map(|n| tree::snapshot(&n.mount))
-            .collect();
+        // A server keeps files in its object store, not its folder (D47):
+        // its folder must stay empty, and its tree is read from the store.
+        let mut trees = Vec::with_capacity(self.nodes.len());
+        for node in 0..self.nodes.len() {
+            let disk = tree::snapshot(&self.nodes[node].mount);
+            if !self.nodes[node].server {
+                trees.push(disk);
+                continue;
+            }
+            if !disk.is_empty() {
+                return Err(self.fail(format!(
+                    "{}: store mode wrote to its folder:\n{}",
+                    self.nodes[node].name,
+                    tree::describe(&disk)
+                )));
+            }
+            trees.push(self.stored_tree(node)?);
+        }
         for (i, tree) in trees.iter().enumerate().skip(1) {
             if *tree != trees[0] {
                 let a = tree::describe(&trees[0]);
                 let b = tree::describe(tree);
+                // Index rows and history of the first path that differs.
+                let first = trees[0]
+                    .iter()
+                    .find(|(path, node)| tree.get(*path) != Some(*node))
+                    .or_else(|| tree.iter().find(|(path, _)| !trees[0].contains_key(*path)))
+                    .map(|(path, _)| path.clone())
+                    .unwrap_or_default();
+                let detail = self.describe_path(&first);
                 return Err(self.fail(format!(
-                    "trees differ after quiesce\n--- {}:\n{a}\n--- {}:\n{b}",
+                    "trees differ after quiesce\n--- {}:\n{a}\n--- {}:\n{b}\n{detail}",
                     self.nodes[0].name, self.nodes[i].name
                 )));
             }
@@ -1810,7 +1831,9 @@ impl<'a> Simulator<'a> {
             }
         }
         for (node, tree) in trees.iter().enumerate() {
-            self.check_index_matches_disk(node, tree)?;
+            if !self.nodes[node].server {
+                self.check_index_matches_disk(node, tree)?;
+            }
             let report = self.nodes[node]
                 .engine
                 .as_ref()
@@ -1888,6 +1911,35 @@ impl<'a> Simulator<'a> {
             }
         }
         out
+    }
+
+    /// A server's live index rows with file bytes read from its store. A
+    /// row whose object is missing fails: that file is not backed up.
+    fn stored_tree(&self, node: usize) -> Result<Tree, Failure> {
+        let engine = self.nodes[node].engine.as_ref().expect("up");
+        let entries = engine
+            .entries(SPACE, MOUNT, false)
+            .map_err(|e| self.fail(format!("entries: {e}")))?;
+        let mut out = Tree::new();
+        for entry in entries {
+            let path = entry.key.path.to_string();
+            match &entry.content {
+                EntryContent::File { object, .. } => {
+                    let bytes = engine.store().read(object).map_err(|e| {
+                        self.fail(format!(
+                            "{}: {path} is indexed but its object is not stored: {e}",
+                            self.nodes[node].name
+                        ))
+                    })?;
+                    out.insert(path, TreeNode::File(bytes));
+                }
+                EntryContent::Directory => {
+                    out.insert(path, TreeNode::Dir);
+                }
+                EntryContent::Symlink { .. } | EntryContent::Deleted => {}
+            }
+        }
+        Ok(out)
     }
 
     fn check_index_matches_disk(&self, node: usize, tree: &Tree) -> Result<(), Failure> {

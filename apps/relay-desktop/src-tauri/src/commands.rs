@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use relay_core::remote::{RemoteCall, RemoteError, RemoteErrorCode, RemoteReply};
+use relay_core::speed::SpeedReport;
 use relay_core::{ConfigApplied, ConfigChange, DeviceId};
 use relay_engine::{
     ConflictClass, DeleteHoldDecision, Engine, EngineError, Resolution,
@@ -20,7 +21,7 @@ use crate::sidecar::{self, CliInstallResult, CliStatus, ShellKind};
 #[cfg(not(target_os = "android"))]
 use crate::updates::{self, UpdateInfo};
 use crate::{AppState, settings};
-use relay_ipc::{Client, PairJoinParams, PairStartParams, PeerLive};
+use relay_ipc::{Client, PairJoinParams, PairStartParams, PeerLive, SpeedTestParams};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,7 +163,16 @@ pub fn suggested_device_name() -> String {
             }
         }
     }
-    if let Ok(output) = std::process::Command::new("hostname").output()
+    #[allow(unused_mut)]
+    let mut hostname = std::process::Command::new("hostname");
+    // A console program; hidden so it doesn't flash a terminal on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        hostname.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = hostname.output()
         && output.status.success()
     {
         let value = String::from_utf8_lossy(&output.stdout);
@@ -321,6 +331,28 @@ pub fn remote_call(
         )
     })?;
     client.remote(&peer, &call).map_err(|err| match err {
+        relay_ipc::IpcError::Remote { code, message } => {
+            RemoteError::new(RemoteErrorCode::parse(&code), message)
+        }
+        other => RemoteError::new(RemoteErrorCode::Failed, error_chain(&other)),
+    })
+}
+
+/// Measure the connection to a connected peer (D48). Blocks for the test,
+/// about ten seconds.
+#[tauri::command(async)]
+pub fn speed_test(app: AppHandle, peer: String) -> Result<SpeedReport, RemoteError> {
+    let mut client = host_client(&app).ok().flatten().ok_or_else(|| {
+        RemoteError::new(
+            RemoteErrorCode::Failed,
+            "Relay is not running on this computer. Resume sync and try again.",
+        )
+    })?;
+    let params = SpeedTestParams {
+        peer,
+        duration_ms: None,
+    };
+    client.speed_test(&params).map_err(|err| match err {
         relay_ipc::IpcError::Remote { code, message } => {
             RemoteError::new(RemoteErrorCode::parse(&code), message)
         }
@@ -491,20 +523,20 @@ pub fn list_spaces(app: AppHandle) -> Result<Vec<SpaceView>, String> {
     let engine = open_ro(&state.home)?;
     let spaces = engine.spaces().map_err(|err| error_chain(&err))?;
     let mounts = engine.mounts(None).map_err(|err| error_chain(&err))?;
-    let status = engine.status().map_err(|err| error_chain(&err))?;
+    // Not `engine.status()`: its entry counts and object store walk grow
+    // with the files synced, and this runs on every visit to Spaces/Peers.
+    let health = engine.mount_health().map_err(|err| error_chain(&err))?;
+    let peer_shares = engine.peer_shares().map_err(|err| error_chain(&err))?;
 
     let mut shared: HashMap<String, Vec<String>> = HashMap::new();
-    for peer in status.peers {
-        for space in peer.spaces {
-            shared
-                .entry(space.space)
-                .or_default()
-                .push(peer.name.clone());
+    for (peer, spaces) in peer_shares {
+        for space in spaces {
+            shared.entry(space).or_default().push(peer.clone());
         }
     }
 
     let mut mount_state: HashMap<(String, String), (Option<String>, String, bool)> = HashMap::new();
-    for m in status.mounts {
+    for m in health {
         mount_state.insert(
             (m.space, m.mount),
             (
@@ -872,6 +904,12 @@ pub async fn install_update(app: AppHandle) -> Result<UpdateInfo, String> {
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
+pub fn releases_url() -> Option<String> {
+    updates::releases_page()
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
 pub fn restart_app(app: AppHandle) {
     updates::restart_now(&app);
 }
@@ -930,6 +968,12 @@ pub fn pending_update() -> Option<UpdateAvailable> {
 #[tauri::command]
 pub async fn install_update() -> Result<UpdateInfo, String> {
     Err("Updates are not available on Android.".to_owned())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn releases_url() -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "android")]

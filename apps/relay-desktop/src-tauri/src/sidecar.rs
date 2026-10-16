@@ -23,9 +23,24 @@ struct ServiceStatusJson {
     running: Option<bool>,
 }
 
+/// A command for the bundled CLI that never shows a console window. The desktop app is a
+/// GUI program, so on Windows each console child would otherwise flash a terminal, which
+/// at login happened once per sync retry.
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 pub fn service_is_running(home: &Path) -> bool {
     let bin = sidecar_path();
-    let output = Command::new(&bin)
+    let output = hidden_command(&bin)
         .arg("--home")
         .arg(home)
         .args(["service", "status", "--json"])

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
+import SpeedTestDialog from "../components/SpeedTestDialog.vue";
 import { api, errorText } from "../lib/api";
 import type { ActivityItem, PeerView, SpaceView } from "../lib/types";
 
@@ -18,6 +19,8 @@ const name = ref("");
 const deviceId = ref("");
 const address = ref("");
 const confirmName = ref<string | null>(null);
+/** Peer whose connection test is open. */
+const testing = ref<string | null>(null);
 const busy = ref(false);
 const share = ref<string[]>([]);
 const pairCode = ref("");
@@ -271,21 +274,32 @@ async function removePeer() {
   }
 }
 
+let loaded = false;
+
 onMounted(async () => {
-  nowMs.value = Date.now();
-  clockTimer = window.setInterval(() => {
-    nowMs.value = Date.now();
-  }, 1000);
   stopActivity = await listen<ActivityItem>("relay://activity", (event) => {
     if (event.payload.kind === "peerConnected" || event.payload.kind === "peerDisconnected") {
       void load(true);
     }
   });
-  await load();
+});
+// Kept alive across tab switches: a revisit refreshes in place, and the
+// "online for" clock only ticks while the page shows.
+onActivated(async () => {
+  nowMs.value = Date.now();
+  clockTimer = window.setInterval(() => {
+    nowMs.value = Date.now();
+  }, 1000);
+  const silent = loaded;
+  loaded = true;
+  await load(silent);
+});
+onDeactivated(() => {
+  if (clockTimer !== undefined) window.clearInterval(clockTimer);
+  clockTimer = undefined;
 });
 onUnmounted(() => {
   stopPairWatch();
-  if (clockTimer !== undefined) window.clearInterval(clockTimer);
   stopActivity?.();
   if (pairCode.value && !pairDone.value) {
     api.pairCancel().catch(() => {});
@@ -383,13 +397,24 @@ defineExpose({ load });
             You can browse {{ peer.name }} from Browse.
           </p>
         </div>
-        <button
-          type="button"
-          class="mt-0.5 shrink-0 text-[var(--color-danger)]"
-          @click="confirmName = peer.name"
-        >
-          Remove
-        </button>
+        <div class="mt-0.5 flex shrink-0 flex-col items-end gap-1">
+          <button
+            v-if="peer.connected"
+            type="button"
+            class="text-[var(--color-accent)]"
+            title="Measure download and upload speed to this device"
+            @click="testing = peer.name"
+          >
+            Test connection
+          </button>
+          <button
+            type="button"
+            class="text-[var(--color-danger)]"
+            @click="confirmName = peer.name"
+          >
+            Remove
+          </button>
+        </div>
       </li>
     </ul>
     <p class="mt-3 text-[12px] text-[var(--color-muted)]">
@@ -541,6 +566,8 @@ defineExpose({ load });
         </button>
       </div>
     </Modal>
+
+    <SpeedTestDialog :peer="testing" @close="testing = null" />
 
     <Modal :open="!!confirmName" title="Remove peer?" @close="confirmName = null">
       <p>

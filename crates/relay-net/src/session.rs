@@ -11,8 +11,8 @@ use relay_core::{DeviceId, ObjectId, format_socket_addr, merge_peer_addresses, r
 use relay_crypto::{DeviceIdentity, device_id_from_certificate};
 use relay_proto::frame::Body;
 use relay_proto::{
-    ErrorFrame, FEATURE_CONTROL, Frame, Hello, ObjectHeader, ObjectRequest, PROTOCOL_VERSION, Ping,
-    device_id_from_bytes, encode_frame, object_id_from_bytes,
+    ErrorFrame, FEATURE_CONTROL, FEATURE_SPEED_TEST, Frame, Hello, ObjectHeader, ObjectRequest,
+    PROTOCOL_VERSION, Ping, device_id_from_bytes, encode_frame, object_id_from_bytes,
 };
 use relay_store::ObjectStore;
 use rustls::pki_types::CertificateDer;
@@ -83,6 +83,10 @@ pub(crate) struct Inner {
     pub discovery: Mutex<Option<Discovery>>,
     /// Answers remote calls from peers with the manage grant (D37).
     pub control: Option<Arc<dyn ControlHandler>>,
+    /// One connection test answered at a time (D48).
+    pub speed_tests_in: Arc<Semaphore>,
+    /// One connection test run from here at a time.
+    pub speed_tests_out: Arc<Semaphore>,
 }
 
 type EstablishedSession = (
@@ -470,7 +474,7 @@ async fn run_session(
         device_id: inner.our_id.as_bytes().to_vec(),
         device_name: inner.device_name.clone(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
-        features: FEATURE_CONTROL,
+        features: FEATURE_CONTROL | FEATURE_SPEED_TEST,
     }));
     let hello_bytes = encode_frame(&hello).map_err(|e| e.to_string())?;
 
@@ -723,6 +727,11 @@ async fn serve_object(
     }
     if let Some(read) = req.read_file {
         return control::serve_read(inner, peer, send, read)
+            .await
+            .map_err(|message| ServeErr { message });
+    }
+    if let Some(test) = req.speed_test {
+        return crate::speed::serve(inner, peer, send, recv, test)
             .await
             .map_err(|message| ServeErr { message });
     }
@@ -1284,6 +1293,8 @@ mod tests {
             discovered: Mutex::new(HashMap::new()),
             discovery: Mutex::new(None),
             control: None,
+            speed_tests_in: Arc::new(Semaphore::new(1)),
+            speed_tests_out: Arc::new(Semaphore::new(1)),
         };
         (Arc::new(inner), rx, dir)
     }

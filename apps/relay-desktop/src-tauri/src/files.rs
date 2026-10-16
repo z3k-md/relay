@@ -1,5 +1,5 @@
 //! Files view: this device's synced folders, with online-only files that
-//! download when opened (remote explorer Stage 1).
+//! download when opened (D38).
 
 use relay_core::ConfigChange;
 use relay_engine::{CopyState, Engine, FolderView};

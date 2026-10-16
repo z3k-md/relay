@@ -2,7 +2,7 @@
 
 **Realtime file sync for all your machines.**
 
-Maintain copies of arbitrary folders and file trees on multiple machines in realtime. Clients available for Windows, Linux, MacOS, and Android. Securely connect machines to your mesh network for seemly end-to-end encrypted file transfer and realtime sync.
+Maintain copies of arbitrary folders and file trees on multiple machines in realtime. The desktop app runs on macOS and Windows, the `relay` command also on Linux, and an Android build runs while open. Devices connect directly to each other over end-to-end encrypted links.
 
 Install Relay, pair your computers, and choose the folders that should stay the same. Each machine keeps ordinary local files. Changes show up on the others within about a second. There is no cloud account, and you can keep working when another computer is off.
 
@@ -43,5 +43,5 @@ Git repositories sync like any other folder, including `.git`. Relay is continuo
 
 - [Using Relay](docs/USAGE.md) — commands, conflicts, safety rules, where data lives
 - [Desktop app](apps/relay-desktop/README.md)
-- [Roadmap](docs/ROADMAP.md) — phases 0–13 shipped; phase 14 is next
-- [Design](docs/DESIGN.md)
+- [Roadmap](docs/ROADMAP.md) — what works today and what is next
+- [Design](docs/DESIGN.md) — how it works; [decisions](docs/DECISIONS.md) for the details

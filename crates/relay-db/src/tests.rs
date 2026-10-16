@@ -1394,3 +1394,63 @@ fn multi_row_reads_load_every_vector_across_chunks() {
         "live_paths lists every live row"
     );
 }
+
+#[test]
+fn store_mode_migration_keeps_rules_and_selectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.sqlite");
+    let space = space("Photos");
+    let rule = relay_core::MaterializationRuleId::new();
+    {
+        let db = Database::open(&path).unwrap();
+        db.repo().init_local_device(&device(1, "nas"), 1).unwrap();
+        db.repo().create_space(&space, 1).unwrap();
+        db.repo()
+            .create_materialization_rule(
+                rule,
+                space.id,
+                "raw",
+                "demand",
+                &["files/raw/**".to_owned(), "files/raw".to_owned()],
+                1,
+            )
+            .unwrap();
+    }
+    {
+        // Rerun 0014 over the rows above.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 13u32).unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    let rules = db.repo().list_materialization_rules(space.id).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, rule);
+    assert_eq!(rules[0].mode, "demand");
+    assert_eq!(rules[0].selectors, ["files/raw/**", "files/raw"]);
+    db.repo()
+        .create_materialization_rule(
+            relay_core::MaterializationRuleId::new(),
+            space.id,
+            "all",
+            "store",
+            &["files/**".to_owned()],
+            2,
+        )
+        .unwrap();
+    db.repo()
+        .delete_materialization_rule(space.id, "raw")
+        .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let selectors: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM materialization_selectors",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        selectors, 1,
+        "deleting a rule still cascades to its selectors"
+    );
+}

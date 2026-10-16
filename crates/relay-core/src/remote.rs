@@ -144,7 +144,7 @@ pub struct PathPreview {
     pub bytes: u64,
     /// The count stopped at the bound; there are at least `files`.
     pub truncated: bool,
-    /// The mount it is inside of or contains, which forbids a new one (§33).
+    /// The mount it is inside of or contains, which forbids a new one (DESIGN §9.7).
     pub overlaps: Option<MountRef>,
     pub cloud_only: bool,
     /// This device could write there (checked by creating and removing a

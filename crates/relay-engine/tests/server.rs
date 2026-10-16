@@ -1,4 +1,4 @@
-//! Server role planning (home server Stage 1).
+//! Server role planning (home server Stages 1 and 2).
 
 use relay_core::ConfigChange;
 use relay_engine::{Engine, SyncInput, Syncer};
@@ -72,6 +72,12 @@ fn plan_joins_and_attaches_then_is_empty() {
                 from_peer: s.client.device().id.to_string(),
                 wait_ms: 0,
             },
+            ConfigChange::SetFolderMode {
+                space: "Photos".into(),
+                mount: "files".into(),
+                path: String::new(),
+                mode: Some("store".into()),
+            },
             ConfigChange::AddMount {
                 space: "Photos".into(),
                 mount: "files".into(),
@@ -88,6 +94,40 @@ fn plan_joins_and_attaches_then_is_empty() {
     let status = s.server.server_status().unwrap();
     assert_eq!(status.mounts.len(), 1);
     assert_eq!(status.mounts[0].path.as_ref(), Some(&path));
+}
+
+#[test]
+fn reattach_keeps_a_mode_the_owner_chose() {
+    let mut s = setup(&["Photos"]);
+    for change in s.server.server_plan().unwrap() {
+        s.server.apply_config(&change).unwrap();
+    }
+    s.server
+        .apply_config(&ConfigChange::SetFolderMode {
+            space: "Photos".into(),
+            mount: "files".into(),
+            path: String::new(),
+            mode: None,
+        })
+        .unwrap();
+    // Only a subfolder choice is left; setting the root would drop it.
+    s.server
+        .apply_config(&ConfigChange::SetFolderMode {
+            space: "Photos".into(),
+            mount: "files".into(),
+            path: "raw".into(),
+            mode: Some("full".into()),
+        })
+        .unwrap();
+    s.server.remove_mount("Photos", "files").unwrap();
+    let plan = s.server.server_plan().unwrap();
+    assert!(
+        matches!(plan.as_slice(), [ConfigChange::AddMount { .. }]),
+        "{plan:?}"
+    );
+    let rules = s.server.materialization_rules(Some("Photos")).unwrap();
+    assert_eq!(rules.len(), 1, "{rules:?}");
+    assert_eq!(rules[0].mode, "full");
 }
 
 #[test]

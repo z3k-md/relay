@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
-import { computed, onMounted, ref } from "vue";
+import { computed, onActivated, ref } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import Modal from "../components/Modal.vue";
@@ -23,8 +23,11 @@ const shareFor = ref<string | null>(null);
 const sharePeer = ref("");
 const busy = ref(false);
 
+let loaded = false;
+
+/** The placeholder shows only until the first load; later loads refresh in place. */
 async function load() {
-  loading.value = true;
+  if (!loaded) loading.value = true;
   error.value = null;
   try {
     const [s, o, p] = await Promise.all([api.listSpaces(), api.listOffers(), api.listPeers()]);
@@ -35,6 +38,7 @@ async function load() {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
     loading.value = false;
+    loaded = true;
   }
 }
 
@@ -174,7 +178,7 @@ function unusedPeers(space: SpaceView): PeerView[] {
   return peers.value.filter((p) => !space.sharedWith.includes(p.name));
 }
 
-onMounted(load);
+onActivated(load);
 defineExpose({ load });
 </script>
 

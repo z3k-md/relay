@@ -654,6 +654,9 @@ fn scoped_previous_paths(
 fn scan_skip_present(mode: MaterializationMode, prev: Option<&EntryRecord>) -> bool {
     match mode {
         MaterializationMode::Exclude | MaterializationMode::Metadata => true,
+        // A file written here before the path went to `store` is tracked like
+        // a full copy; anything else in the folder is not this device's.
+        MaterializationMode::Store => !prev.is_some_and(|record| record.materialized),
         MaterializationMode::Demand => prev.is_some_and(|record| {
             !record.materialized
                 && !record.is_deleted()
@@ -670,6 +673,7 @@ fn scan_skip_present(mode: MaterializationMode, prev: Option<&EntryRecord>) -> b
 fn scan_skip_absence(mode: MaterializationMode, record: &EntryRecord) -> bool {
     match mode {
         MaterializationMode::Exclude | MaterializationMode::Metadata => true,
+        MaterializationMode::Store => !record.materialized,
         MaterializationMode::Demand => !record.materialized && record.stat.is_none(),
         MaterializationMode::Full => false,
     }

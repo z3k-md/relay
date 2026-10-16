@@ -18,6 +18,7 @@ pub mod pairing;
 pub mod path;
 pub mod remote;
 pub mod reserved;
+pub mod speed;
 pub mod version;
 
 pub use addr::{

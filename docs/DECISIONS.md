@@ -1,12 +1,69 @@
-# Design decisions and amendments
+# Design decisions
 
-`DESIGN.md` is the original specification. This file records where the
-implementation deliberately departs from or tightens it, and why. When the two
-disagree, this file wins.
+Each entry records a choice the implementation made and why. Code comments
+cite these numbers, so a superseded entry stays as a one-line pointer to what
+replaced it. [`DESIGN.md`](DESIGN.md) summarizes the current system; when it
+and an entry disagree, the entry wins. What is built and what is next is
+[`ROADMAP.md`](ROADMAP.md).
 
-What is built and what is next is [`ROADMAP.md`](ROADMAP.md). A sentence here
-that says "next phase", "not yet", or "this phase still has no …" describes
-that decision when it was written. Later decisions supersede it.
+Add an entry with the next free number (check open pull requests), then run
+`python3 scripts/check-docs.py --write` to refresh this index.
+
+<!-- index:start -->
+
+| | Decision |
+| --- | --- |
+| D1 | [`.git` is synchronized like any other directory](#d1-git-is-synchronized-like-any-other-directory) |
+| D2 | [Conflict resolution is deterministic and replicated](#d2-conflict-resolution-is-deterministic-and-replicated) |
+| D3 | [Version counters survive database restores](#d3-version-counters-survive-database-restores) |
+| D4 | [Per-device change sequence instead of per-entry acknowledgements](#d4-per-device-change-sequence-instead-of-per-entry-acknowledgements) |
+| D5 | [Merge bases are recorded from the first release](#d5-merge-bases-are-recorded-from-the-first-release) |
+| D6 | [Object store GC is mark-and-sweep](#d6-object-store-gc-is-mark-and-sweep) |
+| D7 | [Mount markers and mass-delete protection](#d7-mount-markers-and-mass-delete-protection) |
+| D8 | [Safe reads and writes of live files](#d8-safe-reads-and-writes-of-live-files) |
+| D9 | [Logical path rules](#d9-logical-path-rules) |
+| D10 | [Device-local integer references in the database](#d10-device-local-integer-references-in-the-database) |
+| D11 | [Superseded by D14](#d11-superseded-by-d14) |
+| D12 | [Superseded by D24 and D36](#d12-superseded-by-d24-and-d36) |
+| D13 | [Watching](#d13-watching) |
+| D14 | [Device identity and transport security](#d14-device-identity-and-transport-security) |
+| D15 | [Pairing, addressing and sharing](#d15-pairing-addressing-and-sharing) |
+| D16 | [Index exchange](#d16-index-exchange) |
+| D17 | [Applying a remote version](#d17-applying-a-remote-version) |
+| D18 | [Conflicts](#d18-conflicts) |
+| D19 | [Daemon threading](#d19-daemon-threading) |
+| D20 | [Desktop app, releases and auto-update](#d20-desktop-app-releases-and-auto-update) |
+| D21 | [Git repository conflict groups and conflict resolution](#d21-git-repository-conflict-groups-and-conflict-resolution) |
+| D22 | [Receive-side mass-delete guard](#d22-receive-side-mass-delete-guard) |
+| D23 | [Batched object durability on macOS](#d23-batched-object-durability-on-macos) |
+| D24 | [Local IPC and the host lock](#d24-local-ipc-and-the-host-lock) |
+| D25 | [Device pairing and LAN discovery](#d25-device-pairing-and-lan-discovery) |
+| D26 | [Space membership](#d26-space-membership) |
+| D27 | [Replication policies](#d27-replication-policies) |
+| D28 | [Sync progress is a snapshot](#d28-sync-progress-is-a-snapshot) |
+| D29 | [Durable mailbox](#d29-durable-mailbox) |
+| D30 | [Encryption at rest](#d30-encryption-at-rest) |
+| D31 | [Automatic text merge](#d31-automatic-text-merge) |
+| D32 | [NAT hole punching](#d32-nat-hole-punching) |
+| D33 | [Android is a foreground Tauri shell](#d33-android-is-a-foreground-tauri-shell) |
+| D34 | [Generalized networking](#d34-generalized-networking) |
+| D35 | [Selective materialization](#d35-selective-materialization) |
+| D36 | [Configuration changes on the running host](#d36-configuration-changes-on-the-running-host) |
+| D37 | [Remote management](#d37-remote-management) |
+| D38 | [Files view and folder choices](#d38-files-view-and-folder-choices) |
+| D39 | [Folder pairs set up from either device](#d39-folder-pairs-set-up-from-either-device) |
+| D40 | [Opening a file that is not synced here](#d40-opening-a-file-that-is-not-synced-here) |
+| D41 | [Read-only copies](#d41-read-only-copies) |
+| D42 | [Sizes on disk and a faster Browse view](#d42-sizes-on-disk-and-a-faster-browse-view) |
+| D43 | [Online-only files in Explorer](#d43-online-only-files-in-explorer) |
+| D44 | [Self-hosted tiers and accounts](#d44-self-hosted-tiers-and-accounts) |
+| D45 | [Server role](#d45-server-role) |
+| D46 | [What a manage grant reaches](#d46-what-a-manage-grant-reaches) |
+| D47 | [Store mode](#d47-store-mode) |
+| D48 | [Connection test](#d48-connection-test) |
+| D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
+
+<!-- index:end -->
 
 ## D1. `.git` is synchronized like any other directory
 
@@ -17,11 +74,11 @@ are generic rules that happen to matter most for Git:
 - **Transient files are excluded by default**: `**/.git/**/*.lock`,
   `.git/gc.pid`, `.git/gc.log`, and fsmonitor state. A replicated lock file
   would make Git on the other device refuse to run.
-- **Immutable before mutable (Phase 2).** Within a directory containing
+- **Immutable before mutable.** Within a directory containing
   `.git/`, content under `objects/**` is materialized before `HEAD`, `refs/**`,
   `packed-refs` and `index`, so a ref never points at an object that has not
   arrived yet.
-- **Repository-level conflict groups (Phase 3).** Concurrent versions of the
+- **Repository-level conflict groups (D21).** Concurrent versions of the
   mutable files in one `.git` directory resolve to the same device's version.
   Losing refs become conflict copies such as
   `refs/heads/main.relay-conflict-<device>-<counter>`, which Git shows as
@@ -56,14 +113,14 @@ old backup from reissuing counters it already used.
 ## D4. Per-device change sequence instead of per-entry acknowledgements
 
 Every change a device commits to its index gets the next value of a persistent,
-monotonic `Sequence`. Index exchange (Phase 2) is "changes after N", and
+monotonic `Sequence`. Index exchange (D16) is "changes after N", and
 acknowledgements are per-peer watermarks. The `replica_acks` table from the
 design is replaced by this.
 
 ## D5. Merge bases are recorded from the first release
 
 Each version stores `parent_object`, the content it was derived from, and every
-version is appended to `history`. Three-way merge (Phase 11) needs bases that
+version is appended to `history`. Three-way merge (D31) needs bases that
 cannot be reconstructed later. GC treats history as a root.
 
 ## D6. Object store GC is mark-and-sweep
@@ -85,7 +142,7 @@ database commit has not landed yet is never collected.
   or invalid names, nested mounts) are protected: they are not tombstoned by
   that scan.
 - Entries that are no longer selected because a rule or `.relayignore`
-  changed are reported as deselected and never tombstoned (design §48.6).
+  changed are reported as deselected and never tombstoned (DESIGN §9.6).
 - A file that changes while it is being hashed is reported as unstable and left
   untouched until the next scan.
 
@@ -125,17 +182,14 @@ database commit has not landed yet is never collected.
 Version vectors are stored normalized with a small integer reference per
 device instead of repeating 32-byte ids on every row.
 
-## D11. Device identity before Phase 2
+## D11. Superseded by D14
 
-Until peer authentication exists, `DeviceId` is 32 random bytes generated at
-`relay init`. Phase 2 derives it from an Ed25519 public key. No state leaves the
-machine before then, so nothing shared needs migrating. Key wrapping for Space
-keys (Phase 9) will use a separate X25519 key signed by the identity key.
+Device identity before peer authentication (random ids).
 
-## D12. Phase 0 CLI talks to the engine directly
+## D12. Superseded by D24 and D36
 
-The `relay` binary embeds `relay-engine` in Phase 0. From Phase 4 it becomes a
-thin IPC client of `relayd`, and commands keep their names.
+The CLI embeds the engine when no host runs and talks to a running host over
+local IPC. There is no separate `relayd`.
 
 ## D13. Watching
 
@@ -149,7 +203,7 @@ watcher and relies on those periodic scans. Changing the root `.relayignore`
 or the mount marker forces a full scan (rules or mount identity changed).
 Nested `.relayignore` files are not yet supported.
 
-## D14. Device identity and transport security (Phase 2)
+## D14. Device identity and transport security
 
 Supersedes D11. Each device owns an Ed25519 key at `<home>/identity/device.key`
 (PKCS#8 PEM, mode 0600 on Unix). `DeviceId` is the raw 32-byte public key.
@@ -158,9 +212,8 @@ A self-signed certificate is regenerated from the key at every start.
 Peers talk QUIC (quinn) with TLS 1.3 (rustls, `ring` provider) and ALPN
 `relay/1`. Both sides present certificates. Each side accepts a certificate
 only if its Ed25519 key equals the id of a peer the user added with
-`relay peer add`; anything else fails the handshake. There is no CA, no TOFU
-and no discovery in Phase 2. A home created before this change has a random
-id and no key; it must be re-initialized.
+`relay peer add`; anything else fails the handshake. There is no CA and no
+TOFU.
 
 ## D15. Pairing, addressing and sharing
 
@@ -260,7 +313,7 @@ engine's single input queue, which also carries watcher signals. The network
 writes fetched objects into the object store directly (verified by hash
 before rename) and serves objects from it; it never touches the database.
 
-## Phase 2 implementation notes
+## Sync implementation notes
 
 - `to_os_path` returns `Result` and rejects any logical component that is not
   exactly one `Component::Normal` on the current OS (`FsError::Unrepresentable`).
@@ -296,9 +349,8 @@ runner is hosted in-process (the same engine the CLI embeds). The `relay`
 CLI is also bundled as a sidecar (`bundle.externalBin`) and placed on PATH
 so terminal workflows keep working.
 
-Releases are produced by GitHub Actions only when the release workflow is
-dispatched (`.github/workflows/release.yml`). A normal push does not
-publish a version. The workflow bumps `[workspace.package] version` (patch
+Releases are produced by GitHub Actions (`.github/workflows/release.yml`),
+started automatically after main CI passes (D49) or by hand. The workflow bumps `[workspace.package] version` (patch
 by default), the Tauri and package.json `"version"` fields, commits, and builds.
 macOS is a universal (`aarch64` + `x86_64`)
 ad-hoc-signed `.dmg` (no notarization yet). Windows is a per-user NSIS
@@ -315,6 +367,11 @@ That URL must be publicly downloadable: if the source repo is private,
 set the `RELEASE_REPO` variable and `RELEASE_TOKEN` secret so artifacts
 go to a public repo and point the endpoint there. Losing the private key
 means existing installs can never auto-update again.
+
+Running apps fetch `latest.json` at startup and every 5 minutes of
+wall-clock time. The file is about 1 KB, so a short interval costs nothing,
+and measuring wall-clock time rather than sleeping a fixed interval means a
+machine that wakes from sleep checks within one 30-second tick.
 
 ## D21. Git repository conflict groups and conflict resolution
 
@@ -464,8 +521,7 @@ is unchanged.
 
 A running host (`relay run`, `relay service`, or the desktop app) exposes a
 blocking local-socket RPC so the CLI can inspect and steer it without
-opening the engine for write. Pairing, discovery, and extra auth tokens are
-out of scope.
+opening the engine for write. Extra auth tokens are out of scope.
 
 - **Transport.** The `interprocess` crate's local sockets, sync/blocking, one
   thread per client. Unix: a socket file `<home>/relay.sock`. If that path
@@ -520,8 +576,7 @@ out of scope.
 
 Pairing replaces copying device ids by hand. A short code plus the existing
 QUIC port is enough on the same LAN; over Tailscale the joiner also types an
-address. There is no internet rendezvous and no NAT traversal in this phase
-(D32 later hole-punches through the mailbox).
+address. There is no internet rendezvous.
 
 - **Code.** Format `NN-NNNN-NNNN` (ten decimal digits). The first two digits
   are a public *nameplate* used only to pick the right mDNS instance. The
@@ -584,15 +639,13 @@ address. There is no internet rendezvous and no NAT traversal in this phase
   `100.x.y.z:47321`).
 - **Known limits.** No internet rendezvous, no hole punching, no pairing
   through a third device. Two devices that cannot reach each other's UDP
-  port cannot pair. Peer revocation in this phase is `relay peer remove`
-  (D30 adds `relay peer revoke`).
+  port cannot pair.
 
 ## D26. Space membership
 
 A space shared with several peers is a membership set. Relaying files through
 a middle machine that has the folder attached is ordinary index exchange —
-not a separate protocol. This phase still has no NAT traversal, no encryption at
-rest, and no durable cloud replica for devices that never overlap online.
+not a separate protocol.
 
 - **Members on the offer.** `SpaceOffer` lists the other peers that space is
   also shared with (name and addresses from the local peers table). Old peers
@@ -615,9 +668,6 @@ rest, and no durable cloud replica for devices that never overlap online.
   with no local path are not stored and cannot be forwarded. Devices that are
   not directly connected still need a path through a member that has the
   folder; there is no introduction of devices for a space you have not joined.
-- **Known limits.** No NAT traversal, no encryption at rest, no durable
-  replica when devices never overlap. Nested `.relayignore` is still
-  root-only.
 
 ## D27. Replication policies
 
@@ -659,10 +709,7 @@ Share remains required — a policy never grants sync by itself.
 - **Groups.** Named sets of device ids (peers or this device). Deleting a
   group removes the group link from policies but keeps direct peer targets
   and the policy itself.
-- **Out of scope.** No durability classes, no metadata-only mode, no GUI
-  policy editor. Nested `.relayignore` is still root-only. This phase still
-  has no durable replica, encryption at rest, automatic text merge, or NAT
-  traversal (those land in D29–D32).
+- **Out of scope.** No durability classes and no policy editor in the app.
 
 ## D28. Sync progress is a snapshot
 
@@ -690,14 +737,12 @@ When two devices never overlap online, a shared directory acts as a
 non-materializing mailbox so each can catch up later. No QUIC session is
 required for that catch-up. The mailbox stores the same content-addressed
 bytes as the local object store plus length-prefixed prost entry logs; it is
-not a filesystem and does not reconstruct working trees. Encryption of
-objects at rest was the following phase (shipped in D30). This phase stores
-plaintext CAS bytes.
+not a filesystem and does not reconstruct working trees. Objects are sealed
+with the space key (D30).
 
 - **Path.** Local setting `replica_path` (string). Empty or absent means
   peer-only sync (today's behavior). `relay replica set PATH` / `clear` /
-  `status` / `gc`. One filesystem backend (`relay-replica`); no network or
-  hosted backend yet.
+  `status` / `gc`. One filesystem backend (`relay-replica`).
 - **Push.** After a scan commits or remote entries are applied, the watch
   loop pushes this device's new index entries and any referenced objects the
   mailbox does not already have. Watermark `replica_push.pushed_seq` advances
@@ -719,8 +764,6 @@ plaintext CAS bytes.
   (`--mirror`) keeps the object of the latest live entry per path even after
   ack; older versions follow the mailbox rule. A transient apply does not
   advance the received cursor.
-- **Out of scope for D29.** No hosted backend. Nested `.relayignore` is still
-  root-only. Encryption, text merge, and NAT are D30–D32.
 
 ## D30. Encryption at rest
 
@@ -738,7 +781,7 @@ mailbox objects still open.
   space, and drops it from the dial set. That is a soft revoke: data already
   decrypted on that device remains. `relay space rotate` starts a new
   generation for future objects; older generations still open.
-- **Known limits.** No hosted backend. Logs are not encrypted. A revoked
+- **Known limits.** Logs are not encrypted. A revoked
   device that already held a generation can still decrypt objects sealed
   with that generation until they age out of the mailbox.
 
@@ -773,7 +816,8 @@ close-to-tray behavior are not part of the Android build.
   not use the desktop `directories` path or a bundled `relay` binary.
 - **Sync.** The host runs while the app process is alive. Leaving the app can
   stop sync; a foreground service is later work. Connectivity is unchanged:
-  LAN, or an explicit address such as Tailscale. NAT traversal is still D32.
+  LAN, or an explicit address such as Tailscale; D32 and D34 reach other
+  networks.
 - **Mounts.** No Android-specific folder picker yet. The supported place for
   phone files is the app sandbox; pointing a mount at an arbitrary path is
   not a supported workflow.
@@ -782,8 +826,8 @@ close-to-tray behavior are not part of the Android build.
 
 ## D34. Generalized networking
 
-Phase 12 removes the requirement that every pair of devices share a LAN,
-Tailscale, or hand-written address. There is still no hosted account. Direct
+This removes the requirement that every pair of devices share a LAN,
+Tailscale, or hand-written address. Direct
 QUIC stays preferred. The relay is a dumb UDP forwarder so the QUIC handshake
 remains end to end between the two devices.
 
@@ -816,18 +860,17 @@ remains end to end between the two devices.
   mailbox object (sealed or legacy plaintext) into the local store, before
   the existing retry limit gives up.
 - **Out of scope.** No public TURN account, no global directory beyond the
-  mailbox file, no connection migration after a path is up, no Phase 13
-  materialization modes.
+  mailbox file, no connection migration after a path is up.
 
 ## D35. Selective materialization
 
-Phase 13. A device can take part in a space without storing every file's
+A device can take part in a space without storing every file's
 bytes. Replication policies (D27) still decide who is offered a path.
 Materialization is a local decision about what this device does with a path
 it wants. Rules are not synced and do not change SpaceOffer.
 
 - **Default.** With no rules, every wanted file is fully materialized, which
-  is the behavior through Phase 12.
+  as before.
 - **Rules.** Local to one device and one space. A rule has a name, one or
   more selectors, and a mode: `full`, `metadata`, `demand`, or `exclude`.
   Selectors are the same case-sensitive globs as policies, matched against
@@ -854,15 +897,14 @@ it wants. Rules are not synced and do not change SpaceOffer.
   for a metadata or unhydrated demand entry whose object is missing. Full
   copies, and demand copies that are already hydrated, still stop on a
   missing object.
-- **Out of scope.** No GUI editor. No placeholder files. No OS
-  file-on-demand. D27's "no metadata-only mode" line described that phase
-  and stays.
+- **Out of scope.** No rule editor in the app beyond folder choices (D38).
+  OS placeholders came later (D43).
 
 ## D36. Configuration changes on the running host
 
 Space, mount, share, materialization, peer, group, and policy edits, and
 held-delete decisions, are data: a `relay_core::ConfigChange`. Every caller builds one: the CLI, the desktop
-app, and later a peer that manages this device (remote explorer proposal).
+app, and a peer that manages this device (D37, D39).
 This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
 `add_mount` / `share` IPC methods.
 
@@ -890,8 +932,8 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
   loop and retried after peer frames until the offer arrives or the wait
   ends. A third device setting up a pair sends the join and the share on
   different connections. Direct writes do not wait.
-- **Remove mount.** Detach only. The folder and its files stay (§48.6). The
-  local index rows and history for that mount are dropped, because an
+- **Remove mount.** Detach only. The folder and its files stay (DESIGN
+  §9.6). The local index rows and history for that mount are dropped, because an
   unattached mount stores no entries (D16): kept rows would turn a later
   attach to another folder into "every file was deleted." The `.relay-mount`
   marker is removed. A marker this device wrote for a mount that is no
@@ -910,8 +952,9 @@ This replaces the per-operation `SyncInput::AddMount` / `Share` inputs and the
 
 ## D37. Remote management
 
-A paired device can be allowed to manage another: browse its folders now,
-set up sync on it later (remote explorer proposal, Stages 2 and 3).
+A paired device can be allowed to manage another: browse its folders, set up
+sync on it (D39), and open its files (D40, D41). D46 limits what the grant
+reaches.
 
 - **A separate grant.** `peers.may_manage` on the managed device means
   "this peer may manage me." It is set only on purpose: the pairing option
@@ -950,13 +993,12 @@ set up sync on it later (remote explorer proposal, Stages 2 and 3).
   `offline`, `failed`. An unknown code from a newer peer reads as `failed`.
 - **macOS.** `Info.plist` carries folder usage strings. Settings shows
   whether Relay has Full Disk Access and opens the pane.
-- **Known limits.** Read-only so far: no remote writes (Stage 3) and no file
-  contents (Stage 5). The target must be online. Listings are not logged to
-  activity; remote writes will be.
+- **Known limits.** The target must be online. Listings are not logged to
+  activity.
 
 ## D38. Files view and folder choices
 
-Remote explorer Stage 1 puts D35 in the desktop app.
+The desktop Files view puts D35 in the app.
 
 - **Listing** is one folder at a time (`Repo::entries_in`, a ranged query
   plus a depth test), so a large mount never goes to the UI whole. Each row
@@ -982,7 +1024,7 @@ Remote explorer Stage 1 puts D35 in the desktop app.
 
 ## D39. Folder pairs set up from either device
 
-Remote explorer Stage 3: one device sets up sync between a folder on itself
+One device sets up sync between a folder on itself
 or a peer and a folder on another device, with nothing done by hand on the
 others.
 
@@ -1025,7 +1067,7 @@ others.
 
 ## D40. Opening a file that is not synced here
 
-Remote explorer Stage 4. From Browse or `relay open PEER PATH`, a file on a
+From Browse or `relay open PEER PATH`, a file on a
 managed device opens here as if it had been synced all along.
 
 - **`Locate`** asks the other device for the file's folder, name, size, and
@@ -1059,7 +1101,7 @@ managed device opens here as if it had been synced all along.
 
 ## D41. Read-only copies
 
-Remote explorer Stage 5: a quick look at a file on a managed device that
+A quick look at a file on a managed device that
 sets nothing up on either device.
 
 - **Same stream as objects.** `ObjectRequest.read_file { path, max_bytes }`
@@ -1084,7 +1126,6 @@ sets nothing up on either device.
   "Read-only" next to each file and then "Sync this folder to edit".
 - **Whole file.** No hashing against an index (there is none); the size
   check and QUIC's integrity are what a quick look gets.
-
 
 ## D42. Sizes on disk and a faster Browse view
 
@@ -1179,8 +1220,8 @@ Plan and later stages: [`proposals/os-integration.md`](proposals/os-integration.
 ## D44. Self-hosted tiers and accounts
 
 Relay is self-hostable end to end. There is no third-party backend: this
-replaces the Supabase Postgres and Storage backend in `DESIGN.md` §38 and the
-Phase 8 deliverables. The plan is
+replaces the Supabase Postgres and Storage backend the original design
+planned for a hosted durable replica. The plan is
 [`proposals/home-server.md`](proposals/home-server.md).
 
 - **Three tiers.** (1) Sync between your own devices, with no account and no
@@ -1189,7 +1230,7 @@ Phase 8 deliverables. The plan is
   people without hardware. It is blind by default, so it never holds space
   keys. Billing exists only at tier 3.
 - **The server is a peer.** It has its own identity and the same protocol,
-  and it is not the authoritative filesystem (§38). Its extra duties
+  and it is not the authoritative filesystem (DESIGN §5). Its extra duties
   (durability target, history owner, preferred source, rendezvous) are
   decided per stage of the proposal.
 - **Accounts are a directory, not a trust root.** Sign-in (OIDC, Google
@@ -1200,8 +1241,7 @@ Phase 8 deliverables. The plan is
   existing device approves it, or from the recovery secret (D30). Approved
   devices on one account manage each other (D37).
 - **Accountless stays.** Code pairing (D25) remains, and the sync engine
-  never depends on account authentication (§23.2). §23.1's account-backed
-  pairing is this directory.
+  never depends on account authentication.
 
 ## D45. Server role
 
@@ -1229,8 +1269,7 @@ with it, with no one at its keyboard.
   manager could not already ask for remotely (D39). Members adopted from an
   offer (D26) never hold the grant, so a device that reached the server only
   through a shared space cannot make it join others. The server does not
-  share spaces onward by itself. Materialization is `full` until store mode
-  (Stage 2).
+  share spaces onward by itself. Mounts start in `store` mode (D47).
 - **Packaging.** `packaging/server`: a container image (Debian slim, runs as
   a non-root user, UDP 47321, one volume), a compose file that publishes
   host port 47322, and a systemd unit. Linux first; `relay service` stays
@@ -1277,3 +1316,112 @@ on an account, so the grant has to stop short of credentials.
   credential in an ordinary folder (a `.env`, a token in Downloads) is not
   protected, and a folder the device's own user already syncs is readable
   whatever it holds.
+
+## D47. Store mode
+
+Home server Stage 2 ([`proposals/home-server.md`](proposals/home-server.md)).
+A device can keep every file's bytes without a working-tree copy.
+
+- **Mode.** `store` is a fifth materialization mode (D35). It fetches each
+  object into the local store, like `full`, and writes nothing to the
+  working tree, like `metadata`. Rows stay `materialized = 0`; the bytes are
+  recorded in `objects`, so `verify` checks them and `gc` keeps them while
+  the index or history names them. A stored file is served to peers like any
+  other object. A file already written here (the path was `full` before)
+  is kept current like a demand file that was fetched, so the folder never
+  holds stale bytes.
+- **Scanner.** As for `metadata` for paths not written here: an absent file
+  is not a tombstone and a file that appears in the folder is not hashed
+  into a version. A file written here is scanned like a full copy.
+- **Fetch.** Index batches and mailbox pulls wait for `store` objects as
+  they do for `full`. The hydration tick looks for store rows whose object
+  is not in the store only at start, after a rule change or a failed fetch,
+  and when a peer connects after a give-up, so a complete store costs no
+  per-tick walk. It skips mounts whose rules give every path one other
+  mode, so `full` hydration on a server reads no rows either.
+- **Conflicts on index-only devices.** A device that does not write a path
+  resolves a concurrent edit as a writing device would: a clean text merge
+  when it holds the base and both sides (usual in `store`, which keeps
+  every version it saw), else the winner plus a conflict-copy row. A copy path already holding other content
+  skips the entry, as on a writer. Before this, an index-only device never
+  merged, so a writer that merged and a hub that copied reached the same
+  vector with different content and never reconciled. Any device missing
+  the base still copies where others merge; that limit predates D47.
+- **Server default.** `server_plan` sets `store` on a mount's root before it
+  attaches it, unless a rule already reaches inside that mount (setting the
+  root would replace the owner's folder choices), so the data folder stays
+  empty. A later rule (`relay materialize add SPACE NAME
+  --mode full --selector 'MOUNT/sub/**'`) or a manager's folder choice in
+  the app switches a mount or subfolder to `full` to browse it on the server
+  (for example over SMB). Mounts attached before Stage 2 keep `full`.
+- **Rule changes.** As in D35, nothing is deleted. `store` to `full`
+  writes the files on the next tick from the store. `full` to `store` leaves
+  the existing files in place and keeps them current; new files go to the
+  store only.
+- **Schema.** Migration 14 rebuilds the materialization rule tables to allow
+  `store`; rules and selectors are kept.
+- **Simulator.** In `home_server`, the server's folder must stay empty after
+  quiesce, and its tree is read from its index and store, so a file the
+  server indexed without its bytes fails the run.
+
+## D48. Connection test
+
+A user can measure the link to a connected peer from the Peers view or
+`relay peer test`. It is stage 1 of
+[`proposals/performance-insights.md`](proposals/performance-insights.md).
+
+- **Shape.** Five seconds of download, then five of upload, over the
+  session's existing QUIC connection, so the test takes the same path,
+  congestion controller, and packet size as sync. Each direction is one
+  bidirectional stream: an `ObjectRequest` with `speed_test` set
+  (`upload`, `duration_ms`), an accepting `ObjectHeader`, then raw bytes
+  until the sender's clock runs out. After an upload the answering device
+  writes one `SpeedTestDone` with the bytes it counted and the time from the
+  first byte to the end. Rates are always the receiver's count. Each side
+  clamps a direction to 10 s.
+- **No disk.** The sender writes zeros; QUIC encrypts every byte and
+  nothing compresses. The result is the link, not either store.
+- **What it reports.** `SpeedReport` (`relay_core::speed`): bytes, elapsed,
+  and rate per direction; bytes per 250 ms window for the graph; the
+  smoothed RTT, the packet size, and packets sent and lost during the
+  test from Quinn's path stats; and the path kind from the remote address
+  (loopback, LAN, Tailscale, internet, or relayed when it is the D34
+  virtual address).
+- **Who may ask.** Any connected trusted peer; no manage grant (D37). It
+  reads nothing and changes nothing, and a trusted peer can already pull
+  every shared object. Each device answers one test at a time and runs one
+  at a time; a second answers `busy`.
+- **Compatibility.** `Hello.features` bit `FEATURE_SPEED_TEST` (2). An
+  older peer would read the request as an object request with an empty id
+  and close the connection as malformed, so the request goes only to peers
+  that set the bit; others answer `unsupported` locally. `PROTOCOL_VERSION`
+  stays 1.
+- **Known limits.** Sync keeps running during a test, so a busy link reads
+  low. The upload graph counts what this side handed to QUIC, which runs
+  ahead of the receiver by up to the flow-control window; the upload rate
+  itself is the receiver's.
+
+## D49. Automatic releases after main CI
+
+A merged change used to reach installed apps only after someone ran
+`scripts/release.sh`, so fixes sat on `main` unshipped. Now the release
+workflow also runs on `workflow_run` of CI completing on `main`, and a
+`gate` job publishes a patch release only when all of these hold:
+
+- CI ran on a `push` and every job that tests what ships passed; the
+  Android APK job (Android is not released here) and cache pruning are
+  ignored, so a queue timeout on either does not hold a release back, and a
+  cancelled run never ships;
+- the commit CI tested is still the tip of `main`, so a release never builds
+  an untested commit; a newer push ships from its own CI run;
+- the commit is not itself a `Release v` commit;
+- shipped code changed since the last `Release v` commit: `crates/`,
+  `apps/relay-cli/`, `apps/relay-desktop/`, `Cargo.toml`, `Cargo.lock` or
+  `rust-toolchain.toml`, ignoring `*.md`.
+
+Docs-only pushes do not run CI, so they never reach the gate. Manual
+dispatch still covers minor, major, exact versions and rebuilds, and
+shares the `release-main` concurrency group, so two releases never run at
+once. The `Release v` commit is pushed with `GITHUB_TOKEN`, which starts
+no workflows, so a release cannot trigger another. Release commits still
+skip CI.

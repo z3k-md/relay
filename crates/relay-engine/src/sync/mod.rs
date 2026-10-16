@@ -310,6 +310,10 @@ pub struct Syncer {
     hydrate_warned: BTreeSet<EntryKey>,
     /// Last time index-only rows were considered for hydration.
     hydrated_at: Option<Instant>,
+    /// Look for store-mode rows missing their object on the next hydration
+    /// tick. Set at start, on a rule change, a failed fetch, and a new peer
+    /// after a give-up, so a complete store costs no per-tick walk (D47).
+    store_scan: bool,
     /// Monotonic time to use instead of [`Instant::now`]. Set by a
     /// simulator that drives the state machine on a virtual clock.
     frozen_now: Option<Instant>,
@@ -327,6 +331,7 @@ impl Default for Syncer {
             fetch_waiters: BTreeMap::new(),
             hydrate_warned: BTreeSet::new(),
             hydrated_at: None,
+            store_scan: true,
             frozen_now: None,
         }
     }
@@ -587,6 +592,16 @@ impl Syncer {
             return Ok(());
         }
         engine.record_peer_name(peer, &name)?;
+        // A new peer may hold what no one had: let hydration ask again.
+        let mut retry = false;
+        for state in self.direct.values_mut() {
+            retry |= state.gave_up;
+            state.gave_up = false;
+        }
+        if retry {
+            self.store_scan = true;
+            self.hydrated_at = None;
+        }
         self.connected.insert(
             peer,
             Connected {

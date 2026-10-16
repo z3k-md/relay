@@ -154,7 +154,7 @@ impl Engine {
     }
 
     /// Stop syncing a mount on this device and return it to the unattached
-    /// state. Files in the folder are left alone (§48.6).
+    /// state. Files in the folder are left alone (DESIGN §9.6).
     pub fn remove_mount(&mut self, space: &str, mount: &str) -> Result<(), EngineError> {
         self.ensure_writable()?;
         let (_, config) = self.lookup_mount(space, mount)?;
