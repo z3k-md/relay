@@ -44,13 +44,24 @@ pub struct DropArrival {
     pub name: String,
     /// "Pixel sent PXL_1.jpg".
     pub summary: String,
+    /// The sending device's name, when the summary names one.
+    pub from: Option<String>,
     pub image: bool,
     pub at_ms: u64,
 }
 
-/// Drops the popup has not taken yet.
+/// Drops the popup has not taken yet, and drag previews made ahead of time
+/// so a drag starts the moment the thumbnail is pressed.
 #[derive(Default)]
-pub struct Pending(Mutex<VecDeque<DropArrival>>);
+pub struct Pending {
+    queue: Mutex<VecDeque<DropArrival>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    previews: Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>,
+}
+
+/// Previews kept for drags; older ones are dropped.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MAX_PREVIEWS: usize = 16;
 
 /// Follow the host's activity for drops until the app exits.
 pub fn spawn_watcher(app: AppHandle, home: PathBuf) {
@@ -92,6 +103,13 @@ fn arrived(app: &AppHandle, item: ActivityItem) {
             .unwrap_or_default(),
         image: is_image(&path),
         path: path.to_string_lossy().into_owned(),
+        from: path
+            .file_name()
+            .and_then(|n| {
+                item.summary
+                    .strip_suffix(&format!(" sent {}", n.to_string_lossy()))
+            })
+            .map(str::to_owned),
         summary: item.summary,
         at_ms: item.at_ms,
     };
@@ -103,7 +121,21 @@ fn arrived(app: &AppHandle, item: ActivityItem) {
             }
         });
     }
-    if let Ok(mut pending) = app.state::<Pending>().0.lock() {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if arrival.image {
+        let (app, path) = (app.clone(), path.clone());
+        std::thread::spawn(move || {
+            if let Some(png) = preview_png(&path)
+                && let Ok(mut previews) = app.state::<Pending>().previews.lock()
+            {
+                if previews.len() >= MAX_PREVIEWS {
+                    previews.clear();
+                }
+                previews.insert(path, png);
+            }
+        });
+    }
+    if let Ok(mut pending) = app.state::<Pending>().queue.lock() {
         pending.push_back(arrival);
     }
     let app = app.clone();
@@ -164,7 +196,7 @@ fn is_image(path: &Path) -> bool {
 #[tauri::command]
 pub fn drop_take(app: AppHandle) -> Vec<DropArrival> {
     app.state::<Pending>()
-        .0
+        .queue
         .lock()
         .map(|mut pending| pending.drain(..).collect())
         .unwrap_or_default()
@@ -174,7 +206,13 @@ pub fn drop_take(app: AppHandle) -> Vec<DropArrival> {
 /// image, as a bitmap for chat apps and editors.
 #[tauri::command(async)]
 pub fn drop_copy(path: String) -> Result<(), String> {
-    copy_to_clipboard(Path::new(&path)).map_err(anyhow_chain)
+    let start = std::time::Instant::now();
+    let copied = copy_to_clipboard(Path::new(&path)).map_err(anyhow_chain);
+    match &copied {
+        Ok(()) => log::info!("drop copied in {} ms", start.elapsed().as_millis()),
+        Err(err) => log::warn!("drop copy: {err}"),
+    }
+    copied
 }
 
 #[tauri::command(async)]
@@ -197,28 +235,40 @@ pub fn drop_reveal(app: AppHandle, path: String) -> Result<(), String> {
 pub async fn drop_drag(window: tauri::WebviewWindow, path: String) -> Result<(), String> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        log::info!("drop drag requested");
         let path = PathBuf::from(path);
-        let preview = {
-            let path = path.clone();
-            tauri::async_runtime::spawn_blocking(move || drag_preview(&path))
-                .await
-                .map_err(|err| err.to_string())?
+        // Made when the drop arrived, so the drag starts while the button
+        // is still down; making it now would take as long as a decode.
+        let cached = window
+            .state::<Pending>()
+            .previews
+            .lock()
+            .ok()
+            .and_then(|previews| previews.get(&path).cloned());
+        let preview = match cached {
+            Some(png) => drag::Image::Raw(png),
+            None => drag::Image::File(path.clone()),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let target = window.clone();
         window
             .run_on_main_thread(move || {
+                log::info!("drop drag starting");
                 let started = drag::start_drag(
                     &target,
                     drag::DragItem::Files(vec![path]),
                     preview,
-                    |_, _| {},
+                    |result, at| log::info!("drop drag ended: {result:?} at {},{}", at.x, at.y),
                     drag::Options::default(),
                 );
                 let _ = tx.send(started.map_err(|err| err.to_string()));
             })
             .map_err(|err| err.to_string())?;
-        rx.recv().map_err(|err| err.to_string())?
+        let dragged = rx.recv().map_err(|err| err.to_string())?;
+        if let Err(err) = &dragged {
+            log::warn!("drop drag: {err}");
+        }
+        dragged
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -227,21 +277,16 @@ pub async fn drop_drag(window: tauri::WebviewWindow, path: String) -> Result<(),
     }
 }
 
-/// A small PNG of the image for the drag cursor, or the system's file
-/// preview when it is not an image this app can decode.
+/// A small PNG of the image for the drag cursor, or `None` when it is not an
+/// image this app can decode.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn drag_preview(path: &Path) -> drag::Image {
-    let thumb = decode(path).ok().and_then(|img| {
-        let mut png = std::io::Cursor::new(Vec::new());
-        img.thumbnail(DRAG_PREVIEW, DRAG_PREVIEW)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .ok()?;
-        Some(png.into_inner())
-    });
-    match thumb {
-        Some(png) => drag::Image::Raw(png),
-        None => drag::Image::File(path.to_path_buf()),
-    }
+fn preview_png(path: &Path) -> Option<Vec<u8>> {
+    let img = decode(path).ok()?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.thumbnail(DRAG_PREVIEW, DRAG_PREVIEW)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .ok()?;
+    Some(png.into_inner())
 }
 
 /// Decode an image upright: phones store portrait photos sideways with an

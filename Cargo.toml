@@ -108,3 +108,10 @@ strip = "symbols"
 opt-level = 3
 [profile.dev.package.libsqlite3-sys]
 opt-level = 3
+# The desktop app decodes photos for the clipboard and drag previews (D50).
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
