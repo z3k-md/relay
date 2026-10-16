@@ -37,8 +37,11 @@ class RelaySyncService : Service() {
       ContextCompat.startForegroundService(context, Intent(context, RelaySyncService::class.java))
     }
 
-    /** Must match Tauri's app_data_dir(): dataDir/<bundle identifier>. */
-    fun home(context: Context): File = File(context.dataDir, context.packageName)
+    /**
+     * The Relay home. Must match app_home() in lib.rs: Tauri's
+     * app_data_dir() on Android is dataDir itself, plus "relay".
+     */
+    fun home(context: Context): File = File(context.dataDir, "relay")
   }
 
   private val handler = Handler(Looper.getMainLooper())

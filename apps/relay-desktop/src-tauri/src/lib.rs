@@ -136,6 +136,10 @@ pub fn run() {
             // The sync service may already run this process's runner; share it.
             #[cfg(target_os = "android")]
             let runner = mobile::runner(home.clone());
+            // The service may have started the runner first; use the home it runs
+            // in, so IPC and config reach the running engine.
+            #[cfg(target_os = "android")]
+            let home = runner.home().to_path_buf();
             app.manage(drops::Pending::default());
             #[cfg(not(target_os = "android"))]
             drops::spawn_watcher(app.handle().clone(), home.clone());
@@ -212,7 +216,8 @@ pub fn run() {
 fn app_home(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
     #[cfg(target_os = "android")]
     {
-        Ok(app.path().app_data_dir()?)
+        // Must match RelaySyncService.home(): <app data>/relay.
+        Ok(app.path().app_data_dir()?.join("relay"))
     }
     #[cfg(not(target_os = "android"))]
     {
