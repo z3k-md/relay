@@ -103,6 +103,11 @@ export const api = {
   dropOpen: (path: string) => call<void>("drop_open", { path }),
   dropReveal: (path: string) => call<void>("drop_reveal", { path }),
   dropDrag: (path: string) => call<void>("drop_drag", { path }),
+  /** Grow the popup into a video player, or back. */
+  dropPopupPlayer: (open: boolean) => call<void>("drop_popup_player", { open }),
+  /** Leave a notification for drops the popup closed on before they were used. */
+  dropMissed: (names: string[], from: string | null) =>
+    call<void>("drop_missed", { names, from }),
   getDropSettings: () => call<DropSettings>("get_drop_settings"),
   setDropSettings: (patch: { receive?: boolean; inbox?: string; autoCopy?: boolean }) =>
     call<DropSettings>("set_drop_settings", { patch }),

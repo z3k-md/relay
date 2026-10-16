@@ -168,7 +168,7 @@ relay drop off
 
 A home server takes no files until `relay drop on`.
 
-The desktop app shows each arriving file in a small popup in the corner: drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. Settings has the same switch and folder, plus an option to copy every arrival automatically. Peers has **Send file…** for each connected device.
+The desktop app shows each arriving file in a small popup in the corner: click it to open the file, drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. A video shows a frame with a play button that grows the popup into a player; if Windows cannot decode it there, play opens your video player. If the popup closes before you use a file, it leaves a Windows notification, and the tray menu's **Recent drops** lists the newest files in the drop folder. Settings has the same switch and folder, plus an option to copy every arrival automatically. Peers has **Send file…** for each connected device.
 
 ## Commands
 

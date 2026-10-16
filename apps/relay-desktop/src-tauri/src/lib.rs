@@ -74,6 +74,8 @@ pub fn run() {
             drops::drop_open,
             drops::drop_reveal,
             drops::drop_drag,
+            drops::drop_popup_player,
+            drops::drop_missed,
             drops::drop_send,
             drops::get_drop_settings,
             drops::set_drop_settings,
@@ -154,6 +156,7 @@ pub fn run() {
                 if let Err(err) = tray::setup(app.handle()) {
                     log::warn!("tray setup failed: {err:#}");
                 }
+                drops::refresh_tray(app.handle());
                 commands::apply_autostart(
                     app.handle(),
                     settings::load(app.handle()).start_at_login,

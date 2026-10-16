@@ -415,6 +415,7 @@ export interface DropArrival {
   /** The sending device, when known. */
   from: string | null;
   image: boolean;
+  video: boolean;
   atMs: number;
 }
 
