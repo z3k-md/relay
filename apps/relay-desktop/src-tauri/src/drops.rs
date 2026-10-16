@@ -8,14 +8,19 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::time::Duration;
 
 use relay_core::drops::DropSent;
 use relay_core::remote::{RemoteError, RemoteErrorCode};
 use relay_engine::{DropSettings, Engine};
-use relay_ipc::{ActivityItem, Client, DropSendParams};
+use relay_ipc::DropSendParams;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use relay_ipc::{ActivityItem, Client};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::commands::host_client;
@@ -25,12 +30,17 @@ use crate::{AppState, settings};
 /// Label of the popup window.
 pub const POPUP: &str = "drop";
 /// Tells the popup that [`drop_take`] has something new.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const ARRIVED_EVENT: &str = "drop-arrived";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const POPUP_WIDTH: f64 = 380.0;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const POPUP_HEIGHT: f64 = 124.0;
 /// Gap between the popup and the edges of the work area, in logical pixels.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const POPUP_MARGIN: f64 = 16.0;
 /// Wait before reconnecting to a host that is not running or went away.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const RECONNECT: Duration = Duration::from_secs(2);
 /// Edge of the drag preview, in pixels.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -64,6 +74,7 @@ pub struct Pending {
 const MAX_PREVIEWS: usize = 16;
 
 /// Follow the host's activity for drops until the app exits.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn spawn_watcher(app: AppHandle, home: PathBuf) {
     let spawned = std::thread::Builder::new()
         .name("relay-drops".into())
@@ -86,6 +97,7 @@ pub fn spawn_watcher(app: AppHandle, home: PathBuf) {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn arrived(app: &AppHandle, item: ActivityItem) {
     let Some(path) = item.detail else {
         return;
@@ -151,6 +163,7 @@ fn arrived(app: &AppHandle, item: ActivityItem) {
 
 /// Open the popup in the bottom corner of the main screen's work area
 /// without taking focus, or tell an open one there is more.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn show_popup(app: &AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(POPUP) {
         window.emit(ARRIVED_EVENT, ())?;
@@ -188,6 +201,7 @@ fn show_popup(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn is_image(path: &Path) -> bool {
     relay_core::drops::mime_for(&path.to_string_lossy()).starts_with("image/")
 }
@@ -291,6 +305,7 @@ fn preview_png(path: &Path) -> Option<Vec<u8>> {
 
 /// Decode an image upright: phones store portrait photos sideways with an
 /// EXIF orientation.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn decode(path: &Path) -> anyhow::Result<image::DynamicImage> {
     use image::ImageDecoder;
     let mut decoder = image::ImageReader::open(path)?
