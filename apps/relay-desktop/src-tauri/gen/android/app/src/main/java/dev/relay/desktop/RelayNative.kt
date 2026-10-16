@@ -24,4 +24,11 @@ object RelayNative {
 
   /** Paired devices, one name per line. */
   external fun peers(home: String): String
+
+  /**
+   * Pairs with the device that showed the relay://pair QR code [link].
+   * Blocks while sync starts and pairing runs; never call it on the main
+   * thread. Returns a line for the user either way.
+   */
+  external fun pairLink(home: String, link: String): String
 }

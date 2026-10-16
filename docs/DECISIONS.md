@@ -1469,7 +1469,9 @@ stage 1 of [`proposals/photo-drop.md`](proposals/photo-drop.md).
   ` (2)`, ` (3)`, and so on. The final name is a hard link, which fails
   rather than replace a file; where hard links are unsupported, a rename
   follows an existence check. The file's modified time is the offered one.
-- **Limits.** 256 MiB per drop, four drops taken at once, no resume.
+- **Limits.** 4 GiB per drop (256 MiB before 0.1.13; an older receiver
+  refuses larger files with `invalid`), four drops taken at once, no
+  resume. A phone copies a file into its cache before sending it.
 - **Settings are read per drop.** `ControlHandler::drop_inbox` and
   `dropped` read the database each time, so a change applies to the next
   drop. A saved drop is an `ActivityItem` of kind `drop` whose `detail` is

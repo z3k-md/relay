@@ -1,103 +1,88 @@
 package dev.relay.desktop
 
-import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
-import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import androidx.core.content.ContextCompat
 import java.io.File
 
 /**
- * Keeps the process alive and runs the Relay engine while the UI is closed.
+ * Keeps the process alive while files are sent to a computer (D50), then
+ * stops, so there is no notification while nothing is happening.
  *
- * The engine is the same in-process runner the UI uses (mobile.rs), so the
- * activity and this service never run two copies. Android 15 caps dataSync
- * foreground services at 6 h per 24 h; on timeout the service stops sync and
- * itself.
+ * A tap on "Send to …" or the share sheet starts it in the foreground with
+ * the "Sending…" notification. The engine is the same in-process runner the
+ * UI uses (mobile.rs); while the app is open it syncs without this service.
+ * When the last send finishes, the service leaves the result notification
+ * behind and stops. The engine keeps running until Android freezes or ends
+ * the idle process.
  */
 class RelaySyncService : Service() {
   companion object {
-    private const val CHANNEL_ID = "sync"
-    private const val NOTIFICATION_ID = 1
-    private const val ACTION_STOP = "dev.relay.desktop.STOP_SYNC"
-    private const val STATUS_INTERVAL_MS = 5_000L
+    /** The always-on status channel this service used to post to. */
+    private const val OLD_SYNC_CHANNEL = "sync"
 
-    fun start(context: Context) {
-      ContextCompat.startForegroundService(context, Intent(context, RelaySyncService::class.java))
-    }
-
-    /** Must match Tauri's app_data_dir(): dataDir/<bundle identifier>. */
-    fun home(context: Context): File = File(context.dataDir, context.packageName)
+    /**
+     * The Relay home. Must match app_home() in lib.rs: Tauri's
+     * app_data_dir() on Android is dataDir itself, plus "relay".
+     */
+    fun home(context: Context): File = File(context.dataDir, "relay")
   }
 
-  private val handler = Handler(Looper.getMainLooper())
   private var multicastLock: WifiManager.MulticastLock? = null
-  private var lastStatus = ""
-
-  private val refresh = object : Runnable {
-    override fun run() {
-      val status = RelayNative.status()
-      if (status != lastStatus) {
-        lastStatus = status
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(status))
-      }
-      handler.postDelayed(this, STATUS_INTERVAL_MS)
-    }
-  }
+  /** Sends in flight. Touched on the main thread only. */
+  private var sending = 0
 
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onCreate() {
     super.onCreate()
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      val channel = NotificationChannel(CHANNEL_ID, "Sync", NotificationManager.IMPORTANCE_LOW)
-      channel.setShowBadge(false)
-      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-    }
     Drops.createChannels(this)
-    val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-    } else {
-      0
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      getSystemService(NotificationManager::class.java).deleteNotificationChannel(OLD_SYNC_CHANNEL)
     }
-    ServiceCompat.startForeground(this, NOTIFICATION_ID, notification("Starting…"), type)
-
     // mDNS discovery needs multicast; Wi-Fi drops it without a lock.
     val wifi = applicationContext.getSystemService(WifiManager::class.java)
     multicastLock = wifi?.createMulticastLock("relay-mdns")?.apply {
       setReferenceCounted(false)
       acquire()
     }
-
     val home = home(this)
     home.mkdirs()
     RelayNative.start(home.absolutePath)
-    handler.post(refresh)
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    if (intent?.action == ACTION_STOP) {
-      stopSelf()
+    val peer = intent?.getStringExtra(Drops.EXTRA_PEER)
+    if (intent?.action != Drops.ACTION_SEND || peer == null) {
+      if (sending == 0) stopSelf()
       return START_NOT_STICKY
     }
-    // "Send to …" from a photo notification or the share sheet (D50). A tap
-    // on a notification may start this foreground service from the
-    // background; sync is already starting in onCreate.
-    if (intent?.action == Drops.ACTION_SEND) {
-      Drops.send(this, intent)
+    // A foreground start must show a notification within seconds: the
+    // progress of this send is that notification.
+    val count = intent.getStringArrayListExtra(Drops.EXTRA_URIS).orEmpty().size +
+      intent.getStringArrayListExtra(Drops.EXTRA_PATHS).orEmpty().size
+    val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+    } else {
+      0
     }
-    return START_STICKY
+    ServiceCompat.startForeground(this, Drops.NOTIFY_SEND, Drops.progress(this, peer, count), type)
+    sending++
+    Drops.send(this, intent) {
+      sending--
+      if (sending == 0) {
+        // Drops.send posts the result right after this.
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf()
+      }
+    }
+    return START_NOT_STICKY
   }
 
   override fun onTimeout(startId: Int, fgsType: Int) {
@@ -105,36 +90,8 @@ class RelaySyncService : Service() {
   }
 
   override fun onDestroy() {
-    handler.removeCallbacks(refresh)
     multicastLock?.release()
     multicastLock = null
-    // stop() joins the engine thread for up to 5 s; keep it off the main thread.
-    Thread({ RelayNative.stop() }, "relay-stop").start()
     super.onDestroy()
-  }
-
-  private fun notification(status: String): Notification {
-    val open = PendingIntent.getActivity(
-      this,
-      0,
-      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-      PendingIntent.FLAG_IMMUTABLE,
-    )
-    val stop = PendingIntent.getService(
-      this,
-      1,
-      Intent(this, RelaySyncService::class.java).setAction(ACTION_STOP),
-      PendingIntent.FLAG_IMMUTABLE,
-    )
-    return NotificationCompat.Builder(this, CHANNEL_ID)
-      .setSmallIcon(android.R.drawable.stat_notify_sync)
-      .setContentTitle("Relay")
-      .setContentText(status)
-      .setContentIntent(open)
-      .addAction(0, "Stop sync", stop)
-      .setOngoing(true)
-      .setOnlyAlertOnce(true)
-      .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-      .build()
   }
 }

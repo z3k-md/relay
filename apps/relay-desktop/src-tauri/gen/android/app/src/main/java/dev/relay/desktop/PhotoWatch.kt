@@ -14,58 +14,89 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import androidx.core.app.NotificationCompat
 
+
 /**
- * Offers each new camera photo to a computer (photo-drop proposal, stage 4).
+ * Offers each new camera photo or video to a computer (photo-drop proposal,
+ * stage 4).
  *
- * A JobScheduler job with a content-URI trigger on MediaStore runs a few
- * seconds after the camera saves a photo, with nothing resident in between.
- * It posts one notification with a thumbnail and a "Send to …" button per
- * paired device. The photo is read when the button is tapped, so a Pixel's
- * processed version is the one that goes. Content-trigger jobs end at
- * reboot, so [DropReceiver] schedules the job again on boot.
+ * A JobScheduler job with content-URI triggers on MediaStore runs a few
+ * seconds after the camera saves something, with nothing resident in
+ * between. It posts one notification with a thumbnail and a "Send to …"
+ * button per paired device. The file is read when the button is tapped, so
+ * a Pixel's processed photo is the one that goes. Content-trigger jobs end
+ * at reboot, so [DropReceiver] schedules the job again on boot.
  */
 object PhotoWatch {
   private const val TAG = "RelayPhotos"
   private const val JOB_ID = 1001
   private const val PREFS = "photo_watch"
   private const val KEY_LAST_ID = "last_id"
-  private const val KEY_PENDING = "pending"
+  private const val KEY_PENDING = "pending_uris"
   private const val KEY_PENDING_AT = "pending_at"
   /** A notification nobody acted on is gone after this. */
   private const val OFFER_MS = 10 * 60 * 1000L
-  /** Photos one notification carries. */
+  /** Files one notification carries. */
   private const val MAX_PENDING = 20
   private const val CAMERA_FOLDER = "DCIM/Camera/"
 
-  fun permission(): String =
+  /** One MediaStore table to watch. IDs are shared across tables. */
+  private class Table(val uri: Uri, val permission: String, val video: Boolean)
+
+  private fun tables(): List<Table> =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-      Manifest.permission.READ_MEDIA_IMAGES
+      listOf(
+        Table(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Manifest.permission.READ_MEDIA_IMAGES, false),
+        Table(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Manifest.permission.READ_MEDIA_VIDEO, true),
+      )
     } else {
-      Manifest.permission.READ_EXTERNAL_STORAGE
+      listOf(
+        Table(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Manifest.permission.READ_EXTERNAL_STORAGE, false),
+        Table(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Manifest.permission.READ_EXTERNAL_STORAGE, true),
+      )
     }
+
+  /** A finished camera file. */
+  private class Item(val id: Long, val uri: String, val video: Boolean)
+
+  /** Permissions to ask for; MainActivity requests the missing ones. */
+  fun permissions(): List<String> = tables().map { it.permission }.distinct()
 
   /** Watching needs MediaStore's relative paths and pending flag (Android 10+). */
   fun supported(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
-  fun allowed(context: Context): Boolean =
-    supported() && context.checkSelfPermission(permission()) == PackageManager.PERMISSION_GRANTED
+  private fun readable(context: Context): List<Table> =
+    if (!supported()) {
+      emptyList()
+    } else {
+      tables().filter { context.checkSelfPermission(it.permission) == PackageManager.PERMISSION_GRANTED }
+    }
+
+  fun allowed(context: Context): Boolean = readable(context).isNotEmpty()
 
   /** Arm the job for the next change in MediaStore. */
   fun schedule(context: Context) {
-    if (!allowed(context)) return
-    val job = JobInfo.Builder(JOB_ID, ComponentName(context, NewPhotoJob::class.java))
-      .addTriggerContentUri(
-        JobInfo.TriggerContentUri(
-          MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-          JobInfo.TriggerContentUri.FLAG_NOTIFY_FOR_DESCENDANTS,
-        ),
+    val tables = readable(context)
+    if (tables.isEmpty()) return
+    // Start from now, so the first photo after install is offered rather
+    // than taken as the starting point.
+    val prefs = prefs(context)
+    if (prefs.getLong(KEY_LAST_ID, -1L) < 0) {
+      Thread({ prefs.edit().putLong(KEY_LAST_ID, latestId(context)).apply() }, "relay-photos-start").start()
+    }
+    val builder = JobInfo.Builder(JOB_ID, ComponentName(context, NewPhotoJob::class.java))
+    for (table in tables) {
+      builder.addTriggerContentUri(
+        JobInfo.TriggerContentUri(table.uri, JobInfo.TriggerContentUri.FLAG_NOTIFY_FOR_DESCENDANTS),
       )
+    }
+    val job = builder
       .setTriggerContentUpdateDelay(500)
       .setTriggerContentMaxDelay(3_000)
       .build()
@@ -78,19 +109,19 @@ object PhotoWatch {
 
   private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-  /** Find photos added since the last look and offer them. */
+  /** Find camera files added since the last look and offer them. */
   fun check(context: Context) {
     if (!allowed(context)) return
     val prefs = prefs(context)
     val last = prefs.getLong(KEY_LAST_ID, -1L)
-    val fresh = newPhotos(context, last)
     if (last < 0) {
       // First run: start from now instead of offering the whole camera roll.
       prefs.edit().putLong(KEY_LAST_ID, latestId(context)).apply()
       return
     }
+    val fresh = newItems(context, last)
     if (fresh.isEmpty()) return
-    prefs.edit().putLong(KEY_LAST_ID, fresh.max()).apply()
+    prefs.edit().putLong(KEY_LAST_ID, fresh.maxOf { it.id }).apply()
 
     val manager = context.getSystemService(NotificationManager::class.java)
     if (!manager.areNotificationsEnabled()) return
@@ -102,66 +133,82 @@ object PhotoWatch {
     val peers = Drops.peers(context)
     if (peers.isEmpty()) return
 
-    // Photos still on offer from a notification shown a moment ago join
+    // Files still on offer from a notification shown a moment ago join
     // this one ("3 new photos").
     val now = System.currentTimeMillis()
     val earlier = if (now - prefs.getLong(KEY_PENDING_AT, 0L) < OFFER_MS) {
-      prefs.getString(KEY_PENDING, "").orEmpty().split(',').mapNotNull { it.toLongOrNull() }
+      prefs.getString(KEY_PENDING, "").orEmpty().lines().filter { it.isNotBlank() }
     } else {
       emptyList()
     }
-    val pending = (earlier + fresh).distinct().takeLast(MAX_PENDING)
+    val pending = (earlier + fresh.map { it.uri }).distinct().takeLast(MAX_PENDING)
     prefs.edit()
-      .putString(KEY_PENDING, pending.joinToString(","))
+      .putString(KEY_PENDING, pending.joinToString("\n"))
       .putLong(KEY_PENDING_AT, now)
       .apply()
-    manager.notify(Drops.NOTIFY_PHOTO, offer(context, pending, peers))
+    manager.notify(Drops.NOTIFY_PHOTO, offer(context, pending, fresh.last(), peers))
   }
 
-  /** IDs of finished camera photos after [after], oldest first. */
-  private fun newPhotos(context: Context, after: Long): List<Long> {
-    val ids = mutableListOf<Long>()
-    val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.IS_PENDING)
-    val selection = "${MediaStore.Images.Media._ID} > ? AND ${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
-    val args = arrayOf(after.toString(), "$CAMERA_FOLDER%")
-    try {
-      context.contentResolver.query(
-        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-        projection,
-        selection,
-        args,
-        "${MediaStore.Images.Media._ID} ASC",
-      )?.use { cursor ->
-        while (cursor.moveToNext()) {
-          // A photo still being written comes back when it is finished;
-          // stop before it so it is not skipped.
-          if (cursor.getInt(1) != 0) break
-          ids.add(cursor.getLong(0))
+  /**
+   * Finished camera files after [after], oldest first. A file still being
+   * written (a video while recording) comes back when it is finished, so
+   * nothing at or after the first unfinished one is returned yet.
+   */
+  private fun newItems(context: Context, after: Long): List<Item> {
+    val items = mutableListOf<Item>()
+    var firstPending = Long.MAX_VALUE
+    for (table in readable(context)) {
+      try {
+        context.contentResolver.query(
+          table.uri,
+          arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.IS_PENDING),
+          "${MediaStore.MediaColumns._ID} > ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+          arrayOf(after.toString(), "$CAMERA_FOLDER%"),
+          "${MediaStore.MediaColumns._ID} ASC",
+        )?.use { cursor ->
+          while (cursor.moveToNext()) {
+            val id = cursor.getLong(0)
+            if (cursor.getInt(1) != 0) {
+              firstPending = minOf(firstPending, id)
+              break
+            }
+            items.add(Item(id, ContentUris.withAppendedId(table.uri, id).toString(), table.video))
+          }
         }
+      } catch (err: Exception) {
+        Log.w(TAG, "query ${table.uri}: $err")
       }
-    } catch (err: Exception) {
-      Log.w(TAG, "query: $err")
     }
-    return ids
+    return items.filter { it.id < firstPending }.sortedBy { it.id }
   }
 
   private fun latestId(context: Context): Long =
-    context.contentResolver.query(
-      MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-      arrayOf(MediaStore.Images.Media._ID),
-      null,
-      null,
-      "${MediaStore.Images.Media._ID} DESC",
-    )?.use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else 0L } ?: 0L
+    readable(context).maxOfOrNull { table ->
+      context.contentResolver.query(
+        table.uri,
+        arrayOf(MediaStore.MediaColumns._ID),
+        null,
+        null,
+        "${MediaStore.MediaColumns._ID} DESC",
+      )?.use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else 0L } ?: 0L
+    } ?: 0L
 
-  private fun offer(context: Context, ids: List<Long>, peers: List<String>): android.app.Notification {
-    val uris = ids.map {
-      ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, it).toString()
+  private fun title(uris: List<String>): String {
+    val videos = uris.count { it.contains("/video/") }
+    val photos = uris.size - videos
+    return when {
+      uris.size == 1 && videos == 1 -> "New video"
+      uris.size == 1 -> "New photo"
+      videos == 0 -> "$photos new photos"
+      photos == 0 -> "$videos new videos"
+      else -> "${uris.size} new photos and videos"
     }
-    val title = if (ids.size == 1) "New photo" else "${ids.size} new photos"
+  }
+
+  private fun offer(context: Context, uris: List<String>, newest: Item, peers: List<String>): android.app.Notification {
     val builder = NotificationCompat.Builder(context, Drops.CHANNEL_PHOTOS)
       .setSmallIcon(android.R.drawable.ic_menu_upload)
-      .setContentTitle(title)
+      .setContentTitle(title(uris))
       .setContentText("Send to ${peers.first()}?")
       .setCategory(NotificationCompat.CATEGORY_RECOMMENDATION)
       .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -175,7 +222,7 @@ object PhotoWatch {
           PendingIntent.FLAG_IMMUTABLE,
         ),
       )
-    thumbnail(context, ids.last())?.let { bitmap ->
+    thumbnail(context, Uri.parse(newest.uri))?.let { bitmap ->
       builder.setLargeIcon(bitmap)
       builder.setStyle(
         NotificationCompat.BigPictureStyle().bigPicture(bitmap).bigLargeIcon(null as Bitmap?),
@@ -188,15 +235,15 @@ object PhotoWatch {
         Drops.sendIntent(context, peer, uris = uris),
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
       )
-      val label = if (ids.size == 1) "Send to $peer" else "Send all to $peer"
+      val label = if (uris.size == 1) "Send to $peer" else "Send all to $peer"
       builder.addAction(0, label, send)
     }
     return builder.build()
   }
 
-  private fun thumbnail(context: Context, id: Long): Bitmap? =
+  /** A frame for a video, a scaled copy for a photo. */
+  private fun thumbnail(context: Context, uri: Uri): Bitmap? =
     try {
-      val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
       context.contentResolver.loadThumbnail(uri, Size(768, 768), null)
     } catch (err: Exception) {
       Log.w(TAG, "thumbnail: $err")

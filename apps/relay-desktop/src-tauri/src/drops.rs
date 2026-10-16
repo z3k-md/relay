@@ -35,6 +35,12 @@ const ARRIVED_EVENT: &str = "drop-arrived";
 const POPUP_WIDTH: f64 = 380.0;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 const POPUP_HEIGHT: f64 = 124.0;
+/// The popup while it plays a video: 16:9 video above the file name and
+/// buttons.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const PLAYER_WIDTH: f64 = 480.0;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const PLAYER_HEIGHT: f64 = 392.0;
 /// Gap between the popup and the edges of the work area, in logical pixels.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 const POPUP_MARGIN: f64 = 16.0;
@@ -56,6 +62,8 @@ pub struct DropArrival {
     /// The sending device's name, when the summary names one.
     pub from: Option<String>,
     pub image: bool,
+    /// A video the popup can show a frame of and play.
+    pub video: bool,
     pub at_ms: u64,
 }
 
@@ -113,6 +121,7 @@ fn arrived(app: &AppHandle, item: ActivityItem) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
         image: is_image(&path),
+        video: is_video(&path),
         path: path.to_string_lossy().into_owned(),
         from: path
             .file_name()
@@ -149,6 +158,7 @@ fn arrived(app: &AppHandle, item: ActivityItem) {
     if let Ok(mut pending) = app.state::<Pending>().queue.lock() {
         pending.push_back(arrival);
     }
+    refresh_tray(app);
     let app = app.clone();
     let shown = app.clone().run_on_main_thread(move || {
         if let Err(err) = show_popup(&app) {
@@ -185,24 +195,57 @@ fn show_popup(app: &AppHandle) -> tauri::Result<()> {
             .visible(false)
             .shadow(true)
             .build()?;
+    place(&window, POPUP_WIDTH, POPUP_HEIGHT)?;
+    // The page shows itself once it has drawn, so no blank frame flashes.
+    Ok(())
+}
+
+/// Size the popup and put it in the bottom corner of the main screen's work
+/// area, so it grows up and to the left.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn place(window: &tauri::WebviewWindow, width: f64, height: f64) -> tauri::Result<()> {
+    window.set_size(tauri::LogicalSize::new(width, height))?;
     if let Some(monitor) = window.primary_monitor()? {
         let scale = monitor.scale_factor();
         let area = monitor.work_area();
         let x = f64::from(area.position.x) / scale + f64::from(area.size.width) / scale
-            - POPUP_WIDTH
+            - width
             - POPUP_MARGIN;
         let y = f64::from(area.position.y) / scale + f64::from(area.size.height) / scale
-            - POPUP_HEIGHT
+            - height
             - POPUP_MARGIN;
         window.set_position(tauri::LogicalPosition::new(x, y))?;
     }
-    // The page shows itself once it has drawn, so no blank frame flashes.
     Ok(())
+}
+
+/// Grow the popup into a player for a video, or back to its normal size.
+#[tauri::command]
+pub fn drop_popup_player(window: tauri::WebviewWindow, open: bool) -> Result<(), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let (width, height) = if open {
+            (PLAYER_WIDTH, PLAYER_HEIGHT)
+        } else {
+            (POPUP_WIDTH, POPUP_HEIGHT)
+        };
+        place(&window, width, height).map_err(|err| err.to_string())
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (window, open);
+        Ok(())
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn is_image(path: &Path) -> bool {
     relay_core::drops::mime_for(&path.to_string_lossy()).starts_with("image/")
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn is_video(path: &Path) -> bool {
+    relay_core::drops::mime_for(&path.to_string_lossy()).starts_with("video/")
 }
 
 /// Drops that arrived since the popup last asked, oldest first.
@@ -386,6 +429,79 @@ pub struct DropSettingsPatch {
     /// A folder, or `""` for the default one.
     pub inbox: Option<String>,
     pub auto_copy: Option<bool>,
+}
+
+/// Files in the drop folder, newest first, for the tray's Recent drops.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn recent(home: &Path, limit: usize) -> Vec<PathBuf> {
+    let Some(inbox) = Engine::open_read_only(home)
+        .and_then(|engine| engine.drop_settings())
+        .ok()
+        .and_then(|settings| settings.inbox)
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&inbox) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            // A drop keeps the photo's modified time; creation is arrival.
+            let arrived = meta.created().or_else(|_| meta.modified()).ok()?;
+            Some((arrived, e.path()))
+        })
+        .collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files.into_iter().take(limit).map(|(_, p)| p).collect()
+}
+
+/// Rebuild the tray's Recent drops from the drop folder.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn refresh_tray(app: &AppHandle) {
+    let home = app.state::<AppState>().home.clone();
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let files = recent(&home, crate::tray::RECENT_DROPS);
+        let inbox = Engine::open_read_only(&home)
+            .and_then(|engine| engine.drop_settings())
+            .ok()
+            .and_then(|settings| settings.inbox);
+        let tray_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            crate::tray::set_recent_drops(&tray_app, files, inbox);
+        });
+    });
+}
+
+/// The popup closed on its own before these files were used: leave a
+/// Windows notification, so they are in the notification history.
+#[tauri::command]
+pub fn drop_missed(app: AppHandle, names: Vec<String>, from: Option<String>) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        let Some(first) = names.first() else {
+            return;
+        };
+        let from = from.unwrap_or_else(|| "A device".to_owned());
+        let title = if names.len() == 1 {
+            format!("{from} sent {first}")
+        } else {
+            format!("{from} sent {} files", names.len())
+        };
+        let body = "Open it from Recent drops in the Relay tray menu.";
+        if let Err(err) = app.notification().builder().title(title).body(body).show() {
+            log::warn!("drop notification: {err}");
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = (app, names, from);
 }
 
 fn settings_view(app: &AppHandle, settings: DropSettings) -> DropSettingsView {

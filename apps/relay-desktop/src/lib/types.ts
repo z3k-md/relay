@@ -208,6 +208,10 @@ export type RemoteErrorCode =
 export interface PairStartResult {
   code: string;
   expiresAtMs: number;
+  /** relay://pair link with the code and this computer's addresses. */
+  link: string;
+  /** The link as an SVG QR code. */
+  qrSvg: string | null;
 }
 
 export type PairStatus =
@@ -411,6 +415,7 @@ export interface DropArrival {
   /** The sending device, when known. */
   from: string | null;
   image: boolean;
+  video: boolean;
   atMs: number;
 }
 

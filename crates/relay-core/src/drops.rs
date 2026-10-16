@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::reserved::component_issues;
 
-/// Largest file one drop carries. Photos, screenshots and short clips fit.
-pub const DROP_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest file one drop carries: several minutes of 4K phone video.
+/// Receivers before 0.1.13 refuse anything over 256 MiB.
+pub const DROP_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Longest saved name, in bytes, before the number a collision adds.
 pub const DROP_NAME_MAX: usize = 200;
 
@@ -74,6 +75,9 @@ pub fn mime_for(name: &str) -> &'static str {
         ".dng" => "image/x-adobe-dng",
         ".mp4" => "video/mp4",
         ".mov" => "video/quicktime",
+        ".3gp" => "video/3gpp",
+        ".webm" => "video/webm",
+        ".mkv" => "video/x-matroska",
         ".pdf" => "application/pdf",
         ".txt" => "text/plain",
         _ => "application/octet-stream",

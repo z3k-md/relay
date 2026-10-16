@@ -157,7 +157,7 @@ Send a file straight to a connected device:
 relay drop send desk ~/Pictures/PXL_20261015.jpg
 ```
 
-It lands in the other device's drop folder, `Pictures/Relay` unless changed there, and keeps its name; a taken name gets ` (2)`. Nothing syncs and nothing is mirrored back: it is an ordinary file on that device. Any paired device may send files up to 256 MB. On the receiving device:
+It lands in the other device's drop folder, `Pictures/Relay` unless changed there, and keeps its name; a taken name gets ` (2)`. Nothing syncs and nothing is mirrored back: it is an ordinary file on that device. Any paired device may send files up to 4 GB, so phone videos fit. On the receiving device:
 
 ```bash
 relay drop status
@@ -168,7 +168,7 @@ relay drop off
 
 A home server takes no files until `relay drop on`.
 
-The desktop app shows each arriving file in a small popup in the corner: drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. Settings has the same switch and folder, plus an option to copy every arrival automatically. Peers has **Send file…** for each connected device.
+The desktop app shows each arriving file in a small popup in the corner: click it to open the file, drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. A video shows a frame with a play button that grows the popup into a player; if Windows cannot decode it there, play opens your video player. If the popup closes before you use a file, it leaves a Windows notification, and the tray menu's **Recent drops** lists the newest files in the drop folder. Settings has the same switch and folder, plus an option to copy every arrival automatically. Peers has **Send file…** for each connected device.
 
 ## Commands
 

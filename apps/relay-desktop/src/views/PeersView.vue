@@ -48,6 +48,8 @@ async function sendFile(peer: string) {
 const busy = ref(false);
 const share = ref<string[]>([]);
 const pairCode = ref("");
+/** The pairing link as a QR code a phone camera can open. */
+const pairQr = ref<string | null>(null);
 const pairExpires = ref(0);
 const pairNow = ref(Date.now());
 const pairDone = ref<string | null>(null);
@@ -202,6 +204,7 @@ async function startPair() {
   try {
     const started = await api.pairStart(share.value, allowManage.value);
     pairCode.value = started.code;
+    pairQr.value = started.qrSvg;
     pairExpires.value = started.expiresAtMs;
     pairNow.value = Date.now();
     pairing.value = true;
@@ -230,6 +233,7 @@ async function closePair() {
   pairing.value = false;
   pairCode.value = "";
   pairFailed.value = null;
+  pairQr.value = null;
   pairDone.value = null;
 }
 
@@ -481,8 +485,15 @@ defineExpose({ load });
       </div>
       <div v-else-if="pairCode">
         <p class="text-[12px] text-[var(--color-muted)]">
-          Enter this code on the other device. It expires in {{ remaining }}.
+          Scan this with your phone's camera, or enter the code on the other device. It
+          expires in {{ remaining }}.
         </p>
+        <!-- eslint-disable-next-line vue/no-v-html -- an SVG this app rendered -->
+        <div
+          v-if="pairQr"
+          class="mx-auto mt-3 w-[200px] rounded-md bg-white p-2"
+          v-html="pairQr"
+        />
         <p class="mono my-4 text-center text-[28px] font-semibold tracking-wide">{{ pairCode }}</p>
         <p class="text-[12px] text-[var(--color-muted)]">Waiting for the other device…</p>
         <div class="mt-4 flex justify-end">
