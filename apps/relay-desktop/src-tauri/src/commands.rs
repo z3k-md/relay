@@ -410,6 +410,10 @@ pub fn remove_peer(app: AppHandle, name: String) -> Result<(), String> {
 pub struct PairStartView {
     pub code: String,
     pub expires_at_ms: u64,
+    /// `relay://pair` link with the code and this device's addresses.
+    pub link: String,
+    /// The link as an SVG QR code, for a phone camera.
+    pub qr_svg: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -434,12 +438,31 @@ fn pairing_client(app: &AppHandle) -> Result<Client, String> {
     if matches!(state.runner.state(), RunnerState::Paused) {
         return Err("Relay is paused; resume before pairing.".to_owned());
     }
-    match Client::connect(&state.home) {
-        Ok(Some(client)) => Ok(client),
-        Ok(None) => Err("Relay is not running; resume sync and try again.".to_owned()),
-        Err(err) => Err(error_chain(&err)),
+    // Sync may still be starting, as on a phone right after naming the device.
+    let deadline = std::time::Instant::now() + PAIRING_HOST_WAIT;
+    loop {
+        match Client::connect(&state.home) {
+            Ok(Some(client)) => return Ok(client),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Ok(None) => {
+                let socket = relay_ipc::Endpoint::from_home(&state.home);
+                log::warn!(
+                    "pairing: no Relay host for {} (endpoint {}, runner {:?})",
+                    state.home.display(),
+                    socket.display(),
+                    state.runner.state(),
+                );
+                return Err("Relay is not running; resume sync and try again.".to_owned());
+            }
+            Err(err) => return Err(error_chain(&err)),
+        }
     }
 }
+
+/// How long pairing waits for sync to come up before saying it is not running.
+const PAIRING_HOST_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Prefer the running host's IPC so config writes do not `stop_join` the sync
 /// thread. Returns `Ok(None)` only when nothing is listening on the socket.
@@ -464,7 +487,16 @@ pub fn pair_start(
             allow_manage,
         })
         .map_err(|err| error_chain(&err))?;
+    let port = client
+        .status()
+        .ok()
+        .and_then(|status| status.listen)
+        .and_then(|listen| listen.rsplit(':').next()?.parse().ok())
+        .unwrap_or(47321);
+    let link = crate::pair_link::link(&started.code, &crate::pair_link::addresses(port));
     Ok(PairStartView {
+        qr_svg: crate::pair_link::qr_svg(&link),
+        link,
         code: started.code,
         expires_at_ms: started.expires_at_ms,
     })
