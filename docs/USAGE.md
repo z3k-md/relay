@@ -157,7 +157,7 @@ Send a file straight to a connected device:
 relay drop send desk ~/Pictures/PXL_20261015.jpg
 ```
 
-It lands in the other device's drop folder, `Pictures/Relay` unless changed there, and keeps its name; a taken name gets ` (2)`. Nothing syncs and nothing is mirrored back: it is an ordinary file on that device. Any paired device may send files up to 256 MB. On the receiving device:
+It lands in the other device's drop folder, `Pictures/Relay` unless changed there, and keeps its name; a taken name gets ` (2)`. Nothing syncs and nothing is mirrored back: it is an ordinary file on that device. Any paired device may send files up to 4 GB, so phone videos fit. On the receiving device:
 
 ```bash
 relay drop status

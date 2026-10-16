@@ -129,3 +129,32 @@ pub extern "system" fn Java_dev_relay_desktop_RelayNative_peers<'local>(
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
+
+/// How long a pairing link waits for sync to start on the phone.
+const PAIR_CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `RelayNative.pairLink(home, link)`: pair with the device that showed the
+/// `relay://pair` QR code. Blocks; call it off the main thread. Returns a
+/// line for the user either way.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_relay_desktop_RelayNative_pairLink<'local>(
+    mut env: JNIEnv<'local>,
+    _this: JObject<'local>,
+    home: JString<'local>,
+    link: JString<'local>,
+) -> jstring {
+    let line = match (java_string(&mut env, &home), java_string(&mut env, &link)) {
+        (Some(home), Some(link)) => {
+            let home = PathBuf::from(home);
+            runner(home.clone()).ensure_running();
+            match crate::pair_link::join(&home, &link, PAIR_CONNECT_WAIT) {
+                Ok(peer) => format!("Paired with {peer}"),
+                Err(err) => format!("Couldn't pair: {err}"),
+            }
+        }
+        _ => "Couldn't pair: bad arguments".to_owned(),
+    };
+    env.new_string(line)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}

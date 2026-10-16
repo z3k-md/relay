@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -27,7 +29,7 @@ object Drops {
   /** Progress and result of a send. */
   const val CHANNEL_SENDS = "sends"
   const val NOTIFY_PHOTO = 100
-  private const val NOTIFY_SEND = 101
+  const val NOTIFY_SEND = 101
 
   const val ACTION_SEND = "dev.relay.desktop.SEND_DROP"
   const val EXTRA_PEER = "peer"
@@ -90,14 +92,20 @@ object Drops {
 
   /**
    * Run one send on a worker thread, showing progress and the result.
-   * Called by [RelaySyncService] for [ACTION_SEND].
+   * Called by [RelaySyncService] for [ACTION_SEND]. [onDone] runs on the main
+   * thread just before the result is posted, so the service can leave the
+   * foreground first and the result stays a normal, dismissible notification.
    */
-  fun send(context: Context, intent: Intent) {
-    val peer = intent.getStringExtra(EXTRA_PEER) ?: return
+  fun send(context: Context, intent: Intent, onDone: () -> Unit) {
+    val peer = intent.getStringExtra(EXTRA_PEER)
     val uris = intent.getStringArrayListExtra(EXTRA_URIS).orEmpty()
     val paths = intent.getStringArrayListExtra(EXTRA_PATHS).orEmpty()
-    if (uris.isEmpty() && paths.isEmpty()) return
+    if (peer == null || (uris.isEmpty() && paths.isEmpty())) {
+      onDone()
+      return
+    }
     val manager = context.getSystemService(NotificationManager::class.java)
+    val main = Handler(Looper.getMainLooper())
     manager.cancel(NOTIFY_PHOTO)
     PhotoWatch.clearPending(context)
     val count = uris.size + paths.size
@@ -113,11 +121,16 @@ object Drops {
         file.parentFile?.deleteRecursively()
         if (error != null && failure == null) failure = error
       }
-      manager.notify(NOTIFY_SEND, result(context, intent, peer, count, failure))
+      val done = result(context, intent, peer, count, failure)
+      main.post {
+        onDone()
+        manager.notify(NOTIFY_SEND, done)
+      }
     }, "relay-drop").start()
   }
 
-  private fun progress(context: Context, peer: String, count: Int) =
+  /** The "Sending…" notification; also the service's foreground notification. */
+  fun progress(context: Context, peer: String, count: Int) =
     NotificationCompat.Builder(context, CHANNEL_SENDS)
       .setSmallIcon(android.R.drawable.stat_sys_upload)
       .setContentTitle(if (count == 1) "Sending to $peer…" else "Sending $count files to $peer…")

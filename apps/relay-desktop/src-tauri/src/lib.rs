@@ -4,6 +4,7 @@ mod error;
 mod files;
 #[cfg(target_os = "android")]
 mod mobile;
+mod pair_link;
 mod pairs;
 mod privacy;
 mod runner;
