@@ -8,15 +8,14 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::time::Duration;
 
 use relay_core::drops::DropSent;
 use relay_core::remote::{RemoteError, RemoteErrorCode};
 use relay_engine::{DropSettings, Engine};
-use relay_ipc::DropSendParams;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use relay_ipc::{ActivityItem, Client};
+use relay_ipc::ActivityItem;
+use relay_ipc::{Client, DropSendParams};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
