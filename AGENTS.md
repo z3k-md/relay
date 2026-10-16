@@ -51,11 +51,11 @@ The desktop crate builds with its frontend and system packages; see
 
 ## Keeping docs true
 
-Docs change in the same PR as the behavior:
+Docs change in the same commit as the behavior:
 
 | You changed | Update |
 | --- | --- |
-| A design choice, protocol, format, or limit | Add or amend a `DECISIONS.md` entry (next free number; check open PRs) and its index line |
+| A design choice, protocol, format, or limit | Add or amend a `DECISIONS.md` entry (next free number; fetch `develop` first) and its index line |
 | How the system works at the level of DESIGN | The DESIGN section, citing the D-number |
 | A command, flag, or user-visible rule | `docs/USAGE.md` |
 | What shipped or what is next | `docs/ROADMAP.md` |
@@ -65,4 +65,4 @@ Remove superseded text rather than annotating it; git keeps history. A
 superseded decision becomes a one-line pointer, because code cites its number.
 `scripts/check-docs.py` runs in CI.
 
-PRs are squash-merged into `main`.
+Work is pushed straight to `develop`. Releases merge `develop` into `main`.

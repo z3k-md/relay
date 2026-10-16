@@ -12,18 +12,21 @@
 #   - every pull request, Linux: a sim smoke (one seed, 200 steps, ~20 s);
 #   - pull requests that touch the engine crates, or carry the `ci:full-sim`
 #     label: the full sim suite on Linux (`sim-full`, ~2 min);
-#   - pushes to main: the full sim suite on Linux;
+#   - pushes to develop and main: the full sim suite on Linux;
 #   - Android debug APK: pull requests touching crates/, apps/relay-desktop/
 #     or the toolchain (or labelled `ci:android`), and pushes to main;
 #   - nightly (sim-nightly.yml): the full suite on every OS plus a wide seed
 #     sweep in release mode.
-# Pushes to main also prune older Actions caches so the repo stays under the
-# 10 GB cache limit (rust-cache saves a new entry per Cargo.lock hash).
+# Pushes also prune older Actions caches so the repo stays under the 10 GB
+# cache limit (rust-cache saves a new entry per Cargo.lock hash).
+#
+# Branches: work lands on develop (the default branch) by direct push; main
+# only moves on a release merge, and CI passing there starts release.yml.
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
     paths-ignore: ["**/*.md", "docs/**"]
   pull_request:
     paths-ignore: ["**/*.md", "docs/**"]
@@ -125,8 +128,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ env.DEV_DRIVE_WORKSPACE || '.' }} -> target
-          # PR runs restore main's cache but do not add their own.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Only develop (the default branch) saves; main and PR runs can
+          # restore default-branch caches but not each other's.
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -240,7 +244,7 @@ jobs:
     needs: changes
     if: >-
       !cancelled() &&
-      (github.event_name == 'push' ||
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
        needs.changes.outputs.android == 'true' ||
        contains(github.event.pull_request.labels.*.name, 'ci:android'))
     timeout-minutes: 45

@@ -11,6 +11,11 @@
 #              the updater)
 # 2. build:    macOS universal + Windows bundles and CLI binaries into it
 # 3. finalize: check latest.json covers every platform, then publish
+# 4. sync:     merge main back into develop so the release commit is on both
+#
+# Branches: work lands on develop; a release is develop merged into main
+# (merge commit, never squash). workflow_run always runs on the default
+# branch (develop), so RELEASE_REF names the branch CI actually ran on.
 #
 # Optional public release destination (private source repo):
 #   repository variable RELEASE_REPO = owner/name
@@ -63,6 +68,7 @@ defaults:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  RELEASE_REF: ${{ github.event.workflow_run.head_branch || github.ref_name }}
 
 jobs:
   gate:
@@ -79,7 +85,7 @@ jobs:
         if: github.event_name == 'workflow_run'
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0
 
       - name: Decide
@@ -91,10 +97,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_EVENT: ${{ github.event.workflow_run.event }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
-          REF_NAME: ${{ github.ref_name }}
+          REF_NAME: ${{ env.RELEASE_REF }}
         run: |
           set -euo pipefail
           ship() { echo "ship=$1" >> "$GITHUB_OUTPUT"; echo "ship=$1: $2"; }
+          if [ "$REF_NAME" != "main" ]; then
+            echo "error: releases ship from main, not ${REF_NAME}" >&2
+            exit 1
+          fi
           if [ "$EVENT" = "workflow_dispatch" ]; then
             ship true "started by hand"
             exit 0
@@ -158,7 +168,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ env.RELEASE_REF }}
           fetch-depth: 1
 
       - name: Resolve destination
@@ -204,7 +214,7 @@ jobs:
           # Automatic runs have no inputs: a patch release.
           BUMP: ${{ inputs.bump || 'patch' }}
           EXACT: ${{ inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
+          REF_NAME: ${{ env.RELEASE_REF }}
         run: |
           set -euo pipefail
           git fetch origin "$REF_NAME"
@@ -345,9 +355,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.sidecar_target }}
-          # Dispatched on main so later releases reuse this cache. A cache
+          # Automatic runs execute on develop (the default branch), whose
+          # caches every branch can restore; dispatches run on main. A cache
           # saved from a tag is visible only to that tag.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       - name: Install frontend dependencies
@@ -409,3 +420,30 @@ jobs:
           fi
           gh release edit "$TAG" --repo "$DEST" --draft=false --latest
           echo "Published ${TAG} to https://github.com/${DEST}/releases/tag/${TAG}"
+
+  # The version bump lands on main only. Merge it back so develop stays a
+  # superset of main and the next release merges cleanly. Runs even when
+  # nothing shipped, since the release merge itself is on main.
+  sync:
+    name: merge main into develop
+    needs: [gate, create]
+    if: >-
+      always() && needs.gate.result == 'success' &&
+      (needs.create.result == 'success' || needs.create.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v5
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Merge and push
+        run: |
+          set -euo pipefail
+          git config user.name "Zach Connelly"
+          git config user.email "zmconnelly@gmail.com"
+          git fetch origin main
+          git merge --no-edit -m "Merge main into develop" origin/main
+          git push origin HEAD:develop
