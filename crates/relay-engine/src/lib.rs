@@ -133,6 +133,9 @@ pub struct Engine {
     placeholders: placeholders::Placeholders,
     /// Whether each mount root folds case, probed once per path.
     case_probe: HashMap<MountId, (PathBuf, bool)>,
+    /// Set while deferred folder tombstones are retried, so the rescans that
+    /// pass runs do not start another one.
+    retrying_deferred: bool,
 }
 
 impl Engine {
@@ -168,6 +171,7 @@ impl Engine {
             lock: Some(lock),
             placeholders: Default::default(),
             case_probe: HashMap::new(),
+            retrying_deferred: false,
         })
     }
 
@@ -219,6 +223,7 @@ impl Engine {
             lock: Some(lock),
             placeholders: Default::default(),
             case_probe: HashMap::new(),
+            retrying_deferred: false,
         })
     }
 
@@ -249,6 +254,7 @@ impl Engine {
             lock: None,
             placeholders: Default::default(),
             case_probe: HashMap::new(),
+            retrying_deferred: false,
         })
     }
 

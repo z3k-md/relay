@@ -185,9 +185,18 @@ pub(super) fn live_tombstones(
         let Some(local) = engine.db.repo().entry(&entry.key)? else {
             continue;
         };
-        // Concurrent tombstones lose to the live side (D18) and stale ones are
-        // ignored; only a dominating tombstone deletes the local file.
-        if local.is_deleted() || entry.vector.compare(&local.vector) != VectorOrdering::Dominates {
+        // Stale tombstones are ignored, and a concurrent one deletes the local
+        // file only when it was made on the live bytes (D18 rule 1).
+        let deletes = match entry.vector.compare(&local.vector) {
+            VectorOrdering::Dominates => true,
+            VectorOrdering::Concurrent => relay_core::conflict::tombstone_supersedes_live(
+                &entry.vector,
+                entry.parent_object,
+                &local,
+            ),
+            _ => false,
+        };
+        if local.is_deleted() || !deletes {
             continue;
         }
         out.entry(entry.key.mount)

@@ -13,10 +13,10 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 pub use error::DbError;
 pub use migrate::SCHEMA_VERSION;
 pub use repo::{
-    CatchupPlan, DeleteHoldDecision, DeleteHoldRow, DeviceGroupRecord, HistoryRecord,
-    IndexOnlyEntry, LocalDevice, MaterializationRuleRecord, MountConfig, MountState, OfferedMember,
-    OfferedMount, PeerOfferRow, PeerPolicySnapshot, PeerRecord, PolicyRecord, Repo, SnapshotPolicy,
-    SpaceKeyWrap, StoredOffer, SyncProgress,
+    CatchupPlan, DeferredDirDelete, DeleteHoldDecision, DeleteHoldRow, DeviceGroupRecord,
+    HistoryRecord, IndexOnlyEntry, LocalDevice, MaterializationRuleRecord, MountConfig, MountState,
+    OfferedMember, OfferedMount, PeerOfferRow, PeerPolicySnapshot, PeerRecord, PolicyRecord, Repo,
+    SnapshotPolicy, SpaceKeyWrap, StoredOffer, SyncProgress,
 };
 
 #[derive(Debug)]

@@ -1165,6 +1165,7 @@ fn read_only_open_upgrades_an_older_schema() {
         conn.execute_batch(
             "
             ALTER TABLE peers DROP COLUMN may_manage;
+            DROP TABLE IF EXISTS deferred_dir_deletes;
             DROP TABLE IF EXISTS materialization_selectors;
             DROP TABLE IF EXISTS materialization_rules;
             DROP INDEX IF EXISTS idx_entries_index_only;

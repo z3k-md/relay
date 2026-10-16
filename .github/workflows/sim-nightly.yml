@@ -82,6 +82,10 @@ jobs:
     name: sim sweep (linux, release)
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # The last step files an issue for failing seeds.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -137,5 +141,7 @@ jobs:
             echo
             echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } > body.md
+          gh label create sim-failure --color B60205 \
+            --description "Nightly simulator sweep found a failing seed" 2>/dev/null || true
           gh issue create --title "$title" --body-file body.md --label "sim-failure" \
             || gh issue create --title "$title" --body-file body.md

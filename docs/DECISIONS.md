@@ -271,7 +271,12 @@ tombstones.
   (`DestinationChanged`); the path is then re-scanned and reconciled again,
   which turns it into a conflict. A missing stat (racy) is verified by
   re-hashing the on-disk file first. Deletions remove a file only if it still
-  matches the local record; directories are removed only when empty.
+  matches the local record; directories are removed only when empty. A
+  directory tombstone that finds its folder still holding something (a file
+  not yet deleted here, or one this device excludes) is not stored but kept
+  aside and retried after every applied batch and every scan; it applies once
+  the folder is empty, and is dropped when a newer version of the folder
+  supersedes it.
 - `Conflict`, `Diverged`: see D18.
 
 File mtimes are set to the sender's observed mtime when known, so Git's stat
@@ -290,7 +295,14 @@ objects-before-refs (D1) even when a large change spans batches.
 For concurrent versions L (local) and R (remote), every device computes the
 same result from replicated data only:
 
-1. If exactly one side is a tombstone, the live side wins; no copy.
+1. If exactly one side is a tombstone, the live side wins; no copy. The
+   exception is a tombstone made on exactly the live file's bytes (its
+   `parent_object` is the live object) whose vector has seen the live
+   writer's own counter: nothing newer was written, so the delete wins. This
+   covers a delete made after a "live wins" merge whose vector carries
+   another device's delete counter the deleter never saw. Writing the same
+   bytes again, such as a D22 restore, bumps the writer's counter, and the
+   file stays.
 2. If kinds differ and one is a directory, the directory wins; the other goes
    to a conflict copy.
 3. Otherwise the winner is chosen by `choose_group_winner` for Git metadata
@@ -420,8 +432,9 @@ when unsure, so the receiver holds a peer mass delete until the user decides.
 
 - **Detection.** In `Syncer::process_head`, before `apply_remote_batch`, count
   tombstones that would delete a live local entry: the local entry is live
-  and the tombstone's vector dominates it. Concurrent tombstones lose to the
-  live side (D18) and are not counted. A per-connection,
+  and the tombstone's vector dominates it, or is concurrent with it and wins
+  by the D18 rule 1 exception. Other concurrent tombstones lose to the live
+  side and are not counted. A per-connection,
   per-(space, mount) counter tracks deletions already applied in the current
   catch-up and resets when a `caught_up` batch for that space has been
   applied. The same map also records the paths whose local entry actually

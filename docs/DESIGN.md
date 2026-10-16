@@ -91,7 +91,8 @@ Relay reconciles state; it does not forward events.
   local edit in the meantime aborts the write and becomes a conflict.
   Within a batch, deletes go first and Git refs go last (D1, D17).
 - **Conflicts.** Resolved identically on every device from replicated data:
-  live beats tombstone, directory beats file, otherwise a deterministic
+  live beats tombstone (unless the delete was made on exactly the live
+  bytes), directory beats file, otherwise a deterministic
   winner keeps the path and the loser becomes
   `name.relay-conflict-<device>-<counter>.ext` (D2, D18). One `.git` directory
   resolves as a group (D21). Non-overlapping concurrent text edits merge

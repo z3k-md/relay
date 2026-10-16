@@ -5,13 +5,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use relay_core::conflict::{ConflictWinner, choose_group_winner, choose_winner, conflict_path};
+use relay_core::conflict::{
+    ConflictWinner, choose_group_winner, choose_winner, conflict_path, tombstone_supersedes_live,
+};
 use relay_core::{
     DeviceId, EntryContent, EntryKey, EntryKind, EntryRecord, LogicalPath, MergeOutcome, MountId,
     ObjectId, SpaceId, StatHint, TEMP_PREFIX, VectorOrdering, VersionRelation, compare_versions,
     is_bookkeeping_path, is_git_metadata, merge_text,
 };
-use relay_db::{MaterializationRuleRecord, MountConfig};
+use relay_db::{DeferredDirDelete, MaterializationRuleRecord, MountConfig};
 use relay_fs::{
     MaterializeOptions, check_real_dir_chain, ensure_real_dir_chain, materialize_file,
     resolve_os_path, to_os_path,
@@ -154,7 +156,73 @@ impl Engine {
                 }
             }
         }
+        outcome.deleted += self.retry_deferred_dir_deletes(space)?;
         Ok(outcome)
+    }
+
+    /// Re-apply folder tombstones that were skipped because the folder was
+    /// not empty (E-M5). Each goes through the normal apply path, so one a
+    /// newer local or remote version superseded is dropped, and one whose
+    /// folder still holds something is deferred again. Returns how many
+    /// folders were removed.
+    pub(crate) fn retry_deferred_dir_deletes(
+        &mut self,
+        space: SpaceId,
+    ) -> Result<usize, EngineError> {
+        if self.retrying_deferred {
+            return Ok(0);
+        }
+        let deferred = self.db.repo().deferred_dir_deletes(space)?;
+        if deferred.is_empty() {
+            return Ok(0);
+        }
+        self.retrying_deferred = true;
+        let result = self.retry_deferred(space, deferred);
+        self.retrying_deferred = false;
+        result
+    }
+
+    fn retry_deferred(
+        &mut self,
+        space: SpaceId,
+        deferred: Vec<DeferredDirDelete>,
+    ) -> Result<usize, EngineError> {
+        let mut mounts = self.load_mount_apply(space)?;
+        let rules = self.db.repo().list_materialization_rules(space)?;
+        let mut removed = 0;
+        for item in deferred {
+            self.db.repo().remove_deferred_dir_delete(&item.key)?;
+            let remote = RemoteEntry {
+                key: item.key.clone(),
+                content: EntryContent::Deleted,
+                vector: item.vector.clone(),
+                parent_object: None,
+                modified_by: item.modified_by,
+                modified_at_unix_ms: item.modified_at_unix_ms,
+                sequence: item.sequence,
+                mtime_ns: None,
+            };
+            let skip = mounts.get(&remote.key.mount).map(|ctx| {
+                let local = self.db.repo().entry(&remote.key).ok().flatten();
+                let writing = self
+                    .writing_remote(&rules, &remote, local.as_ref())
+                    .unwrap_or(true);
+                skip_reason(&remote, ctx, writing).is_some()
+            });
+            if skip != Some(false) {
+                continue;
+            }
+            match self.apply_entry_reeval(remote, &mut mounts, &rules) {
+                Ok(ApplyResult::Deleted) => removed += 1,
+                Ok(_) => {}
+                Err(err) => {
+                    // Keep it for the next pass; the error surfaces as usual.
+                    self.db.repo().put_deferred_dir_delete(&item)?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(removed)
     }
 
     fn load_mount_apply(
@@ -593,10 +661,21 @@ impl Engine {
                     note_gone(mounts, remote);
                     Ok(TryApply::Done(ApplyResult::Deleted))
                 }
-                Err(_) => Ok(TryApply::Done(ApplyResult::Skipped(
-                    remote.key.path.to_string(),
-                    "directory is not empty; tombstone not stored".into(),
-                ))),
+                Err(_) => {
+                    // Retried after later batches and scans, once whatever
+                    // keeps the folder alive is gone (E-M5).
+                    self.db.repo().put_deferred_dir_delete(&DeferredDirDelete {
+                        key: remote.key.clone(),
+                        vector: remote.vector.clone(),
+                        modified_by: remote.modified_by,
+                        modified_at_unix_ms: remote.modified_at_unix_ms,
+                        sequence: remote.sequence,
+                    })?;
+                    Ok(TryApply::Done(ApplyResult::Skipped(
+                        remote.key.path.to_string(),
+                        "directory is not empty; tombstone deferred".into(),
+                    )))
+                }
             }
         } else {
             let still_matches = if meta.file_type().is_symlink() {
@@ -637,6 +716,14 @@ impl Engine {
             .local_path
             .clone()
             .ok_or(EngineError::MountNotLocal)?;
+
+        if winner_remote && remote_rec.is_deleted() {
+            // A delete made on the live bytes (D18 rule 1): remove the file as
+            // a dominating tombstone would, under the merged vector.
+            let mut merged = remote.clone();
+            merged.vector = local.vector.merged(&remote.vector);
+            return self.apply_deletion(&merged, Some(local), &root, mounts);
+        }
 
         let winner = if winner_remote { &remote_rec } else { local };
         let loser = if winner_remote { local } else { &remote_rec };
@@ -1323,7 +1410,13 @@ fn conflict_outcome(local: &EntryRecord, remote: &EntryRecord) -> (bool, bool) {
     let local_tomb = local.is_deleted();
     let remote_tomb = remote.is_deleted();
     if local_tomb ^ remote_tomb {
-        return (!remote_tomb, false);
+        let (tomb, live) = if remote_tomb {
+            (remote, local)
+        } else {
+            (local, remote)
+        };
+        let tomb_wins = tombstone_supersedes_live(&tomb.vector, tomb.parent_object, live);
+        return (remote_tomb == tomb_wins, false);
     }
     let local_dir = matches!(local.content, EntryContent::Directory);
     let remote_dir = matches!(remote.content, EntryContent::Directory);
