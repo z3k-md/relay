@@ -408,6 +408,8 @@ export interface DropArrival {
   path: string;
   name: string;
   summary: string;
+  /** The sending device, when known. */
+  from: string | null;
   image: boolean;
   atMs: number;
 }

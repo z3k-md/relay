@@ -15,6 +15,8 @@ const items = ref<DropArrival[]>([]);
 const index = ref(0);
 const hovered = ref(false);
 const copied = ref(false);
+/** A copy or drag is running; the popup stays until it ends. */
+const busy = ref<"copy" | "drag" | null>(null);
 const error = ref<string | null>(null);
 const current = computed(() => items.value[index.value] ?? null);
 const extension = computed(() => {
@@ -41,7 +43,7 @@ async function take() {
 function armHide(ms = SHOW_MS) {
   window.clearTimeout(hideTimer);
   hideTimer = window.setTimeout(() => {
-    if (!hovered.value) void close();
+    if (!hovered.value && !busy.value) void close();
   }, ms);
 }
 
@@ -78,17 +80,29 @@ async function run(action: (path: string) => Promise<void>) {
 }
 
 async function copy() {
-  await run(api.dropCopy);
+  if (busy.value) return;
+  busy.value = "copy";
+  try {
+    await run(api.dropCopy);
+  } finally {
+    busy.value = null;
+  }
   if (error.value) return;
   copied.value = true;
   window.clearTimeout(hideTimer);
   hideTimer = window.setTimeout(() => void dismiss(), COPIED_MS);
 }
 
-function startDrag(event: MouseEvent) {
-  if (event.button !== 0) return;
+async function startDrag(event: MouseEvent) {
+  if (event.button !== 0 || busy.value) return;
   event.preventDefault();
-  void run(api.dropDrag);
+  busy.value = "drag";
+  try {
+    await run(api.dropDrag);
+  } finally {
+    busy.value = null;
+    armHide(4_000);
+  }
 }
 
 function onEnter() {
@@ -145,7 +159,9 @@ onUnmounted(() => {
       <div class="flex min-w-0 flex-1 flex-col">
         <div class="flex items-start gap-2">
           <div class="min-w-0 flex-1">
-            <p class="truncate text-xs text-muted">{{ current.summary }}</p>
+            <p class="truncate text-xs text-muted">
+              {{ current.from ? `From ${current.from}` : current.summary }}
+            </p>
             <p class="truncate text-sm font-medium" :title="current.path">{{ current.name }}</p>
           </div>
           <span v-if="items.length > 1" class="shrink-0 text-xs text-muted">
@@ -167,7 +183,7 @@ onUnmounted(() => {
             class="rounded-md bg-accent px-3 py-1 text-sm font-medium text-accent-fg hover:opacity-90"
             @click="copy"
           >
-            {{ copied ? "Copied" : "Copy" }}
+            {{ copied ? "Copied" : busy === "copy" ? "Copying…" : "Copy" }}
           </button>
           <button
             class="rounded-md border border-line px-3 py-1 text-sm hover:bg-canvas"
