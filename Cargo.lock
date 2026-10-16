@@ -4396,6 +4396,7 @@ dependencies = [
  "clipboard-win",
  "drag",
  "image",
+ "jni 0.21.1",
  "log",
  "relay-core",
  "relay-daemon",
