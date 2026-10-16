@@ -40,8 +40,8 @@ Not in a fixed order.
 - **Send a photo to a computer** ([proposal](proposals/photo-drop.md)).
   Tap Send to Desk in the notification after taking a photo, and it pops
   up on the computer ready to copy or drag. Drops (D50) and the
-  desktop popup are in review; the phone side (share target and a Send to
-  notification after each photo) is written on top of Android stage 2.
+  desktop popup shipped; the phone side (share target and a Send to
+  notification after each photo) is in review.
 - **Integrations.** Editor sync status, conflict notifications, restore from
   the app, and post-sync automation. These stay above the engine.
 
