@@ -5,7 +5,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use relay_core::conflict::{ConflictWinner, choose_group_winner, choose_winner, conflict_path};
+use relay_core::conflict::{
+    ConflictWinner, choose_group_winner, choose_winner, conflict_path, tombstone_supersedes_live,
+};
 use relay_core::{
     DeviceId, EntryContent, EntryKey, EntryKind, EntryRecord, LogicalPath, MergeOutcome, MountId,
     ObjectId, SpaceId, StatHint, TEMP_PREFIX, VectorOrdering, VersionRelation, compare_versions,
@@ -715,6 +717,14 @@ impl Engine {
             .clone()
             .ok_or(EngineError::MountNotLocal)?;
 
+        if winner_remote && remote_rec.is_deleted() {
+            // A delete made on the live bytes (D18 rule 1): remove the file as
+            // a dominating tombstone would, under the merged vector.
+            let mut merged = remote.clone();
+            merged.vector = local.vector.merged(&remote.vector);
+            return self.apply_deletion(&merged, Some(local), &root, mounts);
+        }
+
         let winner = if winner_remote { &remote_rec } else { local };
         let loser = if winner_remote { local } else { &remote_rec };
 
@@ -1400,7 +1410,13 @@ fn conflict_outcome(local: &EntryRecord, remote: &EntryRecord) -> (bool, bool) {
     let local_tomb = local.is_deleted();
     let remote_tomb = remote.is_deleted();
     if local_tomb ^ remote_tomb {
-        return (!remote_tomb, false);
+        let (tomb, live) = if remote_tomb {
+            (remote, local)
+        } else {
+            (local, remote)
+        };
+        let tomb_wins = tombstone_supersedes_live(&tomb.vector, tomb.parent_object, live);
+        return (remote_tomb == tomb_wins, false);
     }
     let local_dir = matches!(local.content, EntryContent::Directory);
     let remote_dir = matches!(remote.content, EntryContent::Directory);

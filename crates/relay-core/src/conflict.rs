@@ -6,7 +6,7 @@
 
 use crate::entry::{EntryContent, EntryRecord};
 use crate::error::CoreError;
-use crate::ids::DeviceId;
+use crate::ids::{DeviceId, ObjectId};
 use crate::path::LogicalPath;
 
 /// Marker inserted into conflict-copy names. The original extension is
@@ -41,6 +41,25 @@ pub fn choose_winner(a: &EntryRecord, b: &EntryRecord) -> ConflictWinner {
     } else {
         ConflictWinner::B
     }
+}
+
+/// Whether a tombstone concurrent with a live file still wins (D18 rule 1):
+/// it was made on top of exactly the live bytes (`parent_object`), after its
+/// writer had seen the write that produced them. The vectors then differ
+/// only by counters that carry no newer content, such as another device's
+/// delete that an earlier "live wins" merge folded in. A file written again
+/// after the delete, even with the same bytes (a restore, D22), bumps its
+/// writer's counter past what the tombstone saw and keeps the path.
+pub fn tombstone_supersedes_live(
+    tombstone_vector: &crate::VersionVector,
+    tombstone_parent: Option<ObjectId>,
+    live: &EntryRecord,
+) -> bool {
+    let Some(object) = live.content.object() else {
+        return false;
+    };
+    tombstone_parent == Some(object)
+        && tombstone_vector.get(&live.modified_by) >= live.vector.get(&live.modified_by)
 }
 
 /// A total order over content, used only to break otherwise equal ranks.
@@ -145,6 +164,36 @@ mod tests {
             "swapping inputs must swap the label, not the outcome"
         );
         assert_eq!(ab, ConflictWinner::B);
+    }
+
+    #[test]
+    fn tombstone_on_the_live_bytes_wins_only_after_their_write() {
+        let dev = |n: u8| DeviceId::from_bytes([n; 32]);
+        // A live copy that an earlier "live wins" merge gave device 3's
+        // delete counter: written by device 1 at counter 10.
+        let mut live = record(1, b"body", 5_000);
+        live.vector = [(dev(1), 10), (dev(3), 7)].into_iter().collect();
+        let body = ObjectId::of(b"body");
+
+        // Device 1 deleted it after its own write, without seeing device 3.
+        let later: crate::VersionVector = [(dev(1), 12)].into_iter().collect();
+        assert!(tombstone_supersedes_live(&later, Some(body), &live));
+        // A delete of other bytes, or one that had not seen the write, loses.
+        assert!(!tombstone_supersedes_live(
+            &later,
+            Some(ObjectId::of(b"old")),
+            &live
+        ));
+        assert!(!tombstone_supersedes_live(&later, None, &live));
+        let earlier: crate::VersionVector = [(dev(1), 9), (dev(2), 20)].into_iter().collect();
+        assert!(!tombstone_supersedes_live(&earlier, Some(body), &live));
+
+        // The same bytes written again (a D22 restore) bump the writer past
+        // what the tombstone saw, so the file stays.
+        let mut restored = record(2, b"body", 6_000);
+        restored.vector = [(dev(1), 10), (dev(2), 30)].into_iter().collect();
+        let tomb: crate::VersionVector = [(dev(1), 10), (dev(2), 21)].into_iter().collect();
+        assert!(!tombstone_supersedes_live(&tomb, Some(body), &restored));
     }
 
     #[test]
