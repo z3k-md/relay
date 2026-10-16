@@ -1,4 +1,5 @@
 mod commands;
+mod drops;
 mod error;
 mod files;
 #[cfg(target_os = "android")]
@@ -67,6 +68,14 @@ pub fn run() {
             commands::set_peer_manage,
             commands::remote_call,
             commands::speed_test,
+            drops::drop_take,
+            drops::drop_copy,
+            drops::drop_open,
+            drops::drop_reveal,
+            drops::drop_drag,
+            drops::drop_send,
+            drops::get_drop_settings,
+            drops::set_drop_settings,
             commands::pair_start,
             commands::pair_status,
             commands::pair_join,
@@ -127,6 +136,9 @@ pub fn run() {
             // The sync service may already run this process's runner; share it.
             #[cfg(target_os = "android")]
             let runner = mobile::runner(home.clone());
+            app.manage(drops::Pending::default());
+            #[cfg(not(target_os = "android"))]
+            drops::spawn_watcher(app.handle().clone(), home.clone());
             app.manage(AppState {
                 home,
                 runner: Arc::clone(&runner),

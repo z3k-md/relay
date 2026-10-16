@@ -99,4 +99,5 @@ storage work is the same either way, and keeping Tauri reuses the Vue UI.
 ## Out of scope
 
 iOS, Play Store listing, and photo-library (MediaStore) access beyond the
-camera folder.
+camera folder. [Sending a photo to a computer](photo-drop.md) reads new
+camera and screenshot rows only.

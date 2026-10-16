@@ -402,3 +402,29 @@ export interface SpeedReport {
   download: SpeedLeg;
   upload: SpeedLeg;
 }
+
+/** A file another device dropped here (D50), as the popup shows it. */
+export interface DropArrival {
+  path: string;
+  name: string;
+  summary: string;
+  /** The sending device, when known. */
+  from: string | null;
+  image: boolean;
+  atMs: number;
+}
+
+/** Whether this device takes drops, and where they go (D50). */
+export interface DropSettings {
+  receive: boolean;
+  inbox: string | null;
+  inboxSet: boolean;
+  autoCopy: boolean;
+}
+
+/** A drop the other device saved (relay_core::drops::DropSent). */
+export interface DropSent {
+  saved_name: string;
+  size: number;
+  elapsed_ms: number;
+}

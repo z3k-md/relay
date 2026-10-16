@@ -159,6 +159,8 @@ Online presence is not durability; acknowledgements are.
 - Pairing still needs a direct UDP path (D25).
 - A connection test measures any connected peer's link over the live
   session, five seconds each way, with no disk involved (D48).
+- A drop pushes one file to a connected peer's inbox over the live
+  session, verified before it gets a name. It is not sync (D50).
 
 # 8. Processes
 

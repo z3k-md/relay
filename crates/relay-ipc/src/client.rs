@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use interprocess::local_socket::{Stream, prelude::*};
+use relay_core::drops::DropSent;
 use relay_core::remote::{RemoteCall, RemoteReply};
 use relay_core::speed::SpeedReport;
 use relay_core::{ConfigApplied, ConfigChange};
@@ -12,10 +13,10 @@ use relay_core::{ConfigApplied, ConfigChange};
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, EvictResult, FetchParams, FolderPairParams, FolderPairPlan, FolderPairResult,
-    Hello, OpenRemoteParams, OpenedRemote, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
-    PairStartParams, PairStartResult, PairStatus, QuickOpen, RemoteParams, Request, RescanParams,
-    RescanResult, Response, SpeedTestParams, Status, decode_line, encode_line,
+    ActivityItem, DropSendParams, EvictResult, FetchParams, FolderPairParams, FolderPairPlan,
+    FolderPairResult, Hello, OpenRemoteParams, OpenedRemote, PROTOCOL_VERSION, PairJoinParams,
+    PairJoinResult, PairStartParams, PairStartResult, PairStatus, QuickOpen, RemoteParams, Request,
+    RescanParams, RescanResult, Response, SpeedTestParams, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -194,6 +195,15 @@ impl Client {
     pub fn speed_test(&mut self, params: &SpeedTestParams) -> Result<SpeedReport, IpcError> {
         self.call(
             "speed_test",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    /// Push one file to a connected peer (D50). Blocks until the peer has
+    /// saved it or refused.
+    pub fn drop_send(&mut self, params: &DropSendParams) -> Result<DropSent, IpcError> {
+        self.call(
+            "drop_send",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
     }

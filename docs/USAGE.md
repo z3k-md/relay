@@ -149,6 +149,27 @@ relay service logs -f
 
 `uninstall`, `start`, `stop`, and `restart` are the other `relay service` subcommands.
 
+## Send a file
+
+Send a file straight to a connected device:
+
+```bash
+relay drop send desk ~/Pictures/PXL_20261015.jpg
+```
+
+It lands in the other device's drop folder, `Pictures/Relay` unless changed there, and keeps its name; a taken name gets ` (2)`. Nothing syncs and nothing is mirrored back: it is an ordinary file on that device. Any paired device may send files up to 256 MB. On the receiving device:
+
+```bash
+relay drop status
+relay drop inbox ~/Downloads/Phone
+relay drop inbox --default
+relay drop off
+```
+
+A home server takes no files until `relay drop on`.
+
+The desktop app shows each arriving file in a small popup in the corner: drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. Settings has the same switch and folder, plus an option to copy every arrival automatically. Peers has **Send file…** for each connected device.
+
 ## Commands
 
 | Command | What it does |
@@ -164,6 +185,8 @@ relay service logs -f
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
 | `relay peer allow-manage NAME` / `peer deny-manage NAME` | Let a peer browse this device and set up sync on it, or stop |
 | `relay peer test NAME [--seconds N]` | Measure the connection to a connected peer: download, then upload (default 10 s total, max 20) |
+| `relay drop send PEER FILE... [--name NAME]` | Send files to a connected peer's drop folder |
+| `relay drop status` / `drop on` / `drop off` / `drop inbox DIR \| --default` | Whether this device takes files from peers, and where they go |
 | `relay browse PEER [PATH] [--all]` | List a managed device's roots, or one of its folders |
 | `relay open PEER PATH [--into DIR \| --read-only]` | Get a file from a managed device: its folder syncs here online-only and the file downloads, or with `--read-only` a one-off copy. Prints the local path |
 | `relay opened` / `opened remove SPACE` | List folders set up by `relay open`, or remove one |
@@ -207,7 +230,7 @@ Exit codes: `0` ok, `1` error, `2` mass delete refused, `3` `relay verify` found
 
 `--dev-excludes` adds `**/node_modules/**`, `**/target/**`, `**/dist/**`, `**/build/**`, `**/.venv/**`, and `**/__pycache__/**`. A `.relayignore` file at the mount root adds more exclude globs, one per line. Rules are per device.
 
-A running Relay applies `space`, `mount`, `share` / `unshare`, `peer add` / `remove` / `revoke`, `group`, `policy`, `materialize`, and `deletes apply` / `restore` on its live loop. `transport`, `replica`, `server`, `recovery`, and `space rotate` are picked up within about a second by reloading. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
+A running Relay applies `space`, `mount`, `share` / `unshare`, `peer add` / `remove` / `revoke`, `group`, `policy`, `materialize`, and `deletes apply` / `restore` on its live loop. `transport`, `replica`, `server`, `drop on` / `off` / `inbox`, `recovery`, and `space rotate` are picked up within about a second by reloading. Use `relay rescan` to index while a host is running. For `restore` and `gc`, stop the service first (`relay service stop`) so a one-shot write does not interleave with the live loop. Read-only commands (`status`, `ls`, `history`, `conflicts`, `verify`) and `relay pause` / `resume` / `activity` work while it runs.
 
 ## Catch-up and hard-to-reach networks
 

@@ -383,6 +383,18 @@ pub struct SpeedTestParams {
     pub duration_ms: Option<u32>,
 }
 
+/// Push one file to a connected peer's inbox (D50).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DropSendParams {
+    /// The peer's local name.
+    pub peer: String,
+    /// The file on this device.
+    pub path: std::path::PathBuf,
+    /// The name to offer; the file's own name when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairJoinResult {
     pub peer_name: String,

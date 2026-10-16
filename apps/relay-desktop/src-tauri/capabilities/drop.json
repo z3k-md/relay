@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "drop-popup",
+  "description": "The popup that shows a file another device dropped here (D50).",
+  "platforms": ["macOS", "windows", "linux"],
+  "windows": ["drop"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:event:default"
+  ]
+}

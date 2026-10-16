@@ -91,6 +91,24 @@ pub trait ControlHandler: Send + Sync {
             "this device does not hand out file copies",
         ))
     }
+
+    /// The folder a drop of `size` bytes from `peer` goes into (D50). It
+    /// must exist. Refuse when this device takes no drops. Unlike the
+    /// calls above, no manage grant is needed: any trusted peer may offer
+    /// a file. Runs on a blocking thread.
+    fn drop_inbox(&self, peer: DeviceId, size: u64) -> Result<PathBuf, RemoteError> {
+        let _ = (peer, size);
+        Err(RemoteError::new(
+            RemoteErrorCode::Unsupported,
+            "this device does not take drops",
+        ))
+    }
+
+    /// A drop from `peer` was verified and saved at `path`. Runs on a
+    /// blocking thread.
+    fn dropped(&self, peer: DeviceId, path: &Path, size: u64) {
+        let _ = (peer, path, size);
+    }
 }
 
 /// The connection to `peer`, if it is up and answers remote calls.
@@ -182,7 +200,7 @@ fn admit(
 }
 
 /// Run handler work on a blocking thread, bounded by `limit`.
-async fn on_handler<T: Send + 'static>(
+pub(crate) async fn on_handler<T: Send + 'static>(
     limit: Duration,
     work: impl FnOnce() -> Result<T, RemoteError> + Send + 'static,
 ) -> Result<T, RemoteError> {

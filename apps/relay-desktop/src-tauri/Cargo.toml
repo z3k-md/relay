@@ -22,6 +22,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
 log = "0.4"
 relay-core.workspace = true
 relay-daemon.workspace = true
@@ -29,7 +30,7 @@ relay-engine.workspace = true
 relay-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
@@ -40,12 +41,19 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-store = "2"
 tauri-plugin-updater = "2"
 
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+drag = "2"
+
 [target.'cfg(target_os = "android")'.dependencies]
 # Same major as Tauri's own Android dependency, so one copy links.
 jni = "0.21"
 
 [target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
 winreg = "0.55"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+arboard = "3"
 
 # This crate does not inherit workspace lints: Tauri 2 macros expand to
 # `unsafe`, and [workspace.lints.rust] unsafe_code = "forbid" breaks them.

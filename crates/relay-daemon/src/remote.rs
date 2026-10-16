@@ -68,6 +68,14 @@ impl ControlHandler for Browser {
         log(&self.host, &name, &format!("copied {}", path.display()));
         Ok(file)
     }
+
+    fn drop_inbox(&self, peer: DeviceId, _size: u64) -> Result<PathBuf, RemoteError> {
+        crate::drops::inbox(&self.home, peer)
+    }
+
+    fn dropped(&self, peer: DeviceId, path: &Path, size: u64) {
+        crate::drops::dropped(&self.home, &self.host, peer, path, size);
+    }
 }
 
 /// Who is asking. A peer holds the manage grant and stops at protected

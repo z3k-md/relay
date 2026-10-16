@@ -62,6 +62,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D47 | [Store mode](#d47-store-mode) |
 | D48 | [Connection test](#d48-connection-test) |
 | D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
+| D50 | [Drops](#d50-drops) |
 
 <!-- index:end -->
 
@@ -1425,3 +1426,38 @@ shares the `release-main` concurrency group, so two releases never run at
 once. The `Release v` commit is pushed with `GITHUB_TOKEN`, which starts
 no workflows, so a release cannot trigger another. Release commits still
 skip CI.
+
+## D50. Drops
+
+A device can push one file to a connected peer, which saves it in an inbox
+folder: `relay drop send` today, and the phone's Send to Desk later. It is
+stage 1 of [`proposals/photo-drop.md`](proposals/photo-drop.md).
+
+- **Not sync.** No space, mount, index row, or history. The saved file is
+  ordinary and belongs to the receiving device; deleting either copy
+  changes nothing on the other.
+- **Wire.** Like the connection test (D48): one bidirectional stream, an
+  `ObjectRequest` with `drop_offer` (tag 5) carrying the offered name, size,
+  BLAKE3, media type, and the file's time. The receiver accepts with an
+  `ObjectHeader` or refuses with its `error`. The sender then writes exactly
+  `size` bytes and finishes, and the receiver ends with one `DropDone`: the
+  saved name, or an error. The sender reports success only after it.
+  `Hello.features` bit `FEATURE_DROP` (4); offers go only to peers with it,
+  and others answer `unsupported` locally. `PROTOCOL_VERSION` stays 1.
+- **Who may drop.** Any trusted, unrevoked peer; no manage grant (D37).
+  Unlike a connection test, a drop writes a file nobody asked for, so the
+  receiving device can turn drops off. They are on by default, except on a
+  device with the server role (D45).
+- **Where.** The inbox is a device-local setting, by default
+  `Pictures/Relay`; it may not be in the Relay home or contain it. Bytes
+  arrive in a hidden `.relay-drop-*.partial` file in the inbox, are checked
+  against the size and hash, and only then get their name (§9). The offered
+  name is cleaned to one Windows-safe component, and a taken name gets
+  ` (2)`, ` (3)`, and so on. The final name is a hard link, which fails
+  rather than replace a file; where hard links are unsupported, a rename
+  follows an existence check. The file's modified time is the offered one.
+- **Limits.** 256 MiB per drop, four drops taken at once, no resume.
+- **Settings are read per drop.** `ControlHandler::drop_inbox` and
+  `dropped` read the database each time, so a change applies to the next
+  drop. A saved drop is an `ActivityItem` of kind `drop` whose `detail` is
+  the saved path; the desktop app takes it from the activity stream.

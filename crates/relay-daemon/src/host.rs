@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use relay_core::drops::DropSent;
 use relay_core::remote::{RemoteCall, RemoteError, RemoteErrorCode, RemoteReply, RemoteResult};
 use relay_core::speed::{SPEED_TEST_DEFAULT_MS, SPEED_TEST_MAX_MS, SpeedReport};
 use relay_core::{ConfigApplied, ConfigChange, DeviceId, PairingCode, SpaceId};
@@ -12,11 +13,11 @@ use relay_engine::{
     TransferLive as EngineTransfer, WatchEvent, bookends, index_row,
 };
 use relay_ipc::{
-    ActivityItem, EvictResult, FetchParams, FolderPairParams, Handler, Hello, HostKind, HostState,
-    Idle, MountLive, OpenRemoteParams, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
-    PairStartParams, PairStartResult, PairStatus, PeerLive, RemoteParams, RescanParams,
-    RpcErrorBody, SpeedTestParams, Status, TransferDirection as IpcDirection, TransferLive,
-    Watching,
+    ActivityItem, DropSendParams, EvictResult, FetchParams, FolderPairParams, Handler, Hello,
+    HostKind, HostState, Idle, MountLive, OpenRemoteParams, PROTOCOL_VERSION, PairJoinParams,
+    PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive, RemoteParams,
+    RescanParams, RpcErrorBody, SpeedTestParams, Status, TransferDirection as IpcDirection,
+    TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -258,6 +259,24 @@ impl Host {
         // The network bounds the test itself; this only covers a lost reply.
         let wait = Duration::from_millis(u64::from(duration_ms) * 2) + Duration::from_secs(60);
         rx.recv_timeout(wait)
+            .map_err(|_| RpcErrorBody::new("timeout", "no answer from the network"))?
+            .map_err(|err| RpcErrorBody::new(err.code.as_str(), err.message))
+    }
+
+    /// Push one file to a connected peer by its local name (D50).
+    fn drop_send(&self, params: DropSendParams) -> Result<DropSent, RpcErrorBody> {
+        let peer = self.peer_named(&params.peer)?;
+        let net = self.net_sender()?;
+        let (reply, rx) = mpsc::channel();
+        net.send(NetCommand::SendDrop {
+            peer: peer.id,
+            path: params.path,
+            name: params.name,
+            reply,
+        });
+        // The network bounds each step; this only covers a lost reply. A
+        // full-size drop over a slow link can take minutes.
+        rx.recv_timeout(Duration::from_secs(30 * 60))
             .map_err(|_| RpcErrorBody::new("timeout", "no answer from the network"))?
             .map_err(|err| RpcErrorBody::new(err.code.as_str(), err.message))
     }
@@ -1005,6 +1024,11 @@ impl Handler for Host {
                 let params: SpeedTestParams = serde_json::from_value(params)
                     .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
                 serde_json::to_value(self.speed_test(params)?).map_err(internal)
+            }
+            "drop_send" => {
+                let params: DropSendParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(self.drop_send(params)?).map_err(internal)
             }
             "pair_join" => {
                 let params: PairJoinParams = serde_json::from_value(params)

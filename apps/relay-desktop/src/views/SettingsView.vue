@@ -1,11 +1,12 @@
 <script setup lang="ts">
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { computed, onActivated, ref, watch } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import UpdateStatus from "../components/UpdateStatus.vue";
 import { api, errorText } from "../lib/api";
 import { checkForUpdates, updateActive } from "../lib/updateProgress";
-import type { CliShell, CliStatus, Settings } from "../lib/types";
+import type { CliShell, CliStatus, DropSettings, Settings } from "../lib/types";
 
 const props = defineProps<{
   version: string;
@@ -93,13 +94,15 @@ async function load() {
       settings.value = await api.getSettings();
       return;
     }
-    const [s, c, fda, releases] = await Promise.all([
+    const [s, c, fda, releases, d] = await Promise.all([
       api.getSettings(),
       api.cliStatus(),
       api.fullDiskAccess(),
       api.releasesUrl(),
+      api.getDropSettings(),
     ]);
     settings.value = s;
+    drops.value = d;
     cli.value = c;
     fullDiskAccess.value = fda;
     releasesUrl.value = releases;
@@ -122,6 +125,29 @@ async function toggle(key: "startAtLogin" | "autoUpdate", value: boolean) {
     error.value = errorText(err);
     await load();
   }
+}
+
+/** Files other devices send here (D50). Null until loaded, and on mobile. */
+const drops = ref<DropSettings | null>(null);
+
+async function setDrops(patch: { receive?: boolean; inbox?: string; autoCopy?: boolean }) {
+  error.value = null;
+  try {
+    drops.value = await api.setDropSettings(patch);
+  } catch (err) {
+    error.value = errorText(err);
+    drops.value = await api.getDropSettings().catch(() => drops.value);
+  }
+}
+
+async function chooseInbox() {
+  const selected = await openDialog({
+    directory: true,
+    multiple: false,
+    title: "Folder for files sent to this computer",
+    defaultPath: drops.value?.inbox ?? undefined,
+  });
+  if (typeof selected === "string") await setDrops({ inbox: selected });
 }
 
 async function checkUpdates() {
@@ -224,6 +250,59 @@ defineExpose({ load });
             type="checkbox"
             :checked="settings.autoUpdate"
             @change="toggle('autoUpdate', ($event.target as HTMLInputElement).checked)"
+          />
+        </label>
+      </section>
+
+      <section
+        v-if="drops"
+        class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)]"
+      >
+        <label class="flex items-center justify-between gap-3 px-3 py-2">
+          <span>
+            <span class="block font-medium">Take files from your devices</span>
+            <span class="block text-[12px] text-[var(--color-muted)]">
+              A paired phone or computer can send a photo or file here. It pops up in the corner,
+              ready to copy or drag.
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            :checked="drops.receive"
+            @change="setDrops({ receive: ($event.target as HTMLInputElement).checked })"
+          />
+        </label>
+        <div class="flex items-center justify-between gap-3 px-3 py-2">
+          <div class="min-w-0">
+            <p class="font-medium">Save them in</p>
+            <p class="mono truncate text-[12px] text-[var(--color-muted)]" :title="drops.inbox ?? ''">
+              {{ drops.inbox ?? "No folder" }}
+            </p>
+          </div>
+          <div class="flex shrink-0 gap-2">
+            <button
+              v-if="drops.inboxSet"
+              type="button"
+              class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+              @click="setDrops({ inbox: '' })"
+            >
+              Use default
+            </button>
+            <button
+              type="button"
+              class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+              @click="chooseInbox"
+            >
+              Choose…
+            </button>
+          </div>
+        </div>
+        <label class="flex items-center justify-between gap-3 px-3 py-2">
+          <span class="font-medium">Copy each one to the clipboard as it arrives</span>
+          <input
+            type="checkbox"
+            :checked="drops.autoCopy"
+            @change="setDrops({ autoCopy: ($event.target as HTMLInputElement).checked })"
           />
         </label>
       </section>

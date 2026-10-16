@@ -1309,3 +1309,57 @@ fn open_remote_files_and_remove_quick_opens() {
 fn synced_bytes(path: &Path, bytes: &[u8]) -> bool {
     fs::read(path).ok().as_deref() == Some(bytes)
 }
+
+#[test]
+fn a_drop_lands_in_the_inbox_and_shows_in_activity() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let inbox = TempDir::new().unwrap();
+    let source = TempDir::new().unwrap();
+    let mut alice = Engine::init(home_a.path(), "alice").unwrap();
+    alice.set_drop_inbox(Some(inbox.path())).unwrap();
+    drop(alice);
+    Engine::init(home_b.path(), "bob").unwrap();
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    pair(home_a.path(), addr_a, home_b.path());
+    assert!(
+        wait_until(CONVERGE, || wait_ipc(home_b.path())
+            .status()
+            .is_ok_and(|s| s.peers.iter().any(|p| p.name == "alice"))),
+        "bob never connected to alice"
+    );
+
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let mut feed = wait_ipc(home_a.path()).subscribe().expect("subscribe");
+    thread::spawn(move || {
+        while let Ok(Some(item)) = feed.next_item() {
+            if item.kind == relay_daemon::DROP_ACTIVITY {
+                let _ = seen_tx.send(item);
+                return;
+            }
+        }
+    });
+
+    let photo = source.path().join("PXL_20261015.jpg");
+    fs::write(&photo, b"jpeg bytes").unwrap();
+    let sent = wait_ipc(home_b.path())
+        .drop_send(&relay_ipc::DropSendParams {
+            peer: "alice".into(),
+            path: photo.clone(),
+            name: None,
+        })
+        .expect("drop_send");
+    assert_eq!(sent.saved_name, "PXL_20261015.jpg");
+    let saved = canonical(inbox.path()).join("PXL_20261015.jpg");
+    assert_eq!(fs::read(&saved).unwrap(), b"jpeg bytes");
+
+    let item = seen_rx.recv_timeout(CONVERGE).expect("drop activity");
+    assert_eq!(item.summary, "bob sent PXL_20261015.jpg");
+    assert_eq!(item.detail.as_deref(), Some(saved.to_str().unwrap()));
+
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}

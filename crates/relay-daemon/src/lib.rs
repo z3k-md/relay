@@ -4,6 +4,7 @@
 //! `NetEvent` / `NetCommand` onto `SyncInput` / `SyncOutput` and reopens
 //! when another process commits to the database.
 
+mod drops;
 mod folder_pair;
 mod host;
 mod placeholders;
@@ -37,6 +38,7 @@ const PAUSE_POLL: Duration = Duration::from_secs(1);
 const PEERS_RETRY: Duration = Duration::from_millis(250);
 const HOST_LOCK_FILE: &str = "relay.host.lock";
 
+pub use drops::DROP_ACTIVITY;
 pub use relay_ipc::HostKind;
 
 #[derive(Debug, Clone)]
