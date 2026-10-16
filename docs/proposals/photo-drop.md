@@ -1,7 +1,8 @@
 # Send a photo to a computer
 
-**Status:** Stages 1 (drops, D50) and 2 (desktop popup) in review. The phone
-stages need Android stage 2 (PR #19).
+**Status:** Stages 1 (drops, D50) and 2 (desktop popup) shipped. Stages 3
+and 4 (share target, new-photo notification) build in CI and wait for a
+test on a phone.
 
 Take a photo on the phone, tap **Send to Desk** in the notification that
 appears, and a few seconds later the photo pops up on the computer, ready

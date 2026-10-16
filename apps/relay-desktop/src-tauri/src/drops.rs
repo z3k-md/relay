@@ -8,15 +8,14 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::time::Duration;
 
 use relay_core::drops::DropSent;
 use relay_core::remote::{RemoteError, RemoteErrorCode};
 use relay_engine::{DropSettings, Engine};
-use relay_ipc::DropSendParams;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use relay_ipc::{ActivityItem, Client};
+use relay_ipc::ActivityItem;
+use relay_ipc::{Client, DropSendParams};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -454,6 +453,59 @@ pub fn drop_send(app: AppHandle, peer: String, path: String) -> Result<DropSent,
     })
 }
 
+/// Send `path` to `peer` through the host in `home`, waiting up to `wait`
+/// for the host to start and the peer to connect. The phone calls this
+/// right after starting sync from a notification, when neither may be up.
+// Called from the Android JNI entries in mobile.rs, and from tests.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn send_when_connected(
+    home: &Path,
+    peer: &str,
+    path: PathBuf,
+    wait: Duration,
+) -> Result<DropSent, String> {
+    let deadline = std::time::Instant::now() + wait;
+    let params = DropSendParams {
+        peer: peer.to_owned(),
+        path,
+        name: None,
+    };
+    let mut last = String::from("Relay is not running");
+    loop {
+        match Client::connect(home) {
+            Ok(Some(mut client)) => match client.drop_send(&params) {
+                Ok(sent) => return Ok(sent),
+                // Not connected yet: discovery and the handshake take a
+                // few seconds after sync starts.
+                Err(relay_ipc::IpcError::Remote { code, message })
+                    if code == RemoteErrorCode::Offline.as_str() =>
+                {
+                    last = message;
+                }
+                Err(err) => return Err(error_chain(&err)),
+            },
+            Ok(None) => {}
+            Err(err) => last = error_chain(&err),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("couldn't reach {peer}: {last}"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Names of the devices this one may send to, for the phone's buttons.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn peer_names(home: &Path) -> Result<Vec<String>, String> {
+    let engine = Engine::open_read_only(home).map_err(|err| error_chain(&err))?;
+    let peers = engine.peers().map_err(|err| error_chain(&err))?;
+    Ok(peers
+        .into_iter()
+        .filter(|p| !p.revoked)
+        .map(|p| p.name)
+        .collect())
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -490,5 +542,44 @@ mod tests {
         assert_eq!((width, height.abs()), (64, 32));
         drop(_open);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod phone_tests {
+    use super::*;
+
+    #[test]
+    fn sending_without_a_host_gives_up_after_the_wait() {
+        let home = std::env::temp_dir().join(format!("relay-drop-nohost-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let start = std::time::Instant::now();
+        let err = send_when_connected(
+            &home,
+            "Desk",
+            home.join("x.jpg"),
+            Duration::from_millis(800),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("couldn't reach Desk"), "{err}");
+        assert!(start.elapsed() >= Duration::from_millis(800));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn peer_names_skip_revoked_devices() {
+        let home = std::env::temp_dir().join(format!("relay-drop-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut engine = Engine::init(&home, "Pixel").unwrap();
+        engine
+            .add_peer("Desk", relay_core::DeviceId::random(), &[])
+            .unwrap();
+        engine
+            .add_peer("Old laptop", relay_core::DeviceId::random(), &[])
+            .unwrap();
+        engine.revoke_peer("Old laptop").unwrap();
+        drop(engine);
+        assert_eq!(peer_names(&home).unwrap(), vec!["Desk".to_owned()]);
+        let _ = std::fs::remove_dir_all(home);
     }
 }

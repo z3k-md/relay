@@ -14,4 +14,14 @@ object RelayNative {
 
   /** One status line for the notification, e.g. "Running, 2 peers online". */
   external fun status(): String
+
+  /**
+   * Starts sync if needed and sends the file at [path] to [peer] (D50).
+   * Blocks for up to about 25 s while the computer connects; never call it on
+   * the main thread. Returns null once it is saved there, else the reason.
+   */
+  external fun dropSend(home: String, peer: String, path: String): String?
+
+  /** Paired devices, one name per line. */
+  external fun peers(home: String): String
 }

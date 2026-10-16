@@ -65,6 +65,7 @@ class RelaySyncService : Service() {
       channel.setShowBadge(false)
       getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
+    Drops.createChannels(this)
     val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
     } else {
@@ -89,6 +90,12 @@ class RelaySyncService : Service() {
     if (intent?.action == ACTION_STOP) {
       stopSelf()
       return START_NOT_STICKY
+    }
+    // "Send to …" from a photo notification or the share sheet (D50). A tap
+    // on a notification may start this foreground service from the
+    // background; sync is already starting in onCreate.
+    if (intent?.action == Drops.ACTION_SEND) {
+      Drops.send(this, intent)
     }
     return START_STICKY
   }
