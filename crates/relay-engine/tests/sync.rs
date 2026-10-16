@@ -1267,6 +1267,54 @@ fn nonempty_dir_tombstone_is_kept() {
             .into_iter()
             .any(|e| e.key.path.as_str() == "keep" && e.is_deleted());
     assert!(!tombstoned, "non-empty dir must not store the tombstone");
+
+    // Once the excluded file goes, the next scan applies the deferred
+    // tombstone instead of leaving the folder behind for good (E-M5).
+    fs::remove_file(h.mount_b.path().join("keep/secret")).unwrap();
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    assert!(!h.mount_b.path().join("keep").exists());
+    let tombstoned =
+        h.b.entries("Personal", "code", true)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.key.path.as_str() == "keep" && e.is_deleted());
+    assert!(
+        tombstoned,
+        "the deferred tombstone is stored once the dir empties"
+    );
+}
+
+#[test]
+fn deferred_dir_tombstone_yields_to_a_newer_folder() {
+    let mut h = Harness::pair();
+    h.strict = false;
+    h.setup_shared_space(&[("keep/a.txt", b"a")]);
+    h.disconnect();
+    // B adds a file A has not seen, so A's delete of the folder cannot apply.
+    fs::write(h.mount_b.path().join("keep/b.txt"), b"b").unwrap();
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    fs::remove_dir_all(h.mount_a.path().join("keep")).unwrap();
+    h.a.scan(
+        "Personal",
+        "code",
+        ScanOptions {
+            allow_mass_delete: true,
+            ..ScanOptions::default()
+        },
+    )
+    .unwrap();
+    h.connect();
+    h.push_both();
+    h.push_both();
+    // The concurrent file is kept on both sides with its folder, and the
+    // deferred tombstone does not remove the folder later.
+    assert!(h.mount_b.path().join("keep/b.txt").is_file());
+    assert!(h.mount_a.path().join("keep/b.txt").is_file());
+    h.b.scan("Personal", "code", ScanOptions::default())
+        .unwrap();
+    assert!(h.mount_b.path().join("keep").is_dir());
 }
 
 fn entry_at(engine: &Engine, path: &str) -> relay_engine::EntryRecord {

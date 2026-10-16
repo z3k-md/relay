@@ -271,7 +271,12 @@ tombstones.
   (`DestinationChanged`); the path is then re-scanned and reconciled again,
   which turns it into a conflict. A missing stat (racy) is verified by
   re-hashing the on-disk file first. Deletions remove a file only if it still
-  matches the local record; directories are removed only when empty.
+  matches the local record; directories are removed only when empty. A
+  directory tombstone that finds its folder still holding something (a file
+  not yet deleted here, or one this device excludes) is not stored but kept
+  aside and retried after every applied batch and every scan; it applies once
+  the folder is empty, and is dropped when a newer version of the folder
+  supersedes it.
 - `Conflict`, `Diverged`: see D18.
 
 File mtimes are set to the sender's observed mtime when known, so Git's stat

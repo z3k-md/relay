@@ -1417,8 +1417,9 @@ fn store_mode_migration_keeps_rules_and_selectors() {
             .unwrap();
     }
     {
-        // Rerun 0014 over the rows above.
+        // Rerun 0014 (and the migrations after it) over the rows above.
         let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP TABLE deferred_dir_deletes", []).unwrap();
         conn.pragma_update(None, "user_version", 13u32).unwrap();
     }
     let db = Database::open(&path).unwrap();
@@ -1453,4 +1454,37 @@ fn store_mode_migration_keeps_rules_and_selectors() {
         selectors, 1,
         "deleting a rule still cascades to its selectors"
     );
+}
+
+#[test]
+fn deferred_dir_deletes_round_trip_deepest_first() {
+    let db = Database::open_in_memory().unwrap();
+    let repo = db.repo();
+    repo.init_local_device(&device(1, "a"), 1).unwrap();
+    let s = space("Personal");
+    repo.create_space(&s, 1).unwrap();
+    let m = mount(s.id, "code");
+    repo.create_mount(&m, 1).unwrap();
+    let deferred = |p: &str, counter: u64| crate::DeferredDirDelete {
+        key: key(s.id, m.id, p),
+        vector: vector(&[(2, counter)]),
+        modified_by: DeviceId::from_bytes([2; 32]),
+        modified_at_unix_ms: 7,
+        sequence: Sequence(counter),
+    };
+    repo.put_deferred_dir_delete(&deferred("a", 1)).unwrap();
+    repo.put_deferred_dir_delete(&deferred("a/b/c", 2)).unwrap();
+    repo.put_deferred_dir_delete(&deferred("a/b", 3)).unwrap();
+    // A newer tombstone for the same folder replaces the old one.
+    repo.put_deferred_dir_delete(&deferred("a", 4)).unwrap();
+    let listed = repo.deferred_dir_deletes(s.id).unwrap();
+    let paths: Vec<_> = listed.iter().map(|d| d.key.path.as_str()).collect();
+    assert_eq!(paths, ["a/b/c", "a/b", "a"]);
+    assert_eq!(listed[2], deferred("a", 4));
+
+    repo.remove_deferred_dir_delete(&key(s.id, m.id, "a/b"))
+        .unwrap();
+    assert_eq!(repo.deferred_dir_deletes(s.id).unwrap().len(), 2);
+    repo.delete_space(s.id).unwrap();
+    assert!(repo.deferred_dir_deletes(s.id).unwrap().is_empty());
 }

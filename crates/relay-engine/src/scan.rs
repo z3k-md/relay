@@ -122,9 +122,14 @@ impl Engine {
         clear_scan_yield();
         let (space, config) = self.lookup_mount(space_name, mount_name)?;
         let mount_id = config.mount.id;
-        let result = self.scan_attempts(&space, &config, opts, full, paths, on_tick);
+        let mut result = self.scan_attempts(&space, &config, opts, full, paths, on_tick);
         if !opts.dry_run {
             self.record_scan_bookkeeping(mount_id, full, &result)?;
+            // The scan may have seen the last file of a folder go whose
+            // remote tombstone was deferred (E-M5).
+            if let Ok(report) = &mut result {
+                report.deleted += self.retry_deferred_dir_deletes(space.id)?;
+            }
         }
         result
     }

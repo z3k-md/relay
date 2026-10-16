@@ -17,10 +17,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0012_materialization.sql"),
     include_str!("../migrations/0013_peer_manage.sql"),
     include_str!("../migrations/0014_store_mode.sql"),
+    include_str!("../migrations/0015_deferred_dir_deletes.sql"),
 ];
 
 /// The schema this build writes. A database at a higher version is refused.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 pub(crate) fn user_version(conn: &Connection) -> Result<u32, DbError> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

@@ -186,6 +186,18 @@ pub struct HistoryRecord {
     pub modified_at_unix_ms: i64,
 }
 
+/// A remote folder tombstone that was not applied because the folder was not
+/// empty (E-M5). Kept until it applies or a newer version supersedes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredDirDelete {
+    pub key: EntryKey,
+    pub vector: VersionVector,
+    pub modified_by: DeviceId,
+    pub modified_at_unix_ms: i64,
+    /// The sender's sequence of the tombstone.
+    pub sequence: Sequence,
+}
+
 struct RawEntry {
     id: i64,
     mount_id: [u8; 16],
@@ -519,6 +531,7 @@ impl Repo<'_> {
             "DELETE FROM replication_policies WHERE space_id = ?1",
             "DELETE FROM replica_push WHERE space_id = ?1",
             "DELETE FROM materialization_rules WHERE space_id = ?1",
+            "DELETE FROM deferred_dir_deletes WHERE mount_id IN (SELECT id FROM mounts WHERE space_id = ?1)",
             "DELETE FROM mount_state WHERE mount_id IN (SELECT id FROM mounts WHERE space_id = ?1)",
             "DELETE FROM mount_rules WHERE mount_id IN (SELECT id FROM mounts WHERE space_id = ?1)",
             "DELETE FROM mounts WHERE space_id = ?1",
@@ -1025,6 +1038,90 @@ impl Repo<'_> {
             });
         }
         Ok(history)
+    }
+
+    /// Remember a folder tombstone to retry; replaces any earlier one for the path.
+    pub fn put_deferred_dir_delete(&self, deferred: &DeferredDirDelete) -> Result<(), DbError> {
+        let mount = mount_bytes(deferred.key.mount);
+        let vector_json = serde_json::to_string(&deferred.vector)?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO deferred_dir_deletes
+                    (mount_id, path, vector_json, modified_by, modified_at_ms, sequence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (mount_id, path) DO UPDATE SET
+                    vector_json = excluded.vector_json,
+                    modified_by = excluded.modified_by,
+                    modified_at_ms = excluded.modified_at_ms,
+                    sequence = excluded.sequence",
+            )?
+            .execute(params![
+                mount.as_slice(),
+                deferred.key.path.as_str(),
+                vector_json,
+                deferred.modified_by.as_bytes().as_slice(),
+                deferred.modified_at_unix_ms,
+                i64_from_u64(deferred.sequence.0)?,
+            ])?;
+        Ok(())
+    }
+
+    pub fn remove_deferred_dir_delete(&self, key: &EntryKey) -> Result<(), DbError> {
+        let mount = mount_bytes(key.mount);
+        self.conn
+            .prepare_cached("DELETE FROM deferred_dir_deletes WHERE mount_id = ?1 AND path = ?2")?
+            .execute(params![mount.as_slice(), key.path.as_str()])?;
+        Ok(())
+    }
+
+    /// Deferred folder tombstones of `space`, deepest paths first so a parent
+    /// is retried after its children.
+    pub fn deferred_dir_deletes(&self, space: SpaceId) -> Result<Vec<DeferredDirDelete>, DbError> {
+        let space_id = space_bytes(space);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT d.mount_id, d.path, d.vector_json, d.modified_by, d.modified_at_ms, d.sequence
+             FROM deferred_dir_deletes d
+             JOIN mounts m ON m.id = d.mount_id
+             WHERE m.space_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![space_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, [u8; 16]>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, [u8; 32]>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mount, path, vector_json, modified_by, modified_at_ms, sequence) = row?;
+            let path = relay_core::LogicalPath::new(&path).map_err(|err| {
+                DbError::Corrupt(format!("invalid deferred delete path {path:?}: {err}"))
+            })?;
+            let vector = serde_json::from_str(&vector_json).map_err(|err| {
+                DbError::Corrupt(format!("invalid deferred delete vector_json: {err}"))
+            })?;
+            out.push(DeferredDirDelete {
+                key: EntryKey {
+                    space,
+                    mount: mount_from_bytes(mount),
+                    path,
+                },
+                vector,
+                modified_by: DeviceId::from_bytes(modified_by),
+                modified_at_unix_ms: modified_at_ms,
+                sequence: Sequence(u64_from_i64(sequence)?),
+            });
+        }
+        out.sort_by(|a, b| {
+            let depth = |d: &DeferredDirDelete| d.key.path.as_str().matches('/').count();
+            depth(b)
+                .cmp(&depth(a))
+                .then_with(|| a.key.path.as_str().cmp(b.key.path.as_str()))
+        });
+        Ok(out)
     }
 
     pub fn record_object(&self, id: ObjectId, size: u64, now_ms: i64) -> Result<(), DbError> {
