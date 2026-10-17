@@ -32,6 +32,9 @@ Not in a fixed order.
 - **Accounts** (D44). A sign-in directory, Google first, that finds your
   devices; an existing device approves a new one. We run a default instance;
   self-hosters run it inside their home server.
+- **Simpler app and model** ([proposal](proposals/folders-and-devices.md)).
+  A one-screen app built on two ideas, folders and devices; a folder becomes
+  a one-mount space, and policies, groups, and the `metadata` mode retire.
 - **Relay Explorer.** A Files-class file manager in the desktop app, Windows
   first. The WebView2 performance spike is draft PR #5.
 - **Performance insights** ([proposal](proposals/performance-insights.md)).
