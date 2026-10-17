@@ -1,9 +1,10 @@
 # Folders and devices
 
-**Status:** Proposed 2026-10-17. Zach chose the one-screen app (direction B
-in the [UI proposal](https://claude.ai/artifact/FP4hjaXZBdwmrKE4z4TdE6)).
-This file is the model underneath it; nothing here is decided until it
-becomes a D-entry.
+**Status:** Agreed in outline 2026-10-17. Zach chose the one-screen app
+(direction B in the [UI proposal](https://claude.ai/artifact/FP4hjaXZBdwmrKE4z4TdE6))
+and this model under it. Relay is still in test use, so breaking changes to
+config and the CLI are fine; the wire stays additive (D37). Each step lands
+with its D-entry.
 
 Relay grew one concept per feature. A user who wants one folder on two
 computers meets device ids, peers, spaces, mounts, shares, offers, joins, and
@@ -58,11 +59,17 @@ member list and one key, and neither is something people ask for.
 ### 2. Syncing with a device is one step
 
 "Sync Projects with MacBook" runs the folder-pair steps (D39) when MacBook
-lets this device manage it, which is the default for your own devices. The
-receiving location defaults to the same place under the home folder when it
-exists there (`~/Documents` for `C:\Users\zach\Documents`), else
-`~/Relay/<Folder>`; the sheet lets you change it before it starts. On
-Android it is the app's synced-folders root.
+lets this device manage it, which is the default for your own devices.
+
+Each device picks its own location, and the locations don't have to match:
+`~/Desktop` on ORION can be `D:\Archive\Desktop` on one machine and
+`~/Documents/ORION Desktop` on another. Mounts already work this way. The
+app suggests the same place under the home folder when it exists there
+(`~/Documents` for `C:\Users\zach\Documents`), else `~/Relay/<Folder>`,
+and the sheet lets you browse that device to choose any folder (D37) before
+it starts. A device's row in the folder sheet shows its path and has
+"Move…" to change it later. On Android the default is the app's
+synced-folders root.
 
 When the other device does not allow management, it gets an offer, which
 shows in its Needs you list as "ORION wants to sync Projects with this
@@ -75,20 +82,19 @@ this one, as the pairing checkbox already defaults. The app stops showing
 the grant except as "Limited device" under Details, for a machine you do not
 fully control. D46's protected folders still apply to every manager.
 
-### 4. Retire replication policies and groups
+### 4. Delete replication policies and groups
 
 Policies (D27) are CLI-only, have no app editor, and duplicate what a
 per-device "Not here" folder choice (`exclude`, D35/D38) does now that a
-managing device can set it remotely (D39). Removing them deletes the policy
-epoch, snapshots, and replay logic in `relay-engine/src/policies.rs`.
+managing device can set it remotely (D39). No device uses them, so they go
+outright: the `relay policy` and `relay group` commands, the
+`ConfigChange` variants, the policy epoch, snapshots, and replay logic in
+`relay-engine/src/policies.rs`, and their tables (migration 0016).
 
-- Upgrade: if any space has policies, keep honoring them and warn in
-  `relay status`; refuse new ones. Remove the code once no device has any.
-- Old peers that still send `policies` in an offer are ignored on receive.
-  Their own sends stay filtered, which only narrows what arrives.
-- Removing a policy makes devices want more paths, so files may appear. That
-  never deletes data (DESIGN §9.6), but it is a privacy change, which is why
-  existing policies keep working until they are removed by hand.
+- `SpaceOffer.policy_epoch` and `policies` (tags 5 and 6) are no longer
+  sent and are ignored on receive. The tags stay reserved.
+- Removing a policy can only widen what a device wants, so nothing is
+  deleted (DESIGN §9.6).
 
 ### 5. Three choices per folder per device
 
@@ -129,16 +135,12 @@ the CLI for people without a server.
    engine change.
 2. **CLI and docs.** `relay folder …` commands; USAGE and DESIGN use folder
    and device.
-3. **Engine cleanup.** `metadata` to `demand` (migration 0016); policies
-   deprecated, then removed.
+3. **Engine cleanup.** Delete policies and groups; `metadata` to `demand`;
+   both in migration 0016.
 4. **Ignored files editor** and the home server taking over rendezvous and
    forwarding, with the server stages.
 
 ## Open questions
 
-- Do any of your devices have replication policies or groups? If not, step
-  3 can delete them outright instead of deprecating.
-- Default receive location: "same place under home, else `~/Relay/<name>`",
-  or always `~/Relay/<name>`?
 - Should a server show as a device with a Backup badge (proposed), or in its
   own section?
