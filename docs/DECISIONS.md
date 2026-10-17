@@ -63,6 +63,9 @@ Add an entry with the next free number (check open pull requests), then run
 | D48 | [Connection test](#d48-connection-test) |
 | D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
 | D50 | [Drops](#d50-drops) |
+| D52 | [Files view thumbnails](#d52-files-view-thumbnails) |
+| D53 | [The one-screen app](#d53-the-one-screen-app) |
+| D54 | [A parent folder extends the share of the folders inside it](#d54-a-parent-folder-extends-the-share-of-the-folders-inside-it) |
 
 <!-- index:end -->
 
@@ -647,7 +650,7 @@ address. There is no internet rendezvous.
   `NetEvent::Paired` the initiator's host upserts the peer, shares the
   requested spaces, and updates the trusted set live. The joiner learns
   those spaces through the existing offer flow. `relay pair` and the
-  desktop Peers view are the primary path; `relay peer add` remains the
+  desktop app's Add device sheet are the primary path; `relay peer add` remains the
   manual/advanced fallback. Over Tailscale, mDNS does not cross the
   overlay: the joiner passes `--addr` (`my-mac:47321` via MagicDNS or
   `100.x.y.z:47321`).
@@ -1380,7 +1383,7 @@ A device can keep every file's bytes without a working-tree copy.
 
 ## D48. Connection test
 
-A user can measure the link to a connected peer from the Peers view or
+A user can measure the link to a connected peer from a device's page in the app or
 `relay peer test`. It is stage 1 of
 [`proposals/performance-insights.md`](proposals/performance-insights.md).
 
@@ -1476,3 +1479,102 @@ stage 1 of [`proposals/photo-drop.md`](proposals/photo-drop.md).
   `dropped` read the database each time, so a change applies to the next
   drop. A saved drop is an `ActivityItem` of kind `drop` whose `detail` is
   the saved path; the desktop app takes it from the activity stream.
+
+## D52. Files view thumbnails
+
+The desktop Files view shows images as thumbnails, in a list with small
+thumbnails (the default) or a grid of three sizes; a header switch picks
+the layout, remembered per device in the webview's storage.
+
+- **Made in Rust, served on a scheme.** `relay-thumb` answers
+  `space`/`mount`/`path`/`px` with a JPEG, or a PNG when the image has
+  transparency, at most 64, 128, 256, or 512 pixels on its long side
+  (the request rounds up). JPEG, PNG, WebP, BMP, and GIF, upright per EXIF;
+  sources over 128 MiB keep the icon.
+- **Never a download.** Only files the view lists as here are asked for,
+  and the handler refuses a Windows placeholder (D43) whose bytes are not
+  local, since reading one would hydrate it. Store-mode files (D47) have no
+  path to read.
+- **Cheap at scale.** A few background threads, newest request first, at
+  most 256 waiting (the oldest are refused with 503 and retried while the
+  tile is still on screen). Each worker keeps one read-only engine to find
+  paths; no store scans. Tiles load only near the viewport and release
+  their pixels when they leave it, painted through `bitmaprenderer` rather
+  than `<img>`, which kept decoded images alive.
+- **Cache.** `<home>/cache/thumbs`, one file per path, size, modification
+  time, and pixel size, so an edit makes a new one. Trimmed to 384 MiB,
+  oldest first, once it passes 512 MiB, checked when the app first serves
+  a thumbnail.
+
+## D53. The one-screen app
+
+The desktop and Android app is one screen with no tabs. People see folders
+and devices; spaces, mounts, shares, offers, and grants stay underneath
+([`proposals/folders-and-devices.md`](proposals/folders-and-devices.md)).
+
+- **Home.** A status line (paused, what needs you, what is moving, up to
+  date), then **Needs you**, **Folders**, and **Devices**. Needs you holds
+  held mass deletes (D22), offers from other devices, conflicts grouped by
+  folder (D18), and an available update; it is gone when empty.
+- **Sheets.** A folder, a device, adding a device, conflicts, activity,
+  and settings open as a panel over the home screen (full screen on a
+  phone); a sheet opened from another stacks on it. The Files view (D38)
+  lives inside the folder sheet, fixed to that folder.
+- **A device is its files.** A device's sheet opens on its file browser
+  (D37), starting in its first drive or `/`, with its starting places as
+  chips; below are its synced folders and its settings. The header has
+  Send file and Connection, which gathers address, device id, encryption,
+  and the speed test (D48). The folder's file list keeps the
+  thumbnail layouts (D52); an online-only file shows its cloud icon, since
+  a thumbnail would need its bytes.
+- **A folder is one mount.** Add folder creates a space and a mount, both
+  named after the folder (numbered if the name is taken). A folder around
+  one already synced here joins that folder's space instead (D54), and the
+  home list shows the inner folder indented under it, since they share
+  devices. Any other space with several mounts shows each as its own
+  folder and says that they share devices.
+- **Adding a device to a folder.** When the device is online and lets this
+  one manage it, this device runs the destination half of a folder pair
+  (D39) itself: share here, then on the device join, create the folder and
+  any missing parents, optionally set online-only, and attach. The folder
+  can be anywhere there; the suggestion is the same place under the home
+  folder, else `Relay/<name>`. A failed step undoes the earlier ones.
+  Otherwise the folder is shared and the device's Needs you offers it, to
+  be placed in any folder there.
+- **Reads stay cheap.** The home screen polls spaces, peers, offers, held
+  deletes, and conflicts every 5 s; each is O(folders + devices) or a
+  prefiltered query, never a store walk.
+- **Known limits.** The device setup runs from the app, not the host, so
+  closing the app mid-setup can leave a share without an attached folder;
+  the folder then shows "Not on this device" there, with Choose a folder.
+
+## D54. A parent folder extends the share of the folders inside it
+
+Adding a folder that contains one already attached on this device, such as
+`~/code` around `~/code/forever-addons`, is allowed when the new mount goes
+into the same space. It used to fail with "mount path overlaps existing
+mount".
+
+- **Nesting, not re-rooting.** Entries are identified by `(mount, path)`
+  (§9.4), so moving `forever-addons` under a new root would rename every
+  entry on every device and need a new replicated operation. Instead the
+  space gains a second mount for the parent. The inner mount keeps its id,
+  entries, versions, and history unchanged.
+- **One owner per file.** On each device, a mount's rules leave out the
+  subtrees of other mounts attached inside it (`MountRules::with_nested`,
+  literal paths, not globs). The parent never scans, indexes, or applies a
+  path under a nested root; a peer's entry there is skipped like an
+  excluded one, never written and never tombstoned (§9.6). Detaching the
+  inner mount makes its files ordinary content of the parent from the next
+  scan.
+- **Same space only.** A folder that contains a mount of another space, or
+  that sits inside any mount, is still refused. `Engine::space_inside(path)`
+  names the space to extend; the desktop app uses it so Add folder extends
+  the existing share.
+- **Other devices.** They keep the inner folder where it is and see the
+  parent as a new folder of the space to place. Placing it around their
+  copy of the inner folder reproduces the same layout; placing it elsewhere
+  syncs the parent without the inner folder's files.
+- **No wire change.** Mounts were already per space; peers see one more.
+- **Limit.** Windows Cloud Files cannot nest sync roots, so an online-only
+  (`demand`) mount cannot contain or sit inside another one there.

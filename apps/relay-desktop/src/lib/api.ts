@@ -121,6 +121,7 @@ export const api = {
   createSpace: (name: string) => call<SpaceView>("create_space", { name }),
   addMount: (space: string, mount: string, path: string) =>
     call<MountView>("add_mount", { space, mount, path }),
+  spaceInside: (path: string) => call<string | null>("space_inside", { path }),
   removeMount: (space: string, mount: string) => call<void>("remove_mount", { space, mount }),
   share: (space: string, peer: string) => call<void>("share", { space, peer }),
   unshare: (space: string, peer: string) => call<void>("unshare", { space, peer }),
@@ -191,25 +192,6 @@ export const api = {
   installCli: (shell?: CliShell) =>
     call<CliInstallResult>("install_cli", { shell: shell ?? null }),
 };
-
-export function runnerLabel(state: RunnerState): string {
-  switch (state.kind) {
-    case "notInitialized":
-      return "Not initialized";
-    case "starting":
-      return "Starting";
-    case "running":
-      return "Running";
-    case "paused":
-      return "Paused";
-    case "stopped":
-      return "Stopped";
-    case "error":
-      return "Error";
-    case "externalService":
-      return "Background service";
-  }
-}
 
 export function formatTime(tsMs: number): string {
   const d = new Date(tsMs);

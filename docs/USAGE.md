@@ -26,7 +26,7 @@ Over Tailscale or another VPN, mDNS does not cross the network, so pass an addre
 relay pair 12-3456-7890 --addr laptop:47321
 ```
 
-Pass `--share SPACE` on the machine showing the code if that space already exists and the other device should see it as an offer. The desktop app has the same two actions under Peers: **Pair a device** and **Enter a code**.
+Pass `--share SPACE` on the machine showing the code if that space already exists and the other device should see it as an offer. The desktop app has the same two actions under **Add device**: **Show a code** and **Enter a code**.
 
 `relay peer add NAME ID --addr HOST:PORT` is the manual path when you already have both device ids.
 
@@ -52,7 +52,7 @@ To sync a folder there with one here, all from this device:
 relay pair-folder 'C:\Users\zach\xyz' ~/Code --from desktop --create xyz-foo --exclude cache
 ```
 
-`--from` and `--to` name the devices (this one when left out), `--create` makes a new folder inside the destination, `--online-only` keeps the destination's files online until opened, and `--check` shows what would happen without changing anything. The app does the same from Browse with "Sync…".
+`--from` and `--to` name the devices (this one when left out), `--create` makes a new folder inside the destination, `--online-only` keeps the destination's files online until opened, and `--check` shows what would happen without changing anything. The app does the same from a device's file browser with "Sync…", and a folder's **Sync** button adds a device to a folder that already syncs here, in any folder on that device.
 
 To open one file from there without syncing anything by hand:
 
@@ -62,7 +62,7 @@ relay opened
 relay opened remove Documents
 ```
 
-`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. `relay open --read-only` instead copies just that file (up to 256 MB) into Relay's folder as read-only and sets nothing up; edits to the copy stay here. A copy comes only from a folder that already syncs on the other device; for anything else, open the file or sync its folder. Credential folders such as `~/.ssh`, keychains, and browser profiles are never reachable from another device, and a folder set up for sync from another device may not contain them. In the app, click a file in Browse.
+`relay open` prints where the file now is. Its folder syncs here online-only under `~/Relay/desktop/` (`--into DIR` to choose), so only the files you open download, and edits sync back. `relay opened` lists those folders; `remove` stops syncing one and undoes the setup on the other device, keeping files here. `relay open --read-only` instead copies just that file (up to 256 MB) into Relay's folder as read-only and sets nothing up; edits to the copy stay here. A copy comes only from a folder that already syncs on the other device; for anything else, open the file or sync its folder. Credential folders such as `~/.ssh`, keychains, and browser profiles are never reachable from another device, and a folder set up for sync from another device may not contain them. In the app, open the device and click a file.
 
 The first browse form lists where to start (home, drives, volumes). Paths are in the managed device's own format. Relay's data folder is never listed. On a Mac being managed, grant Relay Full Disk Access (Settings shows the state) so Desktop, Documents, and Downloads do not wait on a prompt nobody is there to answer.
 
@@ -82,11 +82,15 @@ Optional `relay policy` and `relay group` commands limit which subtrees go to wh
 
 Optional `relay materialize` rules are local to this computer. They decide whether a path is a full copy, an index row with no bytes (`metadata`), fetched only when you ask (`demand`), kept in Relay's object store with no file in the folder (`store`, the home server's default), or ignored (`exclude`). Later rules override earlier ones. `relay fetch SPACE/MOUNT/PATH` writes one demand file; `relay evict` removes that copy without deleting it on other machines. With no rules, every file is a full copy.
 
-The desktop app's Files view does the same per folder: "Always keep on this computer" or "Online only", Download, Open (downloads first if needed), and Free up space. Those choices are `materialize` rules named `folder-…`; a choice for a folder replaces the folder choices inside it, and rules you add by hand are left alone.
+The desktop app's folder page does the same per folder: "Always keep on this computer" or "Online only", Download, Open (downloads first if needed), and Free up space. Those choices are `materialize` rules named `folder-…`; a choice for a folder replaces the folder choices inside it, and rules you add by hand are left alone.
+
+The view switch at the top of Files shows a plain list, a list with thumbnails, or a grid (small, medium, or large). Images that are on this computer get thumbnails; online-only files keep their icon and are not downloaded to make one. Thumbnails are cached under `cache/thumbs` in the Relay home, up to about 512 MB.
 
 On macOS, prefer a folder outside `~/Documents`, `~/Desktop`, `~/Downloads`, and iCloud Drive unless the binary has Full Disk Access. See [Platform notes](#platform-notes).
 
 A running Relay applies `space`, `mount`, `share`, `peer`, `group`, `policy`, `materialize`, and `deletes` changes immediately, without dropping its connections. You do not need to restart it.
+
+To widen a shared folder, add its parent to the same space: with `~/code/forever-addons` in space `addons`, `relay mount add addons code ~/code` syncs the rest of `~/code` while `forever-addons` keeps its own history. The desktop app's Add folder does this on its own. A folder inside a synced folder, or around a folder of a different space, is refused.
 
 To stop syncing a folder on one machine, run `relay mount remove SPACE MOUNT`. The files stay on disk and other machines keep syncing. `relay space delete SPACE` then forgets the space on this machine; you can join it again from a peer's offer.
 
@@ -168,7 +172,7 @@ relay drop off
 
 A home server takes no files until `relay drop on`.
 
-The desktop app shows each arriving file in a small popup in the corner: click it to open the file, drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. A video shows a frame with a play button that grows the popup into a player; if Windows cannot decode it there, play opens your video player. If the popup closes before you use a file, it leaves a Windows notification, and the tray menu's **Recent drops** lists the newest files in the drop folder. Settings has the same switch and folder, plus an option to copy every arrival automatically. Peers has **Send file…** for each connected device.
+The desktop app shows each arriving file in a small popup in the corner: click it to open the file, drag the thumbnail into another app, or Copy, which puts both the file and the image on the clipboard. A video shows a frame with a play button that grows the popup into a player; if Windows cannot decode it there, play opens your video player. If the popup closes before you use a file, it leaves a Windows notification, and the tray menu's **Recent drops** lists the newest files in the drop folder. Settings has the same switch and folder, plus an option to copy every arrival automatically. Each connected device's page has **Send file**.
 
 ## Commands
 
@@ -264,7 +268,7 @@ Relay keeps data when it is unsure.
 | Windows | `%APPDATA%\Relay\Relay\data` |
 | Linux | `~/.local/share/relay` |
 
-Override with `--home` or `RELAY_HOME`. Inside: `identity/device.key` (keep it private), `relay.db`, `store/objects/`, `store/tmp/`, and `logs/relay.log`.
+Override with `--home` or `RELAY_HOME`. Inside: `identity/device.key` (keep it private), `relay.db`, `store/objects/`, `store/tmp/`, `logs/relay.log`, and the desktop app's `cache/thumbs/`.
 
 Each mount root gets a small `.relay-mount` marker file.
 

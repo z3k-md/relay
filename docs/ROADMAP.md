@@ -32,6 +32,10 @@ Not in a fixed order.
 - **Accounts** (D44). A sign-in directory, Google first, that finds your
   devices; an existing device approves a new one. We run a default instance;
   self-hosters run it inside their home server.
+- **Simpler app and model** ([proposal](proposals/folders-and-devices.md)).
+  A one-screen app built on two ideas, folders and devices (D53, in
+  review); next, `relay folder` commands, then deleting policies, groups,
+  and the `metadata` mode.
 - **Relay Explorer.** A Files-class file manager in the desktop app, Windows
   first. The WebView2 performance spike is draft PR #5.
 - **Performance insights** ([proposal](proposals/performance-insights.md)).
@@ -67,7 +71,7 @@ Smaller open items:
 
 | Area | What ships | Decisions |
 | --- | --- | --- |
-| Local index | Watcher plus periodic scans, multi-mount, root `.relayignore`, mount markers, mass-delete guard | D7–D9, D13 |
+| Local index | Watcher plus periodic scans, multi-mount, nested mounts of one space, root `.relayignore`, mount markers, mass-delete guard | D7–D9, D13, D54 |
 | Direct sync | QUIC with pinned mutual TLS, index deltas, verified atomic writes, forwarding through members | D14–D17, D26 |
 | Conflicts | Deterministic conflict copies, Git repository groups, clean three-way text merge, held peer mass deletes | D2, D18, D21, D22, D31 |
 | Hosts | `relay run`, `relay service`, the desktop app; local IPC; live config changes | D19, D24, D36 |
@@ -79,7 +83,7 @@ Smaller open items:
 | History | `relay history` and `relay restore` | D5 |
 | Desktop app | macOS and Windows, self-updating; Android foreground shell | D20, D33 |
 | Remote management | Manage grant, Browse another device, folder pairs from either side, open or copy remote files, folder sizes | D37–D42, D46 |
-| Online-only files | Files view choices; Cloud Files placeholders on Windows | D38, D43 |
+| Online-only files | Files view choices and thumbnails; Cloud Files placeholders on Windows | D38, D43, D52 |
 | Home server | Server role, store mode, container, systemd unit | D45, D47 |
 | Testing | `relay-sim` lab, `relay-vopr` deterministic simulator, tiered CI | [`DEVELOPMENT.md`](DEVELOPMENT.md) |
 

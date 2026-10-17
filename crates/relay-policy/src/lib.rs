@@ -59,6 +59,9 @@ pub struct MountRules {
     exclude_prefix_set: GlobSet,
     /// Globs `P` taken from include patterns of the form `P/**`.
     include_prefix_set: GlobSet,
+    /// Literal subtrees that belong to another mount nested inside this one
+    /// on this device (D54). Never globs: folder names may hold `[` or `*`.
+    nested: Vec<String>,
     case_insensitive: bool,
 }
 
@@ -104,8 +107,32 @@ impl MountRules {
             exclude_set,
             exclude_prefix_set,
             include_prefix_set,
+            nested: Vec::new(),
             case_insensitive,
         })
+    }
+
+    /// These rules with `paths` left out, with everything under them: the
+    /// roots of other mounts nested inside this one (D54).
+    pub fn with_nested(mut self, paths: &[LogicalPath]) -> Self {
+        self.nested = paths.iter().map(|p| self.fold(p.as_str())).collect();
+        self
+    }
+
+    fn fold(&self, s: &str) -> String {
+        if self.case_insensitive {
+            s.to_lowercase()
+        } else {
+            s.to_owned()
+        }
+    }
+
+    fn is_nested(&self, path: &str) -> bool {
+        if self.nested.is_empty() {
+            return false;
+        }
+        let path = self.fold(path);
+        self.nested.iter().any(|root| prefix_matches(root, &path))
     }
 
     /// Whether compiled globs match case-insensitively.
@@ -129,7 +156,7 @@ impl MountRules {
     /// of the form `P/**` has `P` matching `dir`. Includes never prune.
     pub fn should_descend(&self, dir: &LogicalPath) -> bool {
         let s = dir.as_str();
-        !self.exclude_set.is_match(s) && !self.exclude_prefix_set.is_match(s)
+        !self.exclude_set.is_match(s) && !self.exclude_prefix_set.is_match(s) && !self.is_nested(s)
     }
 
     /// Whether this entry is part of the mount.
@@ -163,11 +190,14 @@ impl MountRules {
     pub fn with_extra_excludes(&self, extra: &[String]) -> Result<Self, PolicyError> {
         let mut excludes = self.excludes.clone();
         excludes.extend(extra.iter().cloned());
-        Self::with_case_insensitive(&self.includes, &excludes, self.case_insensitive)
+        let mut rules =
+            Self::with_case_insensitive(&self.includes, &excludes, self.case_insensitive)?;
+        rules.nested = self.nested.clone();
+        Ok(rules)
     }
 
     fn is_excluded(&self, path: &LogicalPath) -> bool {
-        if self.exclude_set.is_match(path.as_str()) {
+        if self.exclude_set.is_match(path.as_str()) || self.is_nested(path.as_str()) {
             return true;
         }
         let mut current = path.parent();
@@ -323,6 +353,18 @@ mod tests {
 
     fn default_rules() -> MountRules {
         rules(&[], &[])
+    }
+
+    #[test]
+    fn nested_mount_roots_are_left_out_literally() {
+        let rules = rules_case(&[], &[], true).with_nested(&[lp("Forever [addons]")]);
+        assert!(!rules.should_descend(&lp("forever [addons]")));
+        assert!(!rules.is_selected(&lp("Forever [addons]/a.txt"), EntryKind::File));
+        assert!(!rules.is_selected(&lp("Forever [addons]"), EntryKind::Directory));
+        assert!(rules.is_selected(&lp("Forever a"), EntryKind::Directory));
+        assert!(rules.is_selected(&lp("Forever [addons]2/a.txt"), EntryKind::File));
+        let widened = rules.with_extra_excludes(&["*.log".to_owned()]).unwrap();
+        assert!(!widened.is_selected(&lp("Forever [addons]/b"), EntryKind::File));
     }
 
     #[test]

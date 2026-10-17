@@ -231,7 +231,7 @@ impl Engine {
     ) -> Result<HashMap<MountId, MountApply>, EngineError> {
         let mut out = HashMap::new();
         for config in self.db.repo().list_mounts(Some(space))? {
-            let rules = MountRules::new(&config.includes, &config.excludes)?;
+            let rules = self.local_rules(&config)?;
             let rules = if let Some(root) = &config.local_path {
                 let mut warnings = Vec::new();
                 relay_fs::effective_rules(root, &rules, &mut warnings).unwrap_or(rules)
