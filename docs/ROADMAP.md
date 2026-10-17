@@ -67,7 +67,7 @@ Smaller open items:
 
 | Area | What ships | Decisions |
 | --- | --- | --- |
-| Local index | Watcher plus periodic scans, multi-mount, root `.relayignore`, mount markers, mass-delete guard | D7–D9, D13 |
+| Local index | Watcher plus periodic scans, multi-mount, nested mounts of one space, root `.relayignore`, mount markers, mass-delete guard | D7–D9, D13, D54 |
 | Direct sync | QUIC with pinned mutual TLS, index deltas, verified atomic writes, forwarding through members | D14–D17, D26 |
 | Conflicts | Deterministic conflict copies, Git repository groups, clean three-way text merge, held peer mass deletes | D2, D18, D21, D22, D31 |
 | Hosts | `relay run`, `relay service`, the desktop app; local IPC; live config changes | D19, D24, D36 |

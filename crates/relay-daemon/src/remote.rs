@@ -372,7 +372,8 @@ impl Context {
             inside_mount: self
                 .mounts
                 .iter()
-                .find(|(root, _)| dir.starts_with(root))
+                .filter(|(root, _)| dir.starts_with(root))
+                .max_by_key(|(root, _)| root.components().count())
                 .map(|(_, mount)| mount.clone()),
             ancestors: ancestors(&dir),
         })
@@ -508,7 +509,8 @@ impl Context {
         Ok((file, path))
     }
 
-    /// The folder, name, and mount of one file.
+    /// The folder, name, and mount of one file. With nested folders the
+    /// innermost one owns it (D54).
     fn locate(&self, path: &str) -> Result<Located, RemoteError> {
         let file = self.resolve(path)?;
         let meta = fs::metadata(&file).map_err(|err| io_error(&err, &file))?;
@@ -525,7 +527,8 @@ impl Context {
         let mount = self
             .mounts
             .iter()
-            .find(|(root, _)| file.starts_with(root))
+            .filter(|(root, _)| file.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
             .and_then(|(root, mount)| {
                 let inside: Vec<&str> = file
                     .strip_prefix(root)

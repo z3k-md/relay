@@ -624,7 +624,7 @@ fn restore_writes_to_existing_nfd_on_disk_name() {
 }
 
 #[test]
-fn overlapping_mounts_rejected_both_orders() {
+fn folder_inside_a_mount_rejected() {
     let home = new_home();
     let parent = new_home();
     let child = parent.path().join("child");
@@ -638,18 +638,90 @@ fn overlapping_mounts_rejected_both_orders() {
         .add_mount("S", "child", &child, &[], &[])
         .unwrap_err();
     assert!(matches!(err, EngineError::OverlappingMount { .. }), "{err}");
+}
 
-    let home2 = new_home();
-    let parent2 = new_home();
-    let child2 = parent2.path().join("child");
-    fs::create_dir_all(&child2).unwrap();
-    let mut engine = init_engine(home2.path());
-    engine.create_space("S").unwrap();
-    engine.add_mount("S", "child", &child2, &[], &[]).unwrap();
+#[test]
+fn parent_of_another_space_rejected() {
+    let home = new_home();
+    let parent = new_home();
+    let child = parent.path().join("child");
+    fs::create_dir_all(&child).unwrap();
+    let mut engine = init_engine(home.path());
+    engine.create_space("A").unwrap();
+    engine.create_space("B").unwrap();
+    engine.add_mount("A", "child", &child, &[], &[]).unwrap();
+    assert!(engine.space_inside(parent.path()).unwrap().is_some());
     let err = engine
-        .add_mount("S", "parent", parent2.path(), &[], &[])
+        .add_mount("B", "parent", parent.path(), &[], &[])
         .unwrap_err();
     assert!(matches!(err, EngineError::OverlappingMount { .. }), "{err}");
+}
+
+#[test]
+fn parent_folder_extends_the_space_of_the_folder_inside_it() {
+    let home = new_home();
+    let parent = new_home();
+    let child = parent.path().join("forever-addons");
+    fs::create_dir_all(child.join("src")).unwrap();
+    fs::write(child.join("src/lib.rs"), b"child").unwrap();
+    fs::write(parent.path().join("notes.md"), b"parent").unwrap();
+    let mut engine = init_engine(home.path());
+    engine.create_space("forever-addons").unwrap();
+    engine
+        .add_mount("forever-addons", "forever-addons", &child, &[], &[])
+        .unwrap();
+    engine
+        .scan("forever-addons", "forever-addons", ScanOptions::default())
+        .unwrap();
+    let before = engine
+        .entries("forever-addons", "forever-addons", true)
+        .unwrap();
+
+    let space = engine.space_inside(parent.path()).unwrap().unwrap();
+    assert_eq!(space.name, "forever-addons");
+    engine
+        .add_mount("forever-addons", "code", parent.path(), &[], &[])
+        .unwrap();
+    engine
+        .scan("forever-addons", "code", ScanOptions::default())
+        .unwrap();
+    engine
+        .scan("forever-addons", "forever-addons", ScanOptions::default())
+        .unwrap();
+
+    let parent_paths: Vec<String> = engine
+        .entries("forever-addons", "code", true)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.key.path.as_str().to_owned())
+        .collect();
+    assert_eq!(parent_paths, vec!["notes.md".to_owned()]);
+    let after = engine
+        .entries("forever-addons", "forever-addons", true)
+        .unwrap();
+    assert_eq!(after.len(), before.len());
+    for (a, b) in before.iter().zip(&after) {
+        assert_eq!(a.key, b.key);
+        assert_eq!(a.sequence, b.sequence, "{} changed", a.key.path);
+    }
+
+    // A change inside the nested folder stays in its own mount.
+    fs::write(child.join("src/new.rs"), b"new").unwrap();
+    engine
+        .scan_paths(
+            "forever-addons",
+            "code",
+            &[lp("forever-addons/src/new.rs")],
+            ScanOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .entries("forever-addons", "code", true)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

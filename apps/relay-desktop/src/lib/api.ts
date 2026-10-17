@@ -121,6 +121,7 @@ export const api = {
   createSpace: (name: string) => call<SpaceView>("create_space", { name }),
   addMount: (space: string, mount: string, path: string) =>
     call<MountView>("add_mount", { space, mount, path }),
+  spaceInside: (path: string) => call<string | null>("space_inside", { path }),
   removeMount: (space: string, mount: string) => call<void>("remove_mount", { space, mount }),
   share: (space: string, peer: string) => call<void>("share", { space, peer }),
   unshare: (space: string, peer: string) => call<void>("unshare", { space, peer }),
