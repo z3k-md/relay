@@ -63,6 +63,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D48 | [Connection test](#d48-connection-test) |
 | D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
 | D50 | [Drops](#d50-drops) |
+| D52 | [Files view thumbnails](#d52-files-view-thumbnails) |
 | D53 | [The one-screen app](#d53-the-one-screen-app) |
 
 <!-- index:end -->
@@ -1478,6 +1479,32 @@ stage 1 of [`proposals/photo-drop.md`](proposals/photo-drop.md).
   drop. A saved drop is an `ActivityItem` of kind `drop` whose `detail` is
   the saved path; the desktop app takes it from the activity stream.
 
+## D52. Files view thumbnails
+
+The desktop Files view shows images as thumbnails, in a list with small
+thumbnails (the default) or a grid of three sizes; a header switch picks
+the layout, remembered per device in the webview's storage.
+
+- **Made in Rust, served on a scheme.** `relay-thumb` answers
+  `space`/`mount`/`path`/`px` with a JPEG, or a PNG when the image has
+  transparency, at most 64, 128, 256, or 512 pixels on its long side
+  (the request rounds up). JPEG, PNG, WebP, BMP, and GIF, upright per EXIF;
+  sources over 128 MiB keep the icon.
+- **Never a download.** Only files the view lists as here are asked for,
+  and the handler refuses a Windows placeholder (D43) whose bytes are not
+  local, since reading one would hydrate it. Store-mode files (D47) have no
+  path to read.
+- **Cheap at scale.** A few background threads, newest request first, at
+  most 256 waiting (the oldest are refused with 503 and retried while the
+  tile is still on screen). Each worker keeps one read-only engine to find
+  paths; no store scans. Tiles load only near the viewport and release
+  their pixels when they leave it, painted through `bitmaprenderer` rather
+  than `<img>`, which kept decoded images alive.
+- **Cache.** `<home>/cache/thumbs`, one file per path, size, modification
+  time, and pixel size, so an edit makes a new one. Trimmed to 384 MiB,
+  oldest first, once it passes 512 MiB, checked when the app first serves
+  a thumbnail.
+
 ## D53. The one-screen app
 
 The desktop and Android app is one screen with no tabs. People see folders
@@ -1492,7 +1519,9 @@ and devices; spaces, mounts, shares, offers, and grants stay underneath
   conflicts, activity, and settings open as a panel over the home screen
   (full screen on a phone); a sheet opened from another stacks on it. The
   Files (D38) and Browse (D37) views live inside the folder and device
-  sheets, fixed to that folder or device.
+  sheets, fixed to that folder or device. The folder's file list keeps the
+  thumbnail layouts (D52); an online-only file shows its cloud icon, since
+  a thumbnail would need its bytes.
 - **A folder is one mount.** Add folder creates a space and a mount, both
   named after the folder (numbered if the name is taken). A space with
   several mounts shows each as its own folder and says that they share

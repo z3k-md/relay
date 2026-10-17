@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, onActivated, ref } from "vue";
+import { computed, onActivated, ref, watch } from "vue";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
+import FileList from "../components/FileList.vue";
+import FilesLayoutSwitch from "../components/FilesLayoutSwitch.vue";
 import { api, errorText } from "../lib/api";
-import { formatSize } from "../lib/format";
+import { loadFilesPrefs, saveFilesPrefs } from "../lib/thumbs";
 import type { FileRow, FolderView, SpaceView, TransferLive } from "../lib/types";
 
 const props = defineProps<{
@@ -24,6 +26,9 @@ const error = ref<string | null>(null);
 const notice = ref<string | null>(null);
 /** Set once spaces are listed, so the empty state doesn't flash first. */
 const loaded = ref(false);
+/** List, list with thumbnails, or grid; remembered on this device. */
+const prefs = ref(loadFilesPrefs());
+watch(prefs, saveFilesPrefs, { deep: true });
 /** Bumped on every folder opened; a late listing for an older one is dropped. */
 let generation = 0;
 
@@ -186,16 +191,23 @@ onActivated(async () => {
   <div>
     <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
       <h2 v-if="!only" class="text-[15px] font-semibold">Files</h2>
-      <select
-        v-if="mounts.length && !only"
-        :value="current ? mountKey(current) : ''"
-        class="rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-2 py-1"
-        @change="chooseMount(($event.target as HTMLSelectElement).value)"
-      >
-        <option v-for="m in mounts" :key="mountKey(m)" :value="mountKey(m)">
-          {{ m.space }} / {{ m.mount }}
-        </option>
-      </select>
+      <div class="ml-auto flex flex-wrap items-center gap-2">
+        <FilesLayoutSwitch
+          v-if="mounts.length"
+          v-model:layout="prefs.layout"
+          v-model:grid-size="prefs.gridSize"
+        />
+        <select
+          v-if="mounts.length && !only"
+          :value="current ? mountKey(current) : ''"
+          class="rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-2 py-1"
+          @change="chooseMount(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="m in mounts" :key="mountKey(m)" :value="mountKey(m)">
+            {{ m.space }} / {{ m.mount }}
+          </option>
+        </select>
+      </div>
     </div>
     <ErrorBanner :message="error" />
     <p v-if="notice" class="mb-2 text-[12px] text-[var(--color-muted)]">{{ notice }}</p>
@@ -252,42 +264,19 @@ onActivated(async () => {
       </div>
 
       <p v-if="!folder.entries.length" class="text-[var(--color-muted)]">This folder is empty.</p>
-      <ul v-else class="divide-y divide-[var(--color-line)] rounded-md border border-[var(--color-line)]">
-        <li v-for="row in folder.entries" :key="row.path" class="flex items-center gap-2 px-3 py-1.5">
-          <button
-            type="button"
-            class="min-w-0 flex-1 truncate text-left"
-            :class="row.kind === 'directory' ? 'font-medium' : ''"
-            :disabled="working.has(row.path) || row.state === 'metadata_only' || row.state === 'stored'"
-            @click="openRow(row)"
-          >
-            {{ row.kind === "directory" ? "📁" : row.state === "local" ? "📄" : "☁️" }}
-            {{ row.name }}
-            <span v-if="row.conflict_copy" class="text-[11px] text-[var(--color-danger)]">conflict copy</span>
-          </button>
-          <span class="shrink-0 text-[12px] text-[var(--color-muted)]">{{ stateLabel(row) }}</span>
-          <button
-            v-if="row.kind !== 'directory' && row.state === 'online_only' && !working.has(row.path)"
-            type="button"
-            class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
-            @click="download(row)"
-          >
-            Download
-          </button>
-          <button
-            v-if="row.kind !== 'directory' && row.state === 'local' && row.mode === 'demand'"
-            type="button"
-            class="shrink-0 rounded-md border border-[var(--color-line)] px-2 py-0.5 text-[12px]"
-            :disabled="working.has(row.path)"
-            @click="free(row.path)"
-          >
-            Free up space
-          </button>
-          <span class="w-16 shrink-0 text-right text-[12px] text-[var(--color-muted)]">
-            {{ formatSize(row.size) }}
-          </span>
-        </li>
-      </ul>
+      <FileList
+        v-else-if="current"
+        :space="current.space"
+        :mount="current.mount"
+        :rows="folder.entries"
+        :layout="prefs.layout"
+        :grid-size="prefs.gridSize"
+        :working="working"
+        :state-label="stateLabel"
+        @open="openRow"
+        @download="download"
+        @free="free($event.path)"
+      />
     </template>
   </div>
 </template>
