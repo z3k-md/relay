@@ -32,6 +32,9 @@ class RelaySyncService : Service() {
      * app_data_dir() on Android is dataDir itself, plus "relay".
      */
     fun home(context: Context): File = File(context.dataDir, "relay")
+
+    /** A send is keeping the process in the foreground (SyncCatchUp checks). */
+    @Volatile var active = false
   }
 
   private var multicastLock: WifiManager.MulticastLock? = null
@@ -42,6 +45,7 @@ class RelaySyncService : Service() {
 
   override fun onCreate() {
     super.onCreate()
+    active = true
     Drops.createChannels(this)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       getSystemService(NotificationManager::class.java).deleteNotificationChannel(OLD_SYNC_CHANNEL)
@@ -90,6 +94,7 @@ class RelaySyncService : Service() {
   }
 
   override fun onDestroy() {
+    active = false
     multicastLock?.release()
     multicastLock = null
     super.onDestroy()

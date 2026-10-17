@@ -12,6 +12,12 @@ object RelayNative {
   /** Stops sync and waits briefly for the engine to exit. */
   external fun stop()
 
+  /** A sync thread is alive in this process. */
+  external fun running(): Boolean
+
+  /** Starting, transferring or indexing right now. */
+  external fun busy(): Boolean
+
   /** One status line for the notification, e.g. "Running, 2 peers online". */
   external fun status(): String
 

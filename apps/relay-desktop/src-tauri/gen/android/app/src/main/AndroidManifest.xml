@@ -75,6 +75,12 @@
             android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE" />
 
+        <!-- Periodic background folder sync, no notification; see SyncCatchUp.kt. -->
+        <service
+            android:name=".SyncCatchUpJob"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
         <receiver
             android:name=".DropReceiver"
             android:exported="true">

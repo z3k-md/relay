@@ -1,8 +1,9 @@
 # Android app
 
-**Status:** Stage 1 (CI APK build) shipped. Stack chosen 2026-10-05: keep
-the Tauri UI and add a Kotlin service. Stage 2 (service-hosted engine) in
-review.
+**Status:** Stages 1 (CI APK) and 2 (shared in-process runner, #19)
+shipped; #30 then dropped the always-on notification, so the service runs
+only during a send. Stage 3 (quiet background catch-up) in review. Stack:
+Tauri UI plus Kotlin (chosen 2026-10-05).
 
 Turn the D33 foreground shell into a phone that is a full Relay device: it
 syncs in the background, backs up the camera folder, and shows its files in
@@ -28,7 +29,7 @@ Kotlin RelaySyncService (foreground, dataSync)
                                       ├─ host lock + relay-ipc socket in app data
                                       └─ QUIC on 47321, mDNS
 UI (Tauri WebView) ──in-process──► the same runner
-WorkManager catch-up job ──► start host, sync to quiescence, stop
+SyncCatchUpJob (JobScheduler) ──► start runner, sync until quiet, stop
 DocumentsProvider ──relay-ipc──► list / open / fetch-on-demand
 ```
 
@@ -39,22 +40,19 @@ DocumentsProvider ──relay-ipc──► list / open / fetch-on-demand
   the same runner, so the activity and the service never run two engines.
   The service and UI share a process, so no IPC hop is needed yet.
 - **Lifecycle.**
-  - The service starts when the app opens and from the catch-up job. Its
-    notification shows live status, like the desktop tray, with a "Stop
-    sync" action. Android 15 forbids starting a `dataSync` foreground
-    service from `BOOT_COMPLETED`, so start-on-boot goes through the
-    WorkManager job (stage 3).
-  - Android 15 caps `dataSync` foreground services at 6 h per 24 h.
-    `onTimeout` stops the host cleanly.
-  - A WorkManager periodic job (15 min minimum, optional unmetered and
-    charging constraints) runs a bounded catch-up: start the host, sync
-    until it reports quiescent or a time budget runs out, then stop. This
-    needs a quiescence signal from the host (a new IPC call: no pending
-    scan, fetch, or push).
-  - A `WifiManager.MulticastLock` is held while the host runs, so mDNS
-    discovery works. Doze cuts the network outside maintenance windows, and
-    the foreground service is exempt. The app offers the battery
-    optimization exemption; it does not require it.
+  - Sync runs in-process while the app is open. The foreground service
+    runs only while a drop is being sent (#30), so nothing sits in the
+    notification shade.
+  - With the app closed, `SyncCatchUpJob` (a periodic JobScheduler job,
+    every 15 min at best, network required, not on low battery, persisted
+    across reboots) wakes the process, starts the runner, and stops it once
+    `RelayNative.busy()` has been false for 20 s after a 45 s reconnect
+    window, or after 8 min. It leaves the engine running if the app is on
+    screen, a send is in flight, or the engine was already running. No
+    notification, no boot receiver starting a service (Android 15 forbids
+    that for `dataSync`).
+  - A `WifiManager.MulticastLock` is held while the job or the service
+    runs, so mDNS discovery works. Doze defers jobs to maintenance windows.
 - **Storage**, in order:
   1. **DocumentsProvider.** Each mount is a root in the system Files app and
      the SAF picker. Reads and writes go through the provider. `demand`
@@ -82,11 +80,10 @@ DocumentsProvider ──relay-ipc──► list / open / fetch-on-demand
 
 1. **CI APK build.** A debug `aarch64` APK on path-filtered pull requests and main pushes, uploaded
    as a workflow artifact.
-2. **Service-hosted engine.** JNI entries, a foreground service with a
-   status notification and multicast lock, and the UI attaching to the
-   service's runner.
-3. **Background catch-up.** WorkManager job (also start-on-boot), the
-   quiescence signal, and restart after the 6 h timeout.
+2. **Shared runner.** JNI entries and one in-process runner shared by the
+   UI, the send service and background jobs.
+3. **Background catch-up.** Periodic JobScheduler job with no
+   notification, `RelayNative.running/busy`, persisted across reboots.
 4. **DocumentsProvider** over existing mounts, with fetch-on-demand.
 5. **Shared storage.** "All files access" mounts, a folder picker, and a
    camera-folder preset.

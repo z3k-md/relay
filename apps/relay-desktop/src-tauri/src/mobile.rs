@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use jni::JNIEnv;
 use jni::objects::{JObject, JString};
-use jni::sys::jstring;
+use jni::sys::{jboolean, jstring};
 
 use crate::runner::{self, Runner};
 
@@ -49,6 +49,27 @@ pub extern "system" fn Java_dev_relay_desktop_RelayNative_stop<'local>(
     if let Some(runner) = RUNNER.get() {
         runner.stop_join();
     }
+}
+
+/// `RelayNative.running()`: a sync thread is alive in this process.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_relay_desktop_RelayNative_running<'local>(
+    _env: JNIEnv<'local>,
+    _this: JObject<'local>,
+) -> jboolean {
+    RUNNER
+        .get()
+        .is_some_and(|runner| runner.is_running())
+        .into()
+}
+
+/// `RelayNative.busy()`: starting, transferring or indexing right now.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_relay_desktop_RelayNative_busy<'local>(
+    _env: JNIEnv<'local>,
+    _this: JObject<'local>,
+) -> jboolean {
+    RUNNER.get().is_some_and(|runner| runner.is_busy()).into()
 }
 
 /// `RelayNative.status()`: one line for the service notification.
