@@ -636,6 +636,17 @@ pub fn create_space(app: AppHandle, name: String) -> Result<SpaceView, String> {
     })
 }
 
+/// The space whose folders sit inside `path`, if all are in one: adding
+/// `path` to it extends that share instead of starting a new one (D54).
+#[tauri::command(async)]
+pub fn space_inside(app: AppHandle, path: String) -> Result<Option<String>, String> {
+    let engine = open_ro(&app.state::<AppState>().home)?;
+    let space = engine
+        .space_inside(std::path::Path::new(&path))
+        .map_err(|err| error_chain(&err))?;
+    Ok(space.map(|space| space.name))
+}
+
 #[tauri::command(async)]
 pub fn add_mount(
     app: AppHandle,

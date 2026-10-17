@@ -11,6 +11,8 @@ import {
   folderStatus,
   folderTransfers,
   folders,
+  depth,
+  freeMountName,
   freeName,
   home,
   loadHome,
@@ -80,10 +82,31 @@ async function chooseFolder(title: string): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-/** A folder is a space with one mount named like it (folders-and-devices proposal). */
+/**
+ * A folder is a space with one mount named like it (folders-and-devices
+ * proposal), except one around a folder already synced here, which joins
+ * that folder's space so the inner folder keeps syncing as it is (D54).
+ */
 async function addFolder() {
   const path = await chooseFolder("Choose a folder to sync");
   if (!path) return;
+  let parentOf: string | null = null;
+  try {
+    parentOf = await api.spaceInside(path);
+  } catch (err) {
+    error.value = errorText(err);
+    return;
+  }
+  if (parentOf) {
+    const space = parentOf;
+    const mount = freeMountName(
+      home.spaces.find((s) => s.name === space),
+      baseName(path),
+    );
+    await run(() => api.addMount(space, mount, path));
+    if (!error.value) emit("folder", space, mount);
+    return;
+  }
   const name = freeName(baseName(path));
   await run(async () => {
     await api.createSpace(name);
@@ -268,6 +291,7 @@ function deviceFolders(peer: PeerView): string {
           <button
             type="button"
             class="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-[var(--color-canvas)]"
+            :style="depth(folder) ? { paddingLeft: `${0.75 + 1.5 * depth(folder)}rem` } : undefined"
             @click="emit('folder', folder.space.name, folder.mount.name)"
           >
             <span
@@ -279,7 +303,7 @@ function deviceFolders(peer: PeerView): string {
             <span class="flex min-w-0 flex-1 flex-col">
               <span class="truncate font-medium">{{ folder.mount.name }}</span>
               <span class="truncate text-[12px] text-[var(--color-muted)]">
-                {{ devicesLabel(folder.space.sharedWith) }}
+                {{ folder.inside ? `Inside ${folder.inside}` : devicesLabel(folder.space.sharedWith) }}
               </span>
               <span
                 v-if="progress(folder) != null"

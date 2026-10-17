@@ -9,7 +9,7 @@ import Sheet from "../components/Sheet.vue";
 import StatusDot from "../components/StatusDot.vue";
 import FilesView from "./FilesView.vue";
 import { api, errorText } from "../lib/api";
-import { findFolder, folderStatus, home, loadHome, peerLine, siblings } from "../lib/home";
+import { findFolder, folderStatus, home, loadHome, nestedIn, peerLine, siblings } from "../lib/home";
 import type { MaterializationMode, PeerView, TransferLive } from "../lib/types";
 
 const props = defineProps<{
@@ -231,9 +231,17 @@ async function openFolder() {
             </button>
           </li>
         </ul>
-        <p v-if="siblings(folder).length" class="text-[12px] text-[var(--color-muted)]">
+        <p v-if="folder.inside" class="text-[12px] text-[var(--color-muted)]">
+          Inside {{ folder.inside }} here, so it syncs with the same devices.
+        </p>
+        <p v-else-if="siblings(folder).length" class="text-[12px] text-[var(--color-muted)]">
           {{ siblings(folder).join(", ") }} {{ siblings(folder).length === 1 ? "shares" : "share" }}
           this list: devices added here sync those folders too.
+        </p>
+        <p v-if="nestedIn(folder).length" class="text-[12px] text-[var(--color-muted)]">
+          {{ nestedIn(folder).join(", ") }} inside it {{ nestedIn(folder).length === 1 ? "syncs" : "sync" }}
+          as {{ nestedIn(folder).length === 1 ? "its own folder" : "their own folders" }}, listed under it on
+          the home screen.
         </p>
       </section>
 

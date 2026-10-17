@@ -39,6 +39,8 @@ Space
 - A **space** is a sync namespace: a set of mounts shared with chosen peers.
 - A **mount** maps one logical folder to one physical path on each device that
   attaches it. `D:\Code` on Windows and `~/Code` on a Mac are the same mount.
+  A mount may sit inside another mount of the same space; the outer one
+  leaves the inner subtree out (D54).
 - An **entry** is identified by `(SpaceId, MountId, RelativePath)`, never by
   an OS path. Logical paths are relative, `/`-separated, Unicode NFC (D9).
   Names a platform cannot hold are flagged not portable and skipped there,
@@ -194,8 +196,9 @@ These hold everywhere. A change that breaks one needs a decision first.
 5. **Never treat online presence as proof of durable replication.**
 6. **Never delete local user data because a rule, policy, share, or mount
    changed.** Stop syncing first; cleanup is a separate, explicit action.
-7. **Mounts never overlap** each other or the Relay home. One physical file
-   has one logical identity.
+7. **One physical file has one logical identity.** Mounts never overlap
+   the Relay home or a mount of another space. A mount may contain mounts
+   of its own space; the innermost one owns each file (D54).
 8. **When unsure, keep the data and ask** (mount markers, mass-delete guards,
    held deletes).
 

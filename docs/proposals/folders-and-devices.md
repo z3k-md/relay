@@ -30,7 +30,7 @@ Folder
 | Today | Proposed | Under the hood |
 | --- | --- | --- |
 | Peer, device id, address | **Device** | Unchanged. Ids and addresses live under Details. |
-| Space + mount | **Folder** | A space with exactly one mount. Keys stay per space (D30), so per folder. |
+| Space + mount | **Folder** | A space with one mount, plus any folder added around it (D54). Keys stay per space (D30). |
 | Share, offer, join, attach | **Sync with a device** | One step from either side through folder pairs (D39). Offers remain for devices that may not manage this one. |
 | Manage grant | **Your devices** | Implied for devices you pair or approve; "Limited" under Details turns it off. |
 | Replication policies, device groups | Retired | Covered by "Not here" on a device. |
@@ -52,7 +52,12 @@ member list and one key, and neither is something people ask for.
   release.
 - Entry identity stays `(SpaceId, MountId, path)`, so nothing re-syncs and
   old peers see no difference.
-- An existing multi-mount space keeps working. The app lists each mount as
+- The one exception is a folder added around one already synced, like
+  `~/code` around `~/code/forever-addons`: it joins that folder's space as
+  a second mount, and the inner one keeps its entries (D54). Re-rooting
+  would rename every entry. The app lists the inner folder indented under
+  the outer one; they share one device list, which is what nesting implies.
+- Any other multi-mount space keeps working. The app lists each mount as
   its own folder and says that its device list is shared with the others.
   Splitting one would change every entry's id, so it is not offered.
 

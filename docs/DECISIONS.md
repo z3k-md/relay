@@ -65,6 +65,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D50 | [Drops](#d50-drops) |
 | D52 | [Files view thumbnails](#d52-files-view-thumbnails) |
 | D53 | [The one-screen app](#d53-the-one-screen-app) |
+| D54 | [A parent folder extends the share of the folders inside it](#d54-a-parent-folder-extends-the-share-of-the-folders-inside-it) |
 
 <!-- index:end -->
 
@@ -1523,9 +1524,11 @@ and devices; spaces, mounts, shares, offers, and grants stay underneath
   thumbnail layouts (D52); an online-only file shows its cloud icon, since
   a thumbnail would need its bytes.
 - **A folder is one mount.** Add folder creates a space and a mount, both
-  named after the folder (numbered if the name is taken). A space with
-  several mounts shows each as its own folder and says that they share
-  devices.
+  named after the folder (numbered if the name is taken). A folder around
+  one already synced here joins that folder's space instead (D54), and the
+  home list shows the inner folder indented under it, since they share
+  devices. Any other space with several mounts shows each as its own
+  folder and says that they share devices.
 - **Adding a device to a folder.** When the device is online and lets this
   one manage it, this device runs the destination half of a folder pair
   (D39) itself: share here, then on the device join, create the folder and
@@ -1540,3 +1543,34 @@ and devices; spaces, mounts, shares, offers, and grants stay underneath
 - **Known limits.** The device setup runs from the app, not the host, so
   closing the app mid-setup can leave a share without an attached folder;
   the folder then shows "Not on this device" there, with Choose a folder.
+
+## D54. A parent folder extends the share of the folders inside it
+
+Adding a folder that contains one already attached on this device, such as
+`~/code` around `~/code/forever-addons`, is allowed when the new mount goes
+into the same space. It used to fail with "mount path overlaps existing
+mount".
+
+- **Nesting, not re-rooting.** Entries are identified by `(mount, path)`
+  (§9.4), so moving `forever-addons` under a new root would rename every
+  entry on every device and need a new replicated operation. Instead the
+  space gains a second mount for the parent. The inner mount keeps its id,
+  entries, versions, and history unchanged.
+- **One owner per file.** On each device, a mount's rules leave out the
+  subtrees of other mounts attached inside it (`MountRules::with_nested`,
+  literal paths, not globs). The parent never scans, indexes, or applies a
+  path under a nested root; a peer's entry there is skipped like an
+  excluded one, never written and never tombstoned (§9.6). Detaching the
+  inner mount makes its files ordinary content of the parent from the next
+  scan.
+- **Same space only.** A folder that contains a mount of another space, or
+  that sits inside any mount, is still refused. `Engine::space_inside(path)`
+  names the space to extend; the desktop app uses it so Add folder extends
+  the existing share.
+- **Other devices.** They keep the inner folder where it is and see the
+  parent as a new folder of the space to place. Placing it around their
+  copy of the inner folder reproduces the same layout; placing it elsewhere
+  syncs the parent without the inner folder's files.
+- **No wire change.** Mounts were already per space; peers see one more.
+- **Limit.** Windows Cloud Files cannot nest sync roots, so an online-only
+  (`demand`) mount cannot contain or sit inside another one there.

@@ -90,6 +90,8 @@ On macOS, prefer a folder outside `~/Documents`, `~/Desktop`, `~/Downloads`, and
 
 A running Relay applies `space`, `mount`, `share`, `peer`, `group`, `policy`, `materialize`, and `deletes` changes immediately, without dropping its connections. You do not need to restart it.
 
+To widen a shared folder, add its parent to the same space: with `~/code/forever-addons` in space `addons`, `relay mount add addons code ~/code` syncs the rest of `~/code` while `forever-addons` keeps its own history. The desktop app's Add folder does this on its own. A folder inside a synced folder, or around a folder of a different space, is refused.
+
 To stop syncing a folder on one machine, run `relay mount remove SPACE MOUNT`. The files stay on disk and other machines keep syncing. `relay space delete SPACE` then forgets the space on this machine; you can join it again from a peer's offer.
 
 On the other machine:

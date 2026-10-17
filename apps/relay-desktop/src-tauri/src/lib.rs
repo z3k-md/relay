@@ -98,6 +98,7 @@ pub fn run() {
             pairs::remove_quick_open,
             commands::create_space,
             commands::add_mount,
+            commands::space_inside,
             commands::remove_mount,
             commands::share,
             commands::unshare,

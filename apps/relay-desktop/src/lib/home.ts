@@ -51,16 +51,64 @@ export interface Folder {
   mount: MountView;
   /** Unique within this device. */
   key: string;
+  /** The folder of the same space this one sits inside on this device (D54). */
+  inside: string | null;
 }
 
 export function folderKey(space: string, mount: string): string {
   return `${space}/${mount}`;
 }
 
+/** Compare paths the way the OS that wrote them would: Windows ignores case. */
+function pathKey(path: string): string {
+  const windows = /^[A-Za-z]:|\\/.test(path);
+  const p = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return windows ? p.toLowerCase() : p;
+}
+
+/** The closest other attached mount of the space whose folder contains this one. */
+function enclosing(space: SpaceView, mount: MountView): string | null {
+  if (!mount.path) return null;
+  const own = pathKey(mount.path);
+  let best: MountView | null = null;
+  for (const other of space.mounts) {
+    if (other.name === mount.name || !other.path) continue;
+    const root = pathKey(other.path);
+    if (own.startsWith(`${root}/`) && (!best || root.length > pathKey(best.path!).length)) best = other;
+  }
+  return best?.name ?? null;
+}
+
+/** Every folder, with one nested in another of its space listed right after it. */
 export function folders(): Folder[] {
-  return home.spaces.flatMap((space) =>
-    space.mounts.map((mount) => ({ space, mount, key: folderKey(space.name, mount.name) })),
+  const flat = home.spaces.flatMap((space) =>
+    space.mounts.map((mount) => ({
+      space,
+      mount,
+      key: folderKey(space.name, mount.name),
+      inside: enclosing(space, mount),
+    })),
   );
+  const out: Folder[] = [];
+  const place = (f: Folder) => {
+    out.push(f);
+    for (const child of flat) {
+      if (child.space === f.space && child.inside === f.mount.name) place(child);
+    }
+  };
+  for (const f of flat) if (!f.inside) place(f);
+  return out;
+}
+
+/** How many folders up a folder is nested on this device. */
+export function depth(folder: Folder): number {
+  let n = 0;
+  let at: Folder | null = folder;
+  while (at?.inside && n < 8) {
+    at = findFolder(at.space.name, at.inside);
+    n++;
+  }
+  return n;
 }
 
 export function findFolder(space: string, mount: string): Folder | null {
@@ -70,6 +118,23 @@ export function findFolder(space: string, mount: string): Folder | null {
 /** The folder's other mounts in the same space, which share its devices. */
 export function siblings(folder: Folder): string[] {
   return folder.space.mounts.filter((m) => m.name !== folder.mount.name).map((m) => m.name);
+}
+
+/** Folders of the same space sitting directly inside this one here (D54). */
+export function nestedIn(folder: Folder): string[] {
+  return folders()
+    .filter((f) => f.space === folder.space && f.inside === folder.mount.name)
+    .map((f) => f.mount.name);
+}
+
+/** A mount name not used yet in this space. */
+export function freeMountName(space: SpaceView | undefined, wanted: string): string {
+  const taken = new Set(space?.mounts.map((m) => m.name) ?? []);
+  if (!taken.has(wanted)) return wanted;
+  for (let n = 2; ; n++) {
+    const next = `${wanted} ${n}`;
+    if (!taken.has(next)) return next;
+  }
 }
 
 export function pendingHolds(): DeleteHold[] {
