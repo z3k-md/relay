@@ -84,6 +84,8 @@ Optional `relay materialize` rules are local to this computer. They decide wheth
 
 The desktop app's Files view does the same per folder: "Always keep on this computer" or "Online only", Download, Open (downloads first if needed), and Free up space. Those choices are `materialize` rules named `folder-…`; a choice for a folder replaces the folder choices inside it, and rules you add by hand are left alone.
 
+The view switch at the top of Files shows a plain list, a list with thumbnails, or a grid (small, medium, or large). Images that are on this computer get thumbnails; online-only files keep their icon and are not downloaded to make one. Thumbnails are cached under `cache/thumbs` in the Relay home, up to about 512 MB.
+
 On macOS, prefer a folder outside `~/Documents`, `~/Desktop`, `~/Downloads`, and iCloud Drive unless the binary has Full Disk Access. See [Platform notes](#platform-notes).
 
 A running Relay applies `space`, `mount`, `share`, `peer`, `group`, `policy`, `materialize`, and `deletes` changes immediately, without dropping its connections. You do not need to restart it.
@@ -264,7 +266,7 @@ Relay keeps data when it is unsure.
 | Windows | `%APPDATA%\Relay\Relay\data` |
 | Linux | `~/.local/share/relay` |
 
-Override with `--home` or `RELAY_HOME`. Inside: `identity/device.key` (keep it private), `relay.db`, `store/objects/`, `store/tmp/`, and `logs/relay.log`.
+Override with `--home` or `RELAY_HOME`. Inside: `identity/device.key` (keep it private), `relay.db`, `store/objects/`, `store/tmp/`, `logs/relay.log`, and the desktop app's `cache/thumbs/`.
 
 Each mount root gets a small `.relay-mount` marker file.
 
