@@ -22,7 +22,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow.workspace = true
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
+blake3.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
 log = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 relay-core.workspace = true

@@ -11,6 +11,7 @@ mod runner;
 mod settings;
 #[cfg(not(target_os = "android"))]
 mod sidecar;
+mod thumbs;
 #[cfg(not(target_os = "android"))]
 mod tray;
 #[cfg(not(target_os = "android"))]
@@ -60,6 +61,7 @@ pub fn run() {
             ));
     }
     builder = builder
+        .register_asynchronous_uri_scheme_protocol(thumbs::SCHEME, thumbs::handle)
         .invoke_handler(tauri::generate_handler![
             commands::get_overview,
             commands::init_device,

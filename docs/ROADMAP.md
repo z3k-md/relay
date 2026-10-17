@@ -79,7 +79,7 @@ Smaller open items:
 | History | `relay history` and `relay restore` | D5 |
 | Desktop app | macOS and Windows, self-updating; Android foreground shell | D20, D33 |
 | Remote management | Manage grant, Browse another device, folder pairs from either side, open or copy remote files, folder sizes | D37–D42, D46 |
-| Online-only files | Files view choices; Cloud Files placeholders on Windows | D38, D43 |
+| Online-only files | Files view choices and thumbnails; Cloud Files placeholders on Windows | D38, D43, D52 |
 | Home server | Server role, store mode, container, systemd unit | D45, D47 |
 | Testing | `relay-sim` lab, `relay-vopr` deterministic simulator, tiered CI | [`DEVELOPMENT.md`](DEVELOPMENT.md) |
 
