@@ -13,6 +13,8 @@ members = [
     "crates/relay-net",
     "crates/relay-daemon",
     "crates/relay-ipc",
+    "crates/relay-explorer",
+    "crates/relay-shell-win",
     "apps/relay-cli",
     "apps/relay-sim",
     "apps/relay-vopr",
@@ -34,6 +36,8 @@ default-members = [
     "crates/relay-net",
     "crates/relay-daemon",
     "crates/relay-ipc",
+    "crates/relay-explorer",
+    "crates/relay-shell-win",
     "apps/relay-cli",
     "apps/relay-sim",
     "apps/relay-vopr",
@@ -59,6 +63,8 @@ relay-crypto = { path = "crates/relay-crypto" }
 relay-net = { path = "crates/relay-net" }
 relay-daemon = { path = "crates/relay-daemon" }
 relay-ipc = { path = "crates/relay-ipc" }
+relay-explorer = { path = "crates/relay-explorer" }
+relay-shell-win = { path = "crates/relay-shell-win" }
 
 anyhow = "1"
 blake3 = "1"

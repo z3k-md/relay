@@ -28,6 +28,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 relay-core.workspace = true
 relay-daemon.workspace = true
 relay-engine.workspace = true
+relay-explorer.workspace = true
 relay-ipc.workspace = true
 relay-net.workspace = true
 serde.workspace = true
@@ -52,6 +53,8 @@ jni = "0.21"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
+relay-shell-win.workspace = true
+tokio = { workspace = true }
 winreg = "0.55"
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -27,6 +27,7 @@ struct RecentDrops(Mutex<(Vec<PathBuf>, Option<PathBuf>)>);
 pub fn setup(app: &AppHandle) -> anyhow::Result<()> {
     let status = MenuItem::with_id(app, "status", "Relay — Starting…", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open Relay", true, None::<&str>)?;
+    let explorer = MenuItem::with_id(app, "explorer", "Explorer (preview)", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause sync", true, None::<&str>)?;
     let none = MenuItem::with_id(app, "drops-none", "No drops yet", false, None::<&str>)?;
     let drops = Submenu::with_id_and_items(app, "drops", "Recent drops", true, &[&none])?;
@@ -40,6 +41,7 @@ pub fn setup(app: &AppHandle) -> anyhow::Result<()> {
             &status,
             &sep,
             &open,
+            &explorer,
             &drops,
             &pause,
             &updates_item,
@@ -60,6 +62,11 @@ pub fn setup(app: &AppHandle) -> anyhow::Result<()> {
         .tooltip("Relay")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            "explorer" => {
+                if let Err(err) = crate::explorer::open_window(app) {
+                    log::warn!("explorer window: {err}");
+                }
+            }
             "pause" => toggle_pause(app),
             "updates" => {
                 show_main_window(app);
