@@ -185,7 +185,7 @@ impl Engine {
         on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanPlan, EngineError> {
         let local_path = verified_root(config)?;
-        let user_rules = MountRules::new(&config.includes, &config.excludes)?;
+        let user_rules = self.local_rules(config)?;
         let scanned = scan_mount_with(&local_path, &user_rules, &mut || {
             on_tick(ScanTick::Visited);
             !scan_yield_requested()
@@ -232,7 +232,7 @@ impl Engine {
         on_tick: &mut dyn FnMut(ScanTick),
     ) -> Result<ScanPlan, EngineError> {
         let local_path = verified_root(config)?;
-        let user_rules = MountRules::new(&config.includes, &config.excludes)?;
+        let user_rules = self.local_rules(config)?;
         let scanned = relay_fs::scan_paths(&local_path, &user_rules, paths)?;
         let previous = self.db.repo().entries_for_mount(config.mount.id)?;
         let deletion_scope = scoped_previous_paths(self, config.mount.id, &scanned.scopes)?;

@@ -364,13 +364,20 @@ impl Engine {
             return Err(EngineError::OverlapsRelayHome);
         }
 
+        // A folder may hold folders of the same space already attached here:
+        // it extends that share, and each keeps its own entries (D54). Any
+        // other overlap is refused.
+        let target_space = self.db.repo().space_by_name(space)?.map(|s| s.id);
         let existing = self.db.repo().list_mounts(None)?;
         for cfg in &existing {
             let Some(other) = cfg.local_path.as_ref() else {
                 continue;
             };
             let other = dunce::canonicalize(other).unwrap_or_else(|_| other.clone());
-            if paths_overlap(&canonical, &other) {
+            let nested = other != canonical
+                && other.starts_with(&canonical)
+                && target_space == Some(cfg.mount.space);
+            if paths_overlap(&canonical, &other) && !nested {
                 return Err(EngineError::OverlappingMount { existing: other });
             }
         }
@@ -484,6 +491,59 @@ impl Engine {
             .repo()
             .mount_config(mount.id)?
             .ok_or(EngineError::MountNotLocal)
+    }
+
+    /// The space of the folders already attached inside `path`, when they
+    /// all belong to one: adding `path` to it extends that share (D54).
+    pub fn space_inside(&self, path: &Path) -> Result<Option<Space>, EngineError> {
+        let canonical = dunce::canonicalize(path)?;
+        let mut found: Option<relay_core::SpaceId> = None;
+        for cfg in self.db.repo().list_mounts(None)? {
+            let Some(root) = cfg.local_path.as_ref() else {
+                continue;
+            };
+            if *root == canonical || !root.starts_with(&canonical) {
+                continue;
+            }
+            match found {
+                Some(id) if id != cfg.mount.space => return Ok(None),
+                _ => found = Some(cfg.mount.space),
+            }
+        }
+        let Some(id) = found else {
+            return Ok(None);
+        };
+        Ok(self.spaces()?.into_iter().find(|space| space.id == id))
+    }
+
+    /// Rules for a mount attached here: its own, minus the subtrees of other
+    /// mounts attached inside it (D54), so each file belongs to one mount.
+    pub(crate) fn local_rules(
+        &self,
+        config: &relay_db::MountConfig,
+    ) -> Result<MountRules, EngineError> {
+        let rules = MountRules::new(&config.includes, &config.excludes)?;
+        let Some(root) = config.local_path.as_ref() else {
+            return Ok(rules);
+        };
+        let mut nested = Vec::new();
+        for other in self.db.repo().list_mounts(None)? {
+            let Some(path) = other.local_path.as_ref() else {
+                continue;
+            };
+            if other.mount.id == config.mount.id || path == root || !path.starts_with(root) {
+                continue;
+            }
+            match relay_fs::to_logical_path(root, path) {
+                Ok(logical) => nested.push(logical),
+                Err(err) => tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "nested mount has no logical path; leaving it in its parent"
+                ),
+            }
+        }
+        Ok(rules.with_nested(&nested))
     }
 
     pub fn mounts(&self, space: Option<&str>) -> Result<Vec<(Space, MountConfig)>, EngineError> {
