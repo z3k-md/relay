@@ -1,0 +1,239 @@
+import { Channel } from "@tauri-apps/api/core";
+import { type MemoryInfo, explorer } from "./api";
+import { type ScrollResult, describeScroll, machineLines, runScroll } from "./bench";
+import type { Folder } from "./folder";
+
+/** What the one-shot benchmark needs from the explorer window. */
+export interface BenchHost {
+  home: string;
+  active(): Folder;
+  /** Open a tab on `path`, make it active and wait for its view to mount. */
+  openTab(path: string): Promise<Folder>;
+  scroller(): HTMLElement | null;
+  tabs(): number;
+  status(text: string): void;
+}
+
+const MB = 1024 * 1024;
+const SETTLE_MS = 10_000;
+/** Chromium drops decoded images it no longer draws after about 30 s idle. */
+const IDLE_MS = 60_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Where a listing stands, for a report that stops partway. */
+function listingState(f: Folder): string {
+  const s = f.stats;
+  return `loading ${f.loading.value}, batches ${s.batches}, received ${s.total}, unapplied ${f.pending}, rows ${f.rows.value.length}, first paint ${ms(s.firstPaintMs)} ms, Rust ${ms(s.backendMs)} ms, changes ${s.changes}, rescans ${f.rescans}`;
+}
+
+function ms(v: number | null): string {
+  return v === null ? "—" : v.toFixed(0);
+}
+
+function listingLine(label: string, f: Folder): string {
+  const s = f.stats;
+  return `${label}: ${s.total} items, first batch ${ms(s.firstBatchMs)} ms, first paint ${ms(s.firstPaintMs)} ms, all ${ms(s.doneMs)} ms (Rust ${ms(s.backendMs)} ms), sort/merge ${s.sortMs.toFixed(1)} ms`;
+}
+
+/**
+ * Settled readings side by side, one row per process: working set, private
+ * working set and private commit, in MB. Processes of the same kind are
+ * numbered in order.
+ */
+function perProcess(readings: Record<string, MemoryInfo | null>): string[] {
+  const names = Object.keys(readings);
+  const rows = new Map<string, string[]>();
+  names.forEach((name, col) => {
+    const seen = new Map<string, number>();
+    for (const p of readings[name]?.each ?? []) {
+      const n = (seen.get(p.kind) ?? 0) + 1;
+      seen.set(p.kind, n);
+      const key = n > 1 ? `${p.kind} #${n}` : p.kind;
+      const row = rows.get(key) ?? names.map(() => "—");
+      row[col] = [p.workingSetBytes, p.privateWorkingSetBytes, p.privateBytes].map((b) => (b / MB).toFixed(0)).join(" / ");
+      rows.set(key, row);
+    }
+  });
+  if (rows.size === 0) return [];
+  return [
+    "",
+    `Per process, working set / private working set / private commit, MB (${names.join(" | ")}):`,
+    ...[...rows].map(([kind, cells]) => `  ${kind}: ${cells.join(" | ")}`),
+  ];
+}
+
+/**
+ * The P0 pass bars, end to end, with no clicking: first paint of a 10k
+ * folder (5 runs), sweep and smooth scroll of 200k items, a thumbnail grid
+ * sweep, then memory with three tabs open (and at the start, for the
+ * WebView2 runtime's fixed cost). Returns the report.
+ */
+export async function autobench(host: BenchHost): Promise<string> {
+  const lines = [`Relay Explorer P0 benchmark (${new Date().toISOString()})`, ...machineLines()];
+  const args = await explorer.benchArgs().catch(() => null);
+  lines.push(`WebView2 switches: ${args ?? "default"}`, "");
+
+  // WebView2 stops animation frames while the window is minimized or fully
+  // covered. Lists apply batches on a frame and every timing here is
+  // frame-based, so the run pauses until the window is visible again.
+  let hiddenMs = 0;
+  let hides = 0;
+  const countHides = () => {
+    if (document.visibilityState !== "visible") hides++;
+  };
+  document.addEventListener("visibilitychange", countHides);
+  const whenVisible = async (doing: string) => {
+    if (document.visibilityState === "visible") return;
+    const t0 = performance.now();
+    host.status(`paused while the window is hidden or covered (${doing}). Bring it to the front to continue.`);
+    await new Promise<void>((resolve) => {
+      const onChange = () => {
+        if (document.visibilityState !== "visible") return;
+        document.removeEventListener("visibilitychange", onChange);
+        resolve();
+      };
+      document.addEventListener("visibilitychange", onChange);
+    });
+    hiddenMs += performance.now() - t0;
+    host.status(`resumed: ${doing}`);
+  };
+  const waitDone = async (folder: Folder, timeoutMs = 300_000) => {
+    let until = performance.now() + timeoutMs;
+    while (folder.loading.value || folder.stats.doneMs === null) {
+      if (folder.error.value) throw new Error(`listing ${folder.path.value}: ${folder.error.value}`);
+      if (document.visibilityState !== "visible") {
+        const t0 = performance.now();
+        await whenVisible(`listing ${folder.path.value}`);
+        until += performance.now() - t0;
+      }
+      if (performance.now() > until) {
+        throw new Error(`listing ${folder.path.value} timed out (${listingState(folder)})`);
+      }
+      await sleep(25);
+    }
+  };
+  const make = (kind: "files" | "images", count: number) => {
+    const progress = new Channel<number>();
+    progress.onmessage = (n) => host.status(`Creating ${kind}-${count}: ${n.toLocaleString()}`);
+    host.status(`Creating ${kind}-${count}…`);
+    return explorer.makeBench(kind, count, progress);
+  };
+  const scroll = async (folder: Folder, mode: "sweep" | "smooth") => {
+    // A run the window spent partly hidden measures nothing; redo it.
+    for (let attempt = 1; ; attempt++) {
+      await whenVisible(`${mode} scroll`);
+      host.status(`Scrolling (${mode}) ${folder.path.value}…`);
+      const el = host.scroller();
+      if (!el) throw new Error("no list to scroll");
+      const before = hides;
+      const result = await runScroll(el, mode, folder.rows.value.length);
+      if (hides === before || attempt === 3) return result;
+    }
+  };
+
+  // V8 and the allocator give memory back a few seconds after the page goes
+  // quiet, so each memory reading is taken right away and again once settled.
+  const settled = async (what: string, ms = SETTLE_MS) => {
+    host.status(`Letting memory settle (${what})…`);
+    await sleep(ms);
+    return explorer.memory();
+  };
+
+  try {
+    const tab = host.active();
+    const atStart = await settled("start");
+    const tenK = await make("files", 10_000);
+    const paints: number[] = [];
+    for (let run = 1, tries = 0; run <= 5 && tries < 15; tries++) {
+      await whenVisible("first paint");
+      host.status(`First paint, run ${run} of 5…`);
+      const before = hides;
+      tab.navigate(tenK);
+      await waitDone(tab);
+      await sleep(300);
+      // A run the window spent partly hidden timed the pause; run it again.
+      if (hides !== before) continue;
+      paints.push(tab.stats.firstPaintMs ?? Number.NaN);
+      lines.push(listingLine(`10k run ${run}`, tab));
+      run++;
+    }
+    const medianPaint = [...paints].sort((a, b) => a - b)[Math.floor((paints.length - 1) / 2)];
+
+    const big = await make("files", 200_000);
+    tab.navigate(big);
+    await waitDone(tab);
+    lines.push(listingLine("200k", tab));
+    await sleep(500);
+    const sweep = await scroll(tab, "sweep");
+    const smooth = await scroll(tab, "smooth");
+    lines.push(`Details ${describeScroll(sweep)}`, `Details ${describeScroll(smooth)}`);
+    const afterBigNow = await explorer.memory();
+    const afterBig = await settled("200k");
+
+    const images = await make("images", 2_000);
+    const grid = await host.openTab(images);
+    grid.view.value = "grid";
+    await waitDone(grid);
+    await sleep(500);
+    const gridSweep: ScrollResult = await scroll(grid, "sweep");
+    lines.push(listingLine("2k images", grid), `Grid ${describeScroll(gridSweep)}`);
+
+    const home = await host.openTab(host.home);
+    await waitDone(home);
+    const memoryNow = await explorer.memory();
+    const memory = await settled(`${host.tabs()} tabs`);
+    const idle = await settled(`${host.tabs()} tabs, ${IDLE_MS / 1000} s`, IDLE_MS - SETTLE_MS);
+    // What WebView2 gives back when asked to (Relay would ask when its
+    // window goes to the tray), and whether it keeps it after going back.
+    let low: typeof memory = null;
+    let lowError = "";
+    try {
+      await explorer.memoryTarget(true);
+      low = await settled("memory target low");
+      await explorer.memoryTarget(false);
+    } catch (err) {
+      lowError = String(err);
+    }
+    const mem = (m: typeof memory) =>
+      m
+        ? `working set ${(m.workingSetBytes / MB).toFixed(0)} MB, private working set ${(m.privateWorkingSetBytes / MB).toFixed(0)} MB, private ${(m.privateBytes / MB).toFixed(0)} MB, ${m.processes} processes`
+        : "n/a";
+    const settle = `${SETTLE_MS / 1000} s idle`;
+    lines.push(`Memory at start (1 tab, home), after ${settle}: ${mem(atStart)}`);
+    lines.push(`Memory after 200k scroll (1 tab): ${mem(afterBigNow)}; after ${settle}: ${mem(afterBig)}`);
+    lines.push(`Memory with ${host.tabs()} tabs: ${mem(memoryNow)}; after ${settle}: ${mem(memory)}; after ${IDLE_MS / 1000} s idle: ${mem(idle)}`);
+    lines.push(`Memory with ${host.tabs()} tabs, WebView2 target Low, after ${settle}: ${lowError || mem(low)}`);
+    lines.push(
+      ...perProcess({
+        start: atStart,
+        [`${host.tabs()} tabs`]: memory,
+        [`${host.tabs()} tabs, ${IDLE_MS / 1000} s`]: idle,
+        [`${host.tabs()} tabs, Low`]: low,
+      }),
+    );
+
+    const mark = (ok: boolean) => (ok ? "PASS" : "FAIL");
+    lines.push(
+      "",
+      `${mark(medianPaint <= 150)} first paint ≤ 150 ms for 10k items: median ${medianPaint.toFixed(0)} ms (runs ${paints.map((p) => p.toFixed(0)).join(", ")})`,
+      `${mark(sweep.avgFps >= 57 && sweep.p95 <= 20 && sweep.blank <= sweep.frames / 100)} 60 fps sweeping 200k items: ${sweep.avgFps.toFixed(1)} fps, p95 ${sweep.p95.toFixed(1)} ms, ${sweep.blank} blank frames`,
+      ...(memory
+        ? [
+            `${mark(memory.workingSetBytes <= 250 * MB)} ≤ 250 MB working set with ${host.tabs()} tabs: ${(memory.workingSetBytes / MB).toFixed(0)} MB (counts shared pages once per process)`,
+            `${mark(memory.privateWorkingSetBytes <= 250 * MB)} ≤ 250 MB private working set with ${host.tabs()} tabs (Task Manager's Memory column): ${(memory.privateWorkingSetBytes / MB).toFixed(0)} MB`,
+          ]
+        : ["n/a memory (Windows only)"]),
+    );
+  } catch (err) {
+    lines.push("", `Benchmark stopped: ${err}`);
+  } finally {
+    document.removeEventListener("visibilitychange", countHides);
+  }
+  if (hiddenMs > 0) {
+    lines.push(`Paused ${(hiddenMs / 1000).toFixed(0)} s in total while the window was hidden or covered.`);
+  }
+  return lines.join("\n");
+}
