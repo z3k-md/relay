@@ -1516,11 +1516,15 @@ and devices; spaces, mounts, shares, offers, and grants stay underneath
   date), then **Needs you**, **Folders**, and **Devices**. Needs you holds
   held mass deletes (D22), offers from other devices, conflicts grouped by
   folder (D18), and an available update; it is gone when empty.
-- **Sheets.** A folder, a device, adding a device, browsing a device,
-  conflicts, activity, and settings open as a panel over the home screen
-  (full screen on a phone); a sheet opened from another stacks on it. The
-  Files (D38) and Browse (D37) views live inside the folder and device
-  sheets, fixed to that folder or device. The folder's file list keeps the
+- **Sheets.** A folder, a device, adding a device, conflicts, activity,
+  and settings open as a panel over the home screen (full screen on a
+  phone); a sheet opened from another stacks on it. The Files view (D38)
+  lives inside the folder sheet, fixed to that folder.
+- **A device is its files.** A device's sheet opens on its file browser
+  (D37), starting in its first drive or `/`, with its starting places as
+  chips; below are its synced folders and its settings. The header has
+  Send file and Connection, which gathers address, device id, encryption,
+  and the speed test (D48). The folder's file list keeps the
   thumbnail layouts (D52); an online-only file shows its cloud icon, since
   a thumbnail would need its bytes.
 - **A folder is one mount.** Add folder creates a space and a mount, both

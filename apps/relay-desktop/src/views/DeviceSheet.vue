@@ -6,6 +6,7 @@ import Modal from "../components/Modal.vue";
 import Sheet from "../components/Sheet.vue";
 import SpeedTestDialog from "../components/SpeedTestDialog.vue";
 import StatusDot from "../components/StatusDot.vue";
+import BrowseView from "./BrowseView.vue";
 import { api, copyText, errorText } from "../lib/api";
 import { home, loadHome, peerLine, sharedWithPeer } from "../lib/home";
 
@@ -15,7 +16,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: [];
-  browse: [peer: string];
   folder: [space: string, mount: string];
 }>();
 
@@ -26,12 +26,14 @@ const notice = ref<string | null>(null);
 const testing = ref<string | null>(null);
 const removing = ref(false);
 const copied = ref(false);
+const connection = ref(false);
 
+/** Why the device's files can't be shown, or null when they can. */
 const browseWhyNot = computed(() => {
   const d = device.value;
   if (!d) return null;
-  if (!d.connected) return `${d.name} is offline.`;
-  if (!d.canManage) return `${d.name} hasn't allowed this device to set up sync on it.`;
+  if (!d.connected) return `${d.name} is offline. Its files show here when it's back.`;
+  if (!d.canManage) return `${d.name} hasn't allowed this device to browse it. Turn on "Can browse and set up sync here" on ${d.name}.`;
   return null;
 });
 
@@ -94,66 +96,49 @@ async function copyId() {
 </script>
 
 <template>
-  <Sheet :title="peer" @close="emit('close')">
+  <Sheet :title="peer" wide @close="emit('close')">
+    <template #subtitle>
+      <p v-if="device" class="flex items-center gap-1.5 text-[12px] text-[var(--color-muted)]">
+        <StatusDot :tone="device.connected ? 'ok' : 'off'" />
+        {{ peerLine(device) }}
+      </p>
+    </template>
+    <template #actions>
+      <template v-if="device">
+        <button
+          type="button"
+          class="rounded-md border border-[var(--color-line)] px-2.5 py-1 disabled:opacity-50"
+          :disabled="busy || !device.connected"
+          :title="`Send files to ${device.name}`"
+          @click="sendFile"
+        >
+          Send file
+        </button>
+        <button
+          type="button"
+          class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+          @click="connection = true"
+        >
+          Connection
+        </button>
+      </template>
+    </template>
+
     <div v-if="device" class="flex flex-col gap-5">
       <ErrorBanner :message="error" />
-      <div class="flex items-center gap-2">
-        <StatusDot :tone="device.connected ? 'ok' : 'off'" />
-        <span>{{ peerLine(device) }}</span>
-      </div>
       <p v-if="notice" class="rounded-md bg-[var(--color-canvas)] px-3 py-2 text-[var(--color-muted)]">{{ notice }}</p>
 
-      <ul class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)]">
-        <li>
-          <button
-            type="button"
-            class="flex w-full items-center justify-between px-3 py-2.5 text-left hover:bg-[var(--color-canvas)] disabled:opacity-50"
-            :disabled="busy || !device.connected"
-            @click="sendFile"
-          >
-            <span>
-              <span class="block font-medium">Send a file</span>
-              <span class="block text-[12px] text-[var(--color-muted)]">It pops up on {{ device.name }}, ready to use.</span>
-            </span>
-            <span aria-hidden="true">›</span>
-          </button>
-        </li>
-        <li>
-          <button
-            type="button"
-            class="flex w-full items-center justify-between px-3 py-2.5 text-left hover:bg-[var(--color-canvas)] disabled:opacity-50"
-            :disabled="!!browseWhyNot"
-            @click="emit('browse', device.name)"
-          >
-            <span>
-              <span class="block font-medium">Browse files</span>
-              <span class="block text-[12px] text-[var(--color-muted)]">
-                {{ browseWhyNot ?? `Open a file from ${device.name} or sync one of its folders here.` }}
-              </span>
-            </span>
-            <span aria-hidden="true">›</span>
-          </button>
-        </li>
-        <li>
-          <button
-            type="button"
-            class="flex w-full items-center justify-between px-3 py-2.5 text-left hover:bg-[var(--color-canvas)] disabled:opacity-50"
-            :disabled="!device.connected"
-            @click="testing = device.name"
-          >
-            <span>
-              <span class="block font-medium">Test connection</span>
-              <span class="block text-[12px] text-[var(--color-muted)]">Speed and latency between the two devices.</span>
-            </span>
-            <span aria-hidden="true">›</span>
-          </button>
-        </li>
-      </ul>
+      <KeepAlive>
+        <BrowseView v-if="!browseWhyNot" :peer="device.name" />
+      </KeepAlive>
+      <p v-if="browseWhyNot" class="rounded-lg border border-[var(--color-line)] px-3 py-6 text-center text-[var(--color-muted)]">
+        {{ browseWhyNot }}
+      </p>
 
       <section class="flex flex-col gap-2">
-        <h3 class="text-[11px] font-semibold uppercase tracking-wider text-[var(--color-muted)]">Folders</h3>
+        <h3 class="text-[11px] font-semibold uppercase tracking-wider text-[var(--color-muted)]">Synced folders</h3>
         <p v-if="!sharedWithPeer(device).length" class="text-[var(--color-muted)]">
-          No folders sync with {{ device.name }} yet. Open a folder and choose Sync.
+          None yet. Choose Sync on a folder above, or open a folder here and choose Sync.
         </p>
         <ul v-else class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)]">
           <li v-for="f in sharedWithPeer(device)" :key="f.key">
@@ -169,50 +154,69 @@ async function copyId() {
         </ul>
       </section>
 
-      <label class="flex items-start justify-between gap-3 rounded-lg border border-[var(--color-line)] px-3 py-2.5">
-        <span>
-          <span class="block font-medium">Can set up sync here</span>
-          <span class="block text-[12px] text-[var(--color-muted)]">
-            {{ device.name }} can browse this device and sync its folders, as you can from here. Turn
-            off for a device you don't fully control. Credential folders stay private either way.
-          </span>
-        </span>
-        <input
-          type="checkbox"
-          class="mt-1"
-          :checked="device.allowedToManage"
-          :disabled="busy"
-          @change="toggleManage"
-        />
-      </label>
-
       <details class="rounded-lg border border-[var(--color-line)] px-3 py-2">
-        <summary class="cursor-pointer select-none font-medium">Details</summary>
-        <dl class="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-[12px]">
-          <dt class="text-[var(--color-muted)]">Device id</dt>
-          <dd class="flex items-start gap-2">
-            <code class="mono min-w-0 flex-1 break-all">{{ device.id }}</code>
-            <button type="button" class="shrink-0 rounded border border-[var(--color-line)] px-1.5" @click="copyId">
-              {{ copied ? "Copied" : "Copy" }}
+        <summary class="cursor-pointer select-none font-medium">Device settings</summary>
+        <div class="mt-3 flex flex-col gap-3">
+          <label class="flex items-start justify-between gap-3">
+            <span>
+              <span class="block">Can browse and set up sync here</span>
+              <span class="block text-[12px] text-[var(--color-muted)]">
+                Turn off for a device you don't fully control. Credential folders stay private either way.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              class="mt-1"
+              :checked="device.allowedToManage"
+              :disabled="busy"
+              @change="toggleManage"
+            />
+          </label>
+          <div>
+            <button
+              type="button"
+              class="rounded-md border border-[var(--color-line)] px-2.5 py-1 text-[var(--color-danger)]"
+              @click="removing = true"
+            >
+              Remove device
             </button>
-          </dd>
-          <dt class="text-[var(--color-muted)]">Address</dt>
-          <dd class="mono">{{ device.address || "Found on the local network" }}</dd>
-        </dl>
+          </div>
+        </div>
       </details>
-
-      <div class="border-t border-[var(--color-line)] pt-4">
-        <button
-          type="button"
-          class="rounded-md border border-[var(--color-line)] px-2.5 py-1 text-[var(--color-danger)]"
-          @click="removing = true"
-        >
-          Remove device
-        </button>
-      </div>
     </div>
     <p v-else class="text-[var(--color-muted)]">This device was removed.</p>
 
+    <Modal :open="connection && !!device" :title="`Connection to ${peer}`" @close="connection = false">
+      <dl v-if="device" class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 text-[13px]">
+        <dt class="text-[var(--color-muted)]">Status</dt>
+        <dd class="flex items-center gap-1.5">
+          <StatusDot :tone="device.connected ? 'ok' : 'off'" />
+          {{ device.connected && device.connectedSinceMs != null ? `Online since ${new Date(device.connectedSinceMs).toLocaleTimeString()}` : peerLine(device) }}
+        </dd>
+        <dt class="text-[var(--color-muted)]">Address</dt>
+        <dd class="mono">{{ device.address || "Found on the local network" }}</dd>
+        <dt class="text-[var(--color-muted)]">Encryption</dt>
+        <dd>QUIC with mutual TLS 1.3. Each side proves its device key, so only this device and {{ peer }} can read the traffic.</dd>
+        <dt class="text-[var(--color-muted)]">Device id</dt>
+        <dd class="flex items-start gap-2">
+          <code class="mono min-w-0 flex-1 break-all text-[12px]">{{ device.id }}</code>
+          <button type="button" class="shrink-0 rounded border border-[var(--color-line)] px-1.5 text-[12px]" @click="copyId">
+            {{ copied ? "Copied" : "Copy" }}
+          </button>
+        </dd>
+      </dl>
+      <div class="mt-4 flex justify-end gap-2">
+        <button type="button" class="rounded-md px-2.5 py-1" @click="connection = false">Close</button>
+        <button
+          type="button"
+          class="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-[var(--color-accent-fg)] disabled:opacity-60"
+          :disabled="!device?.connected"
+          @click="connection = false; testing = peer"
+        >
+          Test speed
+        </button>
+      </div>
+    </Modal>
     <SpeedTestDialog :peer="testing" @close="testing = null" />
     <Modal :open="removing" :title="`Remove ${peer}?`" @close="removing = false">
       <p>

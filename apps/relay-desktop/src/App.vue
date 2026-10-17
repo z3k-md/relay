@@ -7,7 +7,6 @@ import StatusDot from "./components/StatusDot.vue";
 import UpdateStatus from "./components/UpdateStatus.vue";
 import ActivityView from "./views/ActivityView.vue";
 import AddDeviceSheet from "./views/AddDeviceSheet.vue";
-import BrowseView from "./views/BrowseView.vue";
 import ConflictsView from "./views/ConflictsView.vue";
 import DeviceSheet from "./views/DeviceSheet.vue";
 import FolderSheet from "./views/FolderSheet.vue";
@@ -28,7 +27,6 @@ import type { ActivityItem, Overview, RunnerState, TransferLive, UpdateAvailable
 type SheetView =
   | { kind: "folder"; space: string; mount: string }
   | { kind: "device"; peer: string }
-  | { kind: "browse"; peer: string }
   | { kind: "addDevice" }
   | { kind: "conflicts" }
   | { kind: "activity" }
@@ -275,12 +273,8 @@ onUnmounted(() => {
           v-else-if="view.kind === 'device'"
           :peer="view.peer"
           @close="closeSheet"
-          @browse="(peer) => openSheet({ kind: 'browse', peer })"
           @folder="(space, mount) => openSheet({ kind: 'folder', space, mount })"
         />
-        <Sheet v-else-if="view.kind === 'browse'" :title="`Files on ${view.peer}`" back wide @close="closeSheet">
-          <KeepAlive><BrowseView :peer="view.peer" /></KeepAlive>
-        </Sheet>
         <AddDeviceSheet
           v-else-if="view.kind === 'addDevice'"
           @close="closeSheet"

@@ -49,9 +49,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
         </button>
         <div class="min-w-0 flex-1">
           <h2 class="truncate text-[16px] font-semibold tracking-tight">{{ title }}</h2>
-          <p v-if="subtitle" class="mono truncate text-[12px] text-[var(--color-muted)]" :title="subtitle">
-            {{ subtitle }}
-          </p>
+          <slot name="subtitle">
+            <p v-if="subtitle" class="mono truncate text-[12px] text-[var(--color-muted)]" :title="subtitle">
+              {{ subtitle }}
+            </p>
+          </slot>
         </div>
         <div class="flex shrink-0 items-center gap-2">
           <slot name="actions" />

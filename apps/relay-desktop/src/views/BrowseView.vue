@@ -355,7 +355,12 @@ async function loadPeers() {
     peers.value = await api.listPeers();
     const current = device.value;
     if (props.peer && current !== props.peer) {
-      if (browsable.value.some((p) => p.name === props.peer)) await choose(props.peer);
+      if (browsable.value.some((p) => p.name === props.peer)) {
+        await choose(props.peer);
+        // A device's own browser starts in a folder, not on a list of places.
+        const start = roots.value.find((r) => r.name !== "Home") ?? roots.value[0];
+        if (start && !listing.value) await open(start.path);
+      }
     } else if (current && browsable.value.some((p) => p.name === current)) {
       // Only a device that just became browsable is listed again: resuming
       // on every peer blip would drop a navigation in flight.
@@ -524,6 +529,24 @@ onUnmounted(() => {
           </nav>
           <div v-if="loading" class="loading-bar" aria-hidden="true" />
         </div>
+      </div>
+
+      <div v-if="peer && roots.length > 1" class="mb-2 flex flex-wrap gap-1.5 text-[12px]">
+        <button
+          v-for="root in roots"
+          :key="root.path"
+          type="button"
+          class="rounded-full border px-2.5 py-0.5"
+          :class="
+            listing?.ancestors?.[0]?.path === root.path || listing?.path === root.path
+              ? 'border-[var(--color-accent)] text-[var(--color-accent)]'
+              : 'border-[var(--color-line)] text-[var(--color-muted)] hover:text-[var(--color-ink)]'
+          "
+          :title="root.path"
+          @click="open(root.path)"
+        >
+          {{ root.name }}
+        </button>
       </div>
 
       <div class="mb-2 flex min-h-7 flex-wrap items-center justify-between gap-2 text-[12px]">
@@ -710,16 +733,21 @@ onUnmounted(() => {
       </span>
     </div>
     <p v-if="notice" class="mt-3 text-[12px] text-[var(--color-muted)]">{{ notice }}</p>
-    <section v-if="quickOpens.length" class="mt-6">
-      <h3 class="mb-1 text-[13px] font-semibold">Opened from other devices</h3>
-      <p class="mb-2 text-[12px] text-[var(--color-muted)]">
-        Folders synced online-only so their files could open here. Removing one keeps the files
-        already here.
-      </p>
+    <section v-if="!peer && quickOpens.length" class="mt-6">
+      <h3 class="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-muted)]">
+        Synced folders
+      </h3>
       <ul class="divide-y divide-[var(--color-line)] rounded-md border border-[var(--color-line)]">
-        <li v-for="q in quickOpens" :key="q.space" class="flex items-center gap-2 px-3 py-1.5">
+        <li
+          v-for="q in quickOpens"
+          :key="q.space"
+          class="flex items-center gap-2 px-3 py-1.5"
+          title="Removing it keeps the files already here"
+        >
           <div class="min-w-0 flex-1">
-            <p class="truncate text-[13px]">{{ q.peer }}: <span class="mono">{{ q.folder }}</span></p>
+            <p class="truncate text-[13px]">
+              {{ q.peer }}: <span class="mono">{{ q.folder }}</span>
+            </p>
             <p class="mono truncate text-[12px] text-[var(--color-muted)]">{{ q.local_path ?? "" }}</p>
           </div>
           <button
