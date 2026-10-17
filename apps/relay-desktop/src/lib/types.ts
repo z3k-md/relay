@@ -76,7 +76,18 @@ export type RemoteCall =
   | { call: "list_dir"; path: string; cursor?: number; limit?: number }
   | { call: "stat"; path: string }
   | { call: "spaces" }
+  | { call: "preview"; path: string }
+  | { call: "create_dir"; parent: string; name: string }
+  | { call: "apply"; change: ConfigChange }
   | { call: "folder_sizes"; path: string };
+
+/** The setup changes a managing device may apply remotely (D39). Peers by id. */
+export type ConfigChange =
+  | { op: "join_space"; space: string; from_peer: string; wait_ms?: number }
+  | { op: "add_mount"; space: string; mount: string; path: string }
+  | { op: "remove_mount"; space: string; mount: string }
+  | { op: "delete_space"; space: string }
+  | { op: "set_folder_mode"; space: string; mount: string; path: string; mode: string | null };
 
 export interface RemoteRoot {
   name: string;
@@ -138,6 +149,9 @@ export type RemoteReply =
   | { reply: "listing"; listing: DirListing }
   | { reply: "stat"; entry: DirEntry }
   | { reply: "spaces"; spaces: RemoteSpace[] }
+  | { reply: "preview"; preview: PathPreview }
+  | { reply: "created"; entry: DirEntry }
+  | { reply: "applied"; applied: unknown }
   | { reply: "folder_sizes"; sizes: FolderSizes };
 
 export interface PathPreview {
@@ -371,16 +385,6 @@ export interface CliInstallResult {
   detectedShell: CliShell | null;
   pathConfigured: boolean;
 }
-
-export type Page =
-  | "overview"
-  | "peers"
-  | "spaces"
-  | "files"
-  | "browse"
-  | "conflicts"
-  | "activity"
-  | "settings";
 
 /** How a connection reaches the other device (D48). */
 export type PathKind = "loopback" | "lan" | "tailscale" | "internet" | "relayed";

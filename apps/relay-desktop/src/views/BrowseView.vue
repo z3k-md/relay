@@ -28,6 +28,9 @@ import { formatSize } from "../lib/format";
 import { describeRemoteError } from "../lib/remoteFolders";
 import type { ActivityItem, DirEntry, DirListing, PeerView, QuickOpen } from "../lib/types";
 
+/** Browse only this device, with no picker: a device's Browse files sheet. */
+const props = defineProps<{ peer?: string | null }>();
+
 const peers = ref<PeerView[]>([]);
 const showHidden = ref(false);
 const {
@@ -351,7 +354,9 @@ async function loadPeers() {
     const before = browsable.value;
     peers.value = await api.listPeers();
     const current = device.value;
-    if (current && browsable.value.some((p) => p.name === current)) {
+    if (props.peer && current !== props.peer) {
+      if (browsable.value.some((p) => p.name === props.peer)) await choose(props.peer);
+    } else if (current && browsable.value.some((p) => p.name === current)) {
       // Only a device that just became browsable is listed again: resuming
       // on every peer blip would drop a navigation in flight.
       if (!before.some((p) => p.name === current)) await resume();
@@ -399,8 +404,8 @@ onUnmounted(() => {
 <template>
   <div>
     <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-      <h2 class="text-[15px] font-semibold">Browse</h2>
-      <div v-if="browsable.length" class="flex items-center gap-2">
+      <h2 v-if="!peer" class="text-[15px] font-semibold">Browse</h2>
+      <div v-if="browsable.length && !peer" class="flex items-center gap-2">
         <label class="text-[12px] text-[var(--color-muted)]" for="browse-device">Device</label>
         <select
           id="browse-device"
@@ -417,7 +422,7 @@ onUnmounted(() => {
     <EmptyState
       v-if="!browsable.length"
       title="No device to browse"
-      body="A paired device appears here once it is online and has allowed this computer to manage it. That choice is made while pairing, or later in Peers on that device."
+      body="A paired device appears here once it is online and has allowed this computer to manage it. That choice is made while pairing, or later on that device under Devices."
     >
       <ul v-if="unavailable.length" class="mb-3 space-y-1 text-left text-[13px]">
         <li v-for="peer in unavailable" :key="peer.id">

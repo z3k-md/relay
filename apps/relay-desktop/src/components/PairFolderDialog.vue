@@ -221,7 +221,7 @@ onMounted(async () => {
         {{ warning }}
       </p>
       <p v-if="!plan.problems.length" class="text-[var(--color-muted)]">
-        Ready: the space will be named {{ plan.space }}.
+        Ready to sync as {{ plan.space }}.
       </p>
     </div>
     <p v-if="error" class="mb-3 text-[12px] text-[var(--color-danger)]">{{ error }}</p>

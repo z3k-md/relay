@@ -192,25 +192,6 @@ export const api = {
     call<CliInstallResult>("install_cli", { shell: shell ?? null }),
 };
 
-export function runnerLabel(state: RunnerState): string {
-  switch (state.kind) {
-    case "notInitialized":
-      return "Not initialized";
-    case "starting":
-      return "Starting";
-    case "running":
-      return "Running";
-    case "paused":
-      return "Paused";
-    case "stopped":
-      return "Stopped";
-    case "error":
-      return "Error";
-    case "externalService":
-      return "Background service";
-  }
-}
-
 export function formatTime(tsMs: number): string {
   const d = new Date(tsMs);
   return d.toLocaleTimeString(undefined, {

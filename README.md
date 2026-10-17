@@ -22,8 +22,8 @@ Build from source with the [development guide](docs/DEVELOPMENT.md). Use either 
 ## Start
 
 1. **Install Relay** on each computer and name the device.
-2. **Pair them.** On one machine, open Peers and choose Pair a device. On the other, enter the code. On the same network that is the whole step. Over a VPN such as [Tailscale](https://tailscale.com), also enter the other machine’s address.
-3. **Share a folder.** Create a space (a name for a set of folders, such as Projects), add a folder, and share the space. On the other computer, accept the offer and choose where that folder should live. An empty folder is the simplest start.
+2. **Pair them.** On one machine, choose **Add device** and **Show a code**. On the other, choose **Enter a code**. On the same network that is the whole step. Over a VPN such as [Tailscale](https://tailscale.com), also enter the other machine’s address.
+3. **Sync a folder.** Choose **Add folder**, open it, and choose **Sync** next to the other computer. Pick any folder there for it: it can be a different place on each machine. If that computer has not let this one set up sync on it, it asks there instead. An empty folder is the simplest start.
 
 A change on one machine is on the others a moment later, in either direction. Add another computer the same way: it only needs to pair with one machine that already has the folder.
 

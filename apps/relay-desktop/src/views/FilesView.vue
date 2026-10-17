@@ -8,6 +8,8 @@ import type { FileRow, FolderView, SpaceView, TransferLive } from "../lib/types"
 
 const props = defineProps<{
   transfers?: TransferLive[];
+  /** Show only this folder, with no picker: the folder sheet's Files section. */
+  only?: { space: string; mount: string } | null;
 }>();
 
 type Mount = { space: string; mount: string };
@@ -160,6 +162,12 @@ onActivated(async () => {
   try {
     spaces.value = await api.listSpaces();
     loaded.value = true;
+    if (props.only) {
+      const key = mountKey(props.only);
+      if (current.value && mountKey(current.value) === key) await open(folder.value?.path ?? "");
+      else await chooseMount(key);
+      return;
+    }
     const shown = current.value;
     if (shown && mounts.value.some((m) => mountKey(m) === mountKey(shown))) {
       await open(folder.value?.path ?? "");
@@ -177,9 +185,9 @@ onActivated(async () => {
 <template>
   <div>
     <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-      <h2 class="text-[15px] font-semibold">Files</h2>
+      <h2 v-if="!only" class="text-[15px] font-semibold">Files</h2>
       <select
-        v-if="mounts.length"
+        v-if="mounts.length && !only"
         :value="current ? mountKey(current) : ''"
         class="rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] px-2 py-1"
         @change="chooseMount(($event.target as HTMLSelectElement).value)"
@@ -212,6 +220,7 @@ onActivated(async () => {
       </div>
 
       <div
+        v-if="!only || folder.path"
         class="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-md bg-[var(--color-panel)] px-3 py-2"
       >
         <label class="flex items-center gap-2 text-[13px]">
