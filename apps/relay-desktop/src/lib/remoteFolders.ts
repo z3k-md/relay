@@ -11,7 +11,7 @@ export function describeRemoteError(err: unknown, device: string): string {
     case "protected":
       return `${device} keeps that private. ${err.message}`;
     case "forbidden":
-      return `${device} has not allowed this computer to manage it. Turn it on in Peers on ${device}.`;
+      return `${device} has not allowed this computer to manage it. On ${device}, open this computer under Devices and turn on "Can set up sync here".`;
     case "offline":
       return `${device} is not connected.`;
     case "unsupported":

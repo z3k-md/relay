@@ -2,7 +2,7 @@
 
 **Status:** Agreed in outline 2026-10-17. Zach chose the one-screen app
 (direction B in the [UI proposal](https://claude.ai/artifact/FP4hjaXZBdwmrKE4z4TdE6))
-and this model under it. Relay is still in test use, so breaking changes to
+and this model under it. Step 1, the app, is D53. Relay is still in test use, so breaking changes to
 config and the CLI are fine; the wire stays additive (D37). Each step lands
 with its D-entry.
 
