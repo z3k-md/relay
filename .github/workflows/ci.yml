@@ -17,6 +17,8 @@
 #     or the toolchain (or labelled `ci:android`), and pushes to main;
 #   - nightly (sim-nightly.yml): the full suite on every OS plus a wide seed
 #     sweep in release mode.
+# Docs-only pull requests (Markdown and docs/) still run `rust`, the required
+# check, but skip its steps. Docs-only pushes to main do not run CI at all.
 # Pushes to main also prune older Actions caches so the repo stays under the
 # 10 GB cache limit (rust-cache saves a new entry per Cargo.lock hash).
 name: CI
@@ -25,8 +27,9 @@ on:
   push:
     branches: [main]
     paths-ignore: ["**/*.md", "docs/**"]
+  # No paths-ignore on pull requests: `rust (ubuntu-latest)` is the required
+  # check, so it must report on every PR. Docs-only PRs skip its steps instead.
   pull_request:
-    paths-ignore: ["**/*.md", "docs/**"]
     # `labeled` so adding `ci:full-sim` re-runs with the full suite.
     types: [opened, synchronize, reopened, labeled]
 
@@ -52,6 +55,7 @@ jobs:
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     outputs:
+      code: ${{ steps.diff.outputs.code }}
       engine: ${{ steps.diff.outputs.engine }}
       android: ${{ steps.diff.outputs.android }}
     steps:
@@ -64,6 +68,12 @@ jobs:
         id: diff
         run: |
           base="$(git merge-base "origin/${{ github.event.pull_request.base.ref }}" HEAD)"
+          # Anything besides Markdown and docs/ needs the build and tests.
+          if git diff --name-only "$base" HEAD | grep -Evq '(\.md$|^docs/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
           if git diff --name-only "$base" HEAD \
             | grep -Eq '^(crates/relay-(engine|core|fs|store|db|proto|crypto)/|apps/relay-vopr/|Cargo\.(toml|lock)$)'; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
@@ -81,6 +91,13 @@ jobs:
   rust:
     name: rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: changes
+    # `changes` is skipped on pushes; run anyway unless it failed.
+    if: ${{ !cancelled() && needs.changes.result != 'failure' }}
+    env:
+      # False only for docs-only pull requests: the job still reports success,
+      # so the required check never waits on a run that will not come.
+      BUILD: ${{ github.event_name == 'push' || needs.changes.outputs.code == 'true' }}
     # A normal run takes well under this; a hang should fail, not burn 6 hours.
     timeout-minutes: 60
     strategy:
@@ -100,7 +117,7 @@ jobs:
       # ReFS dev drive: much faster builds and file-heavy tests than C:, which
       # Defender scans synchronously. Every later step runs from the copy.
       - name: Set up Dev Drive
-        if: runner.os == 'Windows'
+        if: env.BUILD == 'true' && (runner.os == 'Windows')
         uses: samypr100/setup-dev-drive@v4
         with:
           drive-size: 12GB
@@ -110,11 +127,12 @@ jobs:
             TEMP,{{ DEV_DRIVE }}/tmp
 
       - name: Create temp dir on Dev Drive
-        if: runner.os == 'Windows'
+        if: env.BUILD == 'true' && (runner.os == 'Windows')
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
 
       - name: Install pinned Rust toolchain
+        if: env.BUILD == 'true'
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
         run: |
           # rust-toolchain.toml is honoured by rustup (channel + rustfmt/clippy).
@@ -122,6 +140,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache Rust
+        if: env.BUILD == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ env.DEV_DRIVE_WORKSPACE || '.' }} -> target
@@ -129,33 +148,34 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install nextest
+        if: env.BUILD == 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
       - name: rustfmt
-        if: matrix.lint
+        if: env.BUILD == 'true' && (matrix.lint)
         run: cargo fmt --all --check
 
       - name: clippy
-        if: matrix.lint
+        if: env.BUILD == 'true' && (matrix.lint)
         run: cargo clippy --workspace --exclude relay-desktop --all-targets --locked -- -D warnings
 
       - name: Setup Bun
-        if: matrix.lint
+        if: env.BUILD == 'true' && (matrix.lint)
         uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: apps/relay-desktop/package.json
 
       - name: Typecheck and build desktop frontend
-        if: matrix.lint
+        if: env.BUILD == 'true' && (matrix.lint)
         working-directory: apps/relay-desktop
         run: |
           bun install --frozen-lockfile
           bun run frontend:build
 
       - name: Placeholder frontend and sidecar for tauri-build
-        if: matrix.desktop
+        if: env.BUILD == 'true' && (matrix.desktop)
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
         run: |
           set -euo pipefail
@@ -173,25 +193,26 @@ jobs:
           printf 'placeholder' > "$dest"
 
       - name: clippy (desktop)
-        if: matrix.desktop
+        if: env.BUILD == 'true' && (matrix.desktop)
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
         run: cargo clippy -p relay-desktop --all-targets --locked -- -D warnings
 
       - name: test (unit)
+        if: env.BUILD == 'true'
         working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
         run: cargo nextest run --workspace --exclude relay-desktop --exclude relay-vopr --locked --no-fail-fast
 
       # One seed and short runs: enough to catch a broken engine seam. The
       # full suite runs in `sim-full` when the engine changed, and nightly.
       - name: test (sim smoke)
-        if: github.event_name == 'pull_request' && runner.os == 'Linux'
+        if: env.BUILD == 'true' && (github.event_name == 'pull_request' && runner.os == 'Linux')
         env:
           RELAY_VOPR_SEEDS: "1"
           RELAY_VOPR_STEPS: "200"
         run: cargo nextest run -p relay-vopr --locked --no-fail-fast
 
       - name: test (sim full)
-        if: github.event_name == 'push' && runner.os == 'Linux'
+        if: env.BUILD == 'true' && (github.event_name == 'push' && runner.os == 'Linux')
         run: cargo nextest run -p relay-vopr --locked --no-fail-fast
 
   # Full simulator suite for pull requests that touch the engine or ask for
