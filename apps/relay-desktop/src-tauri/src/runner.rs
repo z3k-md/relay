@@ -166,14 +166,31 @@ impl Runner {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn ensure_running(self: &Arc<Self>) {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        let alive = self
-            .inner
-            .lock()
-            .map(|g| g.thread.as_ref().is_some_and(|t| !t.is_finished()))
-            .unwrap_or(false);
-        if !alive {
+        if !self.is_running() {
             self.start_locked();
         }
+    }
+
+    /// A sync thread is alive, possibly backing off after an error.
+    pub fn is_running(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.thread.as_ref().is_some_and(|t| !t.is_finished()))
+            .unwrap_or(false)
+    }
+
+    /// Starting up, or moving or indexing files right now. The Android
+    /// catch-up job stops once this has stayed false for a while.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn is_busy(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|g| {
+                matches!(g.state, RunnerState::Starting)
+                    || !g.transfers.is_empty()
+                    || !g.scans.is_empty()
+            })
+            .unwrap_or(false)
     }
 
     fn start_locked(self: &Arc<Self>) {

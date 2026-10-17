@@ -56,9 +56,20 @@ class MainActivity : TauriActivity() {
     }
     Drops.createChannels(this)
     PhotoWatch.schedule(this)
+    SyncCatchUp.schedule(this)
     // Sync runs in-process while the app is open; the service runs only
     // while a file is being sent, so nothing sits in the notifications.
     handlePairLink(intent)
+  }
+
+  override fun onStart() {
+    super.onStart()
+    SyncCatchUp.uiVisible = true
+  }
+
+  override fun onStop() {
+    SyncCatchUp.uiVisible = false
+    super.onStop()
   }
 
   // launchMode singleTask: a QR code scanned while Relay is open lands here.
