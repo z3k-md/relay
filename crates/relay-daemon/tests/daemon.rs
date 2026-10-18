@@ -1363,3 +1363,68 @@ fn a_drop_lands_in_the_inbox_and_shows_in_activity() {
     stop_daemon(session_a);
     stop_daemon(session_b);
 }
+
+fn pair_own(home_a: &Path, addr_a: SocketAddr, home_b: &Path) {
+    let code = wait_ipc(home_a)
+        .pair_start(&PairStartParams {
+            share: Vec::new(),
+            allow_manage: true,
+        })
+        .expect("pair_start")
+        .code;
+    wait_ipc(home_b)
+        .pair_join(&PairJoinParams {
+            code,
+            addr: Some(addr_a.to_string()),
+            allow_manage: true,
+        })
+        .expect("pair_join");
+}
+
+fn connected_to(home: &Path, name: &str) -> bool {
+    wait_ipc(home)
+        .status()
+        .is_ok_and(|status| status.peers.iter().any(|p| p.name == name))
+}
+
+/// Pairing is transitive across own devices (D55): with alice and carol each
+/// paired to bob, alice and carol learn of each other and connect.
+#[test]
+fn own_devices_paired_through_a_third_meet() {
+    let homes: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+    for (home, name) in homes.iter().zip(["alice", "bob", "carol"]) {
+        Engine::init(home.path(), name).unwrap();
+    }
+    let sessions: Vec<DaemonSession> = homes.iter().map(|h| start_daemon(h.path())).collect();
+    let addrs: Vec<SocketAddr> = sessions
+        .iter()
+        .map(|s| wait_started(s).expect("started"))
+        .collect();
+    let [alice, bob, carol] = [homes[0].path(), homes[1].path(), homes[2].path()];
+
+    pair_own(alice, addrs[0], bob);
+    pair_own(carol, addrs[2], bob);
+
+    assert!(
+        wait_until(CONVERGE, || has_peer(alice, "carol")
+            && has_peer(carol, "alice")),
+        "bob did not introduce alice and carol"
+    );
+    assert!(
+        wait_until(CONVERGE, || connected_to(alice, "carol")
+            && connected_to(carol, "alice")),
+        "alice and carol did not connect"
+    );
+    let carol_on_alice = Engine::open_read_only(alice)
+        .unwrap()
+        .peers()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "carol")
+        .unwrap();
+    assert!(carol_on_alice.may_manage);
+
+    for session in sessions {
+        stop_daemon(session);
+    }
+}

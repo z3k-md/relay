@@ -101,7 +101,10 @@ pub fn join(home: &Path, link: &str, wait: Duration) -> Result<String, String> {
         let params = PairJoinParams {
             code: code.clone(),
             addr,
-            allow_manage: false,
+            // A QR code is scanned from the user's own computer: let it set
+            // up sync here, as the desktop default does, which also lets it
+            // introduce the user's other devices (D55).
+            allow_manage: true,
         };
         match client.pair_join(&params) {
             Ok(joined) => return Ok(joined.peer_name),

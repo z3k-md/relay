@@ -3,6 +3,7 @@ package dev.relay.desktop
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.view.View
@@ -15,6 +16,8 @@ import androidx.core.view.WindowInsetsCompat
 private const val LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
 
 class MainActivity : TauriActivity() {
+  private var multicastLock: WifiManager.MulticastLock? = null
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
@@ -59,6 +62,27 @@ class MainActivity : TauriActivity() {
     // Sync runs in-process while the app is open; the service runs only
     // while a file is being sent, so nothing sits in the notifications.
     handlePairLink(intent)
+  }
+
+  // Sync runs in-process while the app is open, and its mDNS needs
+  // multicast: without a lock Wi-Fi filters it out, so the phone announces
+  // itself once and then never answers a computer's lookup, and never sees a
+  // computer's pairing code.
+  override fun onStart() {
+    super.onStart()
+    if (multicastLock == null) {
+      val wifi = applicationContext.getSystemService(WifiManager::class.java)
+      multicastLock = wifi?.createMulticastLock("relay-mdns-app")?.apply {
+        setReferenceCounted(false)
+        acquire()
+      }
+    }
+  }
+
+  override fun onStop() {
+    multicastLock?.release()
+    multicastLock = null
+    super.onStop()
   }
 
   // launchMode singleTask: a QR code scanned while Relay is open lands here.

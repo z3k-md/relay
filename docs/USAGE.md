@@ -28,6 +28,8 @@ relay pair 12-3456-7890 --addr laptop:47321
 
 Pass `--share SPACE` on the machine showing the code if that space already exists and the other device should see it as an offer. The desktop app has the same two actions under Peers: **Pair a device** and **Enter a code**.
 
+Pair a new device with any one of your devices. Devices that let each other manage them (the `--allow-manage` box, on by default in the app) are your own devices, and they introduce each other: with the laptop and the phone each paired to the desktop, the laptop and the phone connect too. Removing a device with `relay peer remove` keeps it from being introduced back.
+
 `relay peer add NAME ID --addr HOST:PORT` is the manual path when you already have both device ids.
 
 ## Manage another device

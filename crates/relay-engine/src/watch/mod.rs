@@ -704,6 +704,11 @@ fn apply_add_peer(
             tracing::warn!(%space, error = %err, "could not refresh offers after add peer");
         }
     }
+    if paired.may_manage
+        && let Err(err) = syncer.refresh_offers_for_own_devices(engine, output)
+    {
+        tracing::warn!(error = %err, "could not introduce the new device");
+    }
     Ok(())
 }
 
