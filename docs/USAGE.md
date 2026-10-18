@@ -142,10 +142,30 @@ The desktop app is the usual way to stay running. The CLI can do the same job:
 relay init --name laptop
 relay service install
 relay service status
-relay service logs -f
+relay log show -f
 ```
 
-`relay service install` installs or upgrades a LaunchAgent on macOS, or a scheduled task on Windows, and starts it. Windows must be elevated. `logs -f` tails the log; Ctrl-C stops the tail, not the service.
+`relay service install` installs or upgrades a LaunchAgent on macOS, or a scheduled task on Windows, and starts it. Windows must be elevated. `log show -f` tails the log; Ctrl-C stops the tail, not the service.
+
+## Logs and diagnostics
+
+Every way of running Relay (the app, `relay run`, the service, the server, the phone) writes `<relay home>/logs/relay.log`, rotated at 10 MB with two older files kept. Connections, failed dials, pairing steps, and activity are logged at `info`. Lines from one connection carry the same `conn=` id on both devices.
+
+```bash
+relay log show -n 200        # end of the log; -f follows
+relay log level debug        # more detail on the running host for 1 hour
+relay log level debug --for 15m
+relay log level --reset
+relay diag                   # relay-diag-<device>-<time>.zip here
+relay diag --all -o ~/diag   # also every connected device this one manages, plus a merged timeline
+relay diag merge a.zip b.zip
+```
+
+A bundle holds the logs and a report: version, OS, network interfaces, peers with the addresses tried and the last failure, each connection's round-trip time and clock offset, and recent activity. It contains file names and paths but no keys or pairing codes. Pulling a bundle from another device needs the manage grant (`relay peer allow-manage` there). `merge` lines bundles up on the first one's clock using the measured offsets.
+
+In the app, Settings has a Detailed logging switch (one hour), and on a computer **Diagnostics**: This device, or All my devices. Bundles go to Downloads. A phone's bundle is collected from a computer with All my devices.
+
+`RELAY_LOG` sets the default filter at start, for example `RELAY_LOG=debug` or `RELAY_LOG=info,relay_net=trace`.
 
 `uninstall`, `start`, `stop`, and `restart` are the other `relay service` subcommands.
 
@@ -176,10 +196,13 @@ The desktop app shows each arriving file in a small popup in the corner: click i
 | --- | --- |
 | `relay init [--name NAME]` | Create this device’s key, id, and local database |
 | `relay id` | Print this device’s id and name |
-| `relay run [--listen ADDR] [--verbose] [--log-file PATH]` | Watch mounts and sync in the foreground until Ctrl-C. Default listen `0.0.0.0:47321` |
+| `relay run [--listen ADDR] [--verbose] [--log-file PATH]` | Watch mounts and sync in the foreground until Ctrl-C. Default listen `0.0.0.0:47321`. Logs go to `<relay home>/logs/relay.log` and, at `RELAY_LOG` (default `warn`), to stderr |
 | `relay service install [--listen ADDR]` | Install or upgrade the background service and start it |
 | `relay service uninstall` / `start` / `stop` / `restart` / `status` | Remove or control the background service |
-| `relay service logs [-n N] [-f]` | Show the service log (`<relay home>/logs/relay.log`) |
+| `relay log show [-n N] [-f]` / `log path` | Show the log (`<relay home>/logs/relay.log`) or print its path |
+| `relay log level [FILTER] [--for DURATION] [--reset]` | Show or change the running host's log level; it reverts after `--for` (default `1h`, `0` keeps it until restart) |
+| `relay diag [-o PATH] [--all] [--peer NAME]...` | Save a diagnostics bundle for this device, and with `--all` or `--peer` for managed peers too |
+| `relay diag merge BUNDLE... [-o FILE]` | Interleave bundles into one timeline |
 | `relay status` | Device, mounts, peers, sync progress, and whether a host is running |
 | `relay pair [--share SPACE]... [--allow-manage]` / `relay pair CODE [--addr HOST:PORT] [--allow-manage]` | Pair with another device. `--allow-manage` lets it manage this one |
 | `relay peer add NAME ID [--addr HOST:PORT]...` / `peer list` / `peer remove NAME` | Add a peer by device id |
@@ -224,7 +247,7 @@ The desktop app shows each arriving file in a small popup in the corner: click i
 | `relay verify` | Re-hash every live object in the store |
 | `relay gc [--grace-secs N]` | Remove objects no longer referenced by the index or history |
 
-Global flags: `--home DIR` for a different data directory, `--json` for machine-readable output. Set `RELAY_LOG=info` (or `debug`) for logs on stderr.
+Global flags: `--home DIR` for a different data directory, `--json` for machine-readable output. Set `RELAY_LOG=info` (or `debug`) for logs on stderr; for `relay run` it also sets the log file's default level.
 
 Exit codes: `0` ok, `1` error, `2` mass delete refused, `3` `relay verify` found missing or corrupt objects.
 

@@ -314,6 +314,20 @@ export interface ActivityItem {
   message: string;
 }
 
+// Logging and diagnostics (D56). IPC shapes, so snake_case.
+export interface LogLevel {
+  filter: string;
+  default: string;
+  until_ms?: number;
+}
+
+export interface Collected {
+  bundles: string[];
+  timeline: string | null;
+  failures: string[];
+  nobody_to_pull: boolean;
+}
+
 export interface Settings {
   startAtLogin: boolean;
   autoUpdate: boolean;

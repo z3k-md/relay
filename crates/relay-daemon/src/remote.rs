@@ -152,6 +152,11 @@ pub(crate) fn answer(host: &Host, home: &Path, call: RemoteCall, asker: Asker) -
         RemoteCall::FolderSizes { path } => Ok(RemoteReply::FolderSizes {
             sizes: context()?.folder_sizes(&host.sizer, &path)?,
         }),
+        RemoteCall::Diagnostics => {
+            let bundle = crate::diag::remote_bundle(host, home)?;
+            log(host, by, "collected this device's diagnostics");
+            Ok(RemoteReply::Diagnostics { bundle })
+        }
         RemoteCall::ScanFirst { space, mount, path } => {
             host.scan_first(&space, &mount, &path)
                 .map_err(|err| RemoteError::new(RemoteErrorCode::parse(&err.code), err.message))?;

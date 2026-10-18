@@ -78,6 +78,14 @@ pub struct Runner {
 
 impl Runner {
     pub fn new(home: PathBuf) -> Self {
+        // The host writes relay.log (D56). When the background service is
+        // the host, this app's own lines go beside it instead.
+        let log = if external_service_running(&home) {
+            home.join(relay_daemon::logging::LOG_DIR).join("app.log")
+        } else {
+            relay_daemon::logging::log_path(&home)
+        };
+        crate::logs::init(Some(log));
         Self {
             home,
             inner: Mutex::new(Inner {

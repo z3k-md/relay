@@ -179,6 +179,11 @@ Online presence is not durability; acknowledgements are.
   reload the host.
 - **Desktop app.** Tauri 2 and Vue 3, engine in-process, CLI bundled,
   self-updating from GitHub Releases (D20, [`RELEASING.md`](RELEASING.md)).
+- **Logs.** Every host writes `<home>/logs/relay.log` at `info`, rotated at
+  10 MiB. Sessions log inside a `conn` span whose id both ends share, and
+  each records the peer's clock offset. The level changes live and reverts.
+  `relay diag` zips the log with a state report, and a managing device can
+  pull a peer's bundle and merge them into one timeline (D56).
 
 # 9. Safety invariants
 
@@ -245,6 +250,7 @@ Where things happen:
 | Remote management calls | `relay-net/src/control.rs`, `relay-daemon/src/remote.rs`, `relay-daemon/src/folder_pair.rs` |
 | Server role: join and attach shared spaces | `relay-engine/src/server.rs`, `packaging/server/` |
 | Online-only files and placeholders | `relay-engine/src/materialize.rs`, `relay-engine/src/placeholders.rs`, `relay-fs/src/cloud/` |
+| Logging, diagnostics bundles, merge | `relay-daemon/src/{logging,diag}.rs`, `relay-core/src/diag.rs` |
 | CLI commands | `relay-cli/src/main.rs` |
 
 The workspace forbids `unsafe`. The engine does not depend on networking or

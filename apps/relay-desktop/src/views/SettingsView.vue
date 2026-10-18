@@ -1,12 +1,19 @@
 <script setup lang="ts">
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { computed, onActivated, ref, watch } from "vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import UpdateStatus from "../components/UpdateStatus.vue";
 import { api, errorText } from "../lib/api";
 import { checkForUpdates, updateActive } from "../lib/updateProgress";
-import type { CliShell, CliStatus, DropSettings, Settings } from "../lib/types";
+import type {
+  CliShell,
+  CliStatus,
+  Collected,
+  DropSettings,
+  LogLevel,
+  Settings,
+} from "../lib/types";
 
 const props = defineProps<{
   version: string;
@@ -63,6 +70,57 @@ async function openLogsFolder() {
   }
 }
 
+/** How long detailed logging stays on before it turns itself off (D56). */
+const DETAILED_MINUTES = 60;
+const logLevel = ref<LogLevel | null>(null);
+const detailed = computed(
+  () => !!logLevel.value && logLevel.value.filter !== logLevel.value.default,
+);
+const detailedUntil = computed(() => {
+  const until = logLevel.value?.until_ms;
+  return until ? new Date(until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+});
+const diagnostics = ref<Collected | null>(null);
+const collecting = ref(false);
+
+async function setDetailed(on: boolean) {
+  error.value = null;
+  try {
+    logLevel.value = await api.setLogLevel(on ? "debug" : null, on ? DETAILED_MINUTES : null);
+  } catch (err) {
+    error.value = errorText(err);
+    logLevel.value = await api.getLogLevel().catch(() => logLevel.value);
+  }
+}
+
+async function saveDiagnostics(all: boolean) {
+  collecting.value = true;
+  error.value = null;
+  diagnostics.value = null;
+  try {
+    diagnostics.value = await api.saveDiagnostics(all);
+  } catch (err) {
+    error.value = errorText(err);
+  } finally {
+    collecting.value = false;
+  }
+}
+
+function folderOf(path: string): string {
+  const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return cut > 0 ? path.slice(0, cut) : path;
+}
+
+async function showDiagnostics() {
+  const first = diagnostics.value?.bundles[0];
+  if (!first) return;
+  try {
+    await openPath(folderOf(first));
+  } catch (err) {
+    error.value = errorText(err);
+  }
+}
+
 const selectedHint = computed(() => {
   const hints = cli.value?.shellHints ?? [];
   return hints.find((h) => h.shell === selectedShell.value) ?? null;
@@ -90,6 +148,7 @@ async function load() {
   if (!loaded) loading.value = true;
   error.value = null;
   try {
+    logLevel.value = await api.getLogLevel().catch(() => null);
     if (props.mobile) {
       settings.value = await api.getSettings();
       return;
@@ -382,14 +441,93 @@ defineExpose({ load });
         <p v-if="displayHint" class="mono mt-1 text-[12px] text-[var(--color-muted)]">{{ displayHint }}</p>
       </section>
 
-      <button
-        v-if="!mobile"
-        type="button"
-        class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
-        @click="openLogsFolder"
+      <section
+        class="divide-y divide-[var(--color-line)] overflow-hidden rounded-lg border border-[var(--color-line)] bg-[var(--color-panel)]"
       >
-        Open logs folder
-      </button>
+        <label class="flex items-center justify-between gap-3 px-3 py-2">
+          <span>
+            <span class="block font-medium">Detailed logging</span>
+            <span class="block text-[12px] text-[var(--color-muted)]">
+              <template v-if="detailed && detailedUntil">On until {{ detailedUntil }}.</template>
+              <template v-else-if="detailed">On until Relay restarts.</template>
+              <template v-else>
+                Records every connection attempt for an hour, then turns itself off.
+              </template>
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            :checked="detailed"
+            :disabled="!logLevel"
+            @change="setDetailed(($event.target as HTMLInputElement).checked)"
+          />
+        </label>
+        <div v-if="!mobile" class="px-3 py-2">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="font-medium">Diagnostics</p>
+              <p class="text-[12px] text-[var(--color-muted)]">
+                Logs and a network report in Downloads. All my devices adds every connected device
+                that lets this one manage it, and a merged timeline.
+              </p>
+            </div>
+            <div class="flex shrink-0 gap-2">
+              <button
+                type="button"
+                class="rounded-md border border-[var(--color-line)] px-2.5 py-1 disabled:opacity-50"
+                :disabled="collecting"
+                @click="saveDiagnostics(false)"
+              >
+                This device
+              </button>
+              <button
+                type="button"
+                class="rounded-md border border-[var(--color-line)] px-2.5 py-1 disabled:opacity-50"
+                :disabled="collecting"
+                @click="saveDiagnostics(true)"
+              >
+                All my devices
+              </button>
+            </div>
+          </div>
+          <p v-if="collecting" class="mt-2 text-[12px] text-[var(--color-muted)]">Collecting…</p>
+          <div v-if="diagnostics" class="mt-2 text-[12px]">
+            <p>
+              Saved {{ diagnostics.bundles.length }}
+              {{ diagnostics.bundles.length === 1 ? "bundle" : "bundles" }}<template
+                v-if="diagnostics.timeline"
+              >
+                and a timeline</template
+              >.
+              <a
+                href="#"
+                class="text-[var(--color-accent)] underline"
+                @click.prevent="showDiagnostics"
+                >Show</a
+              >
+            </p>
+            <p v-if="diagnostics.nobody_to_pull" class="text-[var(--color-muted)]">
+              No connected device lets this one manage it, so only this device is included.
+            </p>
+            <p v-for="failure in diagnostics.failures" :key="failure" class="text-[var(--color-muted)]">
+              {{ failure }}
+            </p>
+          </div>
+        </div>
+        <p v-else class="px-3 py-2 text-[12px] text-[var(--color-muted)]">
+          To collect this phone's logs, choose Diagnostics, All my devices on a computer this phone
+          lets manage it.
+        </p>
+        <div v-if="!mobile" class="px-3 py-2">
+          <button
+            type="button"
+            class="rounded-md border border-[var(--color-line)] px-2.5 py-1"
+            @click="openLogsFolder"
+          >
+            Open logs folder
+          </button>
+        </div>
+      </section>
     </div>
   </div>
 </template>

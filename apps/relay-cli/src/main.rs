@@ -15,7 +15,7 @@ use relay_core::{
     ConfigApplied, ConfigChange, DeviceId, EntryContent, EntryRecord, LogicalPath, PairingCode,
     Sequence, VersionVector,
 };
-use relay_daemon::{DaemonEvent, DaemonOptions, HostKind};
+use relay_daemon::{DaemonEvent, DaemonOptions, HostKind, logging};
 use relay_engine::{
     ConflictClass, ConflictInfo, DeleteHoldDecision, Engine, EngineError, Resolution, ScanOptions,
     ScanReport, TransportStatus, WatchEvent, WatchOptions, default_home, group_git_conflicts,
@@ -26,6 +26,7 @@ use relay_ipc::{
     PairJoinParams, PairStartParams, PairStatus, SpeedTestParams, Status as DaemonStatus,
 };
 
+mod diag;
 mod output;
 mod service;
 
@@ -296,6 +297,27 @@ enum Command {
         /// Which host kind this process reports over IPC (used by `relay service`)
         #[arg(long, hide = true, default_value = "cli")]
         host: HostKind,
+    },
+    /// Show the log, or change the running host's log level
+    Log {
+        #[command(subcommand)]
+        cmd: diag::LogCmd,
+    },
+    /// Save a diagnostics bundle (logs and a network report) for this device
+    /// and, with --all, every connected device that lets this one manage it
+    #[command(args_conflicts_with_subcommands = true)]
+    Diag {
+        #[command(subcommand)]
+        cmd: Option<diag::DiagCmd>,
+        /// A .zip for one bundle, or a folder (default: here)
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Also pull bundles from every connected device that lets this one manage it
+        #[arg(long)]
+        all: bool,
+        /// Also pull a bundle from this peer (repeatable)
+        #[arg(long = "peer")]
+        peers: Vec<String>,
     },
     /// Manage the background Relay service (macOS LaunchAgent / Windows Scheduled Task)
     Service {
@@ -605,7 +627,6 @@ fn main() -> ExitCode {
         eprintln!("error: {err:#}");
         return ExitCode::from(1);
     }
-    init_logging();
     match run(cli) {
         Ok(code) => code,
         Err(err) => {
@@ -622,30 +643,34 @@ fn main() -> ExitCode {
     }
 }
 
+/// `relay run` logs to `<home>/logs/relay.log` like every host (D56), and
+/// to stderr unless `--log-file` (the service) sends everything to the file.
+/// Other commands log to stderr only.
 fn prepare_output(cli: &Cli) -> Result<()> {
-    if let Command::Run {
-        log_file: Some(path),
-        ..
-    } = &cli.command
-    {
-        output::configure(path, VERSION)?;
-        output::install_panic_hook();
+    let stderr = std::env::var("RELAY_LOG").unwrap_or_else(|_| "warn".to_owned());
+    let Command::Run { log_file, .. } = &cli.command else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(stderr))
+            .with_writer(std::io::stderr)
+            .try_init();
+        return Ok(());
+    };
+    let home = cli.home.clone().unwrap_or_else(default_home);
+    let path = log_file.clone().unwrap_or_else(|| logging::log_path(&home));
+    logging::set_file(&path, VERSION).with_context(|| format!("opening {}", path.display()))?;
+    logging::init(
+        logging::LogOptions {
+            file: None,
+            stderr: log_file.is_none().then_some(stderr),
+            mirror: None,
+        },
+        VERSION,
+    );
+    logging::install_panic_hook();
+    if log_file.is_some() {
+        output::to_file();
     }
     Ok(())
-}
-
-fn init_logging() {
-    let filter = std::env::var("RELAY_LOG").unwrap_or_else(|_| "warn".to_owned());
-    let subscriber =
-        tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(filter));
-    if output::is_configured() {
-        let _ = subscriber
-            .with_ansi(false)
-            .with_writer(output::TracingWriter)
-            .try_init();
-    } else {
-        let _ = subscriber.with_writer(std::io::stderr).try_init();
-    }
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
@@ -1119,6 +1144,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cmd_run(&home, listen, opts, verbose, json, host)
         }
         Command::Service { cmd } => service::run(&home, cmd, json),
+        Command::Log { cmd } => diag::cmd_log(&home, cmd, json),
+        Command::Diag {
+            cmd,
+            out,
+            all,
+            peers,
+        } => diag::cmd_diag(&home, cmd, out, all, peers, json),
     }
 }
 
@@ -1202,6 +1234,8 @@ fn cmd_run(
                     ));
                 }
             }
+            // In the log file the host's activity lines already say this (D56).
+            DaemonEvent::Watch(_) if output::is_configured() => {}
             DaemonEvent::Watch(watch) => print_watch_event(watch, json, verbose, &names),
             DaemonEvent::Reloading => {
                 if !json {

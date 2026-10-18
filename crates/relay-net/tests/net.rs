@@ -355,7 +355,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RejectionLayer {
         }
         let mut fields = Fields::default();
         event.record(&mut fields);
-        if fields.message == "peer is not in the trusted set after handshake" {
+        if fields.message == "refused a device that is not paired with this one" {
             *self
                 .0
                 .by_peer

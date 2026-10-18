@@ -10,10 +10,11 @@ use relay_proto::{
 };
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use tokio::time::timeout;
+use tracing::Instrument;
 
 use crate::NetEvent;
 use crate::addr::advertised_addresses;
-use crate::discovery::lookup_nameplate;
+use crate::discovery::{lookup_nameplate, pairing_nameplates};
 use crate::io::read_message_max;
 use crate::session::{CLOSE_PROTOCOL, CLOSE_UNTRUSTED, Inner, close_code, peer_device_id};
 use crate::tls::{SERVER_NAME, make_pairing_client_config};
@@ -58,6 +59,11 @@ pub(crate) fn start_session(inner: &Arc<Inner>, code: String, expires_at: System
         *slot = Some(session);
     }
     inner.refresh_pair_txt(Some(parsed.nameplate()));
+    tracing::info!(
+        nameplate = %parsed.nameplate(),
+        expires_in_s = wait.as_secs(),
+        "showing a pairing code"
+    );
     schedule_expiry(inner.clone(), parsed, wait);
 }
 
@@ -84,6 +90,7 @@ fn expire_if_still(inner: &Inner, code: PairingCode) {
         }
     };
     if expired {
+        tracing::info!(nameplate = %code.nameplate(), "pairing code expired unused");
         inner.refresh_pair_txt(None);
         inner.emit(NetEvent::PairFailed {
             reason: "pairing code expired".into(),
@@ -99,7 +106,19 @@ pub(crate) fn cancel_session(inner: &Inner) {
 }
 
 pub(crate) async fn accept_incoming(inner: Arc<Inner>, conn: Connection) {
+    let span = tracing::info_span!(
+        "pair",
+        role = "show",
+        from = %conn.remote_address(),
+        conn = %crate::session::connection_id(&conn),
+    );
+    accept_in_span(inner, conn).instrument(span).await;
+}
+
+async fn accept_in_span(inner: Arc<Inner>, conn: Connection) {
+    tracing::info!("pairing request");
     if !wait_session_open(&inner).await {
+        tracing::info!("refused a pairing request: no pairing code is showing");
         conn.close(close_code(CLOSE_UNTRUSTED), b"no pairing session");
         return;
     }
@@ -112,7 +131,7 @@ pub(crate) async fn accept_incoming(inner: Arc<Inner>, conn: Connection) {
         }
     };
     if let Err(reason) = run_initiator(&inner, conn, peer_id).await {
-        tracing::warn!(peer = %peer_id, %reason, "pairing initiator failed");
+        tracing::warn!(peer = %peer_id, %reason, "pairing failed");
         inner.emit(NetEvent::PairFailed { reason });
     }
 }
@@ -238,6 +257,7 @@ async fn run_initiator(inner: &Inner, conn: Connection, joiner: DeviceId) -> Res
     let addresses = collect_peer_addresses(&info.addresses, Some(conn.remote_address()));
     let name = sanitize_name(&info.name, joiner);
     conn.close(close_code(CLOSE_PAIRING), b"paired");
+    tracing::info!(peer = %joiner, %name, ?addresses, "paired");
     inner.emit(NetEvent::Paired {
         peer: joiner,
         name,
@@ -281,8 +301,15 @@ pub(crate) async fn join(
     code: String,
     addr: Option<String>,
 ) {
-    let result = join_inner(&inner, &endpoint, code, addr).await;
+    let nameplate = PairingCode::parse(&code)
+        .map(|c| c.nameplate().to_string())
+        .unwrap_or_default();
+    let span = tracing::info_span!("pair", role = "enter", %nameplate);
+    let result = join_inner(&inner, &endpoint, code, addr)
+        .instrument(span.clone())
+        .await;
     if let Err(reason) = result {
+        span.in_scope(|| tracing::warn!(%reason, "pairing failed"));
         inner.emit(NetEvent::PairFailed { reason });
     }
 }
@@ -313,15 +340,21 @@ async fn resolve_join_addrs(
     addr: Option<String>,
 ) -> Result<Vec<String>, String> {
     if let Some(addr) = addr {
+        tracing::info!(%addr, "pairing with the given address");
         return Ok(vec![addr]);
     }
     let deadline = Instant::now() + JOIN_RESOLVE;
     loop {
         let found = lookup_nameplate(&inner.pairing_ads, code.nameplate());
         if !found.is_empty() {
+            tracing::info!(addresses = ?found, "found the device showing the code over mDNS");
             return Ok(found);
         }
         if Instant::now() >= deadline {
+            tracing::info!(
+                seen = ?pairing_nameplates(&inner.pairing_ads),
+                "no device on mDNS shows this pairing code"
+            );
             return Err(
                 "no device on this network is showing that pairing code. Check the code, \
                  allow Relay local network access (macOS: System Settings > Privacy & \
@@ -363,13 +396,20 @@ async fn try_join_addr(
             },
             Err(err) => last = err.to_string(),
         }
+        tracing::info!(%sa, error = %last, "pairing attempt failed");
     }
     Err(last)
 }
 
 async fn run_joiner(inner: &Inner, conn: Connection, code: &PairingCode) -> Result<(), String> {
     let initiator = peer_device_id(&conn).map_err(|e| e.to_string())?;
-    tracing::debug!(peer = %initiator, alpn = ?negotiated_alpn(&conn), "pairing joiner: opening stream");
+    tracing::info!(
+        peer = %initiator,
+        addr = %conn.remote_address(),
+        conn = %crate::session::connection_id(&conn),
+        alpn = ?negotiated_alpn(&conn).map(|a| String::from_utf8_lossy(&a).into_owned()),
+        "connected to the device showing the code"
+    );
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
 
     let (state, msg_b) = Spake2::<Ed25519Group>::start_b(
@@ -441,6 +481,7 @@ async fn run_joiner(inner: &Inner, conn: Connection, code: &PairingCode) -> Resu
     let addresses = collect_peer_addresses(&info.addresses, Some(conn.remote_address()));
     let name = sanitize_name(&info.name, initiator);
     let _ = timeout(PAIR_IO, conn.closed()).await;
+    tracing::info!(peer = %initiator, %name, ?addresses, "paired");
     inner.emit(NetEvent::Paired {
         peer: initiator,
         name,

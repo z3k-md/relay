@@ -722,8 +722,85 @@ fn run_log_file_captures_listening_line() {
     );
 }
 
+/// `relay run` logs to the Relay home's log file like every host (D56).
 #[test]
-fn service_logs_prints_tail() {
+fn run_logs_to_the_home_log_file() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    let log_path = home.path().join("logs").join("relay.log");
+    let bin = assert_cmd::cargo::cargo_bin("relay");
+    let mut child = StdCommand::new(&bin)
+        .args(["--home", &home_s, "run", "--listen", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let found = wait_until(Duration::from_secs(15), || {
+        fs::read_to_string(&log_path).is_ok_and(|s| s.contains("relay started"))
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(found, "log file missing the start line:\n{log}");
+    assert!(log.contains(" INFO "), "{log}");
+}
+
+/// With Relay stopped, `relay diag` still saves this device's bundle, and
+/// `relay diag merge` reads it back (D56).
+#[test]
+fn diag_saves_a_bundle_and_merges_it() {
+    let home = TempDir::new().unwrap();
+    let home_s = home_arg(&home);
+    let out = TempDir::new().unwrap();
+    relay()
+        .args(["--home", &home_s, "init", "--name", "cli-dev"])
+        .assert()
+        .success();
+    let log_dir = home.path().join("logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(
+        log_dir.join("relay.log"),
+        "2026-10-18T00:00:01.000000Z  INFO relay_net: peer connected\n",
+    )
+    .unwrap();
+    let bundle = out.path().join("here.zip");
+    relay()
+        .args(["--home", &home_s, "diag", "-o", bundle.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("here.zip"));
+    relay()
+        .args(["diag", "merge", bundle.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[cli-dev] INFO relay_net: peer connected",
+        ));
+    relay()
+        .args([
+            "--home",
+            &home_s,
+            "diag",
+            "--all",
+            "-o",
+            out.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not running"));
+    relay()
+        .args(["--home", &home_s, "log", "level", "debug"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("RELAY_LOG=debug"));
+}
+
+#[test]
+fn log_show_prints_tail() {
     let home = TempDir::new().unwrap();
     let home_s = home_arg(&home);
     let log_dir = home.path().join("logs");
@@ -735,7 +812,7 @@ fn service_logs_prints_tail() {
     fs::write(log_dir.join("relay.log"), body).unwrap();
 
     relay()
-        .args(["--home", &home_s, "service", "logs", "-n", "3"])
+        .args(["--home", &home_s, "log", "show", "-n", "3"])
         .assert()
         .success()
         .stdout(predicate::str::contains("line-58"))

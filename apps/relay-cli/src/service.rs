@@ -17,7 +17,8 @@ use relay_engine::Engine;
 
 pub const LAUNCH_AGENT_LABEL: &str = "dev.relay.agent";
 pub const WINDOWS_TASK_NAME: &str = "Relay";
-const UNSUPPORTED: &str = "relay service is supported on macOS and Windows; on Linux run `relay run --log-file ...` under systemd";
+const UNSUPPORTED: &str =
+    "relay service is supported on macOS and Windows; on Linux run `relay run` under systemd";
 const NOT_INITIALIZED: &str = "this device is not initialized; run: relay init --name <name>";
 const LISTEN_IN_USE: &str = "is the background service running? stop it with: relay service stop";
 
@@ -34,13 +35,6 @@ pub enum ServiceCmd {
     Stop,
     Restart,
     Status,
-    /// Print the service log
-    Logs {
-        #[arg(short = 'n', default_value_t = 50)]
-        n: usize,
-        #[arg(short = 'f', long)]
-        follow: bool,
-    },
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -80,13 +74,10 @@ pub fn is_addr_in_use(err: &anyhow::Error) -> bool {
 }
 
 pub fn log_path(home: &Path) -> PathBuf {
-    home.join("logs").join("relay.log")
+    relay_daemon::logging::log_path(home)
 }
 
 pub fn run(home: &Path, cmd: ServiceCmd, json: bool) -> Result<ExitCode> {
-    if let ServiceCmd::Logs { n, follow } = cmd {
-        return cmd_logs(home, n, follow);
-    }
     require_supported()?;
     match cmd {
         ServiceCmd::Install { listen } => {
@@ -117,7 +108,6 @@ pub fn run(home: &Path, cmd: ServiceCmd, json: bool) -> Result<ExitCode> {
             print_status(&status_info(home)?, json)?;
             Ok(ExitCode::SUCCESS)
         }
-        ServiceCmd::Logs { .. } => cmd_logs(home, 50, false),
     }
 }
 
@@ -505,7 +495,7 @@ fn print_status(status: &ServiceStatus, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_logs(home: &Path, n: usize, follow: bool) -> Result<ExitCode> {
+pub(crate) fn cmd_logs(home: &Path, n: usize, follow: bool) -> Result<ExitCode> {
     let path = log_path(home);
     if path.exists() {
         for line in tail_lines(&path, n).with_context(|| format!("reading {}", path.display()))? {

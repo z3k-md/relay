@@ -13,11 +13,11 @@ use relay_engine::{
     TransferLive as EngineTransfer, WatchEvent, bookends, index_row,
 };
 use relay_ipc::{
-    ActivityItem, DropSendParams, EvictResult, FetchParams, FolderPairParams, Handler, Hello,
-    HostKind, HostState, Idle, MountLive, OpenRemoteParams, PROTOCOL_VERSION, PairJoinParams,
-    PairJoinResult, PairStartParams, PairStartResult, PairStatus, PeerLive, RemoteParams,
-    RescanParams, RpcErrorBody, SpeedTestParams, Status, TransferDirection as IpcDirection,
-    TransferLive, Watching,
+    ActivityItem, DiagParams, DropSendParams, EvictResult, FetchParams, FolderPairParams, Handler,
+    Hello, HostKind, HostState, Idle, LogLevelParams, MountLive, OpenRemoteParams,
+    PROTOCOL_VERSION, PairJoinParams, PairJoinResult, PairStartParams, PairStartResult, PairStatus,
+    PeerLive, RemoteParams, RescanParams, RpcErrorBody, SpeedTestParams, Status,
+    TransferDirection as IpcDirection, TransferLive, Watching,
 };
 use relay_net::{NetCommand, NetSender, PeerConfig};
 
@@ -752,7 +752,9 @@ impl Host {
             _ => {}
         }
         if let Some(item) = activity_from_watch(event) {
-            self.push_activity(item);
+            let routine =
+                matches!(event, WatchEvent::Scanned { report, .. } if !report.has_changes());
+            self.record_activity(item, !routine);
         }
     }
 
@@ -796,6 +798,18 @@ impl Host {
     }
 
     pub fn push_activity(&self, item: ActivityItem) {
+        self.record_activity(item, true);
+    }
+
+    /// The log keeps what the activity list shows, past the ring and
+    /// restarts (D56); routine items (a scan that found nothing) at `debug`.
+    fn record_activity(&self, item: ActivityItem, notable: bool) {
+        let detail = item.detail.as_deref().unwrap_or("");
+        if notable {
+            tracing::info!(target: "relay::activity", kind = %item.kind, detail, "{}", item.summary);
+        } else {
+            tracing::debug!(target: "relay::activity", kind = %item.kind, detail, "{}", item.summary);
+        }
         if let Ok(mut ring) = self.activity.lock() {
             ring.push_back(item.clone());
             while ring.len() > ACTIVITY_CAP {
@@ -1038,6 +1052,28 @@ impl Handler for Host {
             "pair_cancel" => {
                 self.pair_cancel()?;
                 Ok(serde_json::json!({}))
+            }
+            "log_level" => {
+                let params: LogLevelParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                let level = if params.reset {
+                    crate::logging::set_level(None, None)
+                } else if let Some(filter) = params.filter.as_deref() {
+                    crate::logging::set_level(
+                        Some(filter),
+                        params.for_secs.map(Duration::from_secs),
+                    )
+                } else {
+                    crate::logging::level()
+                        .ok_or_else(|| "logging is not set up in this process".to_owned())
+                }
+                .map_err(|err| RpcErrorBody::new("invalid_params", err))?;
+                serde_json::to_value(level).map_err(internal)
+            }
+            "diag" => {
+                let params: DiagParams = serde_json::from_value(params)
+                    .map_err(|err| RpcErrorBody::new("invalid_params", err.to_string()))?;
+                serde_json::to_value(crate::diag::save(self, &params)?).map_err(internal)
             }
             "activity" => {
                 let limit = params

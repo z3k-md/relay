@@ -29,6 +29,18 @@ pub fn advertised_addresses(port: u16) -> Vec<String> {
     }
 }
 
+/// Every interface address with its interface name, loopback and VPNs
+/// included: `en0 192.168.1.5`. For diagnostics (D56).
+pub fn interfaces() -> Vec<String> {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces
+            .into_iter()
+            .map(|iface| format!("{} {}", iface.name, iface.ip()))
+            .collect(),
+        Err(err) => vec![format!("could not list interfaces: {err}")],
+    }
+}
+
 pub(crate) fn advertised_ips() -> Vec<IpAddr> {
     match if_addrs::get_if_addrs() {
         Ok(ifaces) => ifaces

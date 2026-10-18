@@ -147,11 +147,11 @@ git pull && ./scripts/deploy.sh
 ```bash
 relay --version
 relay service status
-relay service logs -f
+relay log show -f
 
 ssh you@pc-host relay --version
 ssh you@pc-host relay service status
-ssh you@pc-host relay service logs -f
+ssh you@pc-host relay log show -f
 ```
 
 `RELAY_PC=you@pc-host` also selects the PC. `--mac-only` / `--pc-only` deploy one side. `--mac-name` / `--pc-name` override the `relay init` names (default `mac` and `pc`). See `./scripts/deploy.sh --help`.
