@@ -572,7 +572,95 @@ impl Engine {
                 policies,
             });
         }
-        Ok(relay_proto::SpaceOffers { spaces })
+        let devices = self.own_devices_for_peer(peer, &all_peers)?;
+        Ok(relay_proto::SpaceOffers { spaces, devices })
+    }
+
+    /// The other own devices to introduce to `peer` (D55): when this device
+    /// lets `peer` manage it, every other live peer it lets manage it.
+    fn own_devices_for_peer(
+        &self,
+        peer: DeviceId,
+        all_peers: &[relay_db::PeerRecord],
+    ) -> Result<Vec<relay_proto::MemberOffer>, EngineError> {
+        if !self.is_own_device(peer)? {
+            return Ok(Vec::new());
+        }
+        let mut devices = Vec::new();
+        for other in all_peers {
+            if other.device.id == peer || other.device.id == self.device.id {
+                continue;
+            }
+            if !other.may_manage || self.is_revoked(other.device.id)? {
+                continue;
+            }
+            devices.push(relay_proto::MemberOffer {
+                device_id: other.device.id.as_bytes().to_vec(),
+                name: other.device.name.clone(),
+                addresses: other.addresses.clone(),
+            });
+        }
+        Ok(devices)
+    }
+
+    /// A live peer this device lets manage it: one of the user's own devices.
+    pub(crate) fn is_own_device(&self, peer: DeviceId) -> Result<bool, EngineError> {
+        let Some(record) = self.db.repo().peer_by_id(peer)? else {
+            return Ok(false);
+        };
+        Ok(record.may_manage && !self.is_revoked(peer)?)
+    }
+
+    fn is_revoked(&self, peer: DeviceId) -> Result<bool, EngineError> {
+        Ok(self.db.repo().device_status(peer)?.as_deref() == Some("revoked"))
+    }
+
+    /// Adopt the own devices an own device introduced (D55): add each one
+    /// not yet a peer and let it manage this device, as pairing with the box
+    /// checked would; merge addresses for known ones. Removed (dismissed) and
+    /// revoked devices are skipped, and an existing peer's grant is left as
+    /// the user set it. Returns whether the peers table changed.
+    pub fn adopt_introduced_devices(
+        &mut self,
+        introducer: DeviceId,
+        devices: &[OfferedMember],
+    ) -> Result<bool, EngineError> {
+        self.ensure_writable()?;
+        if !self.is_own_device(introducer)? {
+            return Ok(false);
+        }
+        let local = self.device.id;
+        let mut changed = false;
+        for device in devices {
+            if device.id == local || device.id == introducer {
+                continue;
+            }
+            if self.db.repo().is_dismissed(device.id)? || self.is_revoked(device.id)? {
+                continue;
+            }
+            if let Some(peer) = self.db.repo().peer_by_id(device.id)? {
+                let merged = merge_peer_addresses(&device.addresses, &peer.addresses);
+                if merged != peer.addresses {
+                    self.set_peer_addresses(device.id, &merged)?;
+                    changed = true;
+                }
+                continue;
+            }
+            let addresses = merge_peer_addresses(&[], &device.addresses);
+            // A name this device will not take skips that device, not the
+            // rest of the offer.
+            let added = match self.upsert_peer(&device.name, device.id, &addresses) {
+                Ok(added) => added,
+                Err(err) => {
+                    tracing::warn!(peer = %device.id, error = %err, "skipped an introduced device");
+                    continue;
+                }
+            };
+            self.set_peer_manage(&added.name, true)?;
+            tracing::info!(peer = %device.id, name = %added.name, by = %introducer, "adopted an introduced own device");
+            changed = true;
+        }
+        Ok(changed)
     }
 
     pub(crate) fn record_peer_name(&mut self, id: DeviceId, name: &str) -> Result<(), EngineError> {

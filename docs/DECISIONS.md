@@ -63,6 +63,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D48 | [Connection test](#d48-connection-test) |
 | D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
 | D50 | [Drops](#d50-drops) |
+| D55 | [Own devices introduce each other](#d55-own-devices-introduce-each-other) |
 
 <!-- index:end -->
 
@@ -651,9 +652,9 @@ address. There is no internet rendezvous.
   manual/advanced fallback. Over Tailscale, mDNS does not cross the
   overlay: the joiner passes `--addr` (`my-mac:47321` via MagicDNS or
   `100.x.y.z:47321`).
-- **Known limits.** No internet rendezvous, no hole punching, no pairing
-  through a third device. Two devices that cannot reach each other's UDP
-  port cannot pair.
+- **Known limits.** No internet rendezvous, no hole punching. Two devices
+  that cannot reach each other's UDP port cannot pair directly; own devices
+  paired through a third are introduced instead (D55).
 
 ## D26. Space membership
 
@@ -681,7 +682,8 @@ not a separate protocol.
   The middle device must have the mount attached (D16): entries for a mount
   with no local path are not stored and cannot be forwarded. Devices that are
   not directly connected still need a path through a member that has the
-  folder; there is no introduction of devices for a space you have not joined.
+  folder; a space you have not joined introduces nobody. Own devices are
+  introduced regardless of spaces (D55).
 
 ## D27. Replication policies
 
@@ -1476,3 +1478,40 @@ stage 1 of [`proposals/photo-drop.md`](proposals/photo-drop.md).
   `dropped` read the database each time, so a change applies to the next
   drop. A saved drop is an `ActivityItem` of kind `drop` whose `detail` is
   the saved path; the desktop app takes it from the activity stream.
+
+## D55. Own devices introduce each other
+
+Pairing a new device with any one of your devices should be enough: with
+the Mac paired to the PC and the phone paired to the PC, the Mac and the
+phone should find each other without a second pairing. Before this,
+devices met only through a space both had joined (D26), so two devices with
+no common folder never learned of each other, and pairing them directly
+needed a UDP path between them (D25).
+
+- **Own device.** A live (unrevoked) peer this device lets manage it
+  (D37). Pairing with "Let it set up sync on this device" checked, the
+  desktop default and now also a phone scanning a QR code, makes one.
+- **Introduce.** `SpaceOffers.devices` (tag 2, repeated `MemberOffer`)
+  lists the sender's other own devices with their names and addresses. It is
+  filled only when the receiver is one of the sender's own devices. Offers
+  go out on connect, and again to every connected own device right after a
+  pairing that grants manage, so the others learn the newcomer live. Older
+  peers ignore the field; no feature bit is needed.
+- **Adopt.** A receiver adopts a listed device only when the sender is one
+  of its own devices: a device not yet a peer is added and granted manage,
+  as pairing with the box checked would; a known peer gets the listed
+  addresses merged after its own; its grant stays as the user set it.
+  Removed (dismissed, D26) and revoked devices are skipped. The engine then
+  emits `SetPeers`, so the network trusts and dials it.
+- **Trust.** Vouching follows the manage grant: you let a device manage
+  this one only if it is yours, and an introduction from it is the "an
+  existing device approves the newcomer" step of accounts (D44) without a
+  directory. A compromised own device could already read and change every
+  folder it manages; introductions let it add devices too. Nothing is
+  shared by an introduction: spaces still sync only when both sides share
+  them.
+- **Phone LAN discovery.** Sync runs inside the Android app while it is
+  open (#30), and the multicast lock lived in the send-only service, so
+  Wi-Fi filtered inbound mDNS: the phone announced itself once and then
+  never answered a lookup or saw a pairing code. The activity now holds a
+  multicast lock between `onStart` and `onStop`.

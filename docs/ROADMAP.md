@@ -71,7 +71,7 @@ Smaller open items:
 | Direct sync | QUIC with pinned mutual TLS, index deltas, verified atomic writes, forwarding through members | D14–D17, D26 |
 | Conflicts | Deterministic conflict copies, Git repository groups, clean three-way text merge, held peer mass deletes | D2, D18, D21, D22, D31 |
 | Hosts | `relay run`, `relay service`, the desktop app; local IPC; live config changes | D19, D24, D36 |
-| Pairing | Short code with SPAKE2, mDNS on the LAN, `--addr` elsewhere | D25 |
+| Pairing | Short code with SPAKE2, mDNS on the LAN, `--addr` elsewhere; own devices introduce each other | D25, D55 |
 | Selection | Replication policies and device groups; per-device `full` / `metadata` / `demand` / `store` / `exclude` | D27, D35, D47 |
 | Catch-up | Mailbox directory with ack-based GC and mirror mode | D29 |
 | Encryption | Per-space keys for mailbox objects, recovery secret, revoke, rotate | D30 |
@@ -90,8 +90,9 @@ Current behavior, not accidental gaps:
 - Peer-only mode (no mailbox and no `relay transport` address) is LAN,
   Tailscale, or a manual address. Hole punching needs a mailbox (D32). The
   UDP relay needs one reachable address (D34).
-- Two devices that cannot reach each other's UDP port cannot pair (D25).
-  The relay is for sync after they have paired.
+- Two devices that cannot reach each other's UDP port cannot pair directly
+  (D25); own devices paired through a third are introduced (D55). The relay
+  is for sync after they have paired.
 - A middle machine forwards files only when it has the mount attached (D26).
 - Unclean text merges keep both versions as conflict copies (D31).
 - The local object store and working tree are plaintext; only mailbox

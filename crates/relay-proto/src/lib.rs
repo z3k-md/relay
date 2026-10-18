@@ -124,6 +124,12 @@ pub struct Hello {
 pub struct SpaceOffers {
     #[prost(message, repeated, tag = "1")]
     pub spaces: Vec<SpaceOffer>,
+    /// The sender's other own devices: peers it lets manage it. Listed only
+    /// when the sender also lets the receiver manage it, and adopted only by
+    /// a receiver that lets the sender manage it (D55). Older peers ignore
+    /// the field.
+    #[prost(message, repeated, tag = "2")]
+    pub devices: Vec<MemberOffer>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

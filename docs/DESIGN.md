@@ -131,6 +131,9 @@ Online presence is not durability; acknowledgements are.
   key. No CA, no TOFU (D14).
 - **Spaces.** A space syncs with a peer only when both have shared it.
   Joining adopts the space's other members as peers (D26).
+- **Own devices** (D55). Peers granted manage introduce each other's other
+  own devices on every connect, so pairing a new device with one of yours
+  reaches all of them.
 - **Encryption at rest.** Each space has a random 256-bit key. Mailbox
   objects are sealed with it (XChaCha20-Poly1305); each member's copy is
   wrapped with its X25519 box key. The local store, the working tree, and
@@ -139,8 +142,8 @@ Online presence is not durability; acknowledgements are.
   device (D30).
 - **Manage grant** (D37, D46). A peer granted `may_manage` can browse this
   device, set up folder pairs on it (D39), open files from it (D40, D41), and
-  nothing more: no peers, grants, or policies, and never credential stores
-  or the Relay home.
+  nothing more: no grants or policies, no peers beyond own-device
+  introductions (D55), and never credential stores or the Relay home.
 - **Accounts** (planned, D44). An OIDC sign-in directory that finds your
   devices. It holds emails, device names, public keys, and addresses, never
   keys or contents. A new device gets space keys only when an existing

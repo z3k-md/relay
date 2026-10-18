@@ -38,6 +38,22 @@ impl Syncer {
         Ok(())
     }
 
+    /// Re-send offers to every connected own device (D55), so each learns
+    /// about a device just paired or adopted without reconnecting.
+    pub fn refresh_offers_for_own_devices(
+        &self,
+        engine: &Engine,
+        out: &mut dyn FnMut(SyncOutput),
+    ) -> Result<(), EngineError> {
+        let peers: Vec<DeviceId> = self.connected.keys().copied().collect();
+        for peer in peers {
+            if engine.is_own_device(peer)? {
+                self.refresh_offers(engine, peer, out)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn on_offers(
         &mut self,
         engine: &mut Engine,
@@ -63,6 +79,10 @@ impl Syncer {
             .map(|offer| offer.space_id)
             .collect();
         let mut newly_joined: Vec<SpaceId> = Vec::new();
+        let introduced = offered_devices(peer, &offers.devices, events);
+        if !introduced.is_empty() && engine.adopt_introduced_devices(peer, &introduced)? {
+            set_peers = true;
+        }
         for offer in offers.spaces {
             let Ok(space_id) = space_id_from_bytes(&offer.space_id) else {
                 events.push(SyncEvent::SyncWarning {
@@ -194,4 +214,28 @@ impl Syncer {
         }
         Ok(Some(space))
     }
+}
+
+/// The devices an offer introduces (D55), skipping malformed ids.
+fn offered_devices(
+    peer: DeviceId,
+    devices: &[relay_proto::MemberOffer],
+    events: &mut Vec<SyncEvent>,
+) -> Vec<OfferedMember> {
+    let mut out = Vec::new();
+    for device in devices {
+        match device_id_from_bytes(&device.device_id) {
+            Ok(id) => out.push(OfferedMember {
+                id,
+                name: device.name.clone(),
+                addresses: device.addresses.clone(),
+            }),
+            Err(_) => events.push(SyncEvent::SyncWarning {
+                peer,
+                path: String::new(),
+                reason: "invalid device id in an introduction".into(),
+            }),
+        }
+    }
+    out
 }

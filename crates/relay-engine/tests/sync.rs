@@ -2262,6 +2262,7 @@ fn joined_space_trusts_members_listed_on_the_offer() {
             policy_epoch: 0,
             policies: vec![],
         }],
+        devices: Vec::new(),
     };
     let before = h.a.peers().unwrap().len();
     let mut outs = Vec::new();
@@ -2321,6 +2322,7 @@ fn join_adopts_offered_members() {
             policy_epoch: 0,
             policies: vec![],
         }],
+        devices: Vec::new(),
     };
     // B has not joined yet, so members are stored but not adopted.
     let peer_a = h.id_a();
@@ -2484,6 +2486,7 @@ fn removed_peer_is_not_reintroduced() {
             policy_epoch: 0,
             policies: vec![],
         }],
+        devices: Vec::new(),
     };
     h.sa.handle(
         &mut h.a,
@@ -3503,4 +3506,93 @@ fn hydration_does_not_overwrite_an_unscanned_file() {
         b"mine"
     );
     assert_converged(&h);
+}
+
+#[test]
+fn offers_introduce_own_devices_only_to_own_devices() {
+    let mut h = Harness::pair();
+    h.pair_peers();
+    let id_c = DeviceId::from_bytes([0xcc; 32]);
+    h.a.add_peer("charlie", id_c, &["127.0.0.1:47323".into()])
+        .unwrap();
+    h.a.set_peer_manage("charlie", true).unwrap();
+
+    // Bravo may not manage alpha: it is not one of alpha's own devices.
+    let offers = h.a.space_offers_for_peer(h.id_b()).unwrap();
+    assert!(offers.devices.is_empty(), "{:?}", offers.devices);
+
+    h.a.set_peer_manage("bravo", true).unwrap();
+    let offers = h.a.space_offers_for_peer(h.id_b()).unwrap();
+    let listed: Vec<_> = offers.devices.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(listed, ["charlie"]);
+
+    // A device alpha does not let manage it is not introduced.
+    h.a.set_peer_manage("charlie", false).unwrap();
+    let offers = h.a.space_offers_for_peer(h.id_b()).unwrap();
+    assert!(offers.devices.is_empty(), "{:?}", offers.devices);
+}
+
+#[test]
+fn own_device_introduction_is_adopted_from_own_devices_only() {
+    let mut h = Harness::pair();
+    h.pair_peers();
+    let id_c = DeviceId::from_bytes([0xcc; 32]);
+    let peer_a = h.id_a();
+    let introduce = |h: &mut Harness| {
+        let offers = relay_proto::SpaceOffers {
+            spaces: Vec::new(),
+            devices: vec![relay_proto::MemberOffer {
+                device_id: id_c.as_bytes().to_vec(),
+                name: "charlie".into(),
+                addresses: vec!["127.0.0.1:47323".into()],
+            }],
+        };
+        let mut set_peers = false;
+        h.sb.handle(
+            &mut h.b,
+            SyncInput::PeerConnected {
+                peer: peer_a,
+                name: "alpha".into(),
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        h.sb.handle(
+            &mut h.b,
+            SyncInput::Frame {
+                peer: peer_a,
+                body: frame::Body::SpaceOffers(offers),
+            },
+            &mut |out| set_peers |= matches!(out, SyncOutput::SetPeers),
+        )
+        .unwrap();
+        set_peers
+    };
+
+    // Bravo does not let alpha manage it, so alpha cannot vouch for anyone.
+    assert!(!introduce(&mut h));
+    assert!(h.b.peers().unwrap().iter().all(|p| p.id != id_c));
+
+    h.b.set_peer_manage("alpha", true).unwrap();
+    assert!(
+        introduce(&mut h),
+        "adopting a device should update the network's peers"
+    );
+    let charlie =
+        h.b.peers()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == id_c)
+            .unwrap();
+    assert!(
+        charlie.may_manage,
+        "an introduced own device may manage this one"
+    );
+    assert_eq!(charlie.addresses, ["127.0.0.1:47323"]);
+    assert!(!introduce(&mut h), "a second introduction changes nothing");
+
+    // Removing the device sticks: later introductions skip it.
+    h.b.remove_peer(&charlie.name).unwrap();
+    assert!(!introduce(&mut h));
+    assert!(h.b.peers().unwrap().iter().all(|p| p.id != id_c));
 }
