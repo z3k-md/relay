@@ -22,6 +22,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow.workspace = true
+directories.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
 log = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
@@ -32,10 +33,10 @@ relay-ipc.workspace = true
 relay-net.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-process = "2"
@@ -49,6 +50,8 @@ drag = "2"
 [target.'cfg(target_os = "android")'.dependencies]
 # Same major as Tauri's own Android dependency, so one copy links.
 jni = "0.21"
+# Already in the tree through Tauri; mirrors the host log to logcat (D56).
+android_logger = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"

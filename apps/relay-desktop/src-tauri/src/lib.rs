@@ -2,6 +2,7 @@ mod commands;
 mod drops;
 mod error;
 mod files;
+mod logs;
 #[cfg(target_os = "android")]
 mod mobile;
 mod pair_link;
@@ -32,6 +33,7 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logs::init(None);
     let mut builder = tauri::Builder::default();
     #[cfg(not(target_os = "android"))]
     {
@@ -43,12 +45,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .build(),
-        );
+        .plugin(tauri_plugin_notification::init());
     #[cfg(not(target_os = "android"))]
     {
         builder = builder
@@ -118,6 +115,9 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::open_logs_folder,
+            logs::get_log_level,
+            logs::set_log_level,
+            logs::save_diagnostics,
             commands::full_disk_access,
             commands::open_full_disk_access,
             commands::cli_status,

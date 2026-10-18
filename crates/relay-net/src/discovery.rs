@@ -180,12 +180,13 @@ fn note_discovered(inner: &Inner, id: DeviceId, discovered: Vec<String>) {
     }
     let mut discovered = discovered;
     discovered.truncate(MAX_DISCOVERED);
-    tracing::debug!(peer = %id, addresses = ?discovered, "mDNS dial hint");
-    inner
-        .discovered
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, discovered);
+    let mut known = inner.discovered.lock().unwrap_or_else(|e| e.into_inner());
+    if known.get(&id) == Some(&discovered) {
+        tracing::debug!(peer = %id, addresses = ?discovered, "mDNS dial hint");
+    } else {
+        tracing::info!(peer = %id, addresses = ?discovered, "peer seen on the LAN over mDNS");
+    }
+    known.insert(id, discovered);
 }
 
 pub(crate) fn resolved_addresses(info: &ResolvedService) -> Vec<String> {
@@ -218,6 +219,18 @@ pub(crate) fn lookup_nameplate(
         .get(nameplate)
         .map(|ad| ad.addresses.clone())
         .unwrap_or_default()
+}
+
+/// Nameplates of pairing codes mDNS currently sees, for the log.
+pub(crate) fn pairing_nameplates(ads: &Mutex<HashMap<String, PairingAd>>) -> Vec<String> {
+    let mut seen: Vec<String> = ads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    seen.sort();
+    seen
 }
 
 #[cfg(test)]

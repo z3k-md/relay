@@ -16,6 +16,9 @@ pub const MAX_LISTING: u32 = 5_000;
 pub const DEFAULT_LISTING: u32 = 2_000;
 /// Largest file a read-only copy fetches (D41). Bigger files sync instead.
 pub const READ_COPY_MAX: u64 = 256 * 1024 * 1024;
+/// Largest diagnostics bundle a device sends a peer (D56); logs are cut to
+/// fit. Stays under the control response bound.
+pub const DIAG_REMOTE_MAX: usize = 3 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "call", rename_all = "snake_case")]
@@ -68,21 +71,46 @@ pub enum RemoteCall {
     FolderSizes {
         path: String,
     },
+    /// The answering device's diagnostics bundle: its recent logs and what
+    /// it knows about its network and peers (D56).
+    Diagnostics,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum RemoteReply {
-    Roots { roots: Vec<RemoteRoot> },
-    Listing { listing: DirListing },
-    Stat { entry: DirEntry },
-    Spaces { spaces: Vec<RemoteSpace> },
-    Preview { preview: PathPreview },
-    Created { entry: DirEntry },
-    Applied { applied: ConfigApplied },
-    Located { located: Located },
+    Roots {
+        roots: Vec<RemoteRoot>,
+    },
+    Listing {
+        listing: DirListing,
+    },
+    Stat {
+        entry: DirEntry,
+    },
+    Spaces {
+        spaces: Vec<RemoteSpace>,
+    },
+    Preview {
+        preview: PathPreview,
+    },
+    Created {
+        entry: DirEntry,
+    },
+    Applied {
+        applied: ConfigApplied,
+    },
+    Located {
+        located: Located,
+    },
     Done,
-    FolderSizes { sizes: FolderSizes },
+    FolderSizes {
+        sizes: FolderSizes,
+    },
+    /// A zip, at most [`DIAG_REMOTE_MAX`] bytes.
+    Diagnostics {
+        bundle: Vec<u8>,
+    },
 }
 
 /// Progress on the sizes of the folders inside one folder (D42).

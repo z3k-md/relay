@@ -17,7 +17,6 @@
       "allow": [{ "path": "**" }]
     },
     "notification:default",
-    "store:default",
-    "log:default"
+    "store:default"
   ]
 }

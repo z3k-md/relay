@@ -114,6 +114,10 @@ pub struct Hello {
     /// `FEATURE_*` bits. An older peer sends none, which decodes as 0.
     #[prost(uint64, tag = "5")]
     pub features: u64,
+    /// The sender's clock (Unix ms) as it sent this, so the receiver can log
+    /// how far apart the two clocks are (D56). An older peer sends 0.
+    #[prost(uint64, tag = "6")]
+    pub unix_ms: u64,
 }
 
 /// Spaces the sender shares with the receiver. Sent after `Hello` and again

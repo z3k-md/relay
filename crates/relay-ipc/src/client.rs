@@ -13,10 +13,11 @@ use relay_core::{ConfigApplied, ConfigChange};
 use crate::IpcError;
 use crate::endpoint::Endpoint;
 use crate::protocol::{
-    ActivityItem, DropSendParams, EvictResult, FetchParams, FolderPairParams, FolderPairPlan,
-    FolderPairResult, Hello, OpenRemoteParams, OpenedRemote, PROTOCOL_VERSION, PairJoinParams,
-    PairJoinResult, PairStartParams, PairStartResult, PairStatus, QuickOpen, RemoteParams, Request,
-    RescanParams, RescanResult, Response, SpeedTestParams, Status, decode_line, encode_line,
+    ActivityItem, DiagParams, DiagSaved, DropSendParams, EvictResult, FetchParams,
+    FolderPairParams, FolderPairPlan, FolderPairResult, Hello, LogLevel, LogLevelParams,
+    OpenRemoteParams, OpenedRemote, PROTOCOL_VERSION, PairJoinParams, PairJoinResult,
+    PairStartParams, PairStartResult, PairStatus, QuickOpen, RemoteParams, Request, RescanParams,
+    RescanResult, Response, SpeedTestParams, Status, decode_line, encode_line,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -204,6 +205,23 @@ impl Client {
     pub fn drop_send(&mut self, params: &DropSendParams) -> Result<DropSent, IpcError> {
         self.call(
             "drop_send",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    /// Read or change the host's log filter (D56).
+    pub fn log_level(&mut self, params: &LogLevelParams) -> Result<LogLevel, IpcError> {
+        self.call(
+            "log_level",
+            serde_json::to_value(params).map_err(IpcError::codec)?,
+        )
+    }
+
+    /// Write a diagnostics bundle (D56). Pulling one from a peer blocks until
+    /// it arrives.
+    pub fn diag(&mut self, params: &DiagParams) -> Result<DiagSaved, IpcError> {
+        self.call(
+            "diag",
             serde_json::to_value(params).map_err(IpcError::codec)?,
         )
     }

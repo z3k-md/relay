@@ -383,6 +383,47 @@ pub struct SpeedTestParams {
     pub duration_ms: Option<u32>,
 }
 
+/// The log file's filter on the running host (D56).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLevel {
+    /// `info`, `debug`, or a full filter such as `info,relay_net=trace`.
+    pub filter: String,
+    /// What it returns to.
+    pub default: String,
+    /// When a temporary filter returns to the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+}
+
+/// Change the log filter. Neither `filter` nor `reset` only reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLevelParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Return to the default after this many seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_secs: Option<u64>,
+    /// Back to the default now.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// Write a diagnostics bundle (D56) to `dest`, which must not exist: this
+/// device's, or with `peer` the one that connected peer sends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagParams {
+    pub dest: PathBuf,
+    /// The peer's local name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagSaved {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
 /// Push one file to a connected peer's inbox (D50).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DropSendParams {

@@ -4,6 +4,7 @@ import type {
   CliInstallResult,
   CliShell,
   CliStatus,
+  Collected,
   ConflictView,
   PairJoinResult,
   PairStartResult,
@@ -17,6 +18,7 @@ import type {
   FolderPairPlan,
   FolderPairResult,
   FolderView,
+  LogLevel,
   MountView,
   OfferView,
   Overview,
@@ -185,6 +187,10 @@ export const api = {
   setSettings: (patch: Partial<Settings>) =>
     call<Settings>("set_settings", { patch }),
   openLogsFolder: () => call<void>("open_logs_folder"),
+  getLogLevel: () => call<LogLevel | null>("get_log_level"),
+  setLogLevel: (filter: string | null, minutes: number | null) =>
+    call<LogLevel>("set_log_level", { filter, minutes }),
+  saveDiagnostics: (all: boolean) => call<Collected>("save_diagnostics", { all }),
   fullDiskAccess: () => call<boolean | null>("full_disk_access"),
   openFullDiskAccess: () => call<void>("open_full_disk_access"),
   cliStatus: () => call<CliStatus>("cli_status"),

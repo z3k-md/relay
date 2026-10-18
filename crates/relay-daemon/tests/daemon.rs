@@ -1363,3 +1363,152 @@ fn a_drop_lands_in_the_inbox_and_shows_in_activity() {
     stop_daemon(session_a);
     stop_daemon(session_b);
 }
+
+/// Bob pulls alice's diagnostics bundle over the network (D56): it carries
+/// alice's report and logs, and both sides measured the clock offset and
+/// share one connection id. Alice, without a grant from bob, is refused.
+#[test]
+fn granted_peer_pulls_a_diagnostics_bundle() {
+    let home_a = TempDir::new().unwrap();
+    let home_b = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    Engine::init(home_a.path(), "alice").unwrap();
+    Engine::init(home_b.path(), "bob").unwrap();
+    let alice_log = relay_daemon::logging::log_path(home_a.path());
+    fs::create_dir_all(alice_log.parent().unwrap()).unwrap();
+    fs::write(
+        &alice_log,
+        "2026-10-18T00:00:01.000000Z  INFO alice was here\n",
+    )
+    .unwrap();
+    let session_a = start_daemon(home_a.path());
+    let session_b = start_daemon(home_b.path());
+    let addr_a = wait_started(&session_a).expect("alice started");
+    assert!(wait_started(&session_b).is_some(), "bob started");
+    pair_granting(home_a.path(), addr_a, home_b.path(), true);
+    assert!(
+        wait_until(CONVERGE, || wait_ipc(home_b.path()).status().is_ok_and(
+            |s| s.peers.iter().any(|p| p.name == "alice" && p.manageable)
+        )),
+        "bob never learned alice's grant"
+    );
+
+    let dest = out.path().join("alice.zip");
+    let saved = wait_ipc(home_b.path())
+        .diag(&relay_ipc::DiagParams {
+            dest: dest.clone(),
+            peer: Some("alice".into()),
+        })
+        .expect("pull alice's bundle");
+    assert_eq!(saved.path, dest);
+    let alice = relay_daemon::diag::read(&dest).unwrap();
+    assert_eq!(alice.report.device_name, "alice");
+    assert!(
+        alice
+            .logs
+            .iter()
+            .any(|(_, text)| text.contains("alice was here")),
+        "{:?}",
+        alice.logs
+    );
+    let bob_seen = alice
+        .report
+        .net
+        .as_ref()
+        .and_then(|net| net.peers.first())
+        .and_then(|p| p.connection.clone())
+        .expect("alice reports her connection to bob");
+    assert!(bob_seen.clock_offset_ms.is_some(), "{bob_seen:?}");
+
+    let own = out.path().join("bob.zip");
+    wait_ipc(home_b.path())
+        .diag(&relay_ipc::DiagParams {
+            dest: own.clone(),
+            peer: None,
+        })
+        .expect("bob's own bundle");
+    let bob = relay_daemon::diag::read(&own).unwrap();
+    let alice_seen = bob
+        .report
+        .net
+        .as_ref()
+        .and_then(|net| net.peers.first())
+        .and_then(|p| p.connection.clone())
+        .expect("bob reports his connection to alice");
+    assert_eq!(
+        alice_seen.conn_id, bob_seen.conn_id,
+        "one connection, one id"
+    );
+    let merged = relay_daemon::diag::merge(&[bob, alice]).unwrap();
+    assert!(
+        merged
+            .lines
+            .iter()
+            .any(|l| l.contains("[alice] INFO alice was here"))
+    );
+
+    let refused = wait_ipc(home_a.path())
+        .diag(&relay_ipc::DiagParams {
+            dest: out.path().join("bob-from-alice.zip"),
+            peer: Some("bob".into()),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(refused, relay_ipc::IpcError::Remote { ref code, .. } if code == "forbidden"),
+        "{refused:?}"
+    );
+
+    stop_daemon(session_a);
+    stop_daemon(session_b);
+}
+
+/// The log level changes on the running host and returns to the default
+/// when its time runs out (D56).
+#[test]
+fn log_level_changes_live_and_reverts() {
+    let home = TempDir::new().unwrap();
+    Engine::init(home.path(), "alice").unwrap();
+    let log = relay_daemon::logging::log_path(home.path());
+    relay_daemon::logging::init(
+        relay_daemon::logging::LogOptions {
+            file: Some(log.clone()),
+            ..Default::default()
+        },
+        "test",
+    );
+    let session = start_daemon(home.path());
+    assert!(wait_started(&session).is_some(), "started");
+
+    let set = wait_ipc(home.path())
+        .log_level(&relay_ipc::LogLevelParams {
+            filter: Some("debug".into()),
+            for_secs: Some(1),
+            reset: false,
+        })
+        .expect("set the level");
+    assert_eq!(set.filter, "debug");
+    assert!(set.until_ms.is_some());
+    tracing::debug!("a debug line while debug is on");
+    assert!(
+        wait_until(CONVERGE, || wait_ipc(home.path())
+            .log_level(&relay_ipc::LogLevelParams::default())
+            .is_ok_and(
+                |level| level.filter == level.default && level.until_ms.is_none()
+            )),
+        "the level never went back"
+    );
+    tracing::debug!("a debug line after it reverted");
+    let bad = wait_ipc(home.path())
+        .log_level(&relay_ipc::LogLevelParams {
+            filter: Some("info,=x=".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(matches!(bad, relay_ipc::IpcError::Remote { .. }), "{bad:?}");
+
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(text.contains("relay started"), "{text}");
+    assert!(text.contains("a debug line while debug is on"), "{text}");
+    assert!(!text.contains("a debug line after it reverted"), "{text}");
+    stop_daemon(session);
+}

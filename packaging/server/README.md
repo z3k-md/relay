@@ -66,6 +66,11 @@ keeps.
 Turning the role off (`relay server disable`) stops joining new spaces.
 Spaces, folders, and files stay.
 
+The full log is `logs/relay.log` in the Relay home (`relay log show` in the
+container); `docker logs` shows warnings only unless `RELAY_LOG` is set.
+From a computer that manages the server, `relay diag --peer SERVER` pulls
+its diagnostics.
+
 ## Windows desktop as a stand-in
 
 Until there is real hardware, the Docker setup runs on Windows with Docker

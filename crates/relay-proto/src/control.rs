@@ -34,7 +34,7 @@ pub struct PeerGrants {
 pub struct ControlRequest {
     #[prost(
         oneof = "control_request::Call",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
     )]
     pub call: Option<control_request::Call>,
 }
@@ -64,6 +64,9 @@ pub mod control_request {
         /// An older peer decodes this as no call and answers `invalid`.
         #[prost(string, tag = "10")]
         FolderSizes(String),
+        /// An older peer answers `invalid` (D56).
+        #[prost(message, tag = "11")]
+        Diagnostics(super::Empty),
     }
 }
 
@@ -89,7 +92,7 @@ pub struct WireCreateDir {
 pub struct ControlResponse {
     #[prost(
         oneof = "control_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15"
     )]
     pub reply: Option<control_response::Reply>,
 }
@@ -118,6 +121,9 @@ pub mod control_response {
         Done(super::Empty),
         #[prost(message, tag = "10")]
         FolderSizes(super::WireFolderSizes),
+        /// A zipped diagnostics bundle (D56).
+        #[prost(bytes = "vec", tag = "11")]
+        Diagnostics(Vec<u8>),
         #[prost(message, tag = "15")]
         Error(super::WireRemoteError),
     }
@@ -314,6 +320,7 @@ pub fn call_to_wire(call: &RemoteCall) -> ControlRequest {
             path: path.clone(),
         }),
         RemoteCall::FolderSizes { path } => Call::FolderSizes(path.clone()),
+        RemoteCall::Diagnostics => Call::Diagnostics(Empty {}),
     };
     ControlRequest { call: Some(call) }
 }
@@ -346,6 +353,7 @@ pub fn call_from_wire(request: ControlRequest) -> Result<RemoteCall, ProtoError>
                 path: at.path,
             },
             Call::FolderSizes(path) => RemoteCall::FolderSizes { path },
+            Call::Diagnostics(_) => RemoteCall::Diagnostics,
         },
     )
 }
@@ -435,6 +443,7 @@ pub fn result_to_wire(result: &RemoteResult) -> ControlResponse {
                 .collect(),
             done: sizes.done,
         }),
+        Ok(RemoteReply::Diagnostics { bundle }) => Reply::Diagnostics(bundle.clone()),
         Err(err) => Reply::Error(error_to_wire(err)),
     };
     ControlResponse { reply: Some(reply) }
@@ -541,6 +550,7 @@ pub fn result_from_wire(response: ControlResponse) -> Result<RemoteResult, Proto
                     done: sizes.done,
                 },
             }),
+            Reply::Diagnostics(bundle) => Ok(RemoteReply::Diagnostics { bundle }),
             Reply::Error(err) => Err(error_from_wire(err)),
         },
     )
@@ -646,6 +656,7 @@ mod tests {
             RemoteCall::FolderSizes {
                 path: "/Users/zach".into(),
             },
+            RemoteCall::Diagnostics,
             RemoteCall::Apply {
                 change: relay_core::ConfigChange::Share {
                     space: "S".into(),
@@ -688,6 +699,9 @@ mod tests {
                     },
                 ],
             },
+        }));
+        round_trip(Ok(RemoteReply::Diagnostics {
+            bundle: b"PK\x03\x04".to_vec(),
         }));
         round_trip(Ok(RemoteReply::Located {
             located: Located {

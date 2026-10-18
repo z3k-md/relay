@@ -19,6 +19,9 @@ relay-net.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+tracing-log.workspace = true
+tracing-subscriber.workspace = true
+zip.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 filesize = "0.2"

@@ -4,9 +4,11 @@
 //! `NetEvent` / `NetCommand` onto `SyncInput` / `SyncOutput` and reopens
 //! when another process commits to the database.
 
+pub mod diag;
 mod drops;
 mod folder_pair;
 mod host;
+pub mod logging;
 mod placeholders;
 mod protected;
 mod quick_open;
@@ -265,6 +267,15 @@ fn run_loop(
         host.set_net(Some(net.sender()));
         host.set_listen(Some(listen.to_string()));
         host.set_state(HostState::Running, None);
+        tracing::info!(
+            device = %engine.device().name,
+            id = %engine.device().id,
+            %listen,
+            reflexive = ?net.reflexive(),
+            host = %opts.host,
+            version = env!("CARGO_PKG_VERSION"),
+            "relay started"
+        );
         on_event(&DaemonEvent::Started {
             device_name: engine.device().name.clone(),
             device_id: engine.device().id.to_string(),

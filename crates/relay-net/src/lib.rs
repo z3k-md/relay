@@ -207,6 +207,11 @@ pub enum NetCommand {
         name: Option<String>,
         reply: std::sync::mpsc::Sender<Result<DropSent, RemoteError>>,
     },
+    /// What this device knows about its network and peers, for a
+    /// diagnostics bundle (D56).
+    Diagnostics {
+        reply: std::sync::mpsc::Sender<relay_core::diag::NetReport>,
+    },
     Shutdown,
 }
 
@@ -338,6 +343,8 @@ pub fn start(
         speed_tests_in: Arc::new(tokio::sync::Semaphore::new(1)),
         speed_tests_out: Arc::new(tokio::sync::Semaphore::new(1)),
         drops_in: Arc::new(tokio::sync::Semaphore::new(drops::MAX_DROPS_IN)),
+        dial_failures: Mutex::new(HashMap::new()),
+        reflexive,
     });
 
     let (cmd_tx, cmd_rx) = unbounded_channel();
@@ -527,6 +534,13 @@ async fn run(
                             let _ = reply.send(control::call(inner, peer, call).await);
                         });
                     }
+                    Some(NetCommand::Diagnostics { reply }) => {
+                        let mut report = inner.net_report();
+                        if let Ok(local) = endpoint.local_addr() {
+                            report.listen = relay_core::format_socket_addr(local);
+                        }
+                        let _ = reply.send(report);
+                    }
                     Some(NetCommand::SetRelay(addr)) => {
                         *inner
                             .relay_target
@@ -548,11 +562,12 @@ async fn run(
                     }
                     Some(incoming) => {
                         let inner = inner.clone();
+                        let from = incoming.remote_address();
                         tokio::spawn(async move {
                             match incoming.await {
                                 Ok(conn) => handle_incoming(inner, conn).await,
                                 Err(e) => {
-                                    tracing::warn!(error = %e, "incoming handshake failed");
+                                    tracing::warn!(%from, error = %e, "incoming handshake failed");
                                 }
                             }
                         });

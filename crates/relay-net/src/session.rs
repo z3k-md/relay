@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::discovery::{Discovery, PairingAd};
 use crate::pairing::PairSession;
 
 use quinn::{AsyncUdpSocket, Connection, RecvStream, SendStream, VarInt};
+use relay_core::diag::{ConnReport, DialFailure, NetReport, PeerNetReport};
 use relay_core::{DeviceId, ObjectId, format_socket_addr, merge_peer_addresses, rank_addresses};
 use relay_crypto::{DeviceIdentity, device_id_from_certificate};
 use relay_proto::frame::Body;
@@ -20,6 +21,7 @@ use rustls::pki_types::CertificateDer;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, Semaphore};
+use tracing::Instrument;
 
 use crate::control::{self, COPY_IDLE_TIMEOUT, ControlHandler};
 use crate::io::{IoErr, read_message, read_message_max};
@@ -90,6 +92,10 @@ pub(crate) struct Inner {
     pub speed_tests_out: Arc<Semaphore>,
     /// Drops taken at once (D50).
     pub drops_in: Arc<Semaphore>,
+    /// The last dial round that reached nothing, per peer (D56).
+    pub dial_failures: Mutex<HashMap<DeviceId, DialFailure>>,
+    /// The public address STUN reported at start.
+    pub reflexive: Option<std::net::SocketAddr>,
 }
 
 type EstablishedSession = (
@@ -114,6 +120,8 @@ pub(crate) struct LiveSession {
     pub grants_us: bool,
     /// Remote calls this peer may have running here at once.
     pub control_slots: Arc<Semaphore>,
+    /// What a diagnostics bundle reports about this connection (D56).
+    pub report: ConnReport,
 }
 
 impl LiveSession {
@@ -130,6 +138,7 @@ impl LiveSession {
             features: 0,
             grants_us: false,
             control_slots: Arc::new(Semaphore::new(control::MAX_CONCURRENT_CALLS)),
+            report: ConnReport::default(),
         }
     }
 }
@@ -166,6 +175,76 @@ impl Inner {
 
     pub(crate) fn control_connection(&self, peer: DeviceId) -> Option<Connection> {
         self.with_established(peer, |s| s.conn.clone())
+    }
+
+    /// Remember a dial round that reached nothing. Logged at `info` when it
+    /// differs from the last one for this peer, so an offline peer does not
+    /// fill the log every backoff (D56).
+    pub(crate) fn record_dial_failure(&self, peer: DeviceId, attempts: String) {
+        let mut failures = self.dial_failures.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = failures.get(&peer).is_none_or(|f| f.attempts != attempts);
+        if changed {
+            tracing::info!(peer = %peer, %attempts, "could not reach peer");
+        } else {
+            tracing::debug!(peer = %peer, "still cannot reach peer");
+        }
+        failures.insert(
+            peer,
+            DialFailure {
+                at_ms: unix_ms(),
+                attempts,
+            },
+        );
+    }
+
+    fn clear_dial_failure(&self, peer: DeviceId) {
+        self.dial_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer);
+    }
+
+    /// What this device knows about its peers' connections (D56).
+    pub(crate) fn net_report(&self) -> NetReport {
+        let trusted: Vec<PeerConfig> = self
+            .trusted
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let discovered = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        let failures = self.dial_failures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut peers: Vec<PeerNetReport> = trusted
+            .iter()
+            .map(|p| PeerNetReport {
+                id: p.id.to_string(),
+                addresses: p.addresses.clone(),
+                discovered: discovered.get(&p.id).cloned().unwrap_or_default(),
+                connection: sessions.get(&p.id).filter(|s| s.established).map(|s| {
+                    let mut report = s.report.clone();
+                    report.rtt_ms = s.conn.rtt().as_millis() as u64;
+                    report.grants_us = s.grants_us;
+                    report
+                }),
+                last_dial_failure: failures.get(&p.id).cloned(),
+            })
+            .collect();
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
+        NetReport {
+            listen: format!("port {}", self.listen_port),
+            relay: self
+                .relay_target
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            reflexive: self.reflexive.map(format_socket_addr),
+            lan_discovery: self.lan_discovery,
+            interfaces: crate::addr::interfaces(),
+            advertised: crate::addr::advertised_addresses(self.listen_port),
+            peers,
+        }
     }
 
     pub(crate) fn peer_has_feature(&self, peer: DeviceId, feature: u64) -> bool {
@@ -282,16 +361,16 @@ impl Inner {
         peer: DeviceId,
         stable_id: usize,
         write_tx: UnboundedSender<Vec<u8>>,
-        name: String,
-        features: u64,
+        report: ConnReport,
     ) -> bool {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         match sessions.get_mut(&peer) {
             Some(s) if s.stable_id == stable_id => {
                 s.write_tx = Some(write_tx);
                 s.established = true;
-                s.name = name;
-                s.features = features;
+                s.name = report.name.clone();
+                s.features = report.features;
+                s.report = report;
                 true
             }
             _ => false,
@@ -407,11 +486,37 @@ pub(crate) async fn drive_connection(inner: Arc<Inner>, conn: Connection, we_dia
         }
     };
 
+    let span = tracing::info_span!(
+        "conn",
+        peer = %peer_id.short(),
+        conn = %connection_id(&conn),
+        dir = if we_dialed { "out" } else { "in" },
+    );
+    drive_trusted(inner, conn, peer_id, we_dialed)
+        .instrument(span)
+        .await;
+}
+
+/// The id both ends of `conn` derive from its TLS session, so their log lines
+/// for the same connection match (D56).
+pub(crate) fn connection_id(conn: &Connection) -> String {
+    let mut id = [0u8; 4];
+    match conn.export_keying_material(&mut id, b"relay connection id", b"") {
+        Ok(()) => id.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => format!("local{}", conn.stable_id()),
+    }
+}
+
+async fn drive_trusted(inner: Arc<Inner>, conn: Connection, peer_id: DeviceId, we_dialed: bool) {
     // Trust is enforced here, after ALPN is known. The TLS verifier accepts
     // any Relay device cert so pairing can complete; sync data must never
     // flow to an untrusted peer. Checked before any stream is accepted.
     if !inner.is_trusted(&peer_id) {
-        tracing::warn!(peer = %peer_id, "peer is not in the trusted set after handshake");
+        tracing::warn!(
+            peer = %peer_id,
+            addr = %conn.remote_address(),
+            "refused a device that is not paired with this one"
+        );
         conn.close(close_code(CLOSE_UNTRUSTED), b"untrusted peer");
         return;
     }
@@ -478,6 +583,7 @@ async fn run_session(
         device_name: inner.device_name.clone(),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
         features: FEATURE_CONTROL | FEATURE_SPEED_TEST | FEATURE_DROP,
+        unix_ms: unix_ms(),
     }));
     let hello_bytes = encode_frame(&hello).map_err(|e| e.to_string())?;
 
@@ -536,16 +642,25 @@ async fn run_session(
     // must not reach it (same rule as a pairing name).
     let peer_name = sanitize_name(&h.device_name, peer_id);
     let remote = conn.remote_address();
+    let rtt = conn.rtt();
+    let clock_offset_ms = clock_offset(h.unix_ms, unix_ms(), rtt);
+    let report = ConnReport {
+        conn_id: connection_id(&conn),
+        name: peer_name.clone(),
+        remote: format_socket_addr(remote),
+        we_dialed,
+        since_ms: unix_ms(),
+        rtt_ms: rtt.as_millis() as u64,
+        clock_offset_ms,
+        version: sanitize_version(&h.client_version),
+        features: h.features,
+        grants_us: false,
+    };
     let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
     // A connection superseded during the handshake was never announced, so it
     // must not announce itself now; claim() already closed it.
-    if !inner.attach(
-        peer_id,
-        conn.stable_id(),
-        write_tx.clone(),
-        peer_name.clone(),
-        h.features,
-    ) {
+    let version = report.version.clone();
+    if !inner.attach(peer_id, conn.stable_id(), write_tx.clone(), report) {
         return Err("superseded during handshake".into());
     }
     let supports_control = h.features & FEATURE_CONTROL != 0;
@@ -553,7 +668,16 @@ async fn run_session(
         let _ = write_tx.send(bytes);
     }
 
-    tracing::info!(peer = %peer_id, name = %peer_name, addr = %remote, "peer connected");
+    inner.clear_dial_failure(peer_id);
+    tracing::info!(
+        peer = %peer_id,
+        name = %peer_name,
+        addr = %remote,
+        version = %version,
+        rtt_ms = rtt.as_millis() as u64,
+        clock_offset_ms = ?clock_offset_ms,
+        "peer connected"
+    );
     inner.emit(NetEvent::PeerConnected {
         peer: peer_id,
         name: peer_name,
@@ -561,16 +685,13 @@ async fn run_session(
         supports_control,
     });
 
-    let writer = tokio::spawn(write_loop(send, write_rx));
-    let reader = tokio::spawn(read_loop(
-        recv,
-        write_tx.clone(),
-        conn.clone(),
-        peer_id,
-        inner.clone(),
-    ));
-    let incoming = tokio::spawn(incoming_objects(conn.clone(), inner.clone(), peer_id));
-    let ping = tokio::spawn(ping_loop(write_tx, inner.clone()));
+    let writer = tokio::spawn(write_loop(send, write_rx).in_current_span());
+    let reader = tokio::spawn(
+        read_loop(recv, write_tx.clone(), conn.clone(), peer_id, inner.clone()).in_current_span(),
+    );
+    let incoming =
+        tokio::spawn(incoming_objects(conn.clone(), inner.clone(), peer_id).in_current_span());
+    let ping = tokio::spawn(ping_loop(write_tx, inner.clone()).in_current_span());
 
     let outcome = tokio::select! {
         _ = conn.closed() => Ok(()),
@@ -678,11 +799,16 @@ async fn incoming_objects(conn: Connection, inner: Arc<Inner>, peer: DeviceId) {
                 let store = inner.store.clone();
                 let conn = conn.clone();
                 let progress = Arc::clone(&inner);
-                tokio::spawn(async move {
-                    if let Err(e) = serve_object(send, recv, &store, &conn, &progress, peer).await {
-                        tracing::debug!(peer = %peer, error = %e, "object serve failed");
+                tokio::spawn(
+                    async move {
+                        if let Err(e) =
+                            serve_object(send, recv, &store, &conn, &progress, peer).await
+                        {
+                            tracing::debug!(peer = %peer, error = %e, "object serve failed");
+                        }
                     }
-                });
+                    .in_current_span(),
+                );
             }
             Err(_) => return,
         }
@@ -1075,9 +1201,20 @@ pub(crate) async fn dialer(inner: Arc<Inner>, endpoint: quinn::Endpoint, peer_id
         }
 
         let hints = inner.discovered_addresses(peer_id);
-        if let Some((conn, discovered)) =
-            try_dial(&inner, &endpoint, peer_id, &addresses, &hints).await
-        {
+        let mut attempts = Vec::new();
+        let dialed = try_dial(
+            &inner,
+            &endpoint,
+            peer_id,
+            &addresses,
+            &hints,
+            &mut attempts,
+        )
+        .await;
+        if dialed.is_none() && !attempts.is_empty() {
+            inner.record_dial_failure(peer_id, attempts.join("; "));
+        }
+        if let Some((conn, discovered)) = dialed {
             if let Some(address) = discovered {
                 inner.learn_address(peer_id, address);
             }
@@ -1108,6 +1245,7 @@ async fn try_dial(
     peer_id: DeviceId,
     addresses: &[String],
     hints: &[String],
+    attempts: &mut Vec<String>,
 ) -> Option<(Connection, Option<String>)> {
     let client = match make_client_config(&inner.tls, peer_id, &inner.trusted) {
         Ok(c) => c,
@@ -1132,6 +1270,7 @@ async fn try_dial(
             Ok(iter) => iter.collect::<Vec<_>>(),
             Err(e) => {
                 tracing::debug!(peer = %peer_id, addr = %addr_str, error = %e, "dns resolve failed");
+                attempts.push(format!("{addr_str}: does not resolve"));
                 continue;
             }
         };
@@ -1150,18 +1289,21 @@ async fn try_dial(
                     }
                     Ok(Err(e)) => {
                         tracing::debug!(peer = %peer_id, %sa, error = %e, "dial failed");
+                        attempts.push(format!("{sa}: {e}"));
                     }
                     Err(_) => {
                         tracing::debug!(peer = %peer_id, %sa, "dial timed out");
+                        attempts.push(format!("{sa}: no answer"));
                     }
                 },
                 Err(e) => {
                     tracing::debug!(peer = %peer_id, %sa, error = %e, "connect_with failed");
+                    attempts.push(format!("{sa}: {e}"));
                 }
             }
         }
     }
-    try_relay_dial(inner, endpoint, peer_id, &client)
+    try_relay_dial(inner, endpoint, peer_id, &client, attempts)
         .await
         .map(|conn| (conn, None))
 }
@@ -1171,6 +1313,7 @@ async fn try_relay_dial(
     endpoint: &quinn::Endpoint,
     peer_id: DeviceId,
     client: &quinn::ClientConfig,
+    attempts: &mut Vec<String>,
 ) -> Option<Connection> {
     if inner.is_shutting_down() || inner.has_session(peer_id) {
         return None;
@@ -1186,6 +1329,7 @@ async fn try_relay_dial(
     sock.set_relay(Some(relay_addr));
     if let Err(err) = sock.send_bind(peer_id, &inner.identity).await {
         tracing::debug!(peer = %peer_id, error = %err, "relay bind failed");
+        attempts.push(format!("relay {relay_addr}: {err}"));
         return None;
     }
     if inner.is_shutting_down() || inner.has_session(peer_id) {
@@ -1198,15 +1342,18 @@ async fn try_relay_dial(
             Ok(Ok(conn)) => Some(conn),
             Ok(Err(err)) => {
                 tracing::debug!(peer = %peer_id, error = %err, "relay dial failed");
+                attempts.push(format!("relay {relay_addr}: {err}"));
                 None
             }
             Err(_) => {
                 tracing::debug!(peer = %peer_id, "relay dial timed out");
+                attempts.push(format!("relay {relay_addr}: no answer"));
                 None
             }
         },
         Err(err) => {
             tracing::debug!(peer = %peer_id, error = %err, "relay connect_with failed");
+            attempts.push(format!("relay {relay_addr}: {err}"));
             None
         }
     }
@@ -1266,6 +1413,33 @@ pub(crate) fn apply_set_peers(inner: &Inner, peers: Vec<PeerConfig>) -> Vec<Devi
     removed
 }
 
+pub(crate) fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The peer's clock minus ours, from the time it put in its `Hello` (D56).
+/// Half the round trip stands in for the one-way delay. `None` from a peer
+/// too old to send its time.
+fn clock_offset(peer_sent_ms: u64, received_ms: u64, rtt: Duration) -> Option<i64> {
+    if peer_sent_ms == 0 {
+        return None;
+    }
+    let one_way = (rtt.as_millis() / 2) as i64;
+    Some(peer_sent_ms as i64 + one_way - received_ms as i64)
+}
+
+/// A version string from the wire, bounded for logs and reports.
+fn sanitize_version(version: &str) -> String {
+    version
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,6 +1478,8 @@ mod tests {
             speed_tests_in: Arc::new(Semaphore::new(1)),
             speed_tests_out: Arc::new(Semaphore::new(1)),
             drops_in: Arc::new(Semaphore::new(crate::drops::MAX_DROPS_IN)),
+            dial_failures: Mutex::new(HashMap::new()),
+            reflexive: None,
         };
         (Arc::new(inner), rx, dir)
     }

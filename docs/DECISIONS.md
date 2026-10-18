@@ -63,6 +63,7 @@ Add an entry with the next free number (check open pull requests), then run
 | D48 | [Connection test](#d48-connection-test) |
 | D49 | [Automatic releases after main CI](#d49-automatic-releases-after-main-ci) |
 | D50 | [Drops](#d50-drops) |
+| D56 | [Logging and diagnostics](#d56-logging-and-diagnostics) |
 
 <!-- index:end -->
 
@@ -1476,3 +1477,55 @@ stage 1 of [`proposals/photo-drop.md`](proposals/photo-drop.md).
   `dropped` read the database each time, so a change applies to the next
   drop. A saved drop is an `ActivityItem` of kind `drop` whose `detail` is
   the saved path; the desktop app takes it from the activity stream.
+
+## D56. Logging and diagnostics
+
+Field failures between devices (pairing, discovery, NAT, firewalls) are
+outside what `relay-vopr` models, so logs from both sides are the evidence.
+Every host keeps the same log and can hand it, with a state snapshot, to a
+device that manages it.
+
+- **One log per Relay home.** `relay-daemon::logging` installs the one
+  `tracing` subscriber for the CLI, `relay service`, the server, the desktop
+  app, and Android: `<home>/logs/relay.log`, UTC timestamps, rotated at
+  10 MiB keeping `.1` and `.2`. Each start writes a
+  `==== relay VERSION started ... ====` line. `log` crate records are bridged
+  in. Android mirrors every line to logcat; `relay run` without
+  `--log-file` also writes to stderr at `RELAY_LOG` (default `warn`), which
+  is what `docker logs` shows. When the desktop app is a client of a running
+  service, it writes `logs/app.log` instead, so two processes never share a
+  file.
+- **Levels.** The file's default is `info`, or `RELAY_LOG` when set; a bare
+  level quiets chatty dependencies (quinn, rustls, mDNS, Tauri) to `warn`.
+  Connection lifecycle is at `info`: start, peer connected (version, RTT,
+  clock offset) and disconnected, a dial round that failed (addresses tried
+  and why, logged when the summary changes), rejected handshakes with the
+  remote address, mDNS sightings, every pairing step on both sides, and the
+  activity feed.
+- **Correlation.** A session runs inside a `conn{peer, conn, dir}` span.
+  `conn` is 8 hex digits exported from the TLS keying material, so both
+  ends log the same value without a wire change. Pairing runs inside
+  `pair{role, nameplate}`; the code itself is never logged.
+- **Runtime level.** `relay log level debug` or the app's Detailed logging
+  switch changes the running host's filter over IPC, not `ConfigChange`
+  (D36): it is not configuration and is not stored. It returns to the
+  default after `--for` (1 h by default), so nobody leaves debug on.
+- **Clock offset.** `Hello.unix_ms` (tag 6) carries the sender's wall clock.
+  The receiver records `peer + rtt/2 − local` per connection. An older peer
+  sends 0, recorded as unknown.
+- **Bundle.** `relay diag` writes a zip: `report.json` (versions, OS, status,
+  interfaces, listen and reflexive addresses, every peer with addresses,
+  live connection with `conn`, RTT, clock offset, feature bits and grants,
+  last dial failure, and recent activity) plus the log files. Keys,
+  secrets, and pairing codes are never included; paths and file names are,
+  since the reader already manages the device.
+- **Pulling from a peer.** Remote call `Diagnostics` (control tag 11) asks
+  a peer for its bundle. Like browsing, it needs the manage grant (D46);
+  an older peer answers `invalid`. The reply is capped at 3 MiB, cutting
+  the oldest log lines first. `relay diag --all` (or All my devices in the
+  app) saves this device's bundle and every connected managed peer's, so a
+  phone is collected from a computer without adb.
+- **Merge.** `relay diag merge` interleaves bundles into one timeline on the
+  first bundle's clock, shifting each other bundle by the offset either side
+  measured, and labels every line with its device. Bundles with no measured
+  offset are merged unshifted, with a note.
